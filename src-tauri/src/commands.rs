@@ -2029,6 +2029,30 @@ pub fn copy_text_to_clipboard(_text: String) -> Result<(), String> {
     Err("Text clipboard copy is only supported on desktop".to_string())
 }
 
+/// Read text from the system clipboard through the native backend.
+/// Works around the WebKitGTK clipboard bug where the async `navigator.clipboard`
+/// API returns empty for text copied from external applications.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn read_clipboard_text() -> Result<String, String> {
+    // Reading the clipboard can block while the owning application answers, like the image read below.
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|e| format!("Clipboard init failed: {}", e))?;
+        clipboard
+            .get_text()
+            .map_err(|e| format!("Failed to read text from clipboard: {}", e))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[cfg(mobile)]
+#[tauri::command]
+pub async fn read_clipboard_text() -> Result<String, String> {
+    Err("Text clipboard read is only supported on desktop".to_string())
+}
+
 /// Read image from system clipboard (bypasses WebKitGTK clipboard bug).
 /// Returns PNG bytes as Vec<u8>, or error if no image on clipboard.
 #[cfg(desktop)]

@@ -212,6 +212,7 @@ pub fn run() {
             commands::load_vault_state,
             commands::save_vault_state,
             commands::copy_text_to_clipboard,
+            commands::read_clipboard_text,
             commands::read_clipboard_image,
             commands::copy_image_to_clipboard,
             commands::save_image,

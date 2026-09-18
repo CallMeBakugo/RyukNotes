@@ -35,7 +35,7 @@
 	import { openFile, openUrl, copyFileTo, copyImageToClipboard as copyImageToClipboardCmd, writeBytesTo, copyPngToClipboard, copyTextToClipboard } from '$lib/api';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { activeNote, activeNotePath, appConfig, editorDirty, sourceMode, focusMode, readOnly, quickAccessPaths, notes, navHistory, canGoBack, canGoForward, viewerNote, viewMode, notebooks, outlineWidth } from '$lib/stores/app';
-	import { saveNote, importNote, createNote, saveImage, saveAttachment, readClipboardImage, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout } from '$lib/api';
+	import { saveNote, importNote, createNote, saveImage, saveAttachment, readClipboardImage, readClipboardText, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout } from '$lib/api';
 	import type { NoteContent, VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord, FileEvent, SearchTarget, ToolbarLayout } from '$lib/types';
 	import { listen } from '@tauri-apps/api/event';
 	import { debounce } from '$lib/utils/debounce';
@@ -62,6 +62,7 @@
 	import { restoreTitleHeading, stripTitleHeading, type HiddenTitleHeading } from '$lib/editor/titleVisibility';
 	import { documentHeadings, sourceHeadings, activeHeadingIndex, mapDocumentHeadings, mapSourceHeadings, type OutlineHeading } from '$lib/editor/outline';
 	import { createEditorMarkdownParser } from '$lib/editor/markdownParser';
+	import { collectClipboardPayload, isEmptyPayload, type ClipboardPastePayload } from '$lib/utils/clipboard-paste';
 	import { externalNoteReferences } from '$lib/editor/externalNote';
 	import { tagIterationKey } from '$lib/utils/tag-styles';
 	import { replaceWithWikiLink } from '$lib/editor/wikiLinks';
@@ -5850,28 +5851,60 @@
 		if (isOriginCurrent(origin)) closeTextContextMenu();
 	}
 
+	/**
+	 * Replays clipboard data as a paste event on the editor DOM, so it takes the same path as
+	 * Ctrl/Cmd+V. ProseMirror's paste handler then runs every `handlePaste` prop (file paste,
+	 * callout paste, link paste), `transformPastedHTML`, the clipboard parsers and TipTap's paste rules.
+	 */
+	function replayPaste(payload: ClipboardPastePayload): boolean {
+		if (!editor) return false;
+		const data = new DataTransfer();
+		if (payload.text) data.setData('text/plain', payload.text);
+		if (payload.html) data.setData('text/html', payload.html);
+		for (const [type, value] of payload.strings) data.setData(type, value);
+		for (const file of payload.files) data.items.add(file);
+		const event = new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true });
+		editor.view.focus();
+		editor.view.dom.dispatchEvent(event);
+		return event.defaultPrevented;
+	}
+
+	async function readWebClipboard(): Promise<ClipboardPastePayload | null> {
+		try {
+			const payload = await collectClipboardPayload(await navigator.clipboard.read());
+			return isEmptyPayload(payload) ? null : payload;
+		} catch (e) {
+			// WebKitGTK (bug #218519) often cannot read content copied from other applications.
+			console.warn('Web clipboard read failed, using the native clipboard:', e);
+			return null;
+		}
+	}
+
 	async function ctxPaste() {
 		// insertClipboardImage() saves the attachment before inserting it, so an
 		// unguarded paste here would leave an orphan file behind when the editor
 		// cannot accept the insertion.
 		if (!editor || $readOnly || $viewerNote) { closeTextContextMenu(); return; }
 		const origin = captureOrigin();
-		try {
-			const text = await navigator.clipboard.readText();
-			if (!canInsert(origin) || !editor) return;
-			if (text) {
-				editor.commands.insertContent(text);
-				closeTextContextMenu();
-				return;
-			}
-		} catch (e) {
-			console.error('Paste failed:', e);
+		const payload = await readWebClipboard();
+		if (!canInsert(origin) || !editor) return;
+		if (payload && replayPaste(payload)) {
+			closeTextContextMenu();
+			return;
 		}
-		// readText() only reads text/plain. An image copied from a browser has none,
-		// so pasting an image from this menu used to do nothing at all. Fall back to
-		// the same native clipboard reader the paste handler uses; it is a no-op when
-		// the clipboard holds no image.
-		await insertClipboardImage(origin);
+		// Native fallback when the web clipboard is unavailable or empty. An image comes first, so a
+		// browser "Copy image" pastes the bitmap rather than the image URL that may come with it.
+		if (await insertClipboardImage(origin)) {
+			if (isOriginCurrent(origin)) closeTextContextMenu();
+			return;
+		}
+		try {
+			const text = await readClipboardText();
+			if (!canInsert(origin) || !editor) return;
+			if (text) replayPaste({ text, html: '', strings: [], files: [] });
+		} catch (e) {
+			console.error('Native clipboard read failed:', e);
+		}
 		if (isOriginCurrent(origin)) closeTextContextMenu();
 	}
 
@@ -6506,14 +6539,17 @@
 		return false;
 	}
 
-	async function insertClipboardImage(origin = captureOrigin()) {
-		if (!canInsert(origin)) return;
+	/** Inserts the native clipboard image. Resolves true when there was an image to insert. */
+	async function insertClipboardImage(origin = captureOrigin()): Promise<boolean> {
+		if (!canInsert(origin)) return false;
 		try {
 			const data = await readClipboardImage();
-			if (!canInsert(origin)) return;
+			if (!canInsert(origin)) return false;
 			await uploadAsset(origin, 'pasted-image.png', data, 'image');
+			return true;
 		} catch (e) {
 			console.error('Clipboard image fallback failed:', e);
+			return false;
 		}
 	}
 
