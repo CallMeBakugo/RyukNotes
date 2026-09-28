@@ -6,6 +6,7 @@
 	import { tasksLayout, tasksHideCompleted, tasksOnlyFlagged, tasksSort, appConfig } from '$lib/stores/app';
 	import { isAndroid } from '$lib/platform';
 	import type { TaskItem, FileEvent } from '$lib/types';
+	import { isCurrentVaultEvent } from '$lib/utils/note-list-updates';
 
 	let { onOpenTask = (_t: TaskItem) => {}, onToggleTask = async (_t: TaskItem) => {}, onSetTaskPriority = async (_t: TaskItem, _p: string | null) => {}, onSetTaskDue = async (_t: TaskItem, _d: string | null) => {} }: {
 		onOpenTask?: (t: TaskItem) => void;
@@ -18,23 +19,82 @@
 	let loading = $state(true);
 	let taskQuery = $state('');
 	let unlisten: (() => void) | null = null;
+	let disposed = false;
+	let fullLoad = 0;
+	let revision = 0;
+	const noteRevisions = new Map<string, number>();
 
 	async function load() {
+		if (disposed) return;
+		const request = ++fullLoad;
+		const startedAt = revision;
 		try {
-			tasks = await getTasks();
+			const loaded = await getTasks();
+			if (disposed || request !== fullLoad) return;
+			// Keep per-note updates/removals that arrived during the full scan.
+			const changedPaths = new Set(
+				[...noteRevisions].filter(([, changedAt]) => changedAt > startedAt).map(([path]) => path),
+			);
+			tasks = [
+				...loaded.filter((task) => !changedPaths.has(task.note_path)),
+				...tasks.filter((task) => changedPaths.has(task.note_path)),
+			];
 		} catch (e) {
 			console.error('Failed to load tasks:', e);
-			tasks = [];
+		} finally {
+			if (!disposed && request === fullLoad) loading = false;
 		}
-		loading = false;
+	}
+
+	async function loadNote(path: string) {
+		if (disposed) return;
+		const request = ++revision;
+		const generation = fullLoad;
+		noteRevisions.set(path, request);
+		try {
+			const loaded = await getTasks(path);
+			if (disposed || generation !== fullLoad || noteRevisions.get(path) !== request) return;
+			tasks = [...tasks.filter((task) => task.note_path !== path), ...loaded];
+		} catch (e) {
+			console.error('Failed to refresh note tasks:', e);
+		}
 	}
 
 	const debouncedLoad = debounce(load, 400);
 
+	function handleFileChange(event: FileEvent) {
+		if (disposed || !isCurrentVaultEvent(event, $appConfig?.active_vault ?? null)) return;
+		if (event.event_type === 'remove') {
+			const isDescendant = (path: string) =>
+				path.startsWith(event.path + '/') || path.startsWith(event.path + '\\');
+			const removedPaths = new Set([
+				event.path,
+				...tasks.filter((task) => isDescendant(task.note_path)).map((task) => task.note_path),
+				...[...noteRevisions.keys()].filter(isDescendant),
+			]);
+			for (const path of removedPaths) noteRevisions.set(path, ++revision);
+			tasks = tasks.filter((task) => !removedPaths.has(task.note_path));
+			if (event.path.endsWith('.md') && removedPaths.size === 1) return;
+		} else if (event.note) {
+			void loadNote(event.note.path);
+			return;
+		}
+		// Directory/unknown events need the full scan; ordinary note saves do not.
+		fullLoad += 1;
+		debouncedLoad();
+	}
+
 	onMount(() => {
-		load();
-		listen<FileEvent>('file-changed', () => debouncedLoad()).then((u) => (unlisten = u));
-		return () => { unlisten?.(); };
+		void load();
+		listen<FileEvent>('file-changed', ({ payload }) => handleFileChange(payload)).then((u) => {
+			if (disposed) u();
+			else unlisten = u;
+		});
+		return () => {
+			disposed = true;
+			fullLoad += 1;
+			unlisten?.();
+		};
 	});
 
 	// Local YYYY-MM-DD (en-CA gives ISO-style date)
@@ -83,7 +143,7 @@
 
 	async function toggle(t: TaskItem) {
 		await onToggleTask(t);
-		await load();
+		await loadNote(t.note_path);
 	}
 
 	let prioMenuFor = $state<string | null>(null);
@@ -93,13 +153,13 @@
 	async function choosePriority(t: TaskItem, p: string | null) {
 		prioMenuFor = null;
 		await onSetTaskPriority(t, p);
-		await load();
+		await loadNote(t.note_path);
 	}
 
 	async function chooseDue(t: TaskItem, d: string | null) {
 		dueMenuFor = null;
 		await onSetTaskDue(t, d);
-		await load();
+		await loadNote(t.note_path);
 	}
 
 	// ── Calendar ──
@@ -183,7 +243,7 @@
 		dragOverDate = null;
 		if (!t || t.due === date) return;
 		await onSetTaskDue(t, date);
-		await load();
+		await loadNote(t.note_path);
 	}
 </script>
 

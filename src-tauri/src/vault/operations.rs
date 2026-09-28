@@ -1,6 +1,6 @@
 use crate::types::{
-    NoteContent, NoteEntry, NoteMeta, NoteTitleEntry, NotebookEntry, TagStyle, TrashContents,
-    TrashNotebookEntry, VaultState,
+    NoteContent, NoteEntry, NoteMeta, NoteTitleEntry, NotebookEntry, TagStyle, TagStyleChange,
+    TrashContents, TrashNotebookEntry, VaultState,
 };
 use crate::vault::frontmatter;
 use chrono::{DateTime, Local, Locale, Utc};
@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -440,9 +440,9 @@ fn read_note_entry(path: &Path, vault_root: &Path) -> Result<NoteEntry, String> 
     read_note_entry_from_str(&raw, path, vault_root)
 }
 
-/// Android-only: reads just the frontmatter (first 2KB) for tags/title/pinned,
-/// uses filesystem timestamps for dates. No preview text.
-#[cfg(mobile)]
+/// Mobile listing reads the first 2KB and uses the filesystem modification time.
+/// Persisted creation dates survive atomic file replacement.
+#[cfg(any(mobile, test))]
 fn read_note_entry_metadata_only(path: &Path, vault_root: &Path) -> Result<NoteEntry, String> {
     // Read first 2KB - enough for frontmatter with tags, title, pinned
     let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
@@ -459,13 +459,15 @@ fn read_note_entry_metadata_only(path: &Path, vault_root: &Path) -> Result<NoteE
 
     let (mut meta, content) = frontmatter::parse_note(&raw, &filename);
 
-    // Always use filesystem timestamps on Android (faster than parsing date strings)
+    // Creation time belongs to the note, not the replacement file's new inode.
     if let Ok(fs_meta) = fs::metadata(path) {
         if let Ok(m) = fs_meta.modified() {
             meta.modified = m.into();
         }
-        if let Ok(c) = fs_meta.created() {
-            meta.created = c.into();
+        if !raw.contains("\ncreated:") && !raw.starts_with("created:") {
+            if let Ok(c) = fs_meta.created() {
+                meta.created = c.into();
+            }
         }
     }
 
@@ -486,7 +488,7 @@ fn read_note_entry_metadata_only(path: &Path, vault_root: &Path) -> Result<NoteE
 }
 
 /// Fast version: reads only the first ~2KB of the file (enough for frontmatter + preview).
-fn read_note_entry_fast(path: &Path, vault_root: &Path) -> Result<NoteEntry, String> {
+pub(crate) fn read_note_entry_fast(path: &Path, vault_root: &Path) -> Result<NoteEntry, String> {
     let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
     let mut buf = vec![0u8; 2048];
     let bytes_read = file.read(&mut buf).map_err(|e| e.to_string())?;
@@ -588,25 +590,88 @@ fn read_note_content(validated: &Path, reported_path: &str) -> Result<NoteConten
     })
 }
 
-pub fn save_note(vault_path: &str, path: &str, meta: &NoteMeta, body: &str) -> Result<(), String> {
-    let path = ensure_note_path(vault_path, Path::new(path))?;
-    let mut updated_meta = meta.clone();
-    updated_meta.modified = Utc::now();
+pub struct SavedNote {
+    pub id: String,
+    pub previous_raw: String,
+}
 
-    // Generate UUID on first save if note didn't have one
-    if updated_meta.id.is_empty() {
+/// Returns the pre-save content only when the note actually changed.
+pub fn save_note(
+    vault_path: &str,
+    path: &str,
+    meta: &NoteMeta,
+    body: &str,
+) -> Result<Option<SavedNote>, String> {
+    let validated = ensure_note_path(vault_path, Path::new(path))?;
+    // Replace the actual file, not a symlink pointing to it.
+    let target = canonicalize_path(&validated, "note path")?;
+    let existing = read_note_content(&target, path)?;
+    let mut updated_meta = meta.clone();
+
+    // A stale editor may still have an empty ID after the first save.
+    if !existing.meta.id.is_empty() {
+        updated_meta.id.clone_from(&existing.meta.id);
+    } else if updated_meta.id.is_empty() {
         updated_meta.id = Uuid::new_v4().to_string();
     }
 
-    // Read existing file to preserve unknown frontmatter fields
-    let existing = fs::read_to_string(&path).unwrap_or_default();
-    let raw = if existing.is_empty() {
-        frontmatter::update_note_raw(&updated_meta, body)
-    } else {
-        frontmatter::merge_frontmatter(&existing, &updated_meta, body)
-    };
+    // The editor appends one terminal LF; the note parser omits it. Do not
+    // trim spaces here: Markdown hard breaks and indentation are meaningful.
+    let comparable_body = body.strip_suffix('\n').unwrap_or(body);
+    if existing.content == comparable_body
+        && existing.meta.id == updated_meta.id
+        && existing.meta.title == updated_meta.title
+        && existing.meta.tags == updated_meta.tags
+        && existing.meta.pinned == updated_meta.pinned
+        && existing.meta.created == updated_meta.created
+    {
+        return Ok(None);
+    }
 
-    fs::write(path, raw).map_err(|e| e.to_string())?;
+    updated_meta.modified = Utc::now();
+    let raw = frontmatter::merge_frontmatter(&existing.raw, &updated_meta, body);
+    replace_file_atomically(&target, raw.as_bytes())?;
+
+    Ok(Some(SavedNote {
+        id: updated_meta.id,
+        previous_raw: existing.raw,
+    }))
+}
+
+pub(crate) fn replace_file_atomically(path: &Path, content: &[u8]) -> Result<(), String> {
+    let permissions = match fs::metadata(path) {
+        Ok(metadata) => {
+            let permissions = metadata.permissions();
+            if permissions.readonly() {
+                return Err("File is read-only".to_string());
+            }
+            Some(permissions)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    let parent = path.parent().ok_or("File has no parent directory")?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".helixnotes-save-")
+        .tempfile_in(parent)
+        .map_err(|error| error.to_string())?;
+    temporary
+        .write_all(content)
+        .map_err(|error| error.to_string())?;
+    temporary.flush().map_err(|error| error.to_string())?;
+    if let Some(permissions) = permissions {
+        temporary
+            .as_file()
+            .set_permissions(permissions)
+            .map_err(|error| error.to_string())?;
+    }
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    // tempfile uses an atomic replacement on Unix and Windows, and owns cleanup
+    // on every failure before the replacement succeeds.
+    temporary.persist(path).map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -1097,7 +1162,7 @@ pub fn rename_notebook(vault_path: &str, path: &str, new_name: &str) -> Result<S
         return Err("A notebook with that name already exists".to_string());
     }
 
-    fs::rename(src, &new_path).map_err(|e| e.to_string())?;
+    move_notebook_with_icons(vault_path, src, &new_path)?;
     Ok(new_path.to_string_lossy().to_string())
 }
 
@@ -1149,7 +1214,7 @@ pub fn move_notebook(
         return Err("A notebook with that name already exists in the destination".to_string());
     }
 
-    fs::rename(src, &dest).map_err(|e| e.to_string())?;
+    move_notebook_with_icons(vault_path, src, &dest)?;
     Ok(dest.to_string_lossy().to_string())
 }
 
@@ -1394,16 +1459,29 @@ pub fn save_attachment(vault_path: &str, name: &str, data: &[u8]) -> Result<Stri
     let attachments_dir = helixnotes_dir(vault_path).join("attachments");
     fs::create_dir_all(&attachments_dir).map_err(|e| e.to_string())?;
 
-    let timestamp = Utc::now().format("%Y%m%d%H%M%S");
     let safe_name = sanitize_filename(name);
-    let filename = format!("{}_{}", timestamp, safe_name);
-    let dest = attachments_dir.join(&filename);
-
-    fs::write(&dest, data).map_err(|e| e.to_string())?;
-
-    // Return relative path from vault root
-    let relative = format!(".helixnotes/attachments/{}", filename);
-    Ok(relative)
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".helixnotes-asset-")
+        .tempfile_in(&attachments_dir)
+        .map_err(|error| error.to_string())?;
+    temporary
+        .write_all(data)
+        .map_err(|error| error.to_string())?;
+    temporary.flush().map_err(|error| error.to_string())?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    loop {
+        let filename = format!("{}_{}", Uuid::new_v4(), safe_name);
+        match temporary.persist_noclobber(attachments_dir.join(&filename)) {
+            Ok(_) => return Ok(format!(".helixnotes/attachments/{filename}")),
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                temporary = error.file;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
 }
 
 pub(crate) fn normalize_notebook_icon_key(path: &str) -> String {
@@ -1414,11 +1492,13 @@ pub fn load_notebook_icons(
     vault_path: &str,
 ) -> Result<std::collections::HashMap<String, String>, String> {
     let icons_path = helixnotes_dir(vault_path).join("notebook_icons.json");
-    if !icons_path.exists() {
-        return Ok(std::collections::HashMap::new());
-    }
-
-    let data = fs::read_to_string(&icons_path).map_err(|e| e.to_string())?;
+    let data = match fs::read_to_string(&icons_path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(std::collections::HashMap::new())
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let icons: std::collections::HashMap<String, String> =
         serde_json::from_str(&data).map_err(|e| e.to_string())?;
     Ok(icons
@@ -1442,10 +1522,103 @@ pub fn set_notebook_icon(
             icons.remove(&notebook_key);
         }
     }
-    let icons_path = helixnotes_dir(vault_path).join("notebook_icons.json");
-    let data = serde_json::to_string_pretty(&icons).map_err(|e| e.to_string())?;
-    fs::write(&icons_path, data).map_err(|e| e.to_string())?;
+    save_notebook_icons(vault_path, &icons)
+}
+
+fn save_notebook_icons(
+    vault_path: &str,
+    icons: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    let dir = helixnotes_dir(vault_path);
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let data = serde_json::to_vec_pretty(icons).map_err(|error| error.to_string())?;
+    replace_file_atomically(&dir.join("notebook_icons.json"), &data)
+}
+
+fn move_notebook_with_icons(vault_path: &str, src: &Path, dest: &Path) -> Result<(), String> {
+    let icons = load_notebook_icons(vault_path)?;
+    let old_key = normalize_notebook_icon_key(
+        &src.strip_prefix(vault_path)
+            .map_err(|error| error.to_string())?
+            .to_string_lossy(),
+    );
+    let new_key = normalize_notebook_icon_key(
+        &dest
+            .strip_prefix(vault_path)
+            .map_err(|error| error.to_string())?
+            .to_string_lossy(),
+    );
+    let prefix = format!("{old_key}/");
+    let mut changed = false;
+    let migrated = icons
+        .into_iter()
+        .map(|(key, value)| {
+            let key = if key == old_key {
+                changed = true;
+                new_key.clone()
+            } else if let Some(suffix) = key.strip_prefix(&prefix) {
+                changed = true;
+                format!("{new_key}/{suffix}")
+            } else {
+                key
+            };
+            (key, value)
+        })
+        .collect();
+    fs::rename(src, dest).map_err(|error| error.to_string())?;
+    if changed {
+        if let Err(error) = save_notebook_icons(vault_path, &migrated) {
+            return Err(match fs::rename(dest, src) {
+                Ok(()) => error,
+                Err(rollback) => format!("{error}; notebook move rollback failed: {rollback}"),
+            });
+        }
+    }
     Ok(())
+}
+
+fn rollback_import<T>(
+    vault_path: &str,
+    relative: &str,
+    result: Result<T, String>,
+) -> Result<T, String> {
+    result.map_err(
+        |error| match fs::remove_file(Path::new(vault_path).join(relative)) {
+            Ok(()) => error,
+            Err(rollback) => format!("{error}; imported attachment rollback failed: {rollback}"),
+        },
+    )
+}
+
+pub fn import_notebook_icon(
+    vault_path: &str,
+    notebook_relative: &str,
+    name: &str,
+    data: &[u8],
+) -> Result<String, String> {
+    let relative = save_attachment(vault_path, name, data)?;
+    rollback_import(
+        vault_path,
+        &relative,
+        set_notebook_icon(vault_path, notebook_relative, Some(&relative)),
+    )?;
+    Ok(relative)
+}
+
+pub fn import_tag_icon(
+    vault_path: &str,
+    tag: &str,
+    name: &str,
+    data: &[u8],
+) -> Result<TagStyle, String> {
+    let relative = save_attachment(vault_path, name, data)?;
+    let result = patch_tag_style(
+        vault_path,
+        tag,
+        TagStyleChange::Icon(Some(relative.clone())),
+    )
+    .and_then(|style| style.ok_or_else(|| "Imported tag icon was not registered".to_string()));
+    rollback_import(vault_path, &relative, result)
 }
 
 fn tag_styles_path(vault_path: &str) -> PathBuf {
@@ -1488,15 +1661,18 @@ pub fn load_tag_styles(
     vault_path: &str,
 ) -> Result<std::collections::HashMap<String, TagStyle>, String> {
     let styles_path = tag_styles_path(vault_path);
-    if !styles_path.exists() {
-        return Ok(std::collections::HashMap::new());
-    }
-
-    let data = fs::read_to_string(&styles_path).map_err(|e| e.to_string())?;
+    let data = match fs::read_to_string(&styles_path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(std::collections::HashMap::new())
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let styles: std::collections::HashMap<String, TagStyle> =
         serde_json::from_str(&data).map_err(|e| e.to_string())?;
     let mut collapsed = std::collections::HashMap::new();
     for (tag, style) in styles {
+        normalize_tag_color(style.color.as_deref())?;
         let key = normalize_tag_style_key(&tag);
         if key.is_empty() || style.is_empty() {
             continue;
@@ -1507,7 +1683,11 @@ pub fn load_tag_styles(
     Ok(collapsed)
 }
 
-pub fn set_tag_style(vault_path: &str, tag: &str, style: Option<TagStyle>) -> Result<(), String> {
+pub fn patch_tag_style(
+    vault_path: &str,
+    tag: &str,
+    change: TagStyleChange,
+) -> Result<Option<TagStyle>, String> {
     let key = normalize_tag_style_key(tag);
     if key.is_empty() {
         return Err("Tag name is required".to_string());
@@ -1518,28 +1698,45 @@ pub fn set_tag_style(vault_path: &str, tag: &str, style: Option<TagStyle>) -> Re
         .keys()
         .find(|existing| tag_style_key_fold(existing) == tag_style_key_fold(&key))
         .cloned()
-        .unwrap_or_else(|| key.clone());
-    match style {
-        Some(style) => {
-            let next = TagStyle {
-                icon: normalize_tag_icon(style.icon.as_deref()),
-                color: normalize_tag_color(style.color.as_deref())?,
-            };
-            remove_matching_tag_styles(&mut styles, &key);
-            if !next.is_empty() {
-                styles.insert(stored_key, next);
-            }
-        }
-        None => {
-            remove_matching_tag_styles(&mut styles, &key);
-        }
+        .unwrap_or(key);
+    let mut next = styles.remove(&stored_key).unwrap_or_default();
+    match change {
+        TagStyleChange::Icon(value) => next.icon = normalize_tag_icon(value.as_deref()),
+        TagStyleChange::Color(value) => next.color = normalize_tag_color(value.as_deref())?,
+        TagStyleChange::Reset => next = TagStyle::default(),
+    }
+    let next = (!next.is_empty()).then_some(next);
+    if let Some(style) = &next {
+        styles.insert(stored_key, style.clone());
     }
 
     let dir = helixnotes_dir(vault_path);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let data = serde_json::to_string_pretty(&styles).map_err(|e| e.to_string())?;
-    fs::write(tag_styles_path(vault_path), data).map_err(|e| e.to_string())?;
-    Ok(())
+    replace_file_atomically(&tag_styles_path(vault_path), data.as_bytes())?;
+    Ok(next)
+}
+
+pub(crate) fn attachment_metadata_references(
+    mapping: &str,
+    content: &str,
+) -> Result<Vec<String>, String> {
+    if mapping == "notebook_icons.json" {
+        let icons: std::collections::HashMap<String, String> =
+            serde_json::from_str(content).map_err(|error| error.to_string())?;
+        Ok(icons.into_values().collect())
+    } else {
+        let styles: std::collections::HashMap<String, TagStyle> =
+            serde_json::from_str(content).map_err(|error| error.to_string())?;
+        let mut references = Vec::new();
+        for style in styles.into_values() {
+            normalize_tag_color(style.color.as_deref())?;
+            if let Some(icon) = style.icon {
+                references.push(icon);
+            }
+        }
+        Ok(references)
+    }
 }
 
 pub fn load_quick_access(vault_path: &str) -> Result<Vec<String>, String> {
@@ -1660,11 +1857,140 @@ pub fn sanitize_filename(name: &str) -> String {
 mod tests {
     use super::{
         compare_natural_names, create_notebook, duplicate_note, get_note_switcher_titles,
-        helixnotes_dir, load_notebook_icons, load_tag_styles, permanent_delete, read_note,
-        restore_notebook, scan_notebooks, set_notebook_icon, set_tag_style,
+        helixnotes_dir, load_notebook_icons, load_tag_styles, patch_tag_style, permanent_delete,
+        read_note, replace_file_atomically, restore_notebook, save_note, scan_notebooks,
+        set_notebook_icon,
     };
-    use crate::types::TagStyle;
+    use crate::types::{TagStyle, TagStyleChange};
     use std::fs;
+    use std::io::Read;
+
+    #[test]
+    fn same_named_attachment_writes_never_replace_each_other() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().to_str().unwrap();
+        super::ensure_vault_structure(path).unwrap();
+        let assets = std::thread::scope(|scope| {
+            let writes: Vec<_> = (0..16u8)
+                .map(|byte| {
+                    scope.spawn(move || {
+                        let relative =
+                            super::save_attachment(path, "same.png", &[byte; 8]).unwrap();
+                        (relative, byte)
+                    })
+                })
+                .collect();
+            writes
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let mut names = std::collections::HashSet::new();
+        for (relative, byte) in assets {
+            assert!(names.insert(relative.clone()));
+            assert_eq!(fs::read(vault.path().join(relative)).unwrap(), [byte; 8]);
+        }
+    }
+
+    #[test]
+    fn metadata_setters_atomically_replace_without_truncating_open_readers() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().to_str().unwrap();
+        super::ensure_vault_structure(path).unwrap();
+        set_notebook_icon(path, "Book", Some("builtin:folder")).unwrap();
+        patch_tag_style(path, "Work", TagStyleChange::Color(Some("#123456".into()))).unwrap();
+        let icons_path = helixnotes_dir(path).join("notebook_icons.json");
+        let styles_path = helixnotes_dir(path).join("tag_styles.json");
+        let icons_before = fs::read(&icons_path).unwrap();
+        let styles_before = fs::read(&styles_path).unwrap();
+        let mut icons_reader = fs::File::open(&icons_path).unwrap();
+        let mut styles_reader = fs::File::open(&styles_path).unwrap();
+        set_notebook_icon(path, "Book", Some("builtin:star")).unwrap();
+        patch_tag_style(
+            path,
+            "Work",
+            TagStyleChange::Icon(Some("builtin:briefcase".into())),
+        )
+        .unwrap();
+        let mut icons_old = Vec::new();
+        let mut styles_old = Vec::new();
+        icons_reader.read_to_end(&mut icons_old).unwrap();
+        styles_reader.read_to_end(&mut styles_old).unwrap();
+        assert_eq!(icons_old, icons_before);
+        assert_eq!(styles_old, styles_before);
+        assert_eq!(load_notebook_icons(path).unwrap()["Book"], "builtin:star");
+        assert_eq!(
+            load_tag_styles(path).unwrap()["Work"],
+            TagStyle {
+                icon: Some("builtin:briefcase".into()),
+                color: Some("#123456".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn failed_icon_registration_rolls_back_only_the_new_unique_attachment() {
+        for mapping in ["notebook_icons.json", "tag_styles.json"] {
+            let vault = tempfile::tempdir().unwrap();
+            let path = vault.path().to_str().unwrap();
+            super::ensure_vault_structure(path).unwrap();
+            let original = super::save_attachment(path, "same.png", b"keep").unwrap();
+            fs::write(helixnotes_dir(path).join(mapping), b"{broken").unwrap();
+            let result = if mapping == "notebook_icons.json" {
+                super::import_notebook_icon(path, "Book", "same.png", b"reject")
+            } else {
+                super::import_tag_icon(path, "Work", "same.png", b"reject")
+                    .map(|style| style.icon.unwrap())
+            };
+            assert!(result.is_err());
+            assert_eq!(fs::read(vault.path().join(&original)).unwrap(), b"keep");
+            let remaining: Vec<_> = fs::read_dir(helixnotes_dir(path).join("attachments"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert_eq!(remaining, vec![vault.path().join(original)]);
+            assert_eq!(
+                fs::read(helixnotes_dir(path).join(mapping)).unwrap(),
+                b"{broken"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_icon_mapping_prevents_notebook_move_before_renaming_files() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().to_str().unwrap();
+        super::ensure_vault_structure(path).unwrap();
+        let notebook = create_notebook(path, None, "Book").unwrap();
+        let note = super::create_note(path, Some("Book"), "Keep").unwrap();
+        let before = fs::read(&note.path).unwrap();
+        let destination = create_notebook(path, None, "Archive").unwrap();
+        fs::write(helixnotes_dir(path).join("notebook_icons.json"), b"{broken").unwrap();
+        assert!(super::rename_notebook(path, &notebook.path, "Renamed").is_err());
+        assert!(super::move_notebook(path, &notebook.path, &destination.path).is_err());
+        assert_eq!(fs::read(&note.path).unwrap(), before);
+        assert!(!vault.path().join("Renamed").exists());
+        assert!(!vault.path().join("Archive/Book").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_metadata_replacement_keeps_registration_and_rolls_back_notebook_move() {
+        use std::os::unix::fs::PermissionsExt;
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().to_str().unwrap();
+        super::ensure_vault_structure(path).unwrap();
+        let notebook = create_notebook(path, None, "Book").unwrap();
+        set_notebook_icon(path, "Book", Some("builtin:folder")).unwrap();
+        let mapping = helixnotes_dir(path).join("notebook_icons.json");
+        let before = fs::read(&mapping).unwrap();
+        fs::set_permissions(&mapping, fs::Permissions::from_mode(0o440)).unwrap();
+        assert!(set_notebook_icon(path, "Book", Some("builtin:star")).is_err());
+        assert!(super::rename_notebook(path, &notebook.path, "Renamed").is_err());
+        assert!(std::path::Path::new(&notebook.path).is_dir());
+        assert!(!vault.path().join("Renamed").exists());
+        assert_eq!(fs::read(&mapping).unwrap(), before);
+    }
     use uuid::Uuid;
 
     #[test]
@@ -1761,13 +2087,16 @@ mod tests {
             std::env::temp_dir().join(format!("helixnotes-tag-style-test-{}", Uuid::new_v4()));
         let vault_path = vault.to_string_lossy();
 
-        set_tag_style(
+        patch_tag_style(
             &vault_path,
             " Work ",
-            Some(TagStyle {
-                icon: Some("builtin:briefcase".into()),
-                color: Some("#E11D48".into()),
-            }),
+            TagStyleChange::Icon(Some("builtin:briefcase".into())),
+        )
+        .unwrap();
+        patch_tag_style(
+            &vault_path,
+            "Work",
+            TagStyleChange::Color(Some("#E11D48".into())),
         )
         .unwrap();
 
@@ -1783,7 +2112,7 @@ mod tests {
         assert_eq!(work.icon.as_deref(), Some("builtin:briefcase"));
         assert_eq!(work.color.as_deref(), Some("#e11d48"));
 
-        set_tag_style(&vault_path, "Work", None).unwrap();
+        patch_tag_style(&vault_path, "Work", TagStyleChange::Reset).unwrap();
         assert!(load_tag_styles(&vault_path).unwrap().is_empty());
 
         fs::remove_dir_all(vault).unwrap();
@@ -1795,17 +2124,20 @@ mod tests {
             std::env::temp_dir().join(format!("helixnotes-tag-style-case-test-{}", Uuid::new_v4()));
         let vault_path = vault.to_string_lossy();
 
-        set_tag_style(
+        patch_tag_style(
             &vault_path,
             "Work",
-            Some(TagStyle {
-                icon: Some("builtin:briefcase".into()),
-                color: Some("#e11d48".into()),
-            }),
+            TagStyleChange::Icon(Some("builtin:briefcase".into())),
+        )
+        .unwrap();
+        patch_tag_style(
+            &vault_path,
+            "Work",
+            TagStyleChange::Color(Some("#e11d48".into())),
         )
         .unwrap();
 
-        set_tag_style(&vault_path, "work", None).unwrap();
+        patch_tag_style(&vault_path, "work", TagStyleChange::Reset).unwrap();
 
         let stored: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(helixnotes_dir(&vault_path).join("tag_styles.json")).unwrap(),
@@ -1848,13 +2180,10 @@ mod tests {
         ));
         let vault_path = vault.to_string_lossy();
 
-        let err = set_tag_style(
+        let err = patch_tag_style(
             &vault_path,
             "daily",
-            Some(TagStyle {
-                icon: None,
-                color: Some("red".into()),
-            }),
+            TagStyleChange::Color(Some("red".into())),
         )
         .unwrap_err();
         assert!(err.contains("hex"));
@@ -1870,24 +2199,13 @@ mod tests {
         ));
         let vault_path = vault.to_string_lossy();
 
-        set_tag_style(
+        patch_tag_style(
             &vault_path,
             "daily",
-            Some(TagStyle {
-                icon: Some("builtin:calendar".into()),
-                color: None,
-            }),
+            TagStyleChange::Icon(Some("builtin:calendar".into())),
         )
         .unwrap();
-        set_tag_style(
-            &vault_path,
-            "daily",
-            Some(TagStyle {
-                icon: None,
-                color: None,
-            }),
-        )
-        .unwrap();
+        patch_tag_style(&vault_path, "daily", TagStyleChange::Icon(None)).unwrap();
         assert!(load_tag_styles(&vault_path).unwrap().is_empty());
 
         fs::remove_dir_all(vault).unwrap();
@@ -2056,5 +2374,152 @@ mod tests {
         assert_eq!(fs::read_to_string(&source_path).unwrap(), source_raw);
 
         fs::remove_dir_all(vault).unwrap();
+    }
+
+    #[test]
+    fn mobile_listing_preserves_creation_date_after_atomic_save() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().join("Note.md");
+        fs::write(&path, "---\nid: existing\ntitle: Note\ncreated: 2020-01-01T00:00:00Z\n---\n# Note\n\nOld body.\n").unwrap();
+        let note = read_note(vault.path().to_str().unwrap(), path.to_str().unwrap()).unwrap();
+        save_note(
+            vault.path().to_str().unwrap(),
+            path.to_str().unwrap(),
+            &note.meta,
+            "New body.",
+        )
+        .unwrap();
+        let mobile = super::read_note_entry_metadata_only(&path, vault.path()).unwrap();
+        let desktop = super::read_note_entry_fast(&path, vault.path()).unwrap();
+        assert_eq!(mobile.meta.created, note.meta.created);
+        assert_eq!(mobile.meta.created, desktop.meta.created);
+        assert_eq!(mobile.preview, "New body.");
+    }
+
+    #[test]
+    fn unchanged_serialized_save_ignores_modified_without_rewriting_the_file() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().join("Note.md");
+        let original = "---\nid: existing\ntitle: Note\ncreated: 2020-01-01T00:00:00Z\nmodified: 2020-01-02T00:00:00Z\naliases: [Legacy]\n---\n# Note\n\nUnchanged body.\n";
+        fs::write(&path, original).unwrap();
+        let vault_path = vault.path().to_string_lossy();
+        let note_path = path.to_string_lossy();
+        let note = read_note(&vault_path, &note_path).unwrap();
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        let mut meta = note.meta;
+        meta.modified = chrono::Utc::now();
+        let serialized_body = format!("{}\n", note.content);
+
+        assert!(save_note(&vault_path, &note_path, &meta, &serialized_body)
+            .unwrap()
+            .is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+    }
+
+    #[test]
+    fn save_keeps_authored_terminal_spaces_before_the_serializer_newline() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().join("Note.md");
+        let original = "---\nid: existing\ntitle: Note\ncreated: 2020-01-01T00:00:00Z\n---\n# Note\n\nFinal line.\n";
+        fs::write(&path, original).unwrap();
+        let vault_path = vault.path().to_string_lossy();
+        let note_path = path.to_string_lossy();
+        let note = read_note(&vault_path, &note_path).unwrap();
+        let body = format!("{}  \n", note.content);
+
+        assert!(save_note(&vault_path, &note_path, &note.meta, &body)
+            .unwrap()
+            .is_some());
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .ends_with("Final line.  \n"));
+    }
+
+    #[test]
+    fn saves_keep_first_identity_unknown_fields_and_previous_content() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().join("Note.md");
+        let original = "---\ntitle: Note\ncreated: 2020-01-01T00:00:00Z\naliases: [Legacy]\n---\nOriginal body.\n";
+        fs::write(&path, original).unwrap();
+        let vault_path = vault.path().to_string_lossy();
+        let note_path = path.to_string_lossy();
+        let meta = read_note(&vault_path, &note_path).unwrap().meta;
+        assert!(meta.id.is_empty());
+
+        let first = save_note(&vault_path, &note_path, &meta, "# Note\n\nFirst change.\n")
+            .unwrap()
+            .unwrap();
+        Uuid::parse_str(&first.id).unwrap();
+        assert_eq!(first.previous_raw, original);
+        let first_raw = fs::read_to_string(&path).unwrap();
+        let second = save_note(&vault_path, &note_path, &meta, "# Note\n\nSecond change.\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.previous_raw, first_raw);
+
+        let saved = read_note(&vault_path, &note_path).unwrap();
+        assert_eq!(saved.meta.id, first.id);
+        assert_eq!(saved.meta.created, meta.created);
+        assert!(saved.content.contains("Second change."));
+        let parsed = gray_matter::Matter::<gray_matter::engine::YAML>::new().parse(&saved.raw);
+        let fields: serde_yaml::Value = parsed.data.unwrap().deserialize().unwrap();
+        assert_eq!(fields["aliases"][0].as_str(), Some("Legacy"));
+    }
+
+    #[test]
+    fn atomic_replacement_does_not_truncate_an_open_original() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().join("Note.md");
+        fs::write(&path, "original contents").unwrap();
+        let mut original = fs::File::open(&path).unwrap();
+
+        replace_file_atomically(&path, b"replacement contents").unwrap();
+
+        let mut old_contents = String::new();
+        original.read_to_string(&mut old_contents).unwrap();
+        assert_eq!(old_contents, "original contents");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement contents");
+    }
+
+    #[test]
+    fn failed_atomic_replacement_cleans_up_without_removing_destination() {
+        let vault = tempfile::tempdir().unwrap();
+        let destination = vault.path().join("Note.md");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("original"), "keep me").unwrap();
+
+        assert!(replace_file_atomically(&destination, b"replacement").is_err());
+
+        assert_eq!(
+            fs::read_to_string(destination.join("original")).unwrap(),
+            "keep me"
+        );
+        let remaining: Vec<_> = fs::read_dir(vault.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(remaining, vec![std::ffi::OsString::from("Note.md")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_preserves_permissions_and_refuses_read_only_notes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().join("Note.md");
+        fs::write(&path, "original").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        replace_file_atomically(&path, b"saved").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o440)).unwrap();
+        assert!(replace_file_atomically(&path, b"must not save").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "saved");
     }
 }

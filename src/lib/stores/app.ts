@@ -192,9 +192,13 @@ function createNavHistory() {
   const store = writable<NavHistoryState>({ stack: [], index: -1, skipping: false });
   return {
     subscribe: store.subscribe,
+    clear() {
+      store.set({ stack: [], index: -1, skipping: false });
+    },
     push(path: string) {
       store.update(s => {
         if (s.skipping) return { ...s, skipping: false };
+        if (s.stack[s.index] === path) return s;
         const trimmed = s.stack.slice(0, s.index + 1);
         return { stack: [...trimmed, path], index: trimmed.length, skipping: false };
       });
@@ -215,6 +219,34 @@ export const navHistory = createNavHistory();
 export const canGoBack = derived(navHistory, $h => $h.index > 0);
 export const canGoForward = derived(navHistory, $h => $h.index < $h.stack.length - 1);
 
+let dataVaultPath: string | null = null;
+
+/** Never expose the previous vault's editable note while a new vault loads. */
+export function activateVaultData(vaultPath: string | null): void {
+  if (dataVaultPath === vaultPath) return;
+  dataVaultPath = vaultPath;
+  activeNote.set(null);
+  activeNotePath.set(null);
+  activeNotebook.set(null);
+  activeTag.set(null);
+  viewerNote.set(null);
+  editorDirty.set(false);
+  notes.set([]);
+  notebooks.set([]);
+  tags.set([]);
+  rootNoteCount.set(0);
+  quickAccessPaths.set([]);
+  notebookIcons.set({});
+  tagStyles.set({});
+  collapsedNotebooks.set([]);
+  notebookOrder.set({});
+  noteOrder.set({});
+  viewMode.set("all");
+  sortMode.set("modified");
+  groupNotesByDate.set(false);
+  navHistory.clear();
+}
+
 // Derived
 export const sortedNotes = derived(
   [notes, sortMode, viewMode, noteOrder],
@@ -226,35 +258,23 @@ export const sortedNotes = derived(
 
     const pinned = $notes.filter((n) => n.meta.pinned);
     const unpinned = $notes.filter((n) => !n.meta.pinned);
+    const dateField = $sortMode === "title" || ($sortMode === "custom" && customSortable)
+      ? null
+      : $sortMode === "created" ? "created" : "modified";
+    const timestamps = dateField ? new Map<NoteEntry, number>() : null;
+    if (dateField && timestamps) {
+      for (const note of $notes) timestamps.set(note, Date.parse(note.meta[dateField]));
+    }
 
     const sortFn = (a: NoteEntry, b: NoteEntry) => {
-      switch ($sortMode) {
-        case "custom": {
-          if (!customSortable) {
-            return (
-              new Date(b.meta.modified).getTime() -
-              new Date(a.meta.modified).getTime()
-            );
-          }
-          const oa = $noteOrder[a.path] ?? Number.MAX_SAFE_INTEGER;
-          const ob = $noteOrder[b.path] ?? Number.MAX_SAFE_INTEGER;
-          if (oa !== ob) return oa - ob;
-          return a.meta.title.localeCompare(b.meta.title);
-        }
-        case "title":
-          return compareNaturalNames(a.meta.title, b.meta.title);
-        case "created":
-          return (
-            new Date(b.meta.created).getTime() -
-            new Date(a.meta.created).getTime()
-          );
-        case "modified":
-        default:
-          return (
-            new Date(b.meta.modified).getTime() -
-            new Date(a.meta.modified).getTime()
-          );
+      if (timestamps) return timestamps.get(b)! - timestamps.get(a)!;
+      if ($sortMode === "custom") {
+        const oa = $noteOrder[a.path] ?? Number.MAX_SAFE_INTEGER;
+        const ob = $noteOrder[b.path] ?? Number.MAX_SAFE_INTEGER;
+        if (oa !== ob) return oa - ob;
+        return a.meta.title.localeCompare(b.meta.title);
       }
+      return compareNaturalNames(a.meta.title, b.meta.title);
     };
 
     return [...pinned.sort(sortFn), ...unpinned.sort(sortFn)];

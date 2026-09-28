@@ -39,6 +39,11 @@ export interface TagStyle {
   color?: string | null;
 }
 
+export type TagStyleChange =
+  | { kind: "icon"; value: string | null }
+  | { kind: "color"; value: string | null }
+  | { kind: "reset" };
+
 export interface NoteContent {
   path: string;
   meta: NoteMeta;
@@ -177,16 +182,30 @@ export interface VaultState {
   tasks_sort?: string;
 }
 
+export interface SearchMatch {
+  start: number;
+  end: number;
+}
+
 export interface SearchResult {
   path: string;
   title: string;
   snippet: string;
   score: number;
+  title_matches: SearchMatch[];
+  snippet_matches: SearchMatch[];
+}
+
+export interface SearchPage {
+  results: SearchResult[];
+  total: number;
 }
 
 export interface FileEvent {
+  vault_path: string;
   event_type: string;
   path: string;
+  note?: NoteEntry | null;
 }
 
 export interface ImportResult {
@@ -218,6 +237,7 @@ export interface VersionEntry {
 }
 
 export interface AiStreamEvent {
+  request_id: string;
   event_type: string;
   text: string | null;
   error: string | null;

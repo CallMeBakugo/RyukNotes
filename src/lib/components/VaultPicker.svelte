@@ -1,8 +1,9 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import { open } from '@tauri-apps/plugin-dialog';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { documentDir } from '@tauri-apps/api/path';
-	import { chooseExternalVault, getAppConfig, openVault, removeVault, restoreExternalVault } from '$lib/api';
+	import { chooseExternalVault, completeWindowClose, getAppConfig, openVault, removeVault, restoreExternalVault } from '$lib/api';
 	import { appConfig, vaultReady } from '$lib/stores/app';
 	import { isAndroid, isIOS, isMobile } from '$lib/platform';
 	import type { VaultConfig } from '$lib/types';
@@ -10,6 +11,22 @@
 	let { initialError = '' }: { initialError?: string } = $props();
 
 	const appWindow = getCurrentWindow();
+	onMount(() => {
+		let disposed = false;
+		let unlisten: (() => void) | undefined;
+		appWindow.onCloseRequested(async (event) => {
+			event.preventDefault();
+			try {
+				await completeWindowClose();
+			} catch (error) {
+				console.error('Failed to close window:', error);
+			}
+		}).then((stop) => {
+			if (disposed) stop();
+			else unlisten = stop;
+		});
+		return () => { disposed = true; unlisten?.(); };
+	});
 
 	let recentVaults: VaultConfig[] = $derived($appConfig?.vaults ?? []);
 	let loading = $state(false);

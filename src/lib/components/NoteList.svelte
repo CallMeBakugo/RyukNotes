@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { tick } from 'svelte';
+	import { onDestroy, tick, untrack } from 'svelte';
+	import { get } from 'svelte/store';
 	import {
 		notes,
 		sortedNotes,
@@ -16,7 +17,6 @@
 		notelistCollapsed,
 		noteOrder,
 		notebooks,
-		tags,
 		mobileView
 	} from '$lib/stores/app';
 	import {
@@ -36,26 +36,31 @@
 		removeQuickAccess,
 		reorderQuickAccess,
 		moveNote,
-		getAllTags,
 		createDailyNote,
 		revealFile
 	} from '$lib/api';
-	import { formatRelativeTime, formatDate, dateBucketLabel } from '$lib/utils/time';
+	import { formatRelativeTime, formatDate } from '$lib/utils/time';
 	import { openNoteWindow } from '$lib/utils/window';
 	import { encodeNoteDragPaths } from '$lib/utils/note-drag';
 	import { tagIterationKey } from '$lib/utils/tag-styles';
-	import type { NoteEntry, TrashNotebookEntry, SortMode, TaskItem } from '$lib/types';
+	import { updateNoteList } from '$lib/utils/note-list-updates';
+	import { buildNoteListRows, noteListOffsets, noteListWindow } from '$lib/utils/note-list-window';
+	import { beginNoteNavigation, isCurrentNoteNavigation, cancelNoteNavigation } from '$lib/utils/note-navigation';
+	import type { NoteEntry, NoteMeta, TrashNotebookEntry, SortMode, TaskItem } from '$lib/types';
 	import TasksView from './TasksView.svelte';
 	import TagSuggestInput from './TagSuggestInput.svelte';
 	import TagLabel from './TagLabel.svelte';
 	import { isMobile, isAndroid } from '$lib/platform';
 
-	let { onNoteSelected = (_path: string, _content: string, _task?: TaskItem) => {}, onNoteMoved = () => {}, onBeforeNoteSwitch = () => {}, onBeforeNoteDuplicate = async () => true, onNoteCreated = () => {}, onToggleTask = async (_t: TaskItem) => {}, onSetTaskPriority = async (_t: TaskItem, _p: string | null) => {}, onSetTaskDue = async (_t: TaskItem, _d: string | null) => {} }: {
+	let { onNoteSelected = (_path: string, _content: string, _task?: TaskItem) => {}, onNoteMoved = () => {}, onBeforeNoteSwitch = async () => true, onBeforeNoteDuplicate = async () => true, onUpdateActiveNote, onTagsChanged, onRefreshTags, onNoteCreated = () => {}, onToggleTask = async (_t: TaskItem) => {}, onSetTaskPriority = async (_t: TaskItem, _p: string | null) => {}, onSetTaskDue = async (_t: TaskItem, _d: string | null) => {} }: {
 		onNoteSelected?: (path: string, content: string, task?: TaskItem) => void;
 		onNoteMoved?: () => void;
-		onBeforeNoteSwitch?: () => void;
+		onBeforeNoteSwitch?: () => Promise<boolean>;
 		onBeforeNoteDuplicate?: () => Promise<boolean>;
-		onNoteCreated?: () => void;
+		onUpdateActiveNote: (patch: Pick<NoteMeta, 'pinned' | 'tags'>) => Promise<boolean>;
+		onTagsChanged: (path: string, nextTags: string[]) => void;
+		onRefreshTags: () => void;
+		onNoteCreated?: (token: number) => void;
 		onToggleTask?: (t: TaskItem) => Promise<void>;
 		onSetTaskPriority?: (t: TaskItem, p: string | null) => Promise<void>;
 		onSetTaskDue?: (t: TaskItem, d: string | null) => Promise<void>;
@@ -108,40 +113,27 @@
 		calYear = now.getFullYear();
 	}
 
-	async function handleDayClick(date: string) {
+	async function handleDayClick(date: string, token = beginNavigation()) {
+		if (!navigationIsCurrent(token)) return;
 		try {
-			const entry = await createDailyNote(date);
-			const content = await readNote(entry.path);
-			onBeforeNoteSwitch();
+			const entry = await createDailyNote(ownerVault!, date);
+			if (!navigationIsCurrent(token)) return;
+			const content = await readNote(ownerVault!, entry.path);
+			if (!navigationIsCurrent(token)) return;
+			if (!(await onBeforeNoteSwitch())) return;
+			if (!navigationIsCurrent(token)) return;
 			$activeNote = content;
 			$activeNotePath = entry.path;
+			$editorDirty = false;
 			onNoteSelected(entry.path, content.content);
 			if (!dailyDates.has(date)) {
 				dailyDates = new Set([...dailyDates, date]);
+				onNoteMoved();
 			}
 			noteCache.clear();
 			await refresh();
 		} catch (e) {
 			console.error('Failed to open daily note:', e);
-		}
-	}
-
-	/** Derive tags from current $notes store (avoids re-scanning files on mobile) */
-	function deriveTagsFromNotes() {
-		const tagMap = new Map<string, number>();
-		for (const note of $notes) {
-			for (const tag of note.meta.tags) {
-				tagMap.set(tag, (tagMap.get(tag) ?? 0) + 1);
-			}
-		}
-		$tags = Array.from(tagMap.entries()).sort((a, b) => a[0].localeCompare(b[0]));
-	}
-
-	async function refreshTags() {
-		if (isMobile) {
-			deriveTagsFromNotes();
-		} else {
-			try { $tags = await getAllTags(); } catch (_) {}
 		}
 	}
 
@@ -218,40 +210,144 @@
 	const customOrderViews = new Set(['all', 'notebook', 'tag']);
 	let canCustomReorder = $derived($sortMode === 'custom' && customOrderViews.has($viewMode));
 
-	// Relative-date grouping (All Notes + date sorts only). Pinned notes form their own leading group.
 	let groupingActive = $derived($groupNotesByDate && $viewMode === 'all' && ($sortMode === 'created' || $sortMode === 'modified'));
-	let noteGroups = $derived.by(() => {
-		if (!groupingActive) return [] as { label: string; notes: NoteEntry[] }[];
-		const pinned: NoteEntry[] = [];
-		const rest: NoteEntry[] = [];
-		for (const n of $sortedNotes) (n.meta.pinned ? pinned : rest).push(n);
-		const groups: { label: string; notes: NoteEntry[] }[] = [];
-		if (pinned.length) groups.push({ label: 'Pinned', notes: pinned });
-		let cur: { label: string; notes: NoteEntry[] } | null = null;
-		for (const n of rest) {
-			const label = dateBucketLabel($sortMode === 'created' ? n.meta.created : n.meta.modified);
-			if (!cur || cur.label !== label) { cur = { label, notes: [] }; groups.push(cur); }
-			cur.notes.push(n);
+	let listRows = $derived(buildNoteListRows(
+		$sortedNotes,
+		groupingActive ? ($sortMode === 'created' ? 'created' : 'modified') : null,
+	));
+
+	let listContainer = $state<HTMLDivElement>(null!);
+	let virtualList = $state<HTMLDivElement>(null!);
+	let scrollTop = $state(0);
+	let stickToBottom = false;
+	let listOrigin = $state(0);
+	let containerHeight = $state(600);
+	const rowHeights = new Map<string, number>();
+	let heightRevision = $state(0);
+	let rowObserver: ResizeObserver | null = null;
+	const pendingHeights = new Map<string, number>();
+	let measurementFrame: number | null = null;
+	let disposed = false;
+	const ownerVault = get(appConfig)?.active_vault ?? null;
+	let navigationToken = 0;
+
+	function ownerIsCurrent() {
+		return !disposed && (get(appConfig)?.active_vault ?? null) === ownerVault;
+	}
+
+	function beginNavigation() {
+		return navigationToken = beginNoteNavigation();
+	}
+
+	function navigationIsCurrent(token: number) {
+		return ownerIsCurrent() && isCurrentNoteNavigation(token);
+	}
+	const BUFFER = 10;
+	let offsets = $derived.by(() => {
+		void heightRevision;
+		return noteListOffsets(listRows, rowHeights, compact ? (isMobile ? 50 : 33) : (isMobile ? 90 : 62), 32);
+	});
+	let windowRows = $derived(noteListWindow(offsets, scrollTop - listOrigin, containerHeight, BUFFER));
+	let visibleRows = $derived(listRows.slice(windowRows.start, windowRows.end));
+
+	function applyMeasuredRows() {
+		measurementFrame = null;
+		if (disposed) return;
+		if (!listContainer || listContainer.clientHeight === 0) {
+			pendingHeights.clear();
+			return;
 		}
-		return groups;
+		if (virtualList) listOrigin = virtualList.offsetTop;
+		const rows = listRows;
+		const anchor = windowRows.anchor;
+		const previousOffset = offsets[anchor];
+		const previousScroll = scrollTop;
+		const wasAtBottom = stickToBottom;
+		let changed = false;
+		for (const [key, height] of pendingHeights) {
+			if (Math.abs((rowHeights.get(key) ?? 0) - height) > 0.5) {
+				rowHeights.set(key, height);
+				changed = true;
+			}
+		}
+		pendingHeights.clear();
+		if (!changed) return;
+		heightRevision++;
+		// Keep the visible row stationary as overscan rows acquire their actual heights.
+		void tick().then(() => {
+			if (disposed || listRows !== rows || !listContainer) return;
+			if (wasAtBottom && stickToBottom) {
+				listContainer.scrollTop = listContainer.scrollHeight;
+			} else {
+				if (listContainer.scrollTop !== previousScroll) return;
+				listContainer.scrollTop += offsets[anchor] - previousOffset;
+			}
+			scrollTop = listContainer.scrollTop;
+		});
+	}
+
+	function measureRow(node: HTMLDivElement) {
+		rowObserver ??= new ResizeObserver((entries) => {
+			for (const entry of entries) {
+				const key = (entry.target as HTMLElement).dataset.rowKey!;
+				const height = entry.contentRect.height;
+				const previous = pendingHeights.get(key) ?? rowHeights.get(key) ?? 0;
+				if (height > 0 && Math.abs(previous - height) > 0.5) pendingHeights.set(key, height);
+			}
+			// ResizeObserver only records sizes; publishing in the next frame avoids
+			// a measure/render feedback loop in WebKit.
+			if (pendingHeights.size > 0 && measurementFrame === null) {
+				measurementFrame = requestAnimationFrame(applyMeasuredRows);
+			}
+		});
+		rowObserver.observe(node);
+		return { destroy: () => rowObserver?.unobserve(node) };
+	}
+
+	$effect(() => {
+		compact;
+		showDates;
+		untrack(() => {
+			rowHeights.clear();
+			pendingHeights.clear();
+			if (measurementFrame !== null) cancelAnimationFrame(measurementFrame);
+			measurementFrame = null;
+			heightRevision++;
+			void tick().then(() => {
+				if (disposed || !virtualList || !rowObserver) return;
+				for (const row of virtualList.querySelectorAll<HTMLDivElement>('.virtual-note-row')) {
+					rowObserver.unobserve(row);
+					rowObserver.observe(row);
+				}
+			});
+		});
 	});
 
-	// Virtual scroll
-	let listContainer = $state<HTMLDivElement>(null!);
-	let scrollTop = $state(0);
-	let containerHeight = $state(600);
-	let itemHeight = $derived(compact ? 33 : 62);
-	const BUFFER = 10;
+	$effect(() => {
+		$viewMode;
+		calMonth;
+		calYear;
+		trashNotebooks.length;
+		const element = virtualList;
+		void tick().then(() => {
+			if (!disposed && element) listOrigin = element.offsetTop;
+		});
+	});
 
-	let totalHeight = $derived($sortedNotes.length * itemHeight);
-	let startIndex = $derived(Math.max(0, Math.floor(scrollTop / itemHeight) - BUFFER));
-	let endIndex = $derived(Math.min($sortedNotes.length, Math.ceil((scrollTop + containerHeight) / itemHeight) + BUFFER));
-	let visibleNotes = $derived($sortedNotes.slice(startIndex, endIndex));
-	let topPad = $derived(startIndex * itemHeight);
-	let bottomPad = $derived(Math.max(0, ($sortedNotes.length - endIndex) * itemHeight));
+	onDestroy(() => {
+		disposed = true;
+		refreshRequest++;
+		cancelNoteNavigation(navigationToken);
+		if (longPressTimer) clearTimeout(longPressTimer);
+		rowObserver?.disconnect();
+		if (measurementFrame !== null) cancelAnimationFrame(measurementFrame);
+	});
 
 	function onListScroll(e: Event) {
 		const el = e.currentTarget as HTMLDivElement;
+		if (el.clientHeight === 0) return;
+		if (el.scrollHeight - el.scrollTop - el.clientHeight <= 1) stickToBottom = true;
+		else if (el.scrollTop < scrollTop - 1) stickToBottom = false;
 		scrollTop = el.scrollTop;
 	}
 
@@ -266,6 +362,7 @@
 	$effect(() => {
 		const _ = [$viewMode, $activeNotebook, $activeTag];
 		clearSelection();
+		stickToBottom = false;
 		scrollTop = 0;
 		if (listContainer) listContainer.scrollTop = 0;
 	});
@@ -297,6 +394,7 @@
 		if (!listContainer) return;
 		const ro = new ResizeObserver((entries) => {
 			containerHeight = entries[0].contentRect.height;
+			if (virtualList) listOrigin = virtualList.offsetTop;
 		});
 		ro.observe(listContainer);
 		return () => ro.disconnect();
@@ -338,6 +436,28 @@
 
 	// Note list cache: avoids re-scanning when switching views
 	let noteCache = new Map<string, NoteEntry[]>();
+	let refreshRequest = 0;
+	const pendingRefreshes = new Set<Map<string, NoteEntry>>();
+
+	export function updateNote(note: NoteEntry): NoteEntry | undefined {
+		if (!ownerIsCurrent()) return;
+		let previous = $notes.find((entry) => entry.path === note.path);
+		if (!previous) {
+			for (const list of noteCache.values()) {
+				previous = list.find((entry) => entry.path === note.path);
+				if (previous) break;
+			}
+		}
+		for (const pending of pendingRefreshes) pending.set(note.path, note);
+		for (const [key, list] of noteCache) {
+			noteCache.set(key, updateNoteList(list, note, key, $quickAccessPaths));
+		}
+		if ($viewMode !== 'tasks') {
+			const updated = updateNoteList($notes, note, cacheKey(), $quickAccessPaths);
+			if (updated !== $notes) $notes = updated;
+		}
+		return previous;
+	}
 
 	function cacheKey(): string {
 		if ($viewMode === 'trash') return 'trash';
@@ -349,68 +469,75 @@
 	}
 
 	export async function refresh(invalidate = false) {
-		if ($viewMode === 'tasks') { $notes = []; return; } // Tasks view fetches its own data
-		if (invalidate) {
-			noteCache.clear();
-		}
-
+		if (!ownerIsCurrent()) return;
+		const request = ++refreshRequest;
+		const current = () => ownerIsCurrent() && request === refreshRequest;
+		if (invalidate) noteCache.clear();
+		if ($viewMode === 'tasks') { $notes = []; return; }
 		const key = cacheKey();
-		// Never serve the trash view from cache: emptying / restoring / deleting changes it,
-		// and a stale cache left it showing cleared items until an app restart. Always re-read.
-		const cached = $viewMode === 'trash' ? undefined : noteCache.get(key);
+		const mode = $viewMode;
+		const notebookPath = $activeNotebook?.path ?? null;
+		const tag = $activeTag;
+		const vault = $appConfig?.active_vault;
+		const cached = mode === 'trash' ? undefined : noteCache.get(key);
 		if (cached) {
 			$notes = cached;
 			return;
 		}
 
+		// Replay watcher updates that arrive while a list read is in flight.
+		const changes = new Map<string, NoteEntry>();
+		pendingRefreshes.add(changes);
 		try {
-			if ($viewMode === 'trash') {
+			let list: NoteEntry[];
+			let allNotes: NoteEntry[] | undefined;
+			if (mode === 'trash') {
 				const trash = await getTrash();
-				$notes = trash.notes;
-				trashNotebooks = trash.notebooks;
-			} else if ($viewMode === 'daily') {
-				const vault = $appConfig?.active_vault;
-				if (vault) {
-					$notes = await getNotes(`${vault}/Daily`);
-					// Build set of dates from filenames (YYYY-MM-DD.md)
-					const dates = new Set<string>();
-					for (const n of $notes) {
-						const fname = n.path.split('/').pop() ?? '';
-						const m = fname.match(/^(\d{4}-\d{2}-\d{2})\.md$/);
-						if (m) dates.add(m[1]);
-					}
-					dailyDates = dates;
-				} else {
-					$notes = [];
-				}
-			} else if ($viewMode === 'quickaccess') {
-				$notes = await getQuickAccess();
-			} else if ($viewMode === 'tag' && $activeTag) {
-				// Reuse cached "all" notes if available, otherwise fetch and cache them
-				let all = noteCache.get('all');
-				if (!all) {
-					all = await getNotes(null);
-					noteCache.set('all', all);
-				}
-				$notes = all.filter((n) => n.meta.tags.includes($activeTag!));
+				list = trash.notes;
+				if (current()) trashNotebooks = trash.notebooks;
+			} else if (mode === 'daily') {
+				list = vault ? await getNotes(`${vault}/Daily`) : [];
+			} else if (mode === 'quickaccess') {
+				list = await getQuickAccess(ownerVault!);
+			} else if (mode === 'tag' && tag) {
+				allNotes = noteCache.get('all') ?? await getNotes(null);
+				list = allNotes.filter((note) => note.meta.tags.includes(tag));
 			} else {
-				const nbPath = $viewMode === 'notebook' ? $activeNotebook?.path ?? null : null;
-				$notes = await getNotes(nbPath);
+				list = await getNotes(mode === 'notebook' ? notebookPath : null);
 			}
-			noteCache.set(key, $notes);
+			if (!current()) return;
+			for (const note of changes.values()) {
+				list = updateNoteList(list, note, key, $quickAccessPaths);
+				if (allNotes) allNotes = updateNoteList(allNotes, note, 'all', $quickAccessPaths);
+			}
+			if (allNotes) noteCache.set('all', allNotes);
+			noteCache.set(key, list);
+			if (key !== cacheKey()) return;
+			$notes = list;
+			if (mode === 'daily') {
+				dailyDates = new Set(list.flatMap((note) => {
+					const match = note.path.split(/[\\/]/).pop()?.match(/^(\d{4}-\d{2}-\d{2})\.md$/);
+					return match ? [match[1]] : [];
+				}));
+			}
 		} catch (e) {
 			console.error('Failed to refresh notes:', e);
+		} finally {
+			pendingRefreshes.delete(changes);
 		}
 	}
 
-	async function selectNote(note: NoteEntry) {
+	async function selectNote(note: NoteEntry, token = beginNavigation()) {
+		if (!navigationIsCurrent(token)) return;
 		if ($activeNotePath === note.path) {
 			if (isMobile) $mobileView = 'editor';
 			return;
 		}
 		try {
-			const content = await readNote(note.path);
-			onBeforeNoteSwitch();
+			const content = await readNote(ownerVault!, note.path);
+			if (!navigationIsCurrent(token)) return;
+			if (!(await onBeforeNoteSwitch())) return;
+			if (!navigationIsCurrent(token)) return;
 			$activeNote = content;
 			$activeNotePath = note.path;
 			$editorDirty = false;
@@ -421,9 +548,13 @@
 	}
 
 	async function openTask(task: TaskItem) {
+		const token = beginNavigation();
+		if (!navigationIsCurrent(token)) return;
 		try {
-			const content = await readNote(task.note_path);
-			onBeforeNoteSwitch();
+			const content = await readNote(ownerVault!, task.note_path);
+			if (!navigationIsCurrent(token)) return;
+			if (!(await onBeforeNoteSwitch())) return;
+			if (!navigationIsCurrent(token)) return;
 			$activeNote = content;
 			$activeNotePath = task.note_path;
 			$editorDirty = false;
@@ -434,11 +565,14 @@
 	}
 
 	export async function handleCreateNote() {
+		const token = beginNavigation();
+		if (!navigationIsCurrent(token)) return;
 		if ($viewMode === 'quickaccess' || $viewMode === 'trash') return;
 		if ($viewMode === 'daily') {
 			const today = new Date();
 			const date = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
-			await handleDayClick(date);
+			await handleDayClick(date, token);
+			if (!navigationIsCurrent(token)) return;
 			calMonth = today.getMonth();
 			calYear = today.getFullYear();
 			return;
@@ -457,22 +591,30 @@
 			}
 		}
 		try {
-			const entry = await createNote(nbRelative, 'Untitled');
+			if (!(await onBeforeNoteSwitch())) return;
+			if (!navigationIsCurrent(token)) return;
+			const entry = await createNote(ownerVault!, nbRelative, 'Untitled');
+			if (!ownerIsCurrent()) return;
 			if ($sortMode === 'custom') appendManualNoteOrder(entry.path);
 			noteCache.clear();
 			$notes = [entry, ...$notes];
-			onBeforeNoteSwitch();
+			onNoteMoved();
+			if (!navigationIsCurrent(token)) return;
+			if (!(await onBeforeNoteSwitch())) return;
+			if (!navigationIsCurrent(token)) return;
 			$activeNote = { path: entry.path, meta: entry.meta, content: '\n', raw: '' };
 			$activeNotePath = entry.path;
 			$editorDirty = false;
 			onNoteSelected(entry.path, '\n');
-			onNoteCreated();
+			onNoteCreated(token);
 		} catch (e) {
 			console.error('Failed to create note:', e);
 		}
 	}
 
 	async function handleDuplicate(note: NoteEntry) {
+		const token = beginNavigation();
+		if (!navigationIsCurrent(token)) return;
 		contextMenu = null;
 		try {
 			if ($activeNotePath === note.path && $editorDirty) {
@@ -482,12 +624,15 @@
 					return;
 				}
 			}
+			if (!navigationIsCurrent(token)) return;
 
-			const entry = await duplicateNote(note.path);
+			const entry = await duplicateNote(ownerVault!, note.path);
+			if (!ownerIsCurrent()) return;
 			if ($sortMode === 'custom') appendManualNoteOrder(entry.path);
 			noteCache.clear();
 			if ($viewMode !== 'quickaccess') $notes = [entry, ...$notes];
-			await selectNote(entry);
+			onNoteMoved();
+			await selectNote(entry, token);
 		} catch (e) {
 			console.error('Failed to duplicate note:', e);
 		}
@@ -507,8 +652,11 @@
 			return;
 		}
 		try {
+			if ($activeNotePath === note.path && !(await onBeforeNoteSwitch())) return;
+			if (!ownerIsCurrent()) return;
 			const newTitle = editValue.trim();
-			const newPath = await renameNote(note.path, newTitle);
+			const newPath = await renameNote(ownerVault!, note.path, newTitle);
+			if (!ownerIsCurrent()) return;
 			renameManualNoteOrderPath(note.path, newPath);
 			noteCache.clear();
 			editingNote = null;
@@ -520,7 +668,11 @@
 			);
 			if ($activeNotePath === note.path) {
 				$activeNotePath = newPath;
-				$activeNote = await readNote(newPath);
+				const previous = $activeNote;
+				const content = await readNote(ownerVault!, newPath);
+				if (ownerIsCurrent() && $activeNotePath === newPath && $activeNote === previous && !$editorDirty) {
+					$activeNote = content;
+				}
 			}
 		} catch (e) {
 			console.error('Failed to rename:', e);
@@ -530,7 +682,10 @@
 	async function handleDelete(note: NoteEntry) {
 		contextMenu = null;
 		try {
-			await deleteNote(note.path);
+			if ($activeNotePath === note.path && !(await onBeforeNoteSwitch())) return;
+			if (!ownerIsCurrent()) return;
+			await deleteNote(ownerVault!, note.path);
+			if (!ownerIsCurrent()) return;
 			removeManualNoteOrderPath(note.path);
 			noteCache.clear();
 			// Remove from local store immediately (avoid full vault re-scan)
@@ -548,7 +703,8 @@
 	async function handleRestore(note: NoteEntry) {
 		contextMenu = null;
 		try {
-			await restoreNote(note.path, null);
+			await restoreNote(ownerVault!, note.path, null);
+			if (!ownerIsCurrent()) return;
 			noteCache.clear();
 			await refresh();
 		} catch (e) {
@@ -559,7 +715,8 @@
 	async function handlePermanentDelete(note: NoteEntry) {
 		contextMenu = null;
 		try {
-			await permanentDelete(note.path);
+			await permanentDelete(ownerVault!, note.path);
+			if (!ownerIsCurrent()) return;
 			removeManualNoteOrderPath(note.path);
 			noteCache.clear();
 			$notes = $notes.filter(n => n.path !== note.path);
@@ -575,7 +732,8 @@
 	async function handleRestoreNotebook(nb: TrashNotebookEntry) {
 		trashBusy = nb.path;
 		try {
-			await restoreNotebook(nb.path);
+			await restoreNotebook(ownerVault!, nb.path);
+			if (!ownerIsCurrent()) return;
 			noteCache.clear();
 			await refresh();
 		} catch (e) {
@@ -588,7 +746,8 @@
 	async function handleDeleteNotebook(nb: TrashNotebookEntry) {
 		trashBusy = nb.path;
 		try {
-			await permanentDelete(nb.path);
+			await permanentDelete(ownerVault!, nb.path);
+			if (!ownerIsCurrent()) return;
 			noteCache.clear();
 			trashNotebooks = trashNotebooks.filter(n => n.path !== nb.path);
 		} catch (e) {
@@ -598,19 +757,38 @@
 		}
 	}
 
+	async function updateMetadata(path: string, update: (meta: NoteMeta) => void) {
+		if (!ownerIsCurrent()) return;
+		const diskNote = $activeNotePath === path && $activeNote ? $activeNote : await readNote(ownerVault!, path);
+		if (!ownerIsCurrent()) return;
+		const current = $activeNotePath === path && $activeNote ? $activeNote : diskNote;
+		const meta = { ...current.meta, tags: [...current.meta.tags] };
+		update(meta);
+		if ($activeNotePath === path && $activeNote) {
+			if (!(await onUpdateActiveNote({ pinned: meta.pinned, tags: meta.tags }))) {
+				throw new Error('Note still has unsaved changes');
+			}
+		} else {
+			await saveNote(ownerVault!, path, meta, current.content);
+		}
+		if (!ownerIsCurrent()) return;
+		if (current.meta.tags.length !== meta.tags.length || current.meta.tags.some((tag) => !meta.tags.includes(tag))) {
+			onTagsChanged(path, meta.tags);
+		}
+		let entry = $notes.find((note) => note.path === path);
+		if (!entry) {
+			for (const list of noteCache.values()) {
+				entry = list.find((note) => note.path === path);
+				if (entry) break;
+			}
+		}
+		if (entry) updateNote({ ...entry, meta: { ...entry.meta, pinned: meta.pinned, tags: meta.tags } });
+	}
+
 	async function handleTogglePin(note: NoteEntry) {
 		contextMenu = null;
 		try {
-			const content = await readNote(note.path);
-			content.meta.pinned = !content.meta.pinned;
-			await saveNote(note.path, content.meta, content.content);
-			// Update local store immediately
-			$notes = $notes.map(n =>
-				n.path === note.path ? { ...n, meta: { ...n.meta, pinned: content.meta.pinned } } : n
-			);
-			if ($activeNotePath === note.path) {
-				$activeNote = content;
-			}
+			await updateMetadata(note.path, (meta) => { meta.pinned = !meta.pinned; });
 		} catch (e) {
 			console.error('Failed to toggle pin:', e);
 		}
@@ -619,7 +797,7 @@
 	function openTagEdit(note: NoteEntry) {
 		tagEditNote = note;
 		tagEditTags = [...note.meta.tags];
-		refreshTags();
+		onRefreshTags();
 	}
 
 	async function addTagToNote(tag: string) {
@@ -638,16 +816,7 @@
 
 	async function saveTagsForNote(note: NoteEntry, newTags: string[]) {
 		try {
-			const content = await readNote(note.path);
-			content.meta.tags = newTags;
-			await saveNote(note.path, content.meta, content.content);
-			$notes = $notes.map(n =>
-				n.path === note.path ? { ...n, meta: { ...n.meta, tags: newTags } } : n
-			);
-			if ($activeNotePath === note.path && $activeNote) {
-				$activeNote = { ...$activeNote, meta: { ...$activeNote.meta, tags: newTags } };
-			}
-			await refreshTags();
+			await updateMetadata(note.path, (meta) => { meta.tags = newTags; });
 		} catch (e) {
 			console.error('Failed to save tags:', e);
 		}
@@ -655,7 +824,7 @@
 
 	function openBatchTagEdit() {
 		batchTagEdit = true;
-		refreshTags();
+		onRefreshTags();
 		// Show tags common to ALL selected notes
 		const selectedNotes = $notes.filter(n => selectedPaths.has(n.path));
 		if (selectedNotes.length === 0) { tagEditTags = []; return; }
@@ -670,19 +839,10 @@
 		if (!tagEditTags.includes(cleaned)) tagEditTags = [...tagEditTags, cleaned];
 		try {
 			for (const path of selectedPaths) {
-				const content = await readNote(path);
-				if (!content.meta.tags.includes(cleaned)) {
-					content.meta.tags = [...content.meta.tags, cleaned];
-					await saveNote(path, content.meta, content.content);
-					$notes = $notes.map(n =>
-						n.path === path ? { ...n, meta: { ...n.meta, tags: content.meta.tags } } : n
-					);
-					if ($activeNotePath === path) {
-						$activeNote = content;
-					}
-				}
+				await updateMetadata(path, (meta) => {
+					if (!meta.tags.includes(cleaned)) meta.tags = [...meta.tags, cleaned];
+				});
 			}
-			await refreshTags();
 		} catch (e) {
 			console.error('Failed to add tag to batch:', e);
 		}
@@ -692,19 +852,8 @@
 		tagEditTags = tagEditTags.filter(t => t !== tag);
 		try {
 			for (const path of selectedPaths) {
-				const content = await readNote(path);
-				if (content.meta.tags.includes(tag)) {
-					content.meta.tags = content.meta.tags.filter((t: string) => t !== tag);
-					await saveNote(path, content.meta, content.content);
-					$notes = $notes.map(n =>
-						n.path === path ? { ...n, meta: { ...n.meta, tags: content.meta.tags } } : n
-					);
-					if ($activeNotePath === path) {
-						$activeNote = content;
-					}
-				}
+				await updateMetadata(path, (meta) => { meta.tags = meta.tags.filter((value) => value !== tag); });
 			}
-			await refreshTags();
 		} catch (e) {
 			console.error('Failed to remove tag from batch:', e);
 		}
@@ -713,8 +862,10 @@
 	async function handleAddQuickAccess(note: NoteEntry) {
 		contextMenu = null;
 		try {
-			await addQuickAccess(note.relative_path);
-			const qaNotes = await getQuickAccess();
+			await addQuickAccess(ownerVault!, note.relative_path);
+			if (!ownerIsCurrent()) return;
+			const qaNotes = await getQuickAccess(ownerVault!);
+			if (!ownerIsCurrent()) return;
 			$quickAccessPaths = qaNotes.map(n => n.relative_path);
 		} catch (e) {
 			console.error('Failed to add to quick access:', e);
@@ -724,8 +875,10 @@
 	async function handleRemoveQuickAccess(note: NoteEntry) {
 		contextMenu = null;
 		try {
-			await removeQuickAccess(note.relative_path);
-			const qaNotes = await getQuickAccess();
+			await removeQuickAccess(ownerVault!, note.relative_path);
+			if (!ownerIsCurrent()) return;
+			const qaNotes = await getQuickAccess(ownerVault!);
+			if (!ownerIsCurrent()) return;
 			$quickAccessPaths = qaNotes.map(n => n.relative_path);
 			if ($viewMode === 'quickaccess') await refresh(true);
 		} catch (e) {
@@ -806,14 +959,22 @@
 		contextMenu = null;
 		movePickerNote = null;
 		try {
-			const newPath = await moveNote(note.path, destPath);
+			if ($activeNotePath === note.path && !(await onBeforeNoteSwitch())) return;
+			if (!ownerIsCurrent()) return;
+			const newPath = await moveNote(ownerVault!, note.path, destPath);
+			if (!ownerIsCurrent()) return;
 			renameManualNoteOrderPath(note.path, newPath);
 			noteCache.clear();
 			$notes = $notes.filter(n => n.path !== note.path);
 			if ($activeNotePath === note.path) {
 				$activeNotePath = newPath;
-				$activeNote = await readNote(newPath);
+				const previous = $activeNote;
+				const content = await readNote(ownerVault!, newPath);
+				if (ownerIsCurrent() && $activeNotePath === newPath && $activeNote === previous && !$editorDirty) {
+					$activeNote = content;
+				}
 			}
+			if (!ownerIsCurrent()) return;
 			onNoteMoved();
 		} catch (e) {
 			console.error('Failed to move note:', e);
@@ -852,6 +1013,7 @@
 		editingNote = note.path;
 		editValue = note.meta.title;
 		await tick();
+		if (!ownerIsCurrent()) return;
 		renameInput?.focus();
 		renameInput?.select();
 	}
@@ -921,6 +1083,8 @@
 	// Batch operations
 	async function handleBatchDelete() {
 		const toDelete = new Set(selectedPaths);
+		if ($activeNotePath && toDelete.has($activeNotePath) && !(await onBeforeNoteSwitch())) return;
+		if (!ownerIsCurrent()) return;
 		noteCache.clear();
 		for (const path of toDelete) removeManualNoteOrderPath(path);
 		$notes = $notes.filter(n => !toDelete.has(n.path));
@@ -929,12 +1093,15 @@
 			$activeNotePath = null;
 		}
 		clearSelection();
-		await Promise.all([...toDelete].map(p => deleteNote(p).catch(e => console.error('Failed to delete:', p, e))));
+		await Promise.all([...toDelete].map(p => deleteNote(ownerVault!, p).catch(e => console.error('Failed to delete:', p, e))));
+		if (!ownerIsCurrent()) return;
 		onNoteMoved();
 	}
 
 	async function handleBatchMove(destPath: string) {
 		const toMove = new Set(selectedPaths);
+		if ($activeNotePath && toMove.has($activeNotePath) && !(await onBeforeNoteSwitch())) return;
+		if (!ownerIsCurrent()) return;
 		noteCache.clear();
 		$notes = $notes.filter(n => !toMove.has(n.path));
 		if ($activeNotePath && toMove.has($activeNotePath)) {
@@ -942,7 +1109,8 @@
 			$activeNotePath = null;
 		}
 		clearSelection();
-		await Promise.all([...toMove].map(p => moveNote(p, destPath).catch(e => console.error('Failed to move:', p, e))));
+		await Promise.all([...toMove].map(p => moveNote(ownerVault!, p, destPath).catch(e => console.error('Failed to move:', p, e))));
+		if (!ownerIsCurrent()) return;
 		onNoteMoved();
 	}
 
@@ -950,8 +1118,9 @@
 		const toRestore = [...selectedPaths];
 		noteCache.clear();
 		clearSelection();
-		await Promise.all(toRestore.map(p => restoreNote(p, null).catch(e => console.error('Failed to restore:', p, e))));
+		await Promise.all(toRestore.map(p => restoreNote(ownerVault!, p, null).catch(e => console.error('Failed to restore:', p, e))));
 		await refresh();
+		if (!ownerIsCurrent()) return;
 		onNoteMoved();
 	}
 
@@ -965,12 +1134,12 @@
 			$activeNotePath = null;
 		}
 		clearSelection();
-		await Promise.all([...toDelete].map(p => permanentDelete(p).catch(e => console.error('Failed to delete:', p, e))));
+		await Promise.all([...toDelete].map(p => permanentDelete(ownerVault!, p).catch(e => console.error('Failed to delete:', p, e))));
 	}
 
 	function handleWindowClick(event: MouseEvent) {
-		const target = event.target as Element | null;
-		if (target?.closest('.context-menu, .sort-menu')) return;
+		// Opening a submenu can detach the clicked button before window sees it.
+		if (event.composedPath().some((node) => node instanceof Element && node.matches('.context-menu, .sort-menu'))) return;
 		if (contextMenu) { contextMenu = null; movePickerNote = null; tagEditNote = null; batchTagEdit = false; }
 		if (sortMenu) sortMenu = null;
 	}
@@ -1406,20 +1575,19 @@
 			{/if}
 		{/snippet}
 
-		{#if groupingActive}
-			{#each noteGroups as group (group.label)}
-				<div class="note-list-section">{group.label}</div>
-				{#each group.notes as note (note.path)}
-					{@render noteRow(note, -1)}
-				{/each}
+		<div class="virtual-note-rows" bind:this={virtualList}>
+			<div style:height={`${windowRows.top}px`}></div>
+			{#each visibleRows as row, index (row.key)}
+				<div class="virtual-note-row" data-row-key={row.key} use:measureRow>
+					{#if row.kind === 'section'}
+						<div class="note-list-section" class:first-section={windowRows.start + index === 0}>{row.label}</div>
+					{:else}
+						{@render noteRow(row.note, row.noteIndex)}
+					{/if}
+				</div>
 			{/each}
-		{:else}
-			<div style="height: {topPad}px"></div>
-			{#each visibleNotes as note, i (note.path)}
-				{@render noteRow(note, startIndex + i)}
-			{/each}
-			<div style="height: {bottomPad}px"></div>
-		{/if}
+			<div style:height={`${windowRows.bottom}px`}></div>
+		</div>
 	</div>
 </div>
 
@@ -1568,7 +1736,7 @@
 					Add to Quick Access
 				</button>
 			{/if}
-			<button onclick={() => { const n = contextMenu!.note; contextMenu = null; openNoteWindow(n.path, n.meta.title); }}>
+			<button onclick={() => { const n = contextMenu!.note; contextMenu = null; openNoteWindow(ownerVault!, n.path, n.meta.title); }}>
 				<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
 				</svg>
@@ -1728,9 +1896,14 @@
 	}
 
 	.list-content {
+		position: relative;
 		flex: 1;
 		overflow-y: auto;
 		padding: 4px;
+	}
+
+	.virtual-note-row {
+		display: flow-root;
 	}
 
 	.note-list-section {
@@ -1744,7 +1917,7 @@
 		margin-bottom: 2px;
 		user-select: none;
 	}
-	.note-list-section:first-child {
+	.note-list-section.first-section {
 		padding-top: 6px;
 	}
 

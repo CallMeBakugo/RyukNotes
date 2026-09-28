@@ -1,11 +1,12 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { open as openDialog } from '@tauri-apps/plugin-dialog';
 	import { readFile } from '@tauri-apps/plugin-fs';
 	import { get } from 'svelte/store';
-	import { tagStyles } from '$lib/stores/app';
-	import { saveAttachment, setTagStyle } from '$lib/api';
-	import type { TagStyle } from '$lib/types';
+	import { appConfig, tagStyles } from '$lib/stores/app';
+	import { importTagIcon, setTagStyle } from '$lib/api';
+	import type { TagStyle, TagStyleChange } from '$lib/types';
+	import { tagAppearance } from '$lib/utils/appearance-mutations';
 	import { isMobile } from '$lib/platform';
 	import NotebookGlyph from './NotebookGlyph.svelte';
 	import TagLabel from './TagLabel.svelte';
@@ -17,7 +18,6 @@
 	import {
 		TAG_COLOR_PRESETS,
 		applyCommittedTagStyle,
-		createTagStylePersister,
 		lookupTagStyle,
 		tagColor
 	} from '$lib/utils/tag-styles';
@@ -31,15 +31,20 @@
 	} = $props();
 
 	let dialogEl = $state<HTMLDivElement | null>(null);
+	const ownerVault = get(appConfig)?.active_vault ?? null;
+	let disposed = false;
+	let error = $state('');
+	const ownerIsCurrent = () => !disposed && get(appConfig)?.active_vault === ownerVault;
+	onDestroy(() => { disposed = true; });
 	const current = $derived(lookupTagStyle(tag, $tagStyles));
 	const activeIcon = $derived(current?.icon ?? null);
 	const activeColor = $derived(tagColor(tag, $tagStyles));
 	const colorInputValue = $derived(expandHex(activeColor) ?? '#5b6abf');
 	const hasStyle = $derived(!!(activeIcon || activeColor));
-	const persister = createTagStylePersister({
-		getCurrent: () => lookupTagStyle(tag, get(tagStyles)),
-		save: (next) => setTagStyle(tag, next)
-	});
+	function publishStyle(target: string, next: TagStyle | null) {
+		if (get(appConfig)?.active_vault !== ownerVault) return;
+		tagStyles.update(styles => applyCommittedTagStyle(styles, target, next));
+	}
 
 	onMount(() => dialogEl?.focus());
 
@@ -55,45 +60,65 @@
 		return path.slice(Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\')) + 1);
 	}
 
-	async function persist(patch: TagStyle) {
-		const next = persister.apply(patch);
-		$tagStyles = applyCommittedTagStyle($tagStyles, tag, next);
+	async function persist(change: TagStyleChange): Promise<boolean> {
+		if (!ownerVault || !ownerIsCurrent()) return false;
+		const target = tag;
+		const key = target.trim().toLowerCase();
+		let latest: () => boolean;
+		if (change.kind === 'reset') {
+			tagAppearance.choose(ownerVault, `${key}:icon`);
+			tagAppearance.choose(ownerVault, `${key}:color`);
+			latest = () => true;
+		} else {
+			latest = tagAppearance.choose(ownerVault, `${key}:${change.kind}`);
+		}
+		error = '';
 		try {
-			await persister.flush();
-		} catch (e) {
-			console.error('Failed to save tag style:', e);
+			await tagAppearance.run(ownerVault, key, latest,
+				() => setTagStyle(ownerVault, target, change),
+				(next) => publishStyle(target, next));
+			return true;
+		} catch (cause) {
+			if (ownerIsCurrent() && tag === target && latest()) error = String(cause);
+			return false;
 		}
 	}
 
 	function handleBuiltinIcon(icon: NotebookIconId) {
-		void persist({ icon: encodeBuiltinNotebookIcon(icon) });
+		void persist({ kind: 'icon', value: encodeBuiltinNotebookIcon(icon) });
 	}
 
 	async function handleCustomIcon() {
+		if (!ownerVault || !ownerIsCurrent()) return;
+		const target = tag;
+		const key = target.trim().toLowerCase();
+		const latest = tagAppearance.choose(ownerVault, `${key}:icon`);
+		error = '';
 		try {
 			const selected = await openDialog({
 				multiple: false,
 				filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico'] }]
 			});
-			if (!selected) return;
+			if (!selected || !ownerIsCurrent() || tag !== target || !latest()) return;
 			const filePath = selected as string;
 			const data = await readFile(filePath);
+			if (!ownerIsCurrent() || tag !== target || !latest()) return;
 			const fileName = baseOf(filePath) || 'icon.png';
-			const iconRelative = await saveAttachment(`tag-icon-${fileName}`, Array.from(data));
-			await persist({ icon: iconRelative });
-		} catch (e) {
-			console.error('Failed to set tag icon:', e);
+			await tagAppearance.run(ownerVault, key, latest,
+				() => importTagIcon(ownerVault, target, `tag-icon-${fileName}`, Array.from(data)),
+				(next) => publishStyle(target, next));
+		} catch (cause) {
+			if (ownerIsCurrent() && tag === target && latest()) error = String(cause);
 		}
 	}
 
 	async function handleReset() {
-		await persist({ icon: null, color: null });
-		onclose();
+		const target = tag;
+		if (await persist({ kind: 'reset' }) && ownerIsCurrent() && tag === target) onclose();
 	}
 
 	function onColorInput(e: Event) {
-		const value = (e.currentTarget as HTMLInputElement).value;
-		void persist({ color: value });
+		void persist({ kind: 'color', value: (e.currentTarget as HTMLInputElement).value });
 	}
 </script>
 
@@ -127,6 +152,7 @@
 				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
 			</button>
 		</header>
+		{#if error}<div class="picker-error" role="alert">{error}</div>{/if}
 		<div class="icon-picker-grid">
 			{#each NOTEBOOK_ICON_OPTIONS as option (option.id)}
 				<button
@@ -151,7 +177,7 @@
 					class:active={!activeColor}
 					aria-label="Use default color"
 					title="Default color"
-					onclick={() => persist({ color: null })}
+					onclick={() => persist({ kind: 'color', value: null })}
 				></button>
 				{#each TAG_COLOR_PRESETS as preset (preset)}
 					<button
@@ -161,7 +187,7 @@
 						style:background={preset}
 						aria-label={`Use ${preset}`}
 						title={preset}
-						onclick={() => persist({ color: preset })}
+						onclick={() => persist({ kind: 'color', value: preset })}
 					></button>
 				{/each}
 				<label class="swatch custom" title="Custom color">
@@ -186,6 +212,13 @@
 </div>
 
 <style>
+	.picker-error {
+		padding: 8px 16px;
+		font-size: 13px;
+		color: var(--text-primary);
+		overflow-wrap: anywhere;
+	}
+
 	.icon-picker-overlay {
 		position: fixed;
 		inset: 0;

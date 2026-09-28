@@ -89,6 +89,7 @@ pub fn ai_request(
                 let _ = app.emit(
                     "ai-stream",
                     AiStreamEvent {
+                        request_id: request_id.clone(),
                         event_type: "error".to_string(),
                         text: None,
                         error: Some(e),
@@ -109,13 +110,40 @@ fn normalize_openai_base(base: &str) -> String {
         .to_string()
 }
 
+fn openai_request_body(
+    model: &str,
+    system_prompt: Option<&str>,
+    user_message: &str,
+    stream: bool,
+    max_tokens: u32,
+) -> serde_json::Value {
+    // GPT-5/6 reject legacy output limits and sampling with their default reasoning.
+    let reasoning = model.starts_with("gpt-5") || model.starts_with("gpt-6");
+    let token_key = if reasoning {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
+    let mut messages = Vec::with_capacity(if system_prompt.is_some() { 2 } else { 1 });
+    if let Some(system) = system_prompt {
+        messages.push(json!({ "role": "system", "content": system }));
+    }
+    messages.push(json!({ "role": "user", "content": user_message }));
+    let mut body =
+        json!({ "model": model, "stream": stream, token_key: max_tokens, "messages": messages });
+    if stream && !reasoning {
+        body["temperature"] = json!(0.7);
+    }
+    body
+}
+
 async fn stream_anthropic(
     app: &AppHandle,
     api_key: &str,
     model: &str,
     system_prompt: &str,
     user_message: &str,
-    _request_id: &str,
+    request_id: &str,
 ) -> Result<(), String> {
     let client = Client::new();
 
@@ -168,6 +196,7 @@ async fn stream_anthropic(
                         let _ = app.emit(
                             "ai-stream",
                             AiStreamEvent {
+                                request_id: request_id.to_owned(),
                                 event_type: "done".to_string(),
                                 text: None,
                                 error: None,
@@ -185,6 +214,7 @@ async fn stream_anthropic(
                                     let _ = app.emit(
                                         "ai-stream",
                                         AiStreamEvent {
+                                            request_id: request_id.to_owned(),
                                             event_type: "text".to_string(),
                                             text: Some(text.to_string()),
                                             error: None,
@@ -196,6 +226,7 @@ async fn stream_anthropic(
                                 let _ = app.emit(
                                     "ai-stream",
                                     AiStreamEvent {
+                                        request_id: request_id.to_owned(),
                                         event_type: "done".to_string(),
                                         text: None,
                                         error: None,
@@ -210,6 +241,7 @@ async fn stream_anthropic(
                                 let _ = app.emit(
                                     "ai-stream",
                                     AiStreamEvent {
+                                        request_id: request_id.to_owned(),
                                         event_type: "error".to_string(),
                                         text: None,
                                         error: Some(msg.to_string()),
@@ -228,6 +260,7 @@ async fn stream_anthropic(
     let _ = app.emit(
         "ai-stream",
         AiStreamEvent {
+            request_id: request_id.to_owned(),
             event_type: "done".to_string(),
             text: None,
             error: None,
@@ -244,37 +277,11 @@ async fn stream_openai(
     model: &str,
     system_prompt: &str,
     user_message: &str,
-    _request_id: &str,
+    request_id: &str,
 ) -> Result<(), String> {
     let client = Client::new();
 
-    let is_gpt5 = model.starts_with("gpt-5");
-    let token_key = if is_gpt5 {
-        "max_completion_tokens"
-    } else {
-        "max_tokens"
-    };
-
-    let mut body = json!({
-        "model": model,
-        "stream": true,
-        token_key: 4096,
-        "messages": [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": user_message
-            }
-        ]
-    });
-
-    // GPT-5 models don't support temperature
-    if !is_gpt5 {
-        body["temperature"] = json!(0.7);
-    }
+    let body = openai_request_body(model, Some(system_prompt), user_message, true, 4096);
 
     let mut req = client.post(url).header("content-type", "application/json");
 
@@ -312,6 +319,7 @@ async fn stream_openai(
                         let _ = app.emit(
                             "ai-stream",
                             AiStreamEvent {
+                                request_id: request_id.to_owned(),
                                 event_type: "done".to_string(),
                                 text: None,
                                 error: None,
@@ -327,6 +335,7 @@ async fn stream_openai(
                                 let _ = app.emit(
                                     "ai-stream",
                                     AiStreamEvent {
+                                        request_id: request_id.to_owned(),
                                         event_type: "text".to_string(),
                                         text: Some(content.to_string()),
                                         error: None,
@@ -341,6 +350,7 @@ async fn stream_openai(
                                 let _ = app.emit(
                                     "ai-stream",
                                     AiStreamEvent {
+                                        request_id: request_id.to_owned(),
                                         event_type: "done".to_string(),
                                         text: None,
                                         error: None,
@@ -355,6 +365,7 @@ async fn stream_openai(
                             let _ = app.emit(
                                 "ai-stream",
                                 AiStreamEvent {
+                                    request_id: request_id.to_owned(),
                                     event_type: "error".to_string(),
                                     text: None,
                                     error: Some(err.to_string()),
@@ -371,6 +382,7 @@ async fn stream_openai(
     let _ = app.emit(
         "ai-stream",
         AiStreamEvent {
+            request_id: request_id.to_owned(),
             event_type: "done".to_string(),
             text: None,
             error: None,
@@ -445,23 +457,7 @@ async fn test_anthropic(api_key: &str, model: &str) -> Result<String, String> {
 
 async fn test_openai(url: &str, api_key: Option<&str>, model: &str) -> Result<String, String> {
     let client = Client::new();
-    let is_gpt5 = model.starts_with("gpt-5");
-    let token_key = if is_gpt5 {
-        "max_completion_tokens"
-    } else {
-        "max_tokens"
-    };
-
-    let body = json!({
-        "model": model,
-        token_key: 20,
-        "messages": [
-            {
-                "role": "user",
-                "content": "Hi"
-            }
-        ]
-    });
+    let body = openai_request_body(model, None, "Hi", false, 20);
 
     let mut req = client.post(url).header("content-type", "application/json");
 
@@ -481,5 +477,41 @@ async fn test_openai(url: &str, api_key: Option<&str>, model: &str) -> Result<St
         let status = response.status();
         let body_text = response.text().await.unwrap_or_default();
         Err(format!("API error {}: {}", status, body_text))
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[test]
+    fn gpt6_streaming_requests_use_supported_parameters() {
+        let body = openai_request_body(
+            "gpt-6-astra",
+            Some("Return Markdown"),
+            "Revise this",
+            true,
+            4096,
+        );
+        assert_eq!(body["max_completion_tokens"], 4096);
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn prior_openai_and_local_models_keep_their_parameter_contract() {
+        let prior = openai_request_body("gpt-5.5", None, "Hi", false, 20);
+        assert!(prior.get("max_completion_tokens").is_some());
+        assert!(prior.get("max_tokens").is_none());
+        let local = openai_request_body(
+            "gemma3:4b",
+            Some("Return Markdown"),
+            "Revise this",
+            true,
+            4096,
+        );
+        assert_eq!(local["max_tokens"], 4096);
+        assert_eq!(local["temperature"], 0.7);
+        assert!(local.get("max_completion_tokens").is_none());
     }
 }

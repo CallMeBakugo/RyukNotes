@@ -1,97 +1,158 @@
 <script lang="ts">
-	import { showSearch, activeNote, activeNotePath, editorDirty, appConfig, mobileView, notebooks, activeNotebook, activeTag, viewMode } from '$lib/stores/app';
-	import { searchNotes, readNote } from '$lib/api';
-	import { debounce } from '$lib/utils/debounce';
-	import type { SearchResult, NotebookEntry } from '$lib/types';
+	import { tick } from 'svelte';
+	import { showSearch, appConfig, mobileView, notebooks, activeNotebook, activeTag, viewMode } from '$lib/stores/app';
+	import { searchNotes } from '$lib/api';
+	import { relativePath } from '$lib/utils/paths';
+	import type { SearchResult, SearchMatch, NotebookEntry } from '$lib/types';
 	import { isMobile } from '$lib/platform';
 
+	let { onSelectNote }: { onSelectNote: (path: string) => Promise<boolean> } = $props();
+
+	const PAGE_SIZE = 20;
+	const currentVault = $derived($appConfig?.active_vault ?? null);
 	let query = $state('');
-	let results = $state<SearchResult[]>([]);
+	let results = $state.raw<SearchResult[]>([]);
+	let total = $state(0);
+	let offset = $state(0);
+	let loading = $state(false);
+	let opening = $state(false);
+	let error = $state('');
+	let composing = $state(false);
 	let selectedIndex = $state(0);
 	let inputEl = $state<HTMLInputElement>(null!);
 	let resultsEl = $state<HTMLDivElement>(null!);
+	let requestGeneration = 0;
+	let searchTimer: ReturnType<typeof setTimeout> | null = null;
+	const rows = $derived(results.map(result => ({
+		result,
+		title: textParts(result.title, result.title_matches),
+		snippet: textParts(result.snippet, result.snippet_matches),
+	})));
 
-	const doSearch = debounce(async (q: string) => {
-		if (!q.trim()) {
-			results = [];
-			return;
-		}
+	function cancelSearch() {
+		requestGeneration++;
+		if (searchTimer !== null) clearTimeout(searchTimer);
+		searchTimer = null;
+	}
+
+	function isCurrent(generation: number, vault: string | null) {
+		return generation === requestGeneration && $showSearch && vault === currentVault;
+	}
+
+	async function runSearch(q: string, pageOffset: number, generation: number, vault: string | null) {
+		searchTimer = null;
+		if (!isCurrent(generation, vault)) return;
 		try {
-			results = await searchNotes(q, 20);
+			const page = await searchNotes(q, PAGE_SIZE, pageOffset);
+			if (!isCurrent(generation, vault)) return;
+			results = page.results;
+			total = page.total;
 			selectedIndex = 0;
-		} catch (e) {
-			console.error('Search failed:', e);
-			results = [];
+			await tick();
+			if (isCurrent(generation, vault) && resultsEl) resultsEl.scrollTop = 0;
+		} catch (cause) {
+			if (!isCurrent(generation, vault)) return;
+			error = cause instanceof Error ? cause.message : String(cause);
+		} finally {
+			if (isCurrent(generation, vault)) loading = false;
 		}
-	}, 150);
+	}
+
+	function startSearch(value: string, pageOffset = 0, immediate = false) {
+		cancelSearch();
+		query = value;
+		results = [];
+		selectedIndex = 0;
+		error = '';
+		opening = false;
+		offset = pageOffset;
+		if (pageOffset === 0) total = 0;
+		const q = value.trim();
+		loading = !!q && !composing;
+		if (!loading) return;
+		const generation = requestGeneration;
+		const vault = currentVault;
+		if (immediate) void runSearch(q, pageOffset, generation, vault);
+		else searchTimer = setTimeout(() => void runSearch(q, pageOffset, generation, vault), 150);
+	}
 
 	$effect(() => {
-		if ($showSearch && inputEl) {
-			query = '';
-			results = [];
-			selectedIndex = 0;
-			setTimeout(() => inputEl?.focus(), 50);
+		const open = $showSearch;
+		const vault = currentVault;
+		const input = inputEl;
+		cancelSearch();
+		query = '';
+		results = [];
+		total = 0;
+		offset = 0;
+		selectedIndex = 0;
+		loading = false;
+		opening = false;
+		composing = false;
+		error = '';
+		if (open && input) {
+			const generation = requestGeneration;
+			void tick().then(() => { if (isCurrent(generation, vault)) input.focus(); });
 		}
+		return cancelSearch;
 	});
 
-	function handleInput() {
-		doSearch(query);
+	function handleInput(event: Event) {
+		if ((event as InputEvent).isComposing) composing = true;
+		startSearch((event.currentTarget as HTMLInputElement).value);
 	}
 
 	function scrollToSelected() {
-		if (!resultsEl) return;
-		const item = resultsEl.children[selectedIndex] as HTMLElement;
-		if (item) item.scrollIntoView({ block: 'nearest' });
+		void tick().then(() => {
+			const item = resultsEl?.children[selectedIndex] as HTMLElement | undefined;
+			item?.scrollIntoView({ block: 'nearest' });
+		});
 	}
 
 	function handleEscape(e: KeyboardEvent) {
-		if (e.key !== 'Escape') return;
+		if (e.key !== 'Escape' || e.isComposing) return;
 		e.preventDefault();
 		e.stopPropagation();
-		$showSearch = false;
+		close();
 	}
 
 	function handleKeydown(e: KeyboardEvent) {
-		if (e.key === 'ArrowDown') {
+		e.stopPropagation();
+		if (e.isComposing || composing || loading || opening) return;
+		if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
 			e.preventDefault();
-			selectedIndex = Math.min(selectedIndex + 1, results.length - 1);
+			if (!results.length) return;
+			selectedIndex = Math.max(0, Math.min(results.length - 1, selectedIndex + (e.key === 'ArrowDown' ? 1 : -1)));
+			inputEl?.focus({ preventScroll: true });
 			scrollToSelected();
-		} else if (e.key === 'ArrowUp') {
+		} else if (e.key === 'Enter' && e.target === inputEl && results[selectedIndex]) {
 			e.preventDefault();
-			selectedIndex = Math.max(selectedIndex - 1, 0);
-			scrollToSelected();
-		} else if (e.key === 'Enter' && results.length > 0) {
-			openResult(results[selectedIndex]);
+			void openResult(results[selectedIndex]);
 		}
 	}
 
 	function getNotebook(path: string): string {
-		const vault = $appConfig?.active_vault;
-		if (!vault) return '';
-		let rel = path;
-		if (rel.startsWith(vault + '/')) rel = rel.substring(vault.length + 1);
+		if (!currentVault) return '';
+		const rel = relativePath(currentVault, path);
 		const lastSlash = rel.lastIndexOf('/');
-		if (lastSlash <= 0) return '';
-		return rel.substring(0, lastSlash);
+		return lastSlash > 0 ? rel.substring(0, lastSlash) : '';
 	}
 
-	function highlightSnippet(snippet: string, q: string): string {
-		if (!q.trim() || !snippet) return escapeHtml(snippet);
-		const words = q.trim().split(/\s+/).filter(w => w.length > 1);
-		if (words.length === 0) return escapeHtml(snippet);
-		const escaped = escapeHtml(snippet);
-		const pattern = words.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
-		const re = new RegExp(`(${pattern})`, 'gi');
-		return escaped.replace(re, '<mark>$1</mark>');
-	}
-
-	function escapeHtml(str: string): string {
-		return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+	function textParts(text: string, matches: SearchMatch[]) {
+		const parts: { text: string; matched: boolean }[] = [];
+		let cursor = 0;
+		for (const { start, end } of matches) {
+			if (start > cursor) parts.push({ text: text.slice(cursor, start), matched: false });
+			parts.push({ text: text.slice(start, end), matched: true });
+			cursor = end;
+		}
+		if (cursor < text.length) parts.push({ text: text.slice(cursor), matched: false });
+		return parts;
 	}
 
 	function findNotebookByPath(nbs: NotebookEntry[], target: string): NotebookEntry | null {
 		for (const nb of nbs) {
-			if (nb.path === target) return nb;
+			if (relativePath(nb.path, target) === '.') return nb;
 			if (nb.children.length) {
 				const found = findNotebookByPath(nb.children, target);
 				if (found) return found;
@@ -101,41 +162,48 @@
 	}
 
 	async function openResult(result: SearchResult) {
+		if (loading || opening || !$showSearch || !results.includes(result)) return;
+		const generation = requestGeneration;
+		const vault = currentVault;
+		opening = true;
+		error = '';
 		try {
-			const content = await readNote(result.path);
-			$activeNote = content;
-			$activeNotePath = result.path;
-			$editorDirty = false;
-			$showSearch = false;
-			// Reveal the note in the notes list: switch to its notebook (or All Notes).
+			const opened = await onSelectNote(result.path);
+			if (!isCurrent(generation, vault)) return;
+			if (!opened) {
+				error = 'Could not open this note.';
+				return;
+			}
+			close();
+			// Reveal the note without applying a late result to another search/vault.
 			const sep = result.path.includes('\\') ? '\\' : '/';
 			const parentDir = result.path.slice(0, result.path.lastIndexOf(sep));
 			const nb = parentDir ? findNotebookByPath($notebooks, parentDir) : null;
-			if (nb) {
-				$activeNotebook = nb;
-				$activeTag = null;
-				$viewMode = 'notebook';
-			} else {
-				$activeNotebook = null;
-				$activeTag = null;
-				$viewMode = 'all';
-			}
+			$activeNotebook = nb;
+			$activeTag = null;
+			$viewMode = nb ? 'notebook' : 'all';
 			if (isMobile) $mobileView = 'editor';
-		} catch (e) {
-			console.error('Failed to open search result:', e);
+		} catch (cause) {
+			if (isCurrent(generation, vault)) error = cause instanceof Error ? cause.message : String(cause);
+		} finally {
+			if (isCurrent(generation, vault)) opening = false;
 		}
 	}
 
+	function previousPage() {
+		const lastPage = Math.max(0, Math.floor((total - 1) / PAGE_SIZE) * PAGE_SIZE);
+		startSearch(query, Math.max(0, Math.min(offset - PAGE_SIZE, lastPage)), true);
+	}
+
 	function close() {
+		cancelSearch();
 		$showSearch = false;
 	}
 </script>
 
 {#if $showSearch}
-	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="search-overlay" onclick={close} onkeydowncapture={handleEscape} onkeydown={handleKeydown}>
-		<!-- svelte-ignore a11y_no_static_element_interactions -->
-		<div class="search-panel" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+	<div class="search-overlay" role="presentation" onclick={close} onkeydowncapture={handleEscape}>
+		<div class="search-panel" role="dialog" aria-modal="true" aria-label="Search notes" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={handleKeydown}>
 			<div class="search-input-wrapper">
 				<svg class="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<circle cx="11" cy="11" r="8" />
@@ -145,18 +213,36 @@
 					bind:this={inputEl}
 					type="text"
 					placeholder="Search notes..."
+					role="combobox"
+					aria-label="Search notes"
+					aria-controls="global-search-results"
+					aria-expanded={results.length > 0}
+					aria-autocomplete="list"
+					aria-activedescendant={results.length ? `global-search-result-${selectedIndex}` : undefined}
 					bind:value={query}
 					oninput={handleInput}
-					onkeydown={handleKeydown}
+					oncompositionstart={() => { composing = true; cancelSearch(); results = []; total = 0; error = ''; loading = false; }}
+					oncompositionend={(e) => { composing = false; startSearch(e.currentTarget.value); }}
 				/>
 				{#if !isMobile}<kbd class="search-esc">Esc</kbd>{/if}
 			</div>
 
-			{#if results.length > 0}
-				<div class="search-results" bind:this={resultsEl}>
-					{#each results as result, i}
+			{#if error}<div class="search-error" role="alert">{error}</div>{/if}
+			{#if composing}
+				<div class="search-empty">Type to search across all notes</div>
+			{:else if loading}
+				<div class="search-empty" role="status">Searching…</div>
+			{:else if results.length > 0}
+				<div class="search-results" id="global-search-results" role="listbox" aria-label="Search results" bind:this={resultsEl}>
+					{#each rows as row, i (row.result.path)}
+						{@const result = row.result}
 						<button
 							class="result-item"
+							id={`global-search-result-${i}`}
+							role="option"
+							aria-selected={i === selectedIndex}
+							tabindex="-1"
+							disabled={opening}
 							class:selected={i === selectedIndex}
 							onclick={() => openResult(result)}
 							onmouseenter={() => (selectedIndex = i)}
@@ -168,25 +254,18 @@
 									<line x1="16" y1="13" x2="8" y2="13" />
 									<line x1="16" y1="17" x2="8" y2="17" />
 								</svg>
-								<span class="result-title">{result.title}</span>
+								<span class="result-title">{#each row.title as part}{#if part.matched}<mark>{part.text}</mark>{:else}{part.text}{/if}{/each}</span>
 								{#if getNotebook(result.path)}
 									<span class="result-notebook">{getNotebook(result.path)}</span>
 								{/if}
 							</div>
 							{#if result.snippet}
-								<span class="result-snippet">{@html highlightSnippet(result.snippet, query)}</span>
+								<span class="result-snippet">{#each row.snippet as part}{#if part.matched}<mark>{part.text}</mark>{:else}{part.text}{/if}{/each}</span>
 							{/if}
 						</button>
 					{/each}
 				</div>
-				<div class="search-footer">
-					<span class="search-count">{results.length} result{results.length !== 1 ? 's' : ''}</span>
-					<span class="search-hints">
-						<kbd>&uarr;</kbd><kbd>&darr;</kbd> navigate
-						<kbd>&crarr;</kbd> open
-					</span>
-				</div>
-			{:else if query.trim()}
+			{:else if query.trim() && !error}
 				<div class="no-results">
 					<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.3">
 						<circle cx="11" cy="11" r="8" />
@@ -194,11 +273,27 @@
 						<line x1="8" y1="8" x2="14" y2="14" />
 						<line x1="14" y1="8" x2="8" y2="14" />
 					</svg>
-					<span>No results for "{query}"</span>
+					<span>{total > 0 ? 'Results changed. Choose an earlier page.' : `No results for "${query}"`}</span>
 				</div>
-			{:else}
+			{:else if !error}
 				<div class="search-empty">
 					<span>Type to search across all notes</span>
+				</div>
+			{/if}
+			{#if total > 0}
+				<div class="search-footer">
+					<span class="search-count" role="status">
+						{#if results.length}{offset + 1}–{offset + results.length} of {total}{:else}{total} result{total !== 1 ? 's' : ''}{/if}
+					</span>
+					{#if total > PAGE_SIZE || offset > 0}
+						<div class="search-pages" aria-label="Result pages">
+							<button onclick={previousPage} disabled={loading || opening || offset === 0} aria-label="Previous results page">Previous</button>
+							<button onclick={() => startSearch(query, offset + PAGE_SIZE, true)} disabled={loading || opening || offset + PAGE_SIZE >= total} aria-label="Next results page">Next</button>
+						</div>
+					{/if}
+					{#if !isMobile}
+						<span class="search-hints"><kbd>&uarr;</kbd><kbd>&darr;</kbd> navigate <kbd>&crarr;</kbd> open</span>
+					{/if}
 				</div>
 			{/if}
 		</div>
@@ -235,8 +330,8 @@
 		border: 1px solid var(--border-color);
 		border-radius: 14px;
 		box-shadow: 0 16px 48px rgba(0, 0, 0, 0.2), 0 0 0 1px rgba(255, 255, 255, 0.05) inset;
-		width: 620px;
-		max-height: 460px;
+		width: min(620px, calc(100vw - 32px));
+		max-height: min(460px, calc(85dvh - 24px));
 		overflow: hidden;
 		display: flex;
 		flex-direction: column;
@@ -262,6 +357,7 @@
 
 	.search-input-wrapper input {
 		flex: 1;
+		min-width: 0;
 		border: none;
 		background: none;
 		color: var(--text-primary);
@@ -344,18 +440,23 @@
 	}
 
 	.result-snippet {
-		display: block;
+		display: -webkit-box;
+		-webkit-line-clamp: 2;
+		line-clamp: 2;
+		-webkit-box-orient: vertical;
 		font-size: 12px;
 		color: var(--text-tertiary);
 		margin-top: 4px;
 		margin-left: 24px;
 		overflow: hidden;
 		text-overflow: ellipsis;
-		white-space: nowrap;
+		white-space: normal;
+		overflow-wrap: anywhere;
 		line-height: 1.4;
 	}
 
-	.result-snippet :global(mark) {
+	.result-title mark,
+	.result-snippet mark {
 		background: color-mix(in srgb, var(--accent) 25%, transparent);
 		color: var(--text-accent);
 		border-radius: 2px;
@@ -364,6 +465,8 @@
 
 	.search-footer {
 		display: flex;
+		flex-wrap: wrap;
+		gap: 8px;
 		align-items: center;
 		justify-content: space-between;
 		padding: 8px 18px;
@@ -410,5 +513,33 @@
 		text-align: center;
 		color: var(--text-tertiary);
 		font-size: 13px;
+	}
+
+	.search-error {
+		padding: 12px 18px;
+		color: var(--text-primary);
+		font-size: 13px;
+		overflow-wrap: anywhere;
+	}
+
+	.search-pages {
+		display: flex;
+		gap: 6px;
+	}
+
+	.search-pages button {
+		padding: 4px 8px;
+		border: 1px solid var(--border-color);
+		border-radius: 4px;
+		background: var(--bg-secondary);
+		color: var(--text-primary);
+		font: inherit;
+		font-size: 12px;
+		cursor: pointer;
+	}
+
+	.search-pages button:disabled {
+		opacity: 0.45;
+		cursor: default;
 	}
 </style>

@@ -3,7 +3,6 @@
 	import { get } from 'svelte/store';
 	import { Editor } from '@tiptap/core';
 	import StarterKit from '@tiptap/starter-kit';
-	import Placeholder from '@tiptap/extension-placeholder';
 	import TaskList from '@tiptap/extension-task-list';
 	import TaskItem from '@tiptap/extension-task-item';
 	import { Table } from '@tiptap/extension-table';
@@ -19,13 +18,11 @@
 	import Superscript from '@tiptap/extension-superscript';
 	import { Color } from '@tiptap/extension-color';
 	import { TextStyle } from '@tiptap/extension-text-style';
-	import { CodeBlockLowlight } from '@tiptap/extension-code-block-lowlight';
+	import { CachedCodeBlockLowlight } from '$lib/editor/extensions/cachedCodeBlockLowlight';
 	import { Details, DetailsSummary, DetailsContent } from '@tiptap/extension-details';
 	import TextAlign from '@tiptap/extension-text-align';
 	import { common, createLowlight } from 'lowlight';
 	import powershell from 'highlight.js/lib/languages/powershell';
-	import hljs from 'highlight.js/lib/core';
-	import markdownLanguage from 'highlight.js/lib/languages/markdown';
 	import MarkdownIt from 'markdown-it';
 	import markdownItMark from 'markdown-it-mark';
 	import markdownItSup from 'markdown-it-sup';
@@ -43,21 +40,27 @@
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { activeNote, activeNotePath, appConfig, editorDirty, sourceMode, focusMode, readOnly, quickAccessPaths, notes, navHistory, canGoBack, canGoForward, viewerNote, viewMode, notebooks, outlineWidth } from '$lib/stores/app';
 	import { saveNote, saveImage, saveAttachment, readClipboardImage, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote } from '$lib/api';
-	import type { VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord } from '$lib/types';
+	import type { VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord, FileEvent } from '$lib/types';
 	import { listen } from '@tauri-apps/api/event';
 	import { debounce } from '$lib/utils/debounce';
+	import { RevisionSaveQueue, type SaveRevision } from '$lib/utils/revision-save';
+	import { isCurrentVaultEvent } from '$lib/utils/note-list-updates';
+	import { beginNoteNavigation, isCurrentNoteNavigation, cancelNoteNavigation } from '$lib/utils/note-navigation';
 	import { encryptSecretText, decryptSecretText, readSecretTitle } from '$lib/utils/secrets';
 	import { WrapSelectedText } from '$lib/editor/extensions/wrapSelectedText';
 	import { CodeBlockInputScroll } from '$lib/editor/extensions/codeBlockInputScroll';
 	import { calloutGroup, calloutIcon, calloutLabel, CALLOUT_MENU, transformCalloutBlockquotes, serializeCallout } from '$lib/editor/callouts';
-	import { wrapTextareaSelection } from '$lib/editor/source/selectionPairs';
+	import SourceEditor from './SourceEditor.svelte';
+	import { SourceController } from '$lib/editor/source/controller';
+	import { findDocumentMatches, findSourceMatches, closestSearchMatch, type NoteSearchMatch } from '$lib/editor/search';
 	import { convertListNode, type MixedListName } from '$lib/editor/mixedLists';
 	import { clearFormatting } from '$lib/editor/clearFormatting';
+	import { buildCodeCopyDecorations, buildTaskMetaDecorations, focusedPlaceholderDecorations } from '$lib/editor/decorations';
 	import { serializeInlineMarkdown } from '$lib/editor/markdown';
 	import { restoreTitleHeading, stripTitleHeading, type HiddenTitleHeading } from '$lib/editor/titleVisibility';
 	import { tagIterationKey } from '$lib/utils/tag-styles';
 	import { replaceWithWikiLink } from '$lib/editor/wikiLinks';
-	import { assetSourceToMarkdown, assetUrlToLocalPath, normalizeLocalAssetPath, resolveVaultFilePath } from '$lib/utils/paths';
+	import { assetSourceToMarkdown, assetUrlToLocalPath, normalizeLocalAssetPath, resolveVaultFilePath, isTrashedNote } from '$lib/utils/paths';
 	import GraphView from './GraphView.svelte';
 	import TagSuggestInput from './TagSuggestInput.svelte';
 	import TagLabel from './TagLabel.svelte';
@@ -70,9 +73,6 @@
 	} = $props();
 
 	const modKey = navigator.platform.startsWith('Mac') ? '⌘' : 'Ctrl';
-	const sourceHighlighter = hljs.newInstance();
-	sourceHighlighter.registerLanguage('markdown', markdownLanguage);
-	const SOURCE_HIGHLIGHT_MAX_CHARS = 32_000;
 
 	// Track virtual keyboard height on mobile via visualViewport
 	let keyboardHeight = $state(0);
@@ -84,8 +84,6 @@
 	}
 
 	let editorElement = $state<HTMLDivElement>(null!);
-	let sourceElement = $state<HTMLTextAreaElement>(null!);
-	let sourceHighlightElement = $state<HTMLPreElement>(null!);
 	const LARGE_DOC_CHARS = 100_000;
 	let isLargeDoc = $state(false);
 	let editor: Editor | null = null;
@@ -100,14 +98,14 @@
 		},
 	});
 	let editorReady = $state(false);
-	let sourceContent = $state('');
-	let sourceHighlightHtml = $derived.by(() => {
-		if (sourceContent.length > SOURCE_HIGHLIGHT_MAX_CHARS) return escapeHtml(sourceContent);
-		return sourceHighlighter.highlight(sourceContent, { language: 'markdown', ignoreIllegals: true }).value;
-	});
-	let sourceHistory: Array<{ content: string; cursor: number }> = [];
-	let sourceHistoryIndex = -1;
-	let sourceHistoryTimer: ReturnType<typeof setTimeout> | null = null;
+	const trashPreview = $derived(isTrashedNote($activeNotePath, $appConfig?.active_vault));
+	// CM retains an immutable document; edits never bind a full source string to Svelte.
+	const source = new SourceController((changes, edited) => {
+		noteSearchAnchor = changes.mapPos(Math.min(noteSearchAnchor, changes.length));
+		if (edited) markEdited();
+		scheduleCounts();
+		if (noteSearchOpen) scheduleNoteSearch();
+	}, { paste: handleFilePaste, drop: handleFileDrop });
 	let loadedPath = '';
 	type NoteScrollPosition = { rich: number; source: number };
 	const MAX_NOTE_SCROLL_POSITIONS = 200;
@@ -116,13 +114,11 @@
 	let ignoreNextUpdate = false;
 	let isLoadingNote = false;
 	let trashingNote = $state(false);
-	let fixingBlobsPromise: Promise<void> = Promise.resolve();
-	let hasPendingBlobs = false;
+	let renamingNote: SaveRevision | null = null;
 	let lastSourceMode = $sourceMode;
 	let linkContextMenu = $state<{ x: number; y: number; href: string; anchor: HTMLAnchorElement } | null>(null);
 	let hiddenTitleHeading: HiddenTitleHeading | null = null;
 	let taskRevealTimer: ReturnType<typeof setTimeout> | null = null;
-	let taskRevealElement: HTMLElement | null = null;
 	let taskRevealRequest = 0;
 	const taskRevealPluginKey = new PluginKey('taskReveal');
 	type TaskRevealTarget = { sourceOrdinal: number; richOrdinal: number | null };
@@ -146,23 +142,11 @@
 		});
 	}
 
-	function syncSourceEditorScroll() {
-		if (sourceHighlightElement && sourceElement) {
-			sourceHighlightElement.scrollTop = sourceElement.scrollTop;
-			sourceHighlightElement.scrollLeft = sourceElement.scrollLeft;
-		}
-		if ($appConfig?.show_line_numbers && sourceElement) {
-			const clip = sourceElement.closest('.editor-body')?.querySelector('.line-numbers-clip');
-			const gutter = clip?.firstElementChild as HTMLElement | null;
-			if (gutter) gutter.style.transform = `translateY(-${sourceElement.scrollTop}px)`;
-		}
-	}
 
 	function clearTaskReveal() {
 		if (taskRevealTimer) clearTimeout(taskRevealTimer);
 		taskRevealTimer = null;
-		taskRevealElement?.classList.remove('task-target-source');
-		taskRevealElement = null;
+		source.highlight(null);
 		if (editor && !editor.isDestroyed) {
 			editor.view.dispatch(editor.state.tr.setMeta(taskRevealPluginKey, DecorationSet.empty));
 		}
@@ -190,13 +174,10 @@
 	}
 
 	function sourceTaskRange(ordinal: number): { start: number; end: number } | null {
-		let offset = 0;
 		let current = -1;
-		for (const line of sourceContent.split('\n')) {
-			if (TASK_LINE_RE.test(line.replace(/\r$/, ''))) {
-				current++;
-				if (current === ordinal) return { start: offset, end: offset + line.length };
-			}
+		let offset = 0;
+		for (const line of source.state.doc.iterLines()) {
+			if (TASK_LINE_RE.test(line) && ++current === ordinal) return { start: offset, end: offset + line.length };
 			offset += line.length + 1;
 		}
 		return null;
@@ -205,20 +186,13 @@
 	function revealTaskTarget(target: TaskRevealTarget): boolean {
 		clearTaskReveal();
 		if ($sourceMode) {
-			if (!sourceElement) return false;
+			if (!source.view) return false;
 			const range = sourceTaskRange(target.sourceOrdinal);
 			if (!range) return true;
-			sourceElement.classList.add('task-target-source');
-			sourceElement.setSelectionRange(range.start, range.end);
-			scrollSourceToOffset(range.start);
-			requestAnimationFrame(() => scrollSourceToOffset(range.start));
-			taskRevealElement = sourceElement;
+			source.highlight({ from: range.start, to: range.end }, true);
+			const origin = captureOrigin();
 			taskRevealTimer = setTimeout(() => {
-				if (sourceElement?.selectionStart === range.start && sourceElement.selectionEnd === range.end) {
-					sourceElement.setSelectionRange(range.end, range.end);
-				}
-				sourceElement?.classList.remove('task-target-source');
-				taskRevealElement = null;
+				if (isOriginCurrent(origin) && !noteSearchOpen) source.highlight(null);
 				taskRevealTimer = null;
 			}, 1600);
 			return true;
@@ -264,37 +238,6 @@
 		}));
 	}
 
-	function handleSourceCtrlEnd(event: KeyboardEvent) {
-		if (!event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || event.key !== 'End') return false;
-		event.preventDefault();
-		const ta = sourceElement;
-		ta.focus({ preventScroll: true });
-		ta.setSelectionRange(sourceContent.length, sourceContent.length);
-		ta.scrollTop = ta.scrollHeight;
-		requestAnimationFrame(() => {
-			ta.scrollTop = ta.scrollHeight;
-		});
-		return true;
-	}
-
-	function handleSourceSelectionPair(event: KeyboardEvent) {
-		if (event.ctrlKey || event.metaKey || event.altKey || event.key.length !== 1) return false;
-		const ta = sourceElement;
-		if (!ta) return false;
-		const wrapped = wrapTextareaSelection(ta.value, ta.selectionStart, ta.selectionEnd, event.key);
-		if (!wrapped) return false;
-
-		event.preventDefault();
-		pushSourceHistoryImmediate();
-		sourceContent = wrapped.value;
-		tick().then(() => {
-			ta.setSelectionRange(wrapped.selectionStart, wrapped.selectionEnd);
-			pushSourceHistoryImmediate();
-		});
-		$editorDirty = true;
-		autoSave();
-		return true;
-	}
 
 	function closeAllDropdowns() {
 		headingDropdown = false;
@@ -342,6 +285,8 @@
 	let aiOriginalMarkdown = $state('');
 	let aiMediaPlaceholders = $state<Map<string, string>>(new Map());
 	let aiStreamUnlisten: (() => void) | null = null;
+	let aiOrigin: EditorOrigin | null = null;
+	let aiGeneration = 0;
 
 
 	// Outline
@@ -367,11 +312,12 @@
 	}
 
 	async function scrollToHeading(pos: number) {
+		const origin = captureOrigin();
 		if (isMobile) {
 			showOutline = false;
 			await tick();
 		}
-		if (!editor) return;
+		if (!editor || !isOriginCurrent(origin, true)) return;
 		editor.commands.setTextSelection(pos + 1);
 		editor.commands.scrollIntoView();
 		editor.view.focus();
@@ -408,7 +354,10 @@
 	let noteSearchOpen = $state(false);
 	let noteSearchQuery = $state('');
 	let noteSearchIndex = $state(0);
-	let noteSearchResults = $state<{from: number, to: number}[]>([]);
+	let noteSearchResults = $state.raw<NoteSearchMatch[]>([]);
+	let noteSearchMatchCase = $state(false);
+	let noteSearchWholeWord = $state(false);
+	let noteSearchPending = $state(false);
 	let noteSearchInput = $state<HTMLInputElement>(null!);
 	const noteSearchPluginKey = new PluginKey('noteSearch');
 
@@ -548,6 +497,7 @@
 
 	let secretModal = $state<SecretModalState | null>(null);
 	let secretTitleInput = $state<HTMLInputElement | null>(null);
+	let secretOrigin: EditorOrigin | null = null;
 
 	function selectedPlainText(): string {
 		if (!editor) return '';
@@ -557,6 +507,8 @@
 
 	function openSecretInsert() {
 		const selection = editor?.state.selection;
+		const origin = captureOrigin();
+		secretOrigin = origin;
 		secretModal = {
 			title: 'Encrypted secret',
 			text: selectedPlainText(),
@@ -568,6 +520,7 @@
 			busy: false,
 		};
 		tick().then(() => {
+			if (!secretModal || secretOrigin !== origin || !isOriginCurrent(origin)) return;
 			secretTitleInput?.focus();
 			secretTitleInput?.select();
 		});
@@ -579,6 +532,9 @@
 
 	async function commitSecretModal() {
 		if (!editor || !secretModal || secretModal.busy) return;
+		const modal = secretModal;
+		const origin = secretOrigin;
+		if (!origin || !canInsert(origin) || !isOriginCurrent(origin, true)) return;
 		if (!secretModal.text) {
 			secretModal.error = 'Secret text is required.';
 			return;
@@ -594,12 +550,13 @@
 		secretModal.busy = true;
 		secretModal.error = '';
 		try {
-			const payload = await encryptSecretText(secretModal.text, secretModal.passphrase, secretModal.title);
-			const { from, to } = secretModal;
+			const payload = await encryptSecretText(modal.text, modal.passphrase, modal.title);
+			if (!canInsert(origin) || !isOriginCurrent(origin, true) || secretModal !== modal || !editor) return;
+			const { from, to } = modal;
 			secretModal = null;
-			editor.chain().focus().setTextSelection({ from, to }).insertContent({ type: 'secretBlock', attrs: { payload } }).run();
+			editor.commands.insertContentAt({ from, to }, { type: 'secretBlock', attrs: { payload } });
 		} catch (e: any) {
-			if (secretModal) {
+			if (secretModal === modal && isOriginCurrent(origin)) {
 				secretModal.error = e?.message || 'Could not encrypt secret.';
 				secretModal.busy = false;
 			}
@@ -669,6 +626,7 @@
 	}
 
 	function closeViewer() {
+		beginEditorNoteNavigation();
 		$viewerNote = null;
 		$activeNote = null;
 		$activeNotePath = null;
@@ -677,9 +635,10 @@
 	}
 
 	async function viewerImportTo(folderPath: string) {
+		const isCurrent = beginEditorNoteNavigation();
 		const v = $viewerNote;
 		const vaultRoot = $appConfig?.active_vault;
-		if (!v || !vaultRoot || viewerImportBusy) return;
+		if (!isCurrent() || !v || !vaultRoot || viewerImportBusy) return;
 		viewerImportBusy = true;
 		try {
 			const filename = v.path.split('/').pop() || 'imported.md';
@@ -690,24 +649,33 @@
 			let n = 2;
 			// readNote throws if file doesn't exist; use it as an existence probe
 			while (true) {
-				try { await readNote(dest); } catch { break; }
+				try {
+					await readNote(vaultRoot, dest);
+					if (!isCurrent()) return;
+				} catch {
+					if (!isCurrent()) return;
+					break;
+				}
 				dest = `${folder}/${baseName} (${n}).md`;
 				n++;
 				if (n > 100) throw new Error('Could not find a free filename');
 			}
 			await copyFileTo(v.path, dest);
+			if (!isCurrent()) return;
+			const content = await readNote(vaultRoot, dest);
+			if (!isCurrent()) return;
 			// Switch to the imported note as a real vault note
 			$viewerNote = null;
 			$readOnly = false;
 			$focusMode = false;
 			viewerImportPickerOpen = false;
-			const content = await readNote(dest);
 			$activeNote = content;
 			$activeNotePath = dest;
 			$editorDirty = false;
 			loadNote(dest, content.content);
 			viewerFlash('Imported');
 		} catch (e: any) {
+			if (!isCurrent()) return;
 			console.error('[Viewer] import failed', e);
 			viewerFlash('Import failed: ' + (e?.message || String(e)));
 		} finally {
@@ -915,10 +883,12 @@
 
 		form.addEventListener('submit', async (event) => {
 			event.preventDefault();
+			const origin = captureOrigin();
 			error.textContent = '';
 			unlock.disabled = true;
 			try {
 				const plaintext = await decryptSecretText(payload, input.value);
+				if (!isOriginCurrent(origin) || !form.isConnected) return;
 				renderUnlockedSecretNode(dom, payload, plaintext);
 			} catch (e: any) {
 				error.textContent = e?.message || 'Unable to unlock secret.';
@@ -1695,39 +1665,20 @@
 		},
 	});
 
-	const COPY_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
-	const CHECK_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`;
-
 	const CopyButtonExtension = Extension.create({
 		name: 'codeBlockCopyButton',
 		addProseMirrorPlugins() {
-			function buildDecorations(doc: any): DecorationSet {
-				const decos: any[] = [];
-				doc.descendants((node: any, pos: number) => {
-					if (node.type.name === 'codeBlock') {
-						const btn = document.createElement('button');
-						btn.className = 'code-copy-btn';
-						btn.title = 'Copy code';
-						btn.innerHTML = COPY_ICON;
-						btn.addEventListener('click', (e) => {
-							e.preventDefault();
-							e.stopPropagation();
-							navigator.clipboard.writeText(node.textContent).then(() => {
-								btn.innerHTML = CHECK_ICON;
-								btn.classList.add('copied');
-								setTimeout(() => {
-									btn.innerHTML = COPY_ICON;
-									btn.classList.remove('copied');
-								}, 1500);
-							});
-						});
-						decos.push(Decoration.widget(pos + 1, btn, { side: -1, key: `copy-btn:${pos}` }));
-					}
-				});
-				return DecorationSet.create(doc, decos);
-			}
-			const pluginKey = new PluginKey('codeBlockCopyButton');
-			return [lazyDecorationPlugin(pluginKey, buildDecorations)];
+			return [lazyDecorationPlugin(new PluginKey('codeBlockCopyButton'), buildCodeCopyDecorations)];
+		},
+	});
+
+	const FocusedPlaceholder = Extension.create({
+		name: 'placeholder',
+		addProseMirrorPlugins() {
+			return [new Plugin({
+				key: new PluginKey('placeholder'),
+				props: { decorations: (state) => this.editor.isEditable ? focusedPlaceholderDecorations(state) : null },
+			})];
 		},
 	});
 
@@ -1745,7 +1696,8 @@
 		const rect = triggerEl.getBoundingClientRect();
 		codeLangSearch = '';
 		codeLangDropdown = { pos, x: rect.right, y: rect.bottom + 4, current };
-		tick().then(() => codeLangInput?.focus());
+		const origin = captureOrigin();
+		tick().then(() => { if (codeLangDropdown && isOriginCurrent(origin)) codeLangInput?.focus(); });
 	}
 
 	function selectCodeLang(lang: string) {
@@ -1776,7 +1728,7 @@
 						apply(tr, old) {
 							const meta = tr.getMeta(noteSearchPluginKey);
 							if (meta !== undefined) return meta;
-							return old.map(tr.mapping, tr.doc);
+							return tr.docChanged ? DecorationSet.empty : old;
 						},
 					},
 					props: {
@@ -1855,34 +1807,6 @@
 	// task items so they recede visually without disappearing. View-only inline decorations - the
 	// note text is untouched. Token shapes mirror the parser in commands.rs.
 	const taskMetaPluginKey = new PluginKey('taskMetaDim');
-	const TASK_PRIO_RE = /(^|\s)(!(?:high|medium|med|low))\b/gi;
-	const TASK_DUE_RE = /\bdue:\d{4}-\d{2}-\d{2}\b/gi;
-
-	function buildTaskMetaDecorations(doc: any): DecorationSet {
-		const decos: any[] = [];
-		doc.descendants((node: any, pos: number) => {
-			if (!node.isText || !node.text) return;
-			// Only inside task items - elsewhere "!high" / "due:..." are ordinary prose.
-			const rpos = doc.resolve(pos);
-			let inTask = false;
-			for (let d = rpos.depth; d > 0; d--) {
-				if (rpos.node(d).type.name === 'taskItem') { inTask = true; break; }
-			}
-			if (!inTask) return;
-			const text: string = node.text;
-			let m: RegExpExecArray | null;
-			TASK_PRIO_RE.lastIndex = 0;
-			while ((m = TASK_PRIO_RE.exec(text)) !== null) {
-				const start = pos + m.index + m[1].length;
-				decos.push(Decoration.inline(start, start + m[2].length, { class: 'task-meta-dim' }));
-			}
-			TASK_DUE_RE.lastIndex = 0;
-			while ((m = TASK_DUE_RE.exec(text)) !== null) {
-				decos.push(Decoration.inline(pos + m.index, pos + m.index + m[0].length, { class: 'task-meta-dim' }));
-			}
-		});
-		return DecorationSet.create(doc, decos);
-	}
 
 	const TaskMetaDim = Extension.create({
 		name: 'taskMetaDim',
@@ -2095,7 +2019,8 @@
 			slashColorPicker = true;
 			slashSelectedIndex = 0;
 			editor.chain().focus().deleteRange({ from: slashMenu.from, to: slashMenu.to }).run();
-			tick().then(() => slashColorInputEl?.focus());
+			const origin = captureOrigin();
+			tick().then(() => { if (slashColorPicker && isOriginCurrent(origin)) slashColorInputEl?.focus(); });
 			return;
 		}
 		// Delete the slash trigger text (/ + query)
@@ -2103,7 +2028,8 @@
 		slashMenu = null;
 		slashSelectedIndex = 0;
 		// Execute after the deletion is applied
-		tick().then(() => cmd.action());
+		const origin = captureOrigin();
+		tick().then(() => { if (canInsert(origin) && isOriginCurrent(origin, true)) cmd.action(); });
 	}
 
 	function slashInsertTable(rows: number, cols: number) {
@@ -2362,7 +2288,8 @@
 		if (item.kind === 'due') {
 			editor.chain().focus().deleteRange({ from, to }).run();
 			taskDuePicker = { x, y };
-			tick().then(() => { taskDueInputEl?.focus(); taskDueInputEl?.showPicker?.(); });
+			const origin = captureOrigin();
+			tick().then(() => { if (taskDuePicker && isOriginCurrent(origin)) { taskDueInputEl?.focus(); taskDueInputEl?.showPicker?.(); } });
 			return;
 		}
 		editor.chain().focus().deleteRange({ from, to }).insertContent(item.token + ' ').run();
@@ -2474,11 +2401,89 @@
 		return parts.length > 1 ? parts.slice(0, -1).join('/') + '/' : '';
 	}
 
+	let wikiTitleRefresh: Promise<void> | null = null;
+	let wikiTitleVault: string | null = null;
+	let wikiTitleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+	const pendingWikiTitleChanges = new Map<string, NoteTitleEntry | null>();
+	let editorDisposed = false;
+	let editorNavigationToken: number | null = null;
+
+	function beginEditorNoteNavigation(): () => boolean {
+		const token = beginNoteNavigation();
+		editorNavigationToken = token;
+		const vault = $appConfig?.active_vault;
+		const path = $activeNotePath;
+		const session = saves.capture();
+		return () => !editorDisposed
+			&& isCurrentNoteNavigation(token)
+			&& vault === $appConfig?.active_vault
+			&& path === $activeNotePath
+			&& saves.isCurrentSession(session);
+	}
+
 	async function refreshWikiLinkTitles() {
-		try {
-			wikiLinkTitlesCache = await getAllNoteTitles();
-		} catch (e) {
+		const vault = $appConfig?.active_vault;
+		if (editorDisposed || !vault) return;
+		if (vault !== wikiTitleVault) {
+			wikiTitleVault = vault;
+			wikiTitleRefresh = null;
+			wikiLinkTitlesCache = [];
+			pendingWikiTitleChanges.clear();
+		}
+		if (wikiTitleRefresh) return wikiTitleRefresh;
+		const request = getAllNoteTitles(vault).then((titles) => {
+			if (editorDisposed || vault !== $appConfig?.active_vault || wikiTitleRefresh !== request) return;
+			if (pendingWikiTitleChanges.size) {
+				const entries = new Map(titles.map(entry => [entry.path, entry]));
+				for (const [path, entry] of pendingWikiTitleChanges) {
+					if (entry) entries.set(path, entry);
+					else entries.delete(path);
+				}
+				wikiLinkTitlesCache = [...entries.values()];
+			} else {
+				wikiLinkTitlesCache = titles;
+			}
+		}).catch((e) => {
 			console.error('Failed to load note titles:', e);
+		}).finally(() => {
+			if (wikiTitleRefresh === request) {
+				wikiTitleRefresh = null;
+				pendingWikiTitleChanges.clear();
+			}
+		});
+		wikiTitleRefresh = request;
+		return wikiTitleRefresh;
+	}
+
+	function scheduleWikiTitleRefresh() {
+		if (wikiTitleRefreshTimer !== null) clearTimeout(wikiTitleRefreshTimer);
+		wikiTitleRefreshTimer = setTimeout(() => {
+			wikiTitleRefreshTimer = null;
+			// A structural event during a scan needs a fresh scan after that scan finishes.
+			if (wikiTitleRefresh) void wikiTitleRefresh.then(refreshWikiLinkTitles);
+			else void refreshWikiLinkTitles();
+		}, 250);
+	}
+
+	function handleWikiFileChange(event: FileEvent) {
+		if (!$appConfig?.enable_wiki_links || !isCurrentVaultEvent(event, $appConfig.active_vault)) return;
+		const path = normalizeWikiPath(event.note?.relative_path ?? event.path).replace(/\\/g, '/');
+		if (event.note) {
+			const entry = { path, title: event.note.meta.title };
+			const index = wikiLinkTitlesCache.findIndex(note => note.path === path);
+			if (index >= 0) {
+				if (wikiLinkTitlesCache[index].title !== entry.title) wikiLinkTitlesCache[index] = entry;
+			} else {
+				wikiLinkTitlesCache.push(entry);
+			}
+			if (wikiTitleRefresh) pendingWikiTitleChanges.set(path, entry);
+		} else if (event.event_type === 'remove') {
+			wikiLinkTitlesCache = wikiLinkTitlesCache.filter(entry => entry.path !== path && !entry.path.startsWith(path + '/'));
+			if (wikiTitleRefresh) pendingWikiTitleChanges.set(path, null);
+			if (!path.toLowerCase().endsWith('.md')) scheduleWikiTitleRefresh();
+		} else {
+			// Directories and events without note metadata can add, rename or remove descendants.
+			scheduleWikiTitleRefresh();
 		}
 	}
 
@@ -2501,6 +2506,8 @@
 	// Each match triggers a note rename and the mark is updated in-place.
 	async function checkWikiLinkRenames() {
 		if (!editor || !$appConfig?.enable_wiki_links || isLoadingNote) return;
+		const origin = captureOrigin();
+		if (!canInsert(origin)) return;
 
 		type RenameItem = { pos: number; size: number; mark: any; newTitle: string };
 		const toRename: RenameItem[] = [];
@@ -2520,12 +2527,13 @@
 		if (toRename.length === 0) return;
 
 		// Save the current note before renaming so the Rust backend has the latest content
-		await forceSave();
+		if (!(await forceSave()) || !isOriginCurrent(origin, true)) return;
 
 		for (const item of toRename) {
 			try {
 				const absPath = resolveNotePath(item.mark.attrs.path);
-				const newPath = await renameNote(absPath, item.newTitle);
+				const newPath = await renameNote(origin.vault!, absPath, item.newTitle);
+				if (!isOriginCurrent(origin, true)) return;
 				// Update the mark attrs in the editor (title + path) so the next save
 				// serialises [[NewTitle]] and doesn't re-trigger the rename check
 				if (editor) {
@@ -2544,6 +2552,7 @@
 				console.error('Failed to rename note from wiki-link edit:', e);
 			}
 		}
+		if (isOriginCurrent(origin, true)) markEdited();
 	}
 
 	function insertWikiLink(entry: NoteTitleEntry, originalRef?: string) {
@@ -2755,8 +2764,9 @@
 										const menuFrom = wikiLinkMenu.from;
 										const curTo = state.selection.from;
 										closeWikiLinkMenu();
+										const origin = captureOrigin();
 										tick().then(() => {
-											if (!editor) return;
+											if (!editor || !canInsert(origin) || !isOriginCurrent(origin, true)) return;
 											editor.view.dispatch(replaceWithWikiLink(
 												editor.state,
 												menuFrom,
@@ -2826,7 +2836,13 @@
 		wikiLinkSelectedIndex = 0;
 	}
 
-	async function navigateToWikiLink(path: string, title: string, clickEvent?: MouseEvent) {
+	function navigateToWikiLink(path: string, title: string, clickEvent?: MouseEvent) {
+		return resolveWikiLinkNavigation(path, title, clickEvent, beginEditorNoteNavigation());
+	}
+
+	async function resolveWikiLinkNavigation(path: string, title: string, clickEvent: MouseEvent | undefined, isCurrent: () => boolean) {
+		const vault = $appConfig?.active_vault;
+		if (!isCurrent() || !vault) return;
 		// Normalize legacy absolute paths in data-path to vault-relative (issue: cross-device sync)
 		path = normalizeWikiPath(path);
 		// title may contain #heading or ^block anchors - strip for note lookup
@@ -2875,14 +2891,18 @@
 					: null;
 				try {
 					// Save the current note before navigating away
-					await forceSave();
+					if (!(await flushSave()) || !isCurrent()) return;
 					const { createNote } = await import('$lib/api');
-					const newNote = await createNote(notebookRel || null, cleanTitle);
+					if (!isCurrent()) return;
+					const newNote = await createNote(vault, notebookRel || null, cleanTitle);
+					if (!isCurrent()) return;
 					// Refresh titles cache so the new note resolves on future clicks
 					refreshWikiLinkTitles();
 					// Navigate to the new note
-					const content = await readNote(newNote.path);
-					$activeNote = { ...content, content: content.content };
+					const content = await readNote(vault, newNote.path);
+					if (!isCurrent()) return;
+					if (!(await flushSave()) || !isCurrent()) return;
+					$activeNote = content;
 					$activeNotePath = newNote.path;
 					$editorDirty = false;
 				} catch (e) {
@@ -2893,10 +2913,14 @@
 		}
 		try {
 			const absPath = resolveNotePath(path);
-			const content = await readNote(absPath);
-			$activeNote = { ...content, content: content.content };
+			if (absPath === $activeNotePath) return;
+			const content = await readNote(vault, absPath);
+			if (!isCurrent()) return;
+			if (!(await flushSave()) || !isCurrent()) return;
+			$activeNote = content;
 			$activeNotePath = absPath;
 		} catch (e) {
+			if (!isCurrent()) return;
 			// Explicit Markdown links do not have a wiki-link title to recreate from.
 			// Do not turn a failed read into an untitled note.
 			if (!noteTitle) {
@@ -2906,16 +2930,23 @@
 			// Note at path no longer exists (deleted/moved). Refresh cache and
 			// retry as unresolved so the user can recreate it from the link.
 			await refreshWikiLinkTitles();
-			await navigateToWikiLink('', title, clickEvent);
+			if (!isCurrent()) return;
+			await resolveWikiLinkNavigation('', title, clickEvent, isCurrent);
 		}
 	}
 
 	async function navigateToWikiLinkDirect(entry: NoteTitleEntry) {
+		const isCurrent = beginEditorNoteNavigation();
+		const vault = $appConfig?.active_vault;
+		if (!isCurrent() || !vault) return;
 		wikiLinkNavDisambig = null;
 		try {
 			const absPath = resolveNotePath(entry.path);
-			const content = await readNote(absPath);
-			$activeNote = { ...content, content: content.content };
+			if (absPath === $activeNotePath) return;
+			const content = await readNote(vault, absPath);
+			if (!isCurrent()) return;
+			if (!(await flushSave()) || !isCurrent()) return;
+			$activeNote = content;
 			$activeNotePath = absPath;
 		} catch (e) {
 			console.error('Failed to navigate to wiki-link:', e);
@@ -3011,64 +3042,96 @@
 		return src;
 	}
 
-	let saveQueue: Promise<void> = Promise.resolve();
+	const saves = new RevisionSaveQueue();
+	let savedBlobImages = new Map<string, string>();
 
-	function queueSave(task: () => Promise<void>): Promise<void> {
-		const queued = saveQueue.then(task);
-		saveQueue = queued.catch(() => {});
-		return queued;
+	type EditorOrigin = {
+		snapshot: SaveRevision;
+		path: string | null;
+		vault: string | null | undefined;
+		noteId: string | undefined;
+		sourceMode: boolean;
+		surface: Editor | null;
+	};
+
+	function captureOrigin(): EditorOrigin {
+		return { snapshot: saves.capture(), path: $activeNotePath, vault: $appConfig?.active_vault,
+			noteId: $activeNote?.meta.id, sourceMode: $sourceMode, surface: editor };
 	}
 
-	const autoSave = debounce(async () => {
-		if (get(viewerNote) || trashingNote) return; // never autosave external viewer files or a note being trashed
-		if (!$activeNote || !$activeNotePath || !$editorDirty) return;
-		// Only fix blob images if a paste occurred (avoids full doc scan on every save)
-		if (hasPendingBlobs) {
-			hasPendingBlobs = false;
-			fixingBlobsPromise = fixBlobImages();
-		}
-		await fixingBlobsPromise;
-		if (trashingNote || !$activeNote || !$activeNotePath) return;
-		try {
-			const path = $activeNotePath;
-			const note = $activeNote;
-			const body = $sourceMode
-				? restoreTitleH1(sourceContent)
-				: editorToMarkdown();
-			// Safety: never save empty/near-empty body over a note that had real content
-			const trimmed = body.replace(/^#.*\n?/, '').trim();
-			if (!trimmed && note.content && note.content.trim().length > 10) {
-				console.warn('Auto-save blocked: refusing to overwrite note with empty content');
-				return;
-			}
-			await queueSave(() => saveNote(path, note.meta, body));
-			if ($activeNotePath === path) $editorDirty = false;
-		} catch (e) {
-			console.error('Auto-save failed:', e);
-		}
-	}, isMobile ? 1500 : 500);
+	function isOriginCurrent(origin: EditorOrigin, unchanged = false): boolean {
+		return !editorDisposed && !!origin.path && origin.path === loadedPath
+			&& origin.path === $activeNotePath && origin.vault === $appConfig?.active_vault
+			&& origin.sourceMode === $sourceMode && (origin.sourceMode || origin.surface === editor)
+			&& (unchanged ? saves.isCurrent(origin.snapshot) : saves.isCurrentSession(origin.snapshot));
+	}
 
-	export async function forceSave(allowWhileTrashing = false): Promise<boolean> {
-		if (get(viewerNote) || (trashingNote && !allowWhileTrashing)) return false;
-		if (!$activeNote || !$activeNotePath) return false;
-		await fixingBlobsPromise;
-		if (trashingNote && !allowWhileTrashing) return false;
-		if (!$activeNote || !$activeNotePath) return false;
+	function canInsert(origin: EditorOrigin): boolean {
+		return isOriginCurrent(origin) && !!origin.vault && !trashPreview && !$readOnly && !$viewerNote;
+	}
+
+	export function markEdited(): void {
+		saves.markChanged();
+		$editorDirty = true;
+		saves.schedule(() => { void forceSave(); });
+	}
+
+	export function forceSave(allowWhileTrashing = false): Promise<boolean> {
+		saves.cancelScheduled();
+		if (get(viewerNote) || !$activeNote || !$activeNotePath) return Promise.resolve(true);
+		if ((renamingNote && saves.isCurrentSession(renamingNote)) || (trashingNote && !allowWhileTrashing)) return Promise.resolve(false);
+		if (!$editorDirty) return Promise.resolve(true);
+		// Refuse an uninitialized/stale surface, not an intentionally deleted body.
+		if ($activeNotePath !== loadedPath || (!$sourceMode && (!editor || pendingContent !== null))) {
+			return Promise.resolve(false);
+		}
 		try {
+			// Capture everything before yielding: queued work must never read another note's state.
+			const origin = captureOrigin();
+			const { snapshot } = origin;
 			const path = $activeNotePath;
-			const note = $activeNote;
-			const body = $sourceMode ? restoreTitleH1(sourceContent) : editorToMarkdown();
-			const trimmed = body.replace(/^#.*\n?/, '').trim();
-			if (!trimmed && note.content && note.content.trim().length > 10) {
-				console.warn('Force-save blocked: refusing to overwrite note with empty content');
-				return false;
+			const vault = origin.vault;
+			if (!vault) return Promise.resolve(false);
+			const meta = { ...$activeNote.meta, tags: [...$activeNote.meta.tags] };
+			let body = $sourceMode ? restoreTitleH1(source.state.doc.toString()) : editorToMarkdown();
+			const blobUrls = new Set<string>();
+			if (body.includes('blob:')) {
+				if ($sourceMode) {
+					for (const match of body.matchAll(/(?:!\[[^\]\n]*\]\(|src=["'])(blob:[^)\s"']+)/g)) {
+						blobUrls.add(match[1]);
+					}
+				} else {
+					editor!.state.doc.descendants((node) => {
+						if (node.type.name === 'image' && node.attrs.src?.startsWith('blob:')) {
+							blobUrls.add(node.attrs.src);
+						}
+					});
+				}
 			}
-			await queueSave(() => saveNote(path, note.meta, body));
-			if ($activeNotePath === path) $editorDirty = false;
-			return true;
+			const blobImages = savedBlobImages;
+			return saves.save(snapshot, async () => {
+				for (const url of blobUrls) {
+					let relativePath = blobImages.get(url);
+					if (!relativePath) {
+						relativePath = await saveBlobImage(vault, url);
+						blobImages.set(url, relativePath);
+					}
+					body = body.replaceAll(url, relativePath);
+					replaceSavedBlob(origin, url, relativePath);
+				}
+				await saveNote(vault, path, meta, body);
+			}).then((current) => {
+				if (!current || !isOriginCurrent(origin, true)) return false;
+				if ($activeNote) $activeNote = { ...$activeNote, content: body };
+				$editorDirty = false;
+				return true;
+			}).catch((e) => {
+				console.error('Save failed:', e);
+				return false;
+			});
 		} catch (e) {
 			console.error('Save failed:', e);
-			return false;
+			return Promise.resolve(false);
 		}
 	}
 
@@ -3076,13 +3139,13 @@
 		const moveToTrash = onMoveToTrash;
 		if (trashingNote || !$activeNotePath || $viewerNote || !moveToTrash) return false;
 		const path = $activeNotePath;
-		const wasDirty = $editorDirty;
+		const origin = captureOrigin();
 		trashingNote = true;
 		try {
-			// Drain any save already in flight, then persist the latest editor state.
-			await saveQueue;
-			if (wasDirty && !(await forceSave(true))) return false;
-			if ($activeNotePath !== path) return false;
+			// Capture the latest editor state before waiting for older saves.
+			if (!(await forceSave(true)) || !isOriginCurrent(origin)) return false;
+			await saves.idle();
+			if (!isOriginCurrent(origin, true) || $editorDirty) return false;
 			// A queued debounce observes this flag and cannot recreate the moved note.
 			$editorDirty = false;
 			return await moveToTrash(path);
@@ -3093,11 +3156,12 @@
 
 	// The markdown body the editor would currently save; used to ignore the file-watcher echo of our own save.
 	export function getCurrentBody(): string {
-		return $sourceMode ? restoreTitleH1(sourceContent) : editorToMarkdown();
+		return $sourceMode ? restoreTitleH1(source.state.doc.toString()) : editorToMarkdown();
 	}
 
 	// ── Tag editing (active note) ──
 	function toggleTagMenu(e: MouseEvent) {
+		if (trashPreview) return;
 		if (tagMenu) { tagMenu = null; return; }
 		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
 		const width = 240;
@@ -3106,23 +3170,22 @@
 	}
 
 	function addActiveNoteTag(tag: string) {
-		if (!$activeNote) return;
+		if (!$activeNote || trashPreview) return;
 		const cleaned = tag.trim().toLowerCase();
 		if (!cleaned || $activeNote.meta.tags.includes(cleaned)) return;
 		$activeNote = { ...$activeNote, meta: { ...$activeNote.meta, tags: [...$activeNote.meta.tags, cleaned] } };
-		$editorDirty = true;
-		autoSave();
+		markEdited();
 	}
 
 	function removeActiveNoteTag(tag: string) {
-		if (!$activeNote) return;
+		if (!$activeNote || trashPreview) return;
 		$activeNote = { ...$activeNote, meta: { ...$activeNote.meta, tags: $activeNote.meta.tags.filter((t) => t !== tag) } };
-		$editorDirty = true;
-		autoSave();
+		markEdited();
 	}
 
 	// Sync editor editable state when readOnly store changes (from titlebar or editor)
 	$effect(() => {
+		if (trashPreview && !$readOnly) $readOnly = true;
 		const ro = $readOnly;
 		untrack(() => {
 			if (editor) {
@@ -3146,9 +3209,10 @@
 	}
 
 	function updateCounts() {
+		if (!showInfo || editorDisposed) return;
 		let text = '';
 		if (get(sourceMode)) {
-			text = sourceContent
+			text = source.state.doc.toString()
 				.replace(/^---[\s\S]*?---\n?/, '')
 				.replace(/!\[[^\]]*\]\([^)]*\)/g, '')
 				.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
@@ -3163,7 +3227,15 @@
 		charCount = text.replace(/\s/g, '').length;
 	}
 
-	const scheduleCounts = debounce(updateCounts, 250);
+	let countsTimer: ReturnType<typeof setTimeout> | undefined;
+	function cancelCounts() {
+		clearTimeout(countsTimer);
+		countsTimer = undefined;
+	}
+	function scheduleCounts() {
+		cancelCounts();
+		if (showInfo) countsTimer = setTimeout(updateCounts, 250);
+	}
 
 	function toggleInfo() {
 		showInfo = !showInfo;
@@ -3186,27 +3258,38 @@
 		}, 1600);
 	}
 
+	let historyRequest = 0;
+
 	async function toggleHistory() {
+		const origin = captureOrigin();
+		const request = ++historyRequest;
 		showHistory = !showHistory;
 		historyPreview = null;
 		historySelected = null;
-		if (showHistory && $activeNote) {
-			historyLoading = true;
-			try {
-				historyVersions = await getNoteVersions($activeNote.meta.id);
-			} catch (e) {
-				console.error('Failed to load versions:', e);
-				historyVersions = [];
-			}
-			historyLoading = false;
+		historyLoading = false;
+		if (!showHistory || !origin.noteId || !origin.vault) return;
+		historyLoading = true;
+		try {
+			const versions = await getNoteVersions(origin.vault, origin.noteId);
+			if (!isOriginCurrent(origin) || request !== historyRequest || !showHistory) return;
+			historyVersions = versions;
+		} catch (e) {
+			console.error('Failed to load versions:', e);
+			if (isOriginCurrent(origin) && request === historyRequest) historyVersions = [];
+		} finally {
+			if (isOriginCurrent(origin) && request === historyRequest) historyLoading = false;
 		}
 	}
 
 	async function previewVersion(v: VersionEntry) {
-		if (!$activeNote) return;
+		const origin = captureOrigin();
+		if (!origin.noteId || !origin.vault) return;
+		const request = ++historyRequest;
 		historySelected = v;
+		historyPreview = null;
 		try {
-			historyPreview = await getNoteVersionContent($activeNote.meta.id, v.timestamp);
+			const content = await getNoteVersionContent(origin.vault, origin.noteId, v.timestamp);
+			if (isOriginCurrent(origin) && request === historyRequest && showHistory) historyPreview = content;
 		} catch (e) {
 			console.error('Failed to load version:', e);
 		}
@@ -3214,16 +3297,21 @@
 
 	async function restoreVersion() {
 		if (!$activeNote || !$activeNotePath || !historySelected) return;
+		const origin = captureOrigin();
+		const selected = historySelected;
+		const request = historyRequest;
+		if (!canInsert(origin)) return;
 		try {
-			const raw = historyPreview ?? await getNoteVersionContent($activeNote.meta.id, historySelected.timestamp);
+			const raw = historyPreview ?? await getNoteVersionContent(origin.vault!, origin.noteId!, selected.timestamp);
+			if (!isOriginCurrent(origin, true) || !canInsert(origin) || request !== historyRequest || !showHistory) return;
 			// The raw content includes frontmatter - parse out the body
 			const fmEnd = raw.indexOf('---', 4);
 			const body = fmEnd > 0 ? raw.substring(raw.indexOf('\n', fmEnd) + 1) : raw;
-			if (editor) {
+			if ($sourceMode) {
+				source.replace(stripTitleH1(body));
+			} else if (editor) {
 				editor.commands.setContent(markdownToHtml(body));
 			}
-			$editorDirty = true;
-			autoSave();
 			historyPreview = null;
 			historySelected = null;
 			showHistory = false;
@@ -3234,12 +3322,14 @@
 
 	async function handleCreateVersion() {
 		if (!$activeNote || !$activeNotePath) return;
-		// Save current content first so the snapshot is up to date
-		await forceSave();
+		const origin = captureOrigin();
+		const request = historyRequest;
+		if (!origin.vault || !(await forceSave()) || !isOriginCurrent(origin, true)) return;
 		try {
-			await createVersion($activeNotePath, $activeNote.meta.id);
-			// Refresh the version list
-			historyVersions = await getNoteVersions($activeNote.meta.id);
+			await createVersion(origin.vault, origin.path!, origin.noteId!);
+			if (!isOriginCurrent(origin) || request !== historyRequest || !showHistory) return;
+			const versions = await getNoteVersions(origin.vault, origin.noteId!);
+			if (isOriginCurrent(origin) && request === historyRequest && showHistory) historyVersions = versions;
 		} catch (e) {
 			console.error('Failed to create version:', e);
 		}
@@ -3276,8 +3366,12 @@
 		editor.view.updateState(newState);
 	}
 
-	export function focusTitle() {
+	export function focusTitle(navigationToken: number) {
+		const vault = $appConfig?.active_vault;
+		const path = $activeNotePath;
 		tick().then(() => {
+			if (editorDisposed || !isCurrentNoteNavigation(navigationToken)
+				|| vault !== $appConfig?.active_vault || path !== $activeNotePath) return;
 			if (titleInput) {
 				titleInput.focus();
 				titleInput.select();
@@ -3286,33 +3380,26 @@
 	}
 
 	async function editorNavigateHistory(direction: -1 | 1) {
+		const isCurrent = beginEditorNoteNavigation();
+		const vault = $appConfig?.active_vault;
+		if (!isCurrent() || !vault) return;
+		if (!(await flushSave()) || !isCurrent()) return;
 		const path = navHistory.go(direction);
 		if (!path) return;
-		flushSave();
 		try {
-			const content = await readNote(path);
+			const content = await readNote(vault, path);
+			if (!isCurrent()) return;
+			if (!(await flushSave()) || !isCurrent()) return;
 			$activeNote = content;
 			$activeNotePath = path;
 			$editorDirty = false;
 		} catch {}
 	}
 
-	/** Flush unsaved editor content to disk (synchronous serialize + fire-and-forget save).
-	 *  Call BEFORE updating $activeNote/$activeNotePath stores when switching notes. */
-	export function flushSave() {
-		if (!$editorDirty || !$activeNote || !$activeNotePath) return;
-		try {
-			const body = $sourceMode
-				? restoreTitleH1(sourceContent)
-				: editorToMarkdown();
-			const trimmed = body.replace(/^#.*\n?/, '').trim();
-			if (trimmed || !$activeNote.content || $activeNote.content.trim().length <= 10) {
-				saveNote($activeNotePath, $activeNote.meta, body);
-			}
-		} catch (e) {
-			console.error('Pre-switch save failed:', e);
-		}
-		$editorDirty = false;
+	/** Capture and queue unsaved content before changing active-note stores.
+	 * A false result means the save failed or newer edits still need saving. */
+	export function flushSave(): Promise<boolean> {
+		return forceSave();
 	}
 
 	function rememberLoadedNoteScroll() {
@@ -3320,7 +3407,7 @@
 		const previous = noteScrollPositions.get(loadedPath) ?? { rich: 0, source: 0 };
 		const editorBody = editorElement?.closest('.editor-body') as HTMLElement | null;
 		const position = $sourceMode
-			? { ...previous, source: sourceElement?.scrollTop ?? previous.source }
+			? { ...previous, source: source.view?.scrollDOM.scrollTop ?? previous.source }
 			: { ...previous, rich: editorBody?.scrollTop ?? previous.rich };
 
 		// Refresh insertion order so the cap evicts the least recently viewed note.
@@ -3333,20 +3420,46 @@
 	}
 
 	function restoreNoteScroll(surface: HTMLElement, scrollTop: number, path: string) {
+		const snapshot = saves.capture();
 		const apply = () => {
-			if (loadedPath === path && surface.isConnected) surface.scrollTop = scrollTop;
+			if (saves.isCurrentSession(snapshot) && loadedPath === path && surface.isConnected) surface.scrollTop = scrollTop;
 		};
 		apply();
 		requestAnimationFrame(apply);
 	}
 
 	export function loadNote(path: string, content: string, taskTarget?: TaskRecord) {
+		cancelCounts();
+		closeNoteSearch(false);
+		saves.startSession();
+		closeAiMenu();
+		showHistory = false;
+		historyPreview = null;
+		historySelected = null;
+		historyVersions = [];
+		secretModal = null;
+		linkModal = false;
+		textContextMenu = null;
+		closeSlashMenu();
+		closeWikiLinkMenu();
+		closeTaskMetaMenu();
+		taskDuePicker = null;
+		codeLangDropdown = null;
+		linkContextMenu = null;
+		imageToolbar = null;
+		tableContextMenu = null;
+		historyRequest++;
+		historyLoading = false;
+		savedBlobImages = new Map();
+		$editorDirty = false;
 		rememberLoadedNoteScroll();
 		const scrollPosition = taskTarget ? undefined : noteScrollPositions.get(path);
 		clearTaskReveal();
 		const revealRequest = ++taskRevealRequest;
 		const revealTarget = taskTarget ? resolveTaskTarget(taskTarget, content) : null;
 		loadedPath = path;
+		const loadSnapshot = saves.capture();
+		if ($appConfig?.enable_wiki_links && wikiTitleVault !== $appConfig.active_vault) void refreshWikiLinkTitles();
 		isLoadingNote = true;
 		isLargeDoc = content.length > LARGE_DOC_CHARS;
 		// Viewer mode (external file) always forces read-only. New notes stay editable and
@@ -3357,16 +3470,16 @@
 			$sourceMode = true;
 		}
 		lastSourceMode = $sourceMode;
-		const shouldBeReadOnly = isViewer ? true : (isNewNote ? false : ($appConfig?.default_view_mode ?? false));
+		const shouldBeReadOnly = isViewer || isTrashedNote(path, $appConfig?.active_vault)
+			? true : (isNewNote ? false : ($appConfig?.default_view_mode ?? false));
 		$readOnly = shouldBeReadOnly;
 		if (editor) editor.setEditable(!shouldBeReadOnly);
 		const editorBody = editorElement?.closest('.editor-body') as HTMLElement | null;
 		if ($sourceMode) {
-			sourceContent = stripTitleH1(content);
-			resetSourceHistory(sourceContent);
+			source.load(stripTitleH1(content));
 			if (editorBody) editorBody.scrollTop = 0;
 			tick().then(() => {
-				if (sourceElement) restoreNoteScroll(sourceElement, scrollPosition?.source ?? 0, path);
+				if (saves.isCurrentSession(loadSnapshot) && source.view) restoreNoteScroll(source.view.scrollDOM, scrollPosition?.source ?? 0, path);
 			});
 			isLoadingNote = false;
 			updateCounts();
@@ -3377,12 +3490,10 @@
 			editor.commands.setContent(html);
 			// Clear undo/redo history so it doesn't bleed across notes
 			clearEditorHistory();
-			const text = editor.state.doc.textContent;
-			wordCount = countWords(text);
-			charCount = text.replace(/\s/g, '').length;
+			updateCounts();
 			// Restore scroll and reset the cursor after all ProseMirror/Svelte DOM updates settle.
 			tick().then(() => {
-				if (path !== loadedPath) return;
+				if (!saves.isCurrentSession(loadSnapshot) || path !== loadedPath) return;
 				if (editorBody) restoreNoteScroll(editorBody, scrollPosition?.rich ?? 0, path);
 				// Explicitly reset ProseMirror selection to start so TipTap's focus()
 				// (triggered by checkbox clicks etc.) doesn't scroll to the old note's cursor position.
@@ -3509,8 +3620,6 @@
 		});
 		if (changed) {
 			editor.view.dispatch(tr);
-			$editorDirty = true;
-			autoSave();
 		}
 		closeTableContextMenu();
 	}
@@ -3679,75 +3788,71 @@
 
 	// ── In-note search functions ──
 	let noteSearchTimer: ReturnType<typeof setTimeout> | null = null;
+	let noteSearchFrame: number | null = null;
+	let noteSearchGeneration = 0;
+	let noteSearchAnchor = 0;
+	let noteSearchSourceHighlighted = false;
+	const searchRevealedDetails = new Set<HTMLElement>();
 
-	function updateNoteSearch(query: string) {
-		if (noteSearchTimer) clearTimeout(noteSearchTimer);
-		if (!query) {
+	function cancelNoteSearchWork() {
+		noteSearchGeneration++;
+		if (noteSearchTimer !== null) clearTimeout(noteSearchTimer);
+		if (noteSearchFrame !== null) cancelAnimationFrame(noteSearchFrame);
+		noteSearchTimer = null;
+		noteSearchFrame = null;
+		noteSearchPending = false;
+	}
+
+	function scheduleNoteSearch(reset = false, reveal = false) {
+		cancelNoteSearchWork();
+		if (reset) source.highlight(null);
+		if (reset) {
+			noteSearchAnchor = 0;
+			noteSearchSourceHighlighted = false;
 			noteSearchResults = [];
 			noteSearchIndex = 0;
-			if (!$sourceMode && editor) {
-				const tr = editor.state.tr.setMeta(noteSearchPluginKey, DecorationSet.empty);
-				editor.view.dispatch(tr);
+			if (editor && !editor.isDestroyed) {
+				editor.view.dispatch(editor.state.tr.setMeta(noteSearchPluginKey, DecorationSet.empty));
 			}
-			return;
 		}
+		if (!noteSearchOpen || !noteSearchQuery) return;
+		noteSearchPending = true;
+		const generation = noteSearchGeneration;
+		const path = $activeNotePath;
+		const isSource = $sourceMode;
 		noteSearchTimer = setTimeout(() => {
-			if ($sourceMode) {
-				updateNoteSearchSource(query);
-			} else {
-				updateNoteSearchWysiwyg(query);
+			noteSearchTimer = null;
+			if (generation !== noteSearchGeneration || !noteSearchOpen || path !== $activeNotePath || isSource !== $sourceMode || editorDisposed) return;
+			scanNoteSearch();
+			// Query changes may reveal a result; live document edits never move the caret
+			// or viewport, even if a delayed scan finishes after focus moved elsewhere.
+			if (reveal && document.activeElement === noteSearchInput) {
+				revealNoteSearchMatch();
+			} else if (isSource && noteSearchSourceHighlighted) {
+				source.highlight(noteSearchResults[noteSearchIndex] ?? null);
 			}
 		}, 100);
 	}
 
-	function updateNoteSearchWysiwyg(query: string) {
-		if (!editor) return;
-		const results: {from: number, to: number}[] = [];
-		const lowerQuery = query.toLowerCase();
-		editor.state.doc.descendants((node, pos) => {
-			if (!node.isText || !node.text) return;
-			const text = node.text.toLowerCase();
-			let idx = text.indexOf(lowerQuery);
-			while (idx !== -1) {
-				results.push({ from: pos + idx, to: pos + idx + query.length });
-				idx = text.indexOf(lowerQuery, idx + 1);
-			}
-		});
-		noteSearchResults = results;
-		if (noteSearchIndex >= results.length) noteSearchIndex = 0;
-		applySearchDecorations();
+	function scanNoteSearch() {
+		const options = { matchCase: noteSearchMatchCase, wholeWord: noteSearchWholeWord };
+		const sourceText = $sourceMode ? source.state.doc.toString() : '';
+		noteSearchResults = $sourceMode
+			? findSourceMatches(sourceText, noteSearchQuery, options)
+			: editor ? findDocumentMatches(editor.state.doc, noteSearchQuery, options) : [];
+		noteSearchIndex = closestSearchMatch(noteSearchResults, noteSearchAnchor);
+		noteSearchAnchor = noteSearchResults[noteSearchIndex]?.from ?? noteSearchAnchor;
+		noteSearchPending = false;
+		if (!$sourceMode) applySearchDecorations();
 	}
 
-	function updateNoteSearchSource(query: string) {
-		const results: {from: number, to: number}[] = [];
-		const lowerQuery = query.toLowerCase();
-		const text = sourceContent.toLowerCase();
-		let idx = text.indexOf(lowerQuery);
-		while (idx !== -1) {
-			results.push({ from: idx, to: idx + query.length });
-			idx = text.indexOf(lowerQuery, idx + 1);
-		}
-		noteSearchResults = results;
-		if (noteSearchIndex >= results.length) noteSearchIndex = 0;
-		scrollToSourceMatch();
-	}
-
-	function scrollToSourceMatch(focusTextarea = false) {
-		if (!sourceElement || noteSearchResults.length === 0) return;
+	function scrollToSourceMatch() {
 		const match = noteSearchResults[noteSearchIndex];
-		// Only steal focus when navigating (Enter/Shift+Enter), not while typing
-		if (focusTextarea) sourceElement.focus();
-		sourceElement.setSelectionRange(match.from, match.to);
-		scrollSourceToOffset(match.from);
+		if (!match) return;
+		noteSearchSourceHighlighted = true;
+		source.highlight(match, true);
 	}
 
-	// Centre the source textarea's viewport on the line containing `offset`.
-	function scrollSourceToOffset(offset: number) {
-		if (!sourceElement) return;
-		const linesBefore = sourceContent.substring(0, offset).split('\n').length;
-		const lineHeight = parseFloat(getComputedStyle(sourceElement).lineHeight) || 20;
-		sourceElement.scrollTop = Math.max(0, (linesBefore - 1) * lineHeight - sourceElement.clientHeight / 2);
-	}
 
 	// ── Caret carry-over between the rich editor and the markdown source view (issue #125) ──
 	// The caret is a ProseMirror doc position in one mode and a character offset in the other,
@@ -3797,129 +3902,116 @@
 		return lo;
 	}
 
-	function resetSourceHistory(content: string) {
-		sourceHistory = [{ content, cursor: content.length }];
-		sourceHistoryIndex = 0;
-		if (sourceHistoryTimer) {
-			clearTimeout(sourceHistoryTimer);
-			sourceHistoryTimer = null;
-		}
-	}
-
-	function pushSourceHistoryImmediate() {
-		if (!sourceElement) return;
-		if (sourceHistoryTimer) {
-			clearTimeout(sourceHistoryTimer);
-			sourceHistoryTimer = null;
-		}
-		const entry = { content: sourceContent, cursor: sourceElement.selectionStart };
-		// Don't push duplicate
-		if (sourceHistoryIndex >= 0 && sourceHistory[sourceHistoryIndex]?.content === entry.content) return;
-		// Truncate any redo history
-		sourceHistory = sourceHistory.slice(0, sourceHistoryIndex + 1);
-		sourceHistory.push(entry);
-		sourceHistoryIndex++;
-		// Limit stack size
-		if (sourceHistory.length > 200) {
-			sourceHistory.shift();
-			sourceHistoryIndex--;
-		}
-	}
-
-	function pushSourceHistoryDebounced() {
-		if (sourceHistoryTimer) clearTimeout(sourceHistoryTimer);
-		sourceHistoryTimer = setTimeout(() => {
-			sourceHistoryTimer = null;
-			pushSourceHistoryImmediate();
-		}, 300);
-	}
-
-	function sourceUndo() {
-		// Flush any pending debounced snapshot first
-		if (sourceHistoryTimer) {
-			clearTimeout(sourceHistoryTimer);
-			sourceHistoryTimer = null;
-			pushSourceHistoryImmediate();
-		}
-		if (sourceHistoryIndex <= 0) return;
-		sourceHistoryIndex--;
-		const entry = sourceHistory[sourceHistoryIndex];
-		sourceContent = entry.content;
-		tick().then(() => {
-			sourceElement?.setSelectionRange(entry.cursor, entry.cursor);
-		});
-	}
-
-	function sourceRedo() {
-		if (sourceHistoryIndex >= sourceHistory.length - 1) return;
-		sourceHistoryIndex++;
-		const entry = sourceHistory[sourceHistoryIndex];
-		sourceContent = entry.content;
-		tick().then(() => {
-			sourceElement?.setSelectionRange(entry.cursor, entry.cursor);
-		});
-	}
 
 	function applySearchDecorations() {
 		if (!editor) return;
-		const decorations = noteSearchResults.map((m, i) =>
-			Decoration.inline(m.from, m.to, { class: i === noteSearchIndex ? 'note-search-match note-search-active' : 'note-search-match' })
-		);
+		// Count/navigate every hit, but bound passive DOM highlights in dense notes.
+		const limit = 500;
+		const start = Math.max(0, Math.min(noteSearchIndex - limit / 2, noteSearchResults.length - limit));
+		const end = Math.min(noteSearchResults.length, start + limit);
+		const decorations: Decoration[] = [];
+		for (let i = start; i < end; i++) {
+			const match = noteSearchResults[i];
+			decorations.push(Decoration.inline(match.from, match.to, {
+				class: i === noteSearchIndex ? 'note-search-match note-search-active' : 'note-search-match',
+			}));
+		}
 		const decoSet = DecorationSet.create(editor.state.doc, decorations);
 		const tr = editor.state.tr.setMeta(noteSearchPluginKey, decoSet);
 		editor.view.dispatch(tr);
-		scrollToCurrentMatch();
 	}
 
-	function scrollToCurrentMatch() {
-		if (!editor || noteSearchResults.length === 0) return;
-		requestAnimationFrame(() => {
-			const el = editor?.view.dom.querySelector('.note-search-active');
-			if (el) {
-				el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+	function revealNoteSearchMatch() {
+		if ($sourceMode) {
+			scrollToSourceMatch();
+			return;
+		}
+		if (!editor || !noteSearchResults.length) return;
+		if (noteSearchFrame !== null) cancelAnimationFrame(noteSearchFrame);
+		const generation = noteSearchGeneration;
+		noteSearchFrame = requestAnimationFrame(() => {
+			noteSearchFrame = null;
+			if (!noteSearchOpen || generation !== noteSearchGeneration || $sourceMode) return;
+			const el = editor?.view.dom.querySelector<HTMLElement>('.note-search-active');
+			if (!el) return;
+			for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+				if (parent.matches('[data-type="details"]') && !parent.classList.contains('is-open')) {
+					searchRevealedDetails.add(parent);
+					openDetailsEl(parent);
+				}
 			}
+			el.scrollIntoView({ block: 'center', behavior: 'instant' });
 		});
 	}
 
-	function noteSearchNext() {
-		if (noteSearchResults.length === 0) return;
-		noteSearchIndex = (noteSearchIndex + 1) % noteSearchResults.length;
-		if ($sourceMode) {
-			scrollToSourceMatch(true);
-		} else {
-			applySearchDecorations();
+	function navigateNoteSearch(direction: number) {
+		if (!noteSearchOpen) return;
+		const pending = noteSearchPending;
+		cancelNoteSearchWork();
+		if (pending) scanNoteSearch();
+		if (noteSearchResults.length) {
+			noteSearchIndex = (noteSearchIndex + direction + noteSearchResults.length) % noteSearchResults.length;
+			noteSearchAnchor = noteSearchResults[noteSearchIndex].from;
+			if (!$sourceMode) applySearchDecorations();
+			revealNoteSearchMatch();
 		}
+		noteSearchInput?.focus({ preventScroll: true });
 	}
 
-	function noteSearchPrev() {
-		if (noteSearchResults.length === 0) return;
-		noteSearchIndex = (noteSearchIndex - 1 + noteSearchResults.length) % noteSearchResults.length;
-		if ($sourceMode) {
-			scrollToSourceMatch(true);
-		} else {
-			applySearchDecorations();
-		}
-	}
+	function noteSearchNext() { navigateNoteSearch(1); }
+	function noteSearchPrev() { navigateNoteSearch(-1); }
 
 	export function openNoteSearch() {
 		noteSearchOpen = true;
-		tick().then(() => noteSearchInput?.focus());
+		tick().then(() => {
+			if (noteSearchOpen && !editorDisposed) noteSearchInput?.focus({ preventScroll: true });
+		});
 	}
 
-	function closeNoteSearch() {
+	function closeNoteSearch(restoreFocus = true) {
+		cancelNoteSearchWork();
 		noteSearchOpen = false;
 		noteSearchQuery = '';
 		noteSearchResults = [];
 		noteSearchIndex = 0;
-		if (!$sourceMode && editor) {
-			const tr = editor.state.tr.setMeta(noteSearchPluginKey, DecorationSet.empty);
-			editor.view.dispatch(tr);
-			editor.commands.focus();
+		noteSearchSourceHighlighted = false;
+		source.highlight(null);
+		for (const element of searchRevealedDetails) {
+			if (!element.isConnected || !editor || !editor.view.dom.contains(element)) continue;
+			const content = element.querySelector<HTMLElement>('[data-type="detailsContent"]');
+			if (!content) continue;
+			const resolved = editor.state.doc.resolve(editor.view.posAtDOM(content, 0));
+			let persistedOpen = false;
+			for (let depth = resolved.depth; depth > 0; depth--) {
+				if (resolved.node(depth).type.name === 'details') {
+					persistedOpen = !!resolved.node(depth).attrs.open;
+					break;
+				}
+			}
+			if (!persistedOpen && element.classList.contains('is-open')) {
+				element.classList.remove('is-open');
+				content.dispatchEvent(new Event('toggleDetailsContent'));
+			}
+		}
+		searchRevealedDetails.clear();
+		if (editor && !editor.isDestroyed) {
+			editor.view.dispatch(editor.state.tr.setMeta(noteSearchPluginKey, DecorationSet.empty));
+		}
+		if (restoreFocus) {
+			if ($sourceMode) source.focus();
+			else editor?.commands.focus(undefined, { scrollIntoView: false });
 		}
 	}
 
+	function handleNoteSearchKey(event: KeyboardEvent) {
+		if (!noteSearchOpen || event.isComposing || event.key !== 'F3' || event.ctrlKey || event.metaKey || event.altKey) return;
+		event.preventDefault();
+		event.shiftKey ? noteSearchPrev() : noteSearchNext();
+	}
+
 	function stripAssetSrc(src: string): string {
-		return assetSourceToMarkdown(src, $activeNotePath, $appConfig?.active_vault ?? null);
+		// Keep pending images in the captured body until the save queue persists them.
+		return src.startsWith('blob:') ? src : assetSourceToMarkdown(src, $activeNotePath, $appConfig?.active_vault ?? null);
 	}
 
 	function htmlToMarkdown(html: string): string {
@@ -4252,11 +4344,7 @@
 			if (pendingContent !== null) {
 				createEditor(pendingContent);
 				pendingContent = null;
-				if (editor) {
-					const text = (editor as any).state.doc.textContent;
-					wordCount = countWords(text);
-					charCount = text.replace(/\s/g, '').length;
-				}
+				updateCounts();
 			} else if (isMobile && !lastSourceMode) {
 				createEditor('');
 			}
@@ -4276,23 +4364,38 @@
 		return () => document.removeEventListener('mousedown', onClickAway);
 	});
 
-	// Live word/char count in source mode
+	// Count immediately when Info opens or the document/mode changes, but never
+	// serialize source here: ordinary typing only schedules the debounced pass.
 	$effect(() => {
-		if ($sourceMode) updateCounts();
+		if (showInfo) {
+			void $sourceMode;
+			void $activeNotePath;
+			void editorReady;
+			untrack(updateCounts);
+		}
+		return cancelCounts;
 	});
+
 
 	// Close in-note search when switching notes
 	let prevSearchPath = '';
 	$effect(() => {
 		const path = $activeNotePath ?? '';
 		if (prevSearchPath && path !== prevSearchPath) {
-			noteSearchOpen = false;
-			noteSearchQuery = '';
-			noteSearchResults = [];
-			noteSearchIndex = 0;
+			untrack(() => closeNoteSearch(false));
 		}
 		prevSearchPath = path;
 	});
+
+	let previousSearchSettings = '';
+	$effect(() => {
+		const settings = JSON.stringify([noteSearchOpen, noteSearchQuery, noteSearchMatchCase, noteSearchWholeWord, $sourceMode, editorReady]);
+		const reset = settings !== previousSearchSettings;
+		previousSearchSettings = settings;
+		untrack(() => scheduleNoteSearch(reset, reset));
+		return cancelNoteSearchWork;
+	});
+
 
 	// React to activeNotePath changes from external sources (e.g. search panel)
 	$effect(() => {
@@ -4300,6 +4403,9 @@
 		const note = $activeNote;
 		if (!path) {
 			// Note was deselected (e.g. deleted) - destroy editor so it reinits on next note
+			cancelCounts();
+			closeAiMenu();
+			closeNoteSearch(false);
 			destroyEditor();
 			loadedPath = '';
 			return;
@@ -4310,7 +4416,7 @@
 	});
 
 	function destroyEditor() {
-		flushSave();
+		saves.cancelScheduled();
 		if (editor) {
 			editor.destroy();
 			editor = null;
@@ -4338,15 +4444,8 @@
 			editable: !$readOnly,
 			extensions: [
 				MixedListShortcuts,
-				StarterKit.configure({ codeBlock: false }),
-				Placeholder.configure({
-					includeChildren: true,
-					placeholder: ({ node }) => {
-						if (node.type.name === 'detailsSummary') return 'Section title...';
-						if (node.type.name === 'detailsContent') return 'Content...';
-						return 'Start writing...';
-					},
-				}),
+				StarterKit.configure({ codeBlock: false, link: false, underline: false }),
+				FocusedPlaceholder,
 				TaskList,
 				TaskItem.configure({ nested: true }),
 				Table.configure({ resizable: true }),
@@ -4354,7 +4453,7 @@
 				CustomTableCell,
 				CustomTableHeader,
 				Link.configure({ openOnClick: false, HTMLAttributes: { class: 'editor-link' }, isAllowedUri: (url, ctx) => ctx.defaultValidate(url) || !url.startsWith('javascript:'), shouldAutoLink: (url) => /^https?:\/\//.test(url) }),
-				CustomImage.configure({ inline: true, HTMLAttributes: { class: 'editor-image' } }),
+				CustomImage.configure({ inline: true, HTMLAttributes: { class: 'editor-image', crossorigin: 'anonymous' } }),
 				Highlight.configure({ multicolor: true }),
 				Typography,
 				Underline,
@@ -4362,7 +4461,7 @@
 				Superscript,
 				TextStyle,
 				Color,
-				CodeBlockLowlight.configure({ lowlight, enableTabIndentation: true, defaultLanguage: 'text' }),
+				CachedCodeBlockLowlight.configure({ lowlight, enableTabIndentation: true, defaultLanguage: 'text' }),
 				CodeBlockInputScroll,
 				CodeBlockLanguageSelect,
 				CopyButtonExtension,
@@ -4567,11 +4666,7 @@
 					},
 				},
 				handleDrop: (_view, event) => handleFileDrop(event),
-				handlePaste: (_view, event) => {
-					const handled = handleFilePaste(event);
-					if (!handled) hasPendingBlobs = true; // ProseMirror may insert blob: images from web paste
-					return handled;
-				},
+				handlePaste: (_view, event) => handleFilePaste(event),
 				// Strip color / font styling from pasted HTML so the editor uses its own theme.
 				// Keeps semantic marks (bold, italic, links, headings, alignment) - drops only the
 				// inline visual styles that fight the app's theme (color, bg-color, font-family, font-size).
@@ -4599,7 +4694,12 @@
 					}
 				},
 			},
-			onTransaction: () => {
+			onTransaction: ({ transaction, appendedTransactions }) => {
+				if (noteSearchOpen && !$sourceMode && (transaction.docChanged || appendedTransactions.some((tr) => tr.docChanged))) {
+					noteSearchAnchor = transaction.mapping.map(noteSearchAnchor);
+					for (const tr of appendedTransactions) noteSearchAnchor = tr.mapping.map(noteSearchAnchor);
+					scheduleNoteSearch();
+				}
 				// Batch toolbar state updates to once per frame - avoids ~35 isActive() calls per transaction during selection drag
 				if (!editorStateRaf) {
 					editorStateRaf = requestAnimationFrame(() => {
@@ -4621,13 +4721,14 @@
 					prevCursorWikiMark = curWikiMark;
 				}
 			},
-			onUpdate: () => {
-				if (ignoreNextUpdate || isLoadingNote) {
+			onUpdate: ({ transaction, appendedTransactions }) => {
+				// setEditable emits update without changing the document.
+				if (!transaction.docChanged && !appendedTransactions.some((tr) => tr.docChanged)) return;
+				if (ignoreNextUpdate) {
 					ignoreNextUpdate = false;
 					return;
 				}
-				$editorDirty = true;
-				autoSave();
+				markEdited();
 				if (!isMobile && showOutline) scheduleOutline();
 				if (showInfo) scheduleCounts();
 			},
@@ -4665,13 +4766,25 @@
 		linkModalUrl = decodeURIComponent(previousUrl);
 		linkSuggestIndex = 0;
 		linkModal = true;
-		// Load note titles for autocomplete
-		getAllNoteTitles().then(t => { linkSuggestTitles = t; }).catch(() => {});
-		tick().then(() => linkModalInput?.focus());
+		prepareLinkModal();
+	}
+
+	let linkOrigin: EditorOrigin | null = null;
+
+	function prepareLinkModal() {
+		const origin = captureOrigin();
+		linkOrigin = origin;
+		if (!origin.vault) return;
+		getAllNoteTitles(origin.vault).then(t => {
+			if (linkModal && linkOrigin === origin && isOriginCurrent(origin)) linkSuggestTitles = t;
+		}).catch(() => {});
+		tick().then(() => {
+			if (linkModal && linkOrigin === origin && isOriginCurrent(origin)) linkModalInput?.focus();
+		});
 	}
 
 	function linkModalConfirm() {
-		if (!editor) return;
+		if (!editor || !linkOrigin || !canInsert(linkOrigin) || !isOriginCurrent(linkOrigin, true)) return;
 		let url = linkModalUrl.trim();
 		if (url === '') {
 			editor.chain().focus().setTextSelection({ from: linkSelectionFrom, to: linkSelectionTo }).extendMarkRange('link').unsetLink().run();
@@ -4809,8 +4922,6 @@
 		const tr = editor.state.tr.setNodeAttribute(pos, 'size', size);
 		editor.view.dispatch(tr);
 		imageToolbar = { ...imageToolbar, size };
-		$editorDirty = true;
-		autoSave();
 	}
 
 	function getImageAbsPath(src: string): string {
@@ -4948,21 +5059,25 @@
 
 	async function ctxCut() {
 		if (!editor) return;
+		const origin = captureOrigin();
+		if (!canInsert(origin)) return;
 		const { from, to } = editor.state.selection;
 		if (from === to) { closeTextContextMenu(); return; }
 		const text = editor.state.doc.textBetween(from, to, '\n');
 		await navigator.clipboard.writeText(text);
-		editor.chain().focus().deleteSelection().run();
+		if (!canInsert(origin) || !isOriginCurrent(origin, true) || !editor) return;
+		editor.commands.deleteRange({ from, to });
 		closeTextContextMenu();
 	}
 
 	async function ctxCopy() {
 		if (!editor) return;
+		const origin = captureOrigin();
 		const { from, to } = editor.state.selection;
 		if (from === to) { closeTextContextMenu(); return; }
 		const text = editor.state.doc.textBetween(from, to, '\n');
 		await navigator.clipboard.writeText(text);
-		closeTextContextMenu();
+		if (isOriginCurrent(origin)) closeTextContextMenu();
 	}
 
 	async function ctxPaste() {
@@ -4970,10 +5085,12 @@
 		// unguarded paste here would leave an orphan file behind when the editor
 		// cannot accept the insertion.
 		if (!editor || $readOnly || $viewerNote) { closeTextContextMenu(); return; }
+		const origin = captureOrigin();
 		try {
 			const text = await navigator.clipboard.readText();
+			if (!canInsert(origin) || !editor) return;
 			if (text) {
-				editor.chain().focus().insertContent(text).run();
+				editor.commands.insertContent(text);
 				closeTextContextMenu();
 				return;
 			}
@@ -4984,8 +5101,8 @@
 		// so pasting an image from this menu used to do nothing at all. Fall back to
 		// the same native clipboard reader the paste handler uses; it is a no-op when
 		// the clipboard holds no image.
-		await insertClipboardImage();
-		closeTextContextMenu();
+		await insertClipboardImage(origin);
+		if (isOriginCurrent(origin)) closeTextContextMenu();
 	}
 
 	function ctxSelectAll() {
@@ -5137,7 +5254,9 @@
 	function insertDetails() {
 		if (!editor) return;
 		editor.chain().focus().setDetails().run();
+		const origin = captureOrigin();
 		requestAnimationFrame(() => {
+			if (!isOriginCurrent(origin, true)) return;
 			if (!editor) return;
 			const domPos = editor.view.domAtPos(editor.state.selection.from);
 			let node = domPos.node as HTMLElement;
@@ -5221,13 +5340,14 @@
 	// ── AI Actions ──
 
 	function openAiMenu() {
-		if (!editor) return;
+		if ((!$sourceMode && !editor) || $readOnly || $viewerNote) return;
+		closeAiMenu();
+		aiOrigin = captureOrigin();
 		closeTextContextMenu();
 
-		if ($sourceMode && sourceElement) {
-			const start = sourceElement.selectionStart;
-			const end = sourceElement.selectionEnd;
-			const selected = sourceContent.slice(start, end);
+		if ($sourceMode) {
+			const { from: start, to: end } = source.state.selection.main;
+			const selected = source.state.doc.sliceString(start, end);
 			aiResult = null;
 			aiError = null;
 			aiLoading = false;
@@ -5242,12 +5362,8 @@
 				aiSelectionTo = end;
 				aiSelectedText = selected;
 				aiWholeNote = false;
-				requestAnimationFrame(() => {
-					sourceElement?.focus();
-					sourceElement?.setSelectionRange(start, end);
-				});
 			} else {
-				const fullMd = restoreTitleH1(sourceContent);
+				const fullMd = restoreTitleH1(source.state.doc.toString());
 				if (!fullMd.trim()) {
 					aiEmptyNote = true;
 					aiWholeNote = true;
@@ -5262,6 +5378,7 @@
 			aiMenu = isMobile ? { x: 0, y: 0 } : { x: Math.max(4, window.innerWidth / 2 - 110), y: 100 };
 			return;
 		}
+		if (!editor) return;
 
 		editor.commands.focus();
 
@@ -5353,6 +5470,8 @@
 	}
 
 	function closeAiMenu() {
+		aiGeneration++;
+		aiOrigin = null;
 		if (aiStreamUnlisten) { aiStreamUnlisten(); aiStreamUnlisten = null; }
 		aiMenu = null;
 		aiLoading = false;
@@ -5367,7 +5486,12 @@
 	}
 
 	async function runAiAction(action: string, customPrompt?: string) {
-		if (!editor) return;
+		const origin = aiOrigin;
+		if (!origin || !canInsert(origin)) return;
+		if (!isOriginCurrent(origin, true)) {
+			aiError = 'The note changed. Reopen AI Actions to use its current content.';
+			return;
+		}
 		if (!aiEmptyNote && !aiSelectedText.trim()) return;
 		// For empty notes, force action to 'custom' with a generate instruction
 		if (aiEmptyNote) {
@@ -5384,75 +5508,84 @@
 		// Cancel any previous stream listener
 		if (aiStreamUnlisten) { aiStreamUnlisten(); aiStreamUnlisten = null; }
 
+		const generation = ++aiGeneration;
 		const requestId = crypto.randomUUID();
-		const unlisten = await listen<AiStreamEvent>('ai-stream', (event) => {
-			const data = event.payload;
-			if (data.event_type === 'text' && data.text) {
-				aiResult = (aiResult ?? '') + data.text;
-			} else if (data.event_type === 'done') {
-				aiLoading = false;
-				aiStreamUnlisten = null;
-				unlisten();
-			} else if (data.event_type === 'error') {
-				aiError = data.error ?? 'Unknown error';
-				aiLoading = false;
-				aiStreamUnlisten = null;
-				unlisten();
-			}
-		});
-		aiStreamUnlisten = unlisten;
-
+		const selectedText = aiSelectedText;
+		const current = () => generation === aiGeneration && aiOrigin === origin && isOriginCurrent(origin);
+		let stop: (() => void) | null = null;
 		try {
-			await aiAsk(action, aiSelectedText, customPrompt ?? null, requestId);
+			stop = await listen<AiStreamEvent>('ai-stream', (event) => {
+				const data = event.payload;
+				if (!current() || data.request_id !== requestId) return;
+				if (data.event_type === 'text' && data.text) {
+					aiResult = (aiResult ?? '') + data.text;
+				} else if (data.event_type === 'done' || data.event_type === 'error') {
+					if (data.event_type === 'error') aiError = data.error ?? 'Unknown error';
+					aiLoading = false;
+					aiStreamUnlisten = null;
+					stop?.();
+				}
+			});
+			if (!current()) { stop(); return; }
+			aiStreamUnlisten = stop;
+			await aiAsk(action, selectedText, customPrompt ?? null, requestId);
 		} catch (e) {
+			stop?.();
+			if (!current()) return;
 			aiError = String(e);
 			aiLoading = false;
-			unlisten();
 			aiStreamUnlisten = null;
 		}
 	}
 
 	async function aiApplyResult() {
-		if (!aiResult) return;
-		// Save a version snapshot before applying AI changes
-		if ($activeNotePath && $activeNote && !aiEmptyNote) {
+		const origin = aiOrigin;
+		if (!origin || !aiResult || aiLoading || !canInsert(origin)) return;
+		if (!isOriginCurrent(origin, true)) {
+			aiError = 'The note changed. Reopen AI Actions before applying a new result.';
+			return;
+		}
+		const generation = aiGeneration;
+		const result = aiResult;
+		if (origin.path && origin.noteId && !aiEmptyNote) {
 			try {
-				await forceSave();
-				await createVersion($activeNotePath, $activeNote.meta.id);
+				if (!(await forceSave()) || !isOriginCurrent(origin, true) || generation !== aiGeneration) return;
+				await createVersion(origin.vault!, origin.path, origin.noteId);
 			} catch (e) {
 				console.error('Failed to create version before AI apply:', e);
 			}
 		}
+		if (!isOriginCurrent(origin, true) || !canInsert(origin) || generation !== aiGeneration) return;
 		if ($sourceMode) {
 			if (aiEmptyNote) {
-				const lines = aiResult.split('\n');
+				const lines = result.split('\n');
 				let title = lines[0]?.replace(/^#+\s*/, '').trim() || 'Untitled';
 				const body = lines.slice(1).join('\n').replace(/^\n+/, '');
 				if ($activeNote) $activeNote.meta.title = title;
-				sourceContent = body;
+				markEdited();
+				source.replace(body);
 			} else if (aiWholeNote) {
-				sourceContent = stripTitleH1(aiResult);
+				source.replace(stripTitleH1(result));
 			} else {
-				sourceContent = sourceContent.slice(0, aiSelectionFrom) + aiResult + sourceContent.slice(aiSelectionTo);
+				source.replace(result, aiSelectionFrom, aiSelectionTo);
 			}
-			$editorDirty = true;
-			autoSave();
 			closeAiMenu();
 			return;
 		}
 		if (!editor) return;
 		if (aiEmptyNote) {
 			// Parse title from first line, rest is content
-			const lines = aiResult.split('\n');
+			const lines = result.split('\n');
 			let title = lines[0]?.replace(/^#+\s*/, '').trim() || 'Untitled';
 			const body = lines.slice(1).join('\n').replace(/^\n+/, '');
 			if ($activeNote) {
 				$activeNote.meta.title = title;
+				markEdited();
 			}
 			editor.commands.setContent(markdownToHtml(body));
 		} else if (aiWholeNote) {
 			// Restore media placeholders back to original markdown
-			let finalMarkdown = aiResult;
+			let finalMarkdown = result;
 			for (const [key, original] of aiMediaPlaceholders) {
 				finalMarkdown = finalMarkdown.replace(key, original);
 			}
@@ -5460,21 +5593,16 @@
 			editor.commands.setContent(markdownToHtml(finalMarkdown));
 		} else {
 			// Replace the selected range with the AI result (convert markdown → HTML so TipTap renders it properly)
-			const html = markdownToHtml(aiResult);
-			editor.chain().focus()
-				.setTextSelection({ from: aiSelectionFrom, to: aiSelectionTo })
-				.deleteSelection()
-				.insertContent(html)
-				.run();
+			const html = markdownToHtml(result);
+			editor.commands.insertContentAt({ from: aiSelectionFrom, to: aiSelectionTo }, html);
 		}
-		$editorDirty = true;
-		autoSave();
 		closeAiMenu();
 	}
 
 	function aiDiscard() {
 		closeAiMenu();
-		editor?.commands.focus();
+		if ($sourceMode) source.focus();
+		else editor?.commands.focus();
 	}
 
 	function closeLinkContextMenu() {
@@ -5528,8 +5656,7 @@
 		linkModalUrl = decodeURIComponent(href);
 		linkModalDisplayText = '';
 		linkModal = true;
-		getAllNoteTitles().then(t => { linkSuggestTitles = t; }).catch(() => {});
-		tick().then(() => linkModalInput?.focus());
+		prepareLinkModal();
 	}
 
 	function linkMenuRemove() {
@@ -5543,8 +5670,6 @@
 				.extendMarkRange('link')
 				.unsetLink()
 				.run();
-			$editorDirty = true;
-			autoSave();
 		}
 		closeLinkContextMenu();
 	}
@@ -5583,15 +5708,8 @@
 		const files = event.dataTransfer?.files;
 		if (!files || files.length === 0) return false;
 		event.preventDefault();
-		for (const file of Array.from(files)) {
-			if (file.type.startsWith('image/')) {
-				insertImage(file);
-			} else if (file.type === 'application/pdf') {
-				insertPdf(file);
-			} else {
-				insertFileAttachment(file);
-			}
-		}
+		const origin = captureOrigin();
+		for (const file of Array.from(files)) void insertFile(file, origin);
 		return true;
 	}
 
@@ -5602,13 +5720,7 @@
 			const file = item.getAsFile();
 			if (!file) continue;
 			event.preventDefault();
-			if (item.type.startsWith('image/')) {
-				insertImage(file);
-			} else if (file.type === 'application/pdf') {
-				insertPdf(file);
-			} else {
-				insertFileAttachment(file);
-			}
+			void insertFile(file);
 			return true;
 		}
 		// WebKitGTK fallback (bug #218519): WebKitGTK never exposes a clipboard image
@@ -5629,165 +5741,153 @@
 		return false;
 	}
 
-	async function insertClipboardImage() {
+	async function insertClipboardImage(origin = captureOrigin()) {
+		if (!canInsert(origin)) return;
 		try {
 			const data = await readClipboardImage();
-			const relativePath = await saveImage('pasted-image.png', data);
-			if (editor) {
-				const displaySrc = resolveImageSrc(relativePath);
-				editor.chain().focus().setImage({ src: displaySrc }).run();
-			}
+			if (!canInsert(origin)) return;
+			await uploadAsset(origin, 'pasted-image.png', data, 'image');
 		} catch (e) {
 			console.error('Clipboard image fallback failed:', e);
 		}
 	}
 
-	async function insertImage(file: File) {
-		try {
-			const buffer = await file.arrayBuffer();
-			const data = Array.from(new Uint8Array(buffer));
-			const relativePath = await saveImage(file.name, data);
-			if (editor) {
-				const displaySrc = resolveImageSrc(relativePath);
-				editor.chain().focus().setImage({ src: displaySrc }).run();
-			}
-		} catch (e) {
-			console.error('Failed to insert image:', e);
-		}
-	}
+	type AssetKind = 'image' | 'pdf' | 'file';
 
-	function handleImageInput(event: Event) {
-		const input = event.currentTarget as HTMLInputElement;
-		const file = input.files?.[0];
-		if (file) insertImage(file);
-		input.value = '';
-	}
-
-	async function insertPdf(file: File) {
-		try {
-			const buffer = await file.arrayBuffer();
-			const data = Array.from(new Uint8Array(buffer));
-			const relativePath = await saveAttachment(file.name, data);
-			if (!editor) return;
-			const usePdfPreview = !isMobile && ($appConfig?.pdf_preview ?? false);
-			if (usePdfPreview) {
-				editor.chain().focus().insertContent({
-					type: 'pdfEmbed',
-					attrs: { src: relativePath, name: file.name },
-				}).run();
+	async function uploadAsset(origin: EditorOrigin, name: string, data: number[], kind: AssetKind) {
+		if (!canInsert(origin)) return;
+		const relativePath = kind === 'image'
+			? await saveImage(origin.vault!, name, data)
+			: await saveAttachment(origin.vault!, name, data);
+		if (!canInsert(origin)) return;
+		const label = `${name} (${Math.round(data.length / 1024)} kB)`;
+		if (origin.sourceMode) {
+			const { from, to } = source.state.selection.main;
+			const escaped = (kind === 'image' ? name : label).replace(/[[\]\\]/g, '\\$&');
+			source.replace(`${kind === 'image' ? '!' : ''}[${escaped}](${relativePath}) `, from, to);
+		} else if (editor) {
+			// Async completion may insert into its origin, but must never take focus.
+			if (kind === 'image') editor.commands.setImage({ src: resolveImageSrc(relativePath) });
+			else if (kind === 'pdf' && !isMobile && $appConfig?.pdf_preview) {
+				editor.commands.insertContent({ type: 'pdfEmbed', attrs: { src: relativePath, name } });
 			} else {
-				const sizeKB = Math.round(file.size / 1024);
-				const label = `${file.name} (${sizeKB} kB)`;
-				editor.chain().focus()
-					.insertContent(`<a href="${relativePath}">${label}</a> `)
-					.run();
+				editor.commands.insertContent([
+					{ type: 'text', text: label, marks: [{ type: 'link', attrs: { href: relativePath } }] },
+					{ type: 'text', text: ' ' },
+				]);
 			}
-		} catch (e) {
-			console.error('Failed to insert PDF:', e);
 		}
 	}
 
-	async function saveBlobImage(blobUrl: string): Promise<string | null> {
-		try {
-			const resp = await fetch(blobUrl);
-			const blob = await resp.blob();
-			const ext = blob.type.split('/')[1] || 'png';
-			const name = `pasted-image.${ext}`;
-			const buffer = await blob.arrayBuffer();
-			const data = Array.from(new Uint8Array(buffer));
-			const relativePath = await saveImage(name, data);
-			return resolveImageSrc(relativePath);
-		} catch (e) {
-			console.error('Failed to save blob image:', e);
-			return null;
-		}
-	}
-
-	async function fixBlobImages() {
-		if (!editor) return;
-		const { doc, tr } = editor.state;
-		let changed = false;
-		const promises: Array<{ pos: number; blobUrl: string }> = [];
-		doc.descendants((node, pos) => {
-			if (node.type.name === 'image' && node.attrs.src?.startsWith('blob:')) {
-				promises.push({ pos, blobUrl: node.attrs.src });
-			}
-		});
-		for (const { pos, blobUrl } of promises) {
-			const savedSrc = await saveBlobImage(blobUrl);
-			if (savedSrc && editor) {
-				const currentTr = editor.state.tr;
-				// Re-find the node since positions may have shifted
-				let found = false;
-				editor.state.doc.descendants((node, nodePos) => {
-					if (!found && node.type.name === 'image' && node.attrs.src === blobUrl) {
-						currentTr.setNodeAttribute(nodePos, 'src', savedSrc);
-						found = true;
-						changed = true;
-					}
-				});
-				if (found) editor.view.dispatch(currentTr);
-			}
-		}
-		if (changed) {
-			$editorDirty = true;
-			autoSave();
-		}
-	}
-
-	async function insertFileAttachment(file: File) {
+	async function insertFile(file: File, origin = captureOrigin()) {
+		if (!canInsert(origin)) return;
 		try {
 			const buffer = await file.arrayBuffer();
-			const data = Array.from(new Uint8Array(buffer));
-			const relativePath = await saveAttachment(file.name, data);
-			if (editor) {
-				const sizeKB = Math.round(file.size / 1024);
-				const label = `${file.name} (${sizeKB} kB)`;
-				editor.chain().focus()
-					.insertContent(`<a href="${relativePath}">${label}</a> `)
-					.run();
-			}
+			if (!canInsert(origin)) return;
+			await uploadAsset(origin, file.name, Array.from(new Uint8Array(buffer)),
+				file.type.startsWith('image/') ? 'image' : file.type === 'application/pdf' ? 'pdf' : 'file');
 		} catch (e) {
 			console.error('Failed to insert attachment:', e);
 		}
 	}
+
+	const assetPickerOrigins = new WeakMap<HTMLInputElement, EditorOrigin>();
+
+	function openAssetPicker(id: string) {
+		insertDropdown = false;
+		const input = document.getElementById(id) as HTMLInputElement | null;
+		if (!input) return;
+		assetPickerOrigins.set(input, captureOrigin());
+		input.click();
+	}
+
+	function handleAssetInput(event: Event) {
+		const input = event.currentTarget as HTMLInputElement;
+		const origin = assetPickerOrigins.get(input);
+		assetPickerOrigins.delete(input);
+		if (origin) for (const file of Array.from(input.files ?? [])) void insertFile(file, origin);
+		input.value = '';
+	}
+
+	async function saveBlobImage(vault: string, blobUrl: string): Promise<string> {
+		const resp = await fetch(blobUrl);
+		if (!resp.ok) throw new Error(`Failed to read pasted image: ${resp.status}`);
+		const blob = await resp.blob();
+		const ext = blob.type.split('/')[1] || 'png';
+		const buffer = await blob.arrayBuffer();
+		return saveImage(vault, `pasted-image.${ext}`, Array.from(new Uint8Array(buffer)));
+	}
+
+	function replaceSavedBlob(origin: EditorOrigin, blobUrl: string, relativePath: string) {
+		if (!isOriginCurrent(origin)) return;
+		if ($sourceMode) {
+			// Only asset resolution serializes here; ordinary CM edits retain Text.
+			const text = source.state.doc.toString();
+			const matches = [...text.matchAll(new RegExp(blobUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'))];
+			for (const match of matches.reverse()) source.replace(relativePath, match.index!, match.index! + blobUrl.length, true);
+			return;
+		}
+		if (!editor) return;
+		const tr = editor.state.tr;
+		editor.state.doc.descendants((node, pos) => {
+			if (node.type.name === 'image' && node.attrs.src === blobUrl) {
+				tr.setNodeAttribute(pos, 'src', resolveImageSrc(relativePath));
+			}
+		});
+		if (tr.docChanged) {
+			// Resolving an image changes its representation, not the user's revision.
+			ignoreNextUpdate = true;
+			editor.view.dispatch(tr);
+		}
+	}
+
 
 	// Source mode toggle - only react to explicit user toggle, not note switches
 	$effect(() => {
 		const isSource = $sourceMode;
 		// Only act if we have a loaded note
 		if (!loadedPath) return;
+		const origin = captureOrigin();
+		const isCurrent = () => !editorDisposed && origin.path === loadedPath
+			&& origin.path === $activeNotePath && origin.vault === $appConfig?.active_vault
+			&& saves.isCurrentSession(origin.snapshot) && isSource === $sourceMode;
 
 		if (isSource && !lastSourceMode) {
-			// Switching TO source: extract markdown, then drop the caret on the same word (#125).
-			const caretNonWs = editor
-				? editor.state.doc.textBetween(0, editor.state.selection.from, '\n', '').replace(/\s/g, '').length
-				: 0;
+			// Markdown conversion is lossy; carry both selection ends by visible text.
+			const selection = editor?.state.selection;
+			const visibleBefore = (position: number) => editor
+				? editor.state.doc.textBetween(0, position, '\n', '').replace(/\s/g, '').length : 0;
+			const anchorNonWs = visibleBefore(selection?.anchor ?? 0);
+			const headNonWs = selection?.head === selection?.anchor ? anchorNonWs : visibleBefore(selection?.head ?? 0);
 			const docNonWs = docNonWhitespace();
-			sourceContent = stripTitleH1(editor ? editorToMarkdown() : ($activeNote?.content ?? ''));
-			resetSourceHistory(sourceContent);
+			const text = stripTitleH1(editor ? editorToMarkdown() : ($activeNote?.content ?? ''));
+			source.load(text);
 			lastSourceMode = true;
-			const target = caretNonWs > 0 ? scanAlign(sourceContent, docNonWs, { stopAtNw: caretNonWs }).srcOffset : 0;
+			const anchor = scanAlign(text, docNonWs, { stopAtNw: anchorNonWs }).srcOffset;
+			const head = headNonWs === anchorNonWs ? anchor : scanAlign(text, docNonWs, { stopAtNw: headNonWs }).srcOffset;
 			tick().then(() => {
-				if (!sourceElement) return;
-				if (!isMobile) sourceElement.focus();
-				sourceElement.setSelectionRange(target, target);
-				scrollSourceToOffset(target);
+				if (!isCurrent() || !source.view) return;
+				if (noteSearchOpen) return;
+				source.select(anchor, head, true);
+				if (!isMobile) source.focus();
 			});
 		} else if (!isSource && lastSourceMode) {
 			lastSourceMode = false;
-			// Capture the source caret before the textarea is torn down (#125).
-			const srcOffset = sourceElement ? sourceElement.selectionStart : 0;
-			const srcText = sourceContent;
-			// Re-anchor the caret in the rich editor once it holds the new content.
+			const selection = source.state.selection.main;
+			const srcText = source.state.doc.toString();
 			const restoreRichCaret = () => {
-				if (!editor) return;
-				const nwBefore = scanAlign(srcText, docNonWhitespace(), { limit: srcOffset }).nwCount;
-				const pos = Math.min(docPosForNonWsCount(editor.state.doc, nwBefore), editor.state.doc.content.size);
-				const sel = TextSelection.near(editor.state.doc.resolve(pos));
+				if (!isCurrent() || !editor || noteSearchOpen) return;
+				const visible = docNonWhitespace();
+				const positionAt = (offset: number) => {
+					const count = scanAlign(srcText, visible, { limit: offset }).nwCount;
+					return Math.min(docPosForNonWsCount(editor!.state.doc, count), editor!.state.doc.content.size);
+				};
+				const anchor = positionAt(selection.anchor);
+				const head = selection.empty ? anchor : positionAt(selection.head);
+				const sel = TextSelection.between(editor.state.doc.resolve(anchor), editor.state.doc.resolve(head));
 				editor.view.dispatch(editor.state.tr.setSelection(sel).scrollIntoView());
 				if (!isMobile) editor.view.focus();
-				requestAnimationFrame(() => editor?.commands.scrollIntoView());
+				requestAnimationFrame(() => { if (isCurrent()) editor?.commands.scrollIntoView(); });
 			};
 			if (isMobile) {
 				// Mobile: editor stays in DOM, just update its content
@@ -5795,17 +5895,19 @@
 				if (editor) {
 					ignoreNextUpdate = true;
 					editor.commands.setContent(markdownToHtml(restoreTitleH1(content)));
+					updateCounts();
 					tick().then(restoreRichCaret);
 				}
 			} else {
 				// Desktop: destroy old editor (its DOM element is gone),
-				// wait for DOM to swap textarea→div, then create editor on new element.
+				// Wait for the source component to unmount before recreating the rich view.
 				destroyEditor();
 				const content = srcText;
 				tick().then(() => {
-					if (editorElement && !editor) {
+					if (isCurrent() && editorElement && !editor) {
 						createEditor(restoreTitleH1(content));
 						restoreRichCaret();
+						if ($editorDirty) void forceSave();
 					}
 				});
 			}
@@ -5813,72 +5915,65 @@
 	});
 
 	// Tauri drag-drop listener for OS file drops (browser DragEvent doesn't have files in Tauri)
-	let unlistenDragDrop: (() => void) | null = null;
 	$effect(() => {
-		const appWindow = getCurrentWindow();
-		appWindow.onDragDropEvent((event) => {
-			if (event.payload.type !== 'drop' || !editor || !$activeNote) return;
-			const paths = event.payload.paths;
-			for (const filePath of paths) {
-				const name = filePath.split('/').pop() || 'file';
+		let disposed = false;
+		let unlisten: (() => void) | undefined;
+		getCurrentWindow().onDragDropEvent((event) => {
+			if (event.payload.type !== 'drop') return;
+			const origin = captureOrigin();
+			if (!canInsert(origin)) return;
+			for (const filePath of event.payload.paths) {
+				const name = filePath.replace(/\\/g, '/').split('/').pop() || 'file';
 				const ext = name.split('.').pop()?.toLowerCase() || '';
-				if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico'].includes(ext)) {
-					readFile(filePath).then((data) => {
-						saveImage(name, Array.from(data)).then((relativePath) => {
-							if (editor) {
-								editor.chain().focus().setImage({ src: resolveImageSrc(relativePath) }).run();
-							}
-						});
-					}).catch((e) => console.error('Failed to drop image:', e));
-				} else if (ext === 'pdf') {
-					readFile(filePath).then((data) => {
-						saveAttachment(name, Array.from(data)).then((relativePath) => {
-							if (!editor) return;
-							const usePdfPreview = !isMobile && ($appConfig?.pdf_preview ?? false);
-							if (usePdfPreview) {
-								editor.chain().focus().insertContent({
-									type: 'pdfEmbed',
-									attrs: { src: relativePath, name },
-								}).run();
-							} else {
-								editor.chain().focus().insertContent(`<a href="${relativePath}">${name}</a> `).run();
-							}
-						});
-					}).catch((e) => console.error('Failed to drop PDF:', e));
-				} else {
-					readFile(filePath).then((data) => {
-						saveAttachment(name, Array.from(data)).then((relativePath) => {
-							if (editor) {
-								editor.chain().focus().insertContent(`<a href="${relativePath}">${name}</a> `).run();
-							}
-						});
-					}).catch((e) => console.error('Failed to drop file:', e));
-				}
+				const kind: AssetKind = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico'].includes(ext)
+					? 'image' : ext === 'pdf' ? 'pdf' : 'file';
+				void readFile(filePath).then(async (data) => {
+					if (disposed || !canInsert(origin)) return;
+					await uploadAsset(origin, name, Array.from(data), kind);
+				}).catch((e) => console.error('Failed to drop file:', e));
 			}
-		}).then((unlisten) => {
-			unlistenDragDrop = unlisten;
-		});
-		return () => {
-			unlistenDragDrop?.();
-		};
+		}).then((fn) => {
+			if (disposed) fn();
+			else unlisten = fn;
+		}).catch((e) => console.error('Failed to listen for file drops:', e));
+		return () => { disposed = true; unlisten?.(); };
 	});
 
-	// Refresh wiki-link title cache whenever vault files change so that deleted
-	// notes become unresolved and newly created notes become resolvable.
+	// Note events update one cached title; only structural changes need a vault scan.
 	let unlistenFileChange: (() => void) | null = null;
-	if ($appConfig?.enable_wiki_links) {
-		listen('file-changed', () => {
-			if ($appConfig?.enable_wiki_links) refreshWikiLinkTitles();
-		}).then(fn => { unlistenFileChange = fn; });
+	listen<FileEvent>('file-changed', (event) => {
+		handleWikiFileChange(event.payload);
+	}).then(fn => {
+		if (editorDisposed) fn();
+		else unlistenFileChange = fn;
+	}).catch(e => console.error('Failed to listen for note changes:', e));
+
+	function handleOpenNote(event: Event) {
+		const path = (event as CustomEvent<string>).detail;
+		if (typeof path === 'string' && path) void navigateToWikiLink(path, '');
 	}
+	window.addEventListener('helixnotes-open-note', handleOpenNote);
 
 	onDestroy(() => {
+		void flushSave();
+		closeAiMenu();
+		editorDisposed = true;
+		if (editorNavigationToken !== null) cancelNoteNavigation(editorNavigationToken);
+		saves.startSession();
+		cancelCounts();
+		cancelNoteSearchWork();
+		searchRevealedDetails.clear();
+		if (wikiTitleRefreshTimer !== null) clearTimeout(wikiTitleRefreshTimer);
+		window.removeEventListener('helixnotes-open-note', handleOpenNote);
 		clearTaskReveal();
 		destroyEditor();
 		unlistenFileChange?.();
 		if (infoPathCopyTimer) clearTimeout(infoPathCopyTimer);
 	});
 </script>
+
+<svelte:window onkeydown={handleNoteSearchKey} />
+
 
 <div class="editor-container" class:mobile={isMobile}>
 	{#if !$activeNote}
@@ -5920,14 +6015,24 @@
 					type="text"
 					readonly={$readOnly}
 					value={$activeNote.meta.title}
+					oninput={(e) => {
+						if (!$activeNote) return;
+						const title = e.currentTarget.value;
+						if ($activeNote.meta.title === title) return;
+						$activeNote.meta.title = title;
+						if (hiddenTitleHeading) hiddenTitleHeading = { ...hiddenTitleHeading, title };
+						markEdited();
+					}}
 					onkeydown={(e) => {
 						if (e.key === 'Tab') {
 							e.preventDefault();
-							editor?.commands.focus('start');
+							if ($sourceMode) { source.select(0); source.focus(); }
+							else editor?.commands.focus('start');
 						}
 						if (e.key === 'Enter') {
 							e.preventDefault();
-							editor?.commands.focus('start');
+							if ($sourceMode) { source.select(0); source.focus(); }
+							else editor?.commands.focus('start');
 						}
 					}}
 					onchange={async (e) => {
@@ -5935,20 +6040,26 @@
 							const newTitle = (e.target as HTMLInputElement).value.trim();
 							if (!newTitle) return;
 							const oldPath = $activeNotePath;
-							$activeNote.meta.title = newTitle;
-							// Update stripped title so restoreTitleH1 uses the new title
-							if (hiddenTitleHeading) hiddenTitleHeading = { ...hiddenTitleHeading, title: newTitle };
-							$editorDirty = true;
-							// Force save current editor content before renaming so disk is up-to-date
-							await forceSave();
+							if ($activeNote.meta.title !== newTitle) {
+								$activeNote.meta.title = newTitle;
+								if (hiddenTitleHeading) hiddenTitleHeading = { ...hiddenTitleHeading, title: newTitle };
+								markEdited();
+							}
+							const origin = captureOrigin();
+							if (!origin.vault) return;
+							if (!(await forceSave()) || !isOriginCurrent(origin, true)) return;
 							// Rename file on disk if filename doesn't match the new title
 							const filename = oldPath.split('/').pop() ?? '';
 							const stem = filename.replace(/\.md$/, '');
 							if (stem !== newTitle) {
+								renamingNote = origin.snapshot;
 								try {
-									const newPath = await renameNote(oldPath, newTitle);
-									loadedPath = newPath;
-									$activeNotePath = newPath;
+									const newPath = await renameNote(origin.vault, oldPath, newTitle);
+									if (isOriginCurrent(origin)) {
+										loadedPath = newPath;
+										$activeNotePath = newPath;
+									}
+									if (origin.vault !== $appConfig?.active_vault) return;
 									notes.update(list => list.map(n =>
 										n.path === oldPath
 											? { ...n, path: newPath, relative_path: n.relative_path.replace(/[^/]+$/, newTitle + '.md'), meta: { ...n.meta, title: newTitle } }
@@ -5958,9 +6069,13 @@
 									refreshWikiLinkTitles();
 								} catch (err) {
 									console.error('Failed to rename note file:', err);
+									if (!isOriginCurrent(origin)) return;
 									notes.update(list => list.map(n =>
 										n.path === oldPath ? { ...n, meta: { ...n.meta, title: newTitle } } : n
 									));
+								} finally {
+									if (renamingNote === origin.snapshot) renamingNote = null;
+									if (origin.vault === $appConfig?.active_vault && $editorDirty) void forceSave();
 								}
 							} else {
 								notes.update(list => list.map(n =>
@@ -6003,6 +6118,7 @@
 				<button
 					class="icon-btn"
 					class:active={!!tagMenu}
+					disabled={trashPreview}
 					onclick={toggleTagMenu}
 					title="Edit tags"
 				>
@@ -6014,11 +6130,11 @@
 				<button
 					class="icon-btn"
 					class:active={$activeNote?.meta.pinned}
+					disabled={trashPreview}
 					onclick={() => {
 						if ($activeNote) {
 							$activeNote.meta.pinned = !$activeNote.meta.pinned;
-							$editorDirty = true;
-							autoSave();
+							markEdited();
 						}
 					}}
 					title={$activeNote?.meta.pinned ? 'Unpin note' : 'Pin note'}
@@ -6033,14 +6149,18 @@
 					class:active={isQuickAccess}
 					onclick={async () => {
 						if (!noteRelativePath) return;
+						const origin = captureOrigin();
+						const relativePath = noteRelativePath;
+						if (!origin.vault) return;
 						try {
 							if (isQuickAccess) {
-								await removeQuickAccess(noteRelativePath);
+								await removeQuickAccess(origin.vault, relativePath);
 							} else {
-								await addQuickAccess(noteRelativePath);
+								await addQuickAccess(origin.vault, relativePath);
 							}
-							const qa = await getQuickAccess();
-							$quickAccessPaths = qa.map(n => n.relative_path);
+							if (!isOriginCurrent(origin)) return;
+							const qa = await getQuickAccess(origin.vault);
+							if (isOriginCurrent(origin)) $quickAccessPaths = qa.map(n => n.relative_path);
 						} catch (e) {
 							console.error('Quick access toggle failed:', e);
 						}
@@ -6155,186 +6275,45 @@
 						type="text"
 						class="note-search-input"
 						placeholder="Find in note..."
+						aria-label="Find in note"
 						bind:value={noteSearchQuery}
-						oninput={() => updateNoteSearch(noteSearchQuery)}
 						onkeydown={(e) => {
+							if (e.isComposing) return;
 							if (e.key === 'Enter') { e.preventDefault(); e.shiftKey ? noteSearchPrev() : noteSearchNext(); }
-							if (e.key === 'Escape') { e.preventDefault(); closeNoteSearch(); }
+							if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeNoteSearch(); }
 						}}
-						use:autofocus
 					/>
-					<span class="note-search-count">
-						{#if noteSearchQuery && noteSearchResults.length > 0}
+					<button type="button" class="note-search-btn note-search-option" aria-label="Match case" aria-pressed={noteSearchMatchCase} title="Match case" onmousedown={(e) => e.preventDefault()} onclick={() => { noteSearchMatchCase = !noteSearchMatchCase; noteSearchInput?.focus({ preventScroll: true }); }}>Aa</button>
+					<button type="button" class="note-search-btn note-search-option whole-word" aria-label="Whole word" aria-pressed={noteSearchWholeWord} title="Whole word" onmousedown={(e) => e.preventDefault()} onclick={() => { noteSearchWholeWord = !noteSearchWholeWord; noteSearchInput?.focus({ preventScroll: true }); }}>ab</button>
+					<span class="note-search-count" aria-live="polite" aria-atomic="true">
+						{#if noteSearchPending}
+							Searching…
+						{:else if noteSearchQuery && noteSearchResults.length > 0}
 							{noteSearchIndex + 1} / {noteSearchResults.length}
 						{:else if noteSearchQuery}
 							No results
 						{/if}
 					</span>
-					<button class="note-search-btn" onclick={noteSearchPrev} title="Previous (Shift+Enter)">
+					<button class="note-search-btn" onclick={noteSearchPrev} onmousedown={(e) => e.preventDefault()} disabled={!noteSearchPending && !noteSearchResults.length} aria-label="Previous match" title="Previous (Shift+Enter)">
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>
 					</button>
-					<button class="note-search-btn" onclick={noteSearchNext} title="Next (Enter)">
+					<button class="note-search-btn" onclick={noteSearchNext} onmousedown={(e) => e.preventDefault()} disabled={!noteSearchPending && !noteSearchResults.length} aria-label="Next match" title="Next (Enter)">
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
 					</button>
-					<button class="note-search-btn" onclick={closeNoteSearch} title="Close (Esc)">
+					<button class="note-search-btn" onclick={() => closeNoteSearch()} aria-label="Close find" title="Close (Esc)">
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 					</button>
 				</div>
 			{/if}
 			<div class="editor-body-row">
-			<div class="editor-body">
+			<div class="editor-body" class:source-body={$sourceMode}>
 				{#if isMobile}
-					<!-- Mobile: both views always in DOM, toggled via display to avoid slow editor re-creation -->
-					<div class="source-editor-layer" style={$sourceMode ? '' : 'display:none'}>
-						<pre class="source-highlight" aria-hidden="true" bind:this={sourceHighlightElement}><code>{@html sourceHighlightHtml}</code></pre>
-					<textarea
-						class="source-editor"
-						bind:this={sourceElement}
-						bind:value={sourceContent}
-						readonly={$readOnly}
-						oninput={() => {
-							$editorDirty = true;
-							autoSave();
-							pushSourceHistoryDebounced();
-						}}
-						onkeydown={(e) => {
-							if (handleSourceCtrlEnd(e)) return;
-							if (handleSourceSelectionPair(e)) return;
-							const mod = e.ctrlKey || e.metaKey;
-							if (e.key === 'Enter' && e.shiftKey && !mod) {
-								e.preventDefault();
-								const ta = sourceElement;
-								const start = ta.selectionStart;
-								const end = ta.selectionEnd;
-								const val = ta.value;
-								sourceContent = val.slice(0, start) + '  \n' + val.slice(end);
-								tick().then(() => {
-									const newPos = start + 3;
-									ta.setSelectionRange(newPos, newPos);
-								});
-								$editorDirty = true;
-								autoSave();
-								pushSourceHistoryDebounced();
-								return;
-							}
-							if (mod && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
-								e.preventDefault();
-								sourceUndo();
-								return;
-							}
-							if ((mod && (e.key === 'z' || e.key === 'Z') && e.shiftKey) || (mod && (e.key === 'y' || e.key === 'Y'))) {
-								e.preventDefault();
-								sourceRedo();
-								return;
-							}
-						}}
-						onscroll={syncSourceEditorScroll}
-						spellcheck="false"
-					></textarea>
-					</div>
+					<SourceEditor controller={source} readonly={$readOnly || !!$viewerNote} visible={$sourceMode} mobile />
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div class="tiptap-wrapper" class:large-doc={isLargeDoc} style={$sourceMode ? 'display:none' : ''} spellcheck="false" bind:this={editorElement} onclick={(e) => { closeLinkContextMenu(); handleEditorClick(e); }} onkeydown={(e) => { if (e.key === 'Escape') closeLinkContextMenu(); }}></div>
 				{:else}
-					<!-- Desktop: conditional rendering with line numbers -->
 					{#if $sourceMode}
-						{#if $appConfig?.show_line_numbers}
-							<div class="line-numbers-clip" aria-hidden="true">
-								<div class="line-numbers">
-									{#each sourceContent.split('\n') as _, i}
-										<span>{i + 1}</span>
-									{/each}
-								</div>
-							</div>
-						{/if}
-						<div class="source-editor-layer" class:with-line-numbers={$appConfig?.show_line_numbers}>
-							<pre class="source-highlight" aria-hidden="true" bind:this={sourceHighlightElement}><code>{@html sourceHighlightHtml}</code></pre>
-						<textarea
-							class="source-editor"
-							class:with-line-numbers={$appConfig?.show_line_numbers}
-							bind:this={sourceElement}
-							bind:value={sourceContent}
-							readonly={$readOnly}
-							oninput={() => {
-								$editorDirty = true;
-								autoSave();
-								pushSourceHistoryDebounced();
-							}}
-							onkeydown={(e) => {
-								if (handleSourceCtrlEnd(e)) return;
-								if (handleSourceSelectionPair(e)) return;
-								const mod = e.ctrlKey || e.metaKey;
-								// Shift+Enter: insert two trailing spaces + newline for markdown hard break
-								if (e.key === 'Enter' && e.shiftKey && !mod) {
-									e.preventDefault();
-									const ta = sourceElement;
-									const start = ta.selectionStart;
-									const end = ta.selectionEnd;
-									const val = ta.value;
-									sourceContent = val.slice(0, start) + '  \n' + val.slice(end);
-									tick().then(() => {
-										const newPos = start + 3;
-										ta.setSelectionRange(newPos, newPos);
-									});
-									$editorDirty = true;
-									autoSave();
-									pushSourceHistoryDebounced();
-									return;
-								}
-								// Undo
-								if (mod && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
-									e.preventDefault();
-									sourceUndo();
-									return;
-								}
-								// Redo
-								if ((mod && (e.key === 'z' || e.key === 'Z') && e.shiftKey) || (mod && (e.key === 'y' || e.key === 'Y'))) {
-									e.preventDefault();
-									sourceRedo();
-									return;
-								}
-								if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
-									e.preventDefault();
-									pushSourceHistoryImmediate();
-									const ta = sourceElement;
-									const val = ta.value;
-									const start = ta.selectionStart;
-									const lines = val.split('\n');
-									// Find current line index
-									let pos = 0;
-									let curLine = 0;
-									for (let i = 0; i < lines.length; i++) {
-										if (pos + lines[i].length >= start) { curLine = i; break; }
-										pos += lines[i].length + 1;
-									}
-									if (e.key === 'ArrowUp' && curLine > 0) {
-										const tmp = lines[curLine];
-										lines[curLine] = lines[curLine - 1];
-										lines[curLine - 1] = tmp;
-										sourceContent = lines.join('\n');
-										tick().then(() => {
-											const newPos = lines.slice(0, curLine - 1).join('\n').length + 1 + (start - pos);
-											ta.setSelectionRange(newPos, newPos);
-											pushSourceHistoryImmediate();
-										});
-									} else if (e.key === 'ArrowDown' && curLine < lines.length - 1) {
-										const tmp = lines[curLine];
-										lines[curLine] = lines[curLine + 1];
-										lines[curLine + 1] = tmp;
-										sourceContent = lines.join('\n');
-										tick().then(() => {
-											const newPos = lines.slice(0, curLine + 1).join('\n').length + 1 + (start - pos);
-											ta.setSelectionRange(newPos, newPos);
-											pushSourceHistoryImmediate();
-										});
-									}
-									$editorDirty = true;
-									autoSave();
-								}
-							}}
-							onscroll={syncSourceEditorScroll}
-							spellcheck="false"
-						></textarea>
-						</div>
+						<SourceEditor controller={source} readonly={$readOnly || !!$viewerNote} numbers={$appConfig?.show_line_numbers ?? false} />
 					{:else}
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
 						<div class="tiptap-wrapper" class:large-doc={isLargeDoc} spellcheck="false" bind:this={editorElement} onclick={(e) => { closeLinkContextMenu(); handleEditorClick(e); }} onkeydown={(e) => { if (e.key === 'Escape') closeLinkContextMenu(); }} oncontextmenu={handleEditorContextMenu}></div>
@@ -6527,17 +6506,17 @@
 					</button>
 					{#if insertDropdown}
 						<div class="fmt-dropdown insert-dropdown">
-							<button onclick={() => { insertDropdown = false; document.querySelector<HTMLInputElement>('#insert-image-input')?.click(); }}>
+							<button onclick={() => openAssetPicker('insert-image-input')}>
 								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 00-2.828 0L6 21"/></svg>
 								Image
 							</button>
 							{#if isAndroid}
-								<button onclick={() => { insertDropdown = false; document.querySelector<HTMLInputElement>('#insert-camera-input')?.click(); }}>
+								<button onclick={() => openAssetPicker('insert-camera-input')}>
 									<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 00-2 2v9a2 2 0 002 2h16a2 2 0 002-2V9a2 2 0 00-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>
 									Take Photo
 								</button>
 							{/if}
-							<button onclick={() => { insertDropdown = false; document.querySelector<HTMLInputElement>('#insert-file-input')?.click(); }}>
+							<button onclick={() => openAssetPicker('insert-file-input')}>
 								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22a2 2 0 01-2-2V4a2 2 0 012-2h8a2.4 2.4 0 011.704.706l3.588 3.588A2.4 2.4 0 0120 8v12a2 2 0 01-2 2z"/><path d="M14 2v5a1 1 0 001 1h5"/></svg>
 								File
 							</button>
@@ -6716,11 +6695,11 @@
 					</button>
 					{#if insertDropdown}
 						<div class="fmt-dropdown insert-dropdown">
-							<button onclick={() => { insertDropdown = false; document.querySelector<HTMLInputElement>('#insert-image-input')?.click(); }}>
+							<button onclick={() => openAssetPicker('insert-image-input')}>
 								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 00-2.828 0L6 21"/></svg>
 								Image
 							</button>
-							<button onclick={() => { insertDropdown = false; document.querySelector<HTMLInputElement>('#insert-file-input')?.click(); }}>
+							<button onclick={() => openAssetPicker('insert-file-input')}>
 								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22a2 2 0 01-2-2V4a2 2 0 012-2h8a2.4 2.4 0 011.704.706l3.588 3.588A2.4 2.4 0 0120 8v12a2 2 0 01-2 2z"/><path d="M14 2v5a1 1 0 001 1h5"/></svg>
 								File
 							</button>
@@ -7009,19 +6988,11 @@
 	{/if}
 
 	<!-- Hidden file inputs for Insert dropdown -->
-	<input type="file" id="insert-image-input" accept="image/*" style="display:none" onchange={handleImageInput} />
+	<input type="file" id="insert-image-input" accept="image/*" style="display:none" onchange={handleAssetInput} />
 	{#if isAndroid}
-		<input type="file" id="insert-camera-input" accept="image/*" capture="environment" style="display:none" onchange={handleImageInput} />
+		<input type="file" id="insert-camera-input" accept="image/*" capture="environment" style="display:none" onchange={handleAssetInput} />
 	{/if}
-	<input type="file" id="insert-file-input" style="display:none" onchange={(e) => {
-		const file = (e.target as HTMLInputElement).files?.[0];
-		if (file) {
-			if (file.type.startsWith('image/')) insertImage(file);
-			else if (file.type === 'application/pdf') insertPdf(file);
-			else insertFileAttachment(file);
-		}
-		(e.target as HTMLInputElement).value = '';
-	}} />
+	<input type="file" id="insert-file-input" style="display:none" onchange={handleAssetInput} />
 </div>
 
 {#if linkContextMenu}
@@ -8281,6 +8252,11 @@
 		background: var(--bg-hover);
 		color: var(--text-primary);
 	}
+	.note-search-btn:disabled { opacity: 0.4; cursor: default; }
+	.note-search-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+	.note-search-option { min-width: 24px; justify-content: center; font-size: 12px; height: 24px; }
+	.note-search-option[aria-pressed="true"] { background: var(--accent); color: var(--bg-primary); }
+	.note-search-option.whole-word { text-decoration: underline; text-underline-offset: 3px; }
 	:global(.note-search-match) {
 		background: rgba(255, 200, 0, 0.3);
 		border-radius: 2px;
@@ -8312,7 +8288,7 @@
 		margin-right: 8px;
 	}
 
-	.editor-body:has(.source-editor) {
+	.editor-body.source-body {
 		overflow: hidden;
 	}
 
@@ -8524,132 +8500,6 @@
 	.outline-level-5 { padding-left: 62px; }
 	.outline-level-6 { padding-left: 74px; }
 
-	.source-editor-layer {
-		position: relative;
-		width: 100%;
-		height: 100%;
-		max-width: var(--editor-content-width, none);
-		margin: 0 auto;
-	}
-
-	.source-highlight,
-	.source-editor {
-		box-sizing: border-box;
-		width: 100%;
-		height: 100%;
-		border: none;
-		font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
-		font-size: var(--editor-font-size, 14px);
-		line-height: 1.3;
-		padding: 0 0 var(--editor-scroll-past-end, 65vh);
-		white-space: pre-wrap;
-		word-break: break-word;
-	}
-
-	.source-highlight {
-		position: absolute;
-		inset: 0;
-		z-index: 0;
-		margin: 0;
-		overflow: hidden;
-		pointer-events: none;
-		user-select: none;
-		color: var(--text-primary);
-	}
-
-	.source-highlight code {
-		font: inherit;
-		white-space: inherit;
-		color: inherit;
-	}
-
-	.source-editor {
-		position: absolute;
-		inset: 0;
-		z-index: 1;
-		background: transparent;
-		color: transparent;
-		caret-color: var(--text-primary);
-		resize: none;
-		outline: none;
-		user-select: text;
-		overflow-x: hidden;
-	}
-
-	.source-editor-layer.with-line-numbers {
-		max-width: none;
-		margin: 0;
-	}
-
-	.source-editor.with-line-numbers,
-	.source-editor-layer.with-line-numbers .source-highlight {
-		padding-left: 48px;
-		/* The line-number gutter has one fixed row per line, so wrapping would desync it.
-		   Keep no-wrap (horizontal scroll) whenever line numbers are on. (issue #100) */
-		white-space: pre;
-		word-break: normal;
-	}
-
-	.source-editor.with-line-numbers {
-		overflow-x: auto;
-	}
-
-	.line-numbers-clip {
-		position: absolute;
-		left: 0;
-		top: 0;
-		bottom: 0;
-		width: 44px;
-		overflow: hidden;
-		pointer-events: none;
-	}
-
-	.line-numbers {
-		padding-top: 8px;
-		font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
-		font-size: var(--editor-font-size, 14px);
-		line-height: 1.3;
-		color: var(--text-secondary);
-		opacity: 0.5;
-		text-align: right;
-		user-select: none;
-		will-change: transform;
-	}
-
-	.line-numbers span {
-		display: block;
-		padding-right: 12px;
-	}
-
-	/* Markdown source highlighting stays color-only so glyph metrics match the textarea caret. */
-	:global(.source-highlight .hljs-section),
-	:global(.source-highlight .hljs-strong) {
-		color: var(--accent);
-		font-weight: inherit;
-	}
-
-	:global(.source-highlight .hljs-string),
-	:global(.source-highlight .hljs-link) {
-		color: color-mix(in srgb, var(--accent) 78%, var(--text-primary));
-	}
-
-	:global(.source-highlight .hljs-bullet),
-	:global(.source-highlight .hljs-symbol),
-	:global(.source-highlight .hljs-meta),
-	:global(.source-highlight .hljs-attr) {
-		color: var(--success);
-	}
-
-	:global(.source-highlight .hljs-quote),
-	:global(.source-highlight .hljs-code) {
-		color: var(--text-secondary);
-		font-style: inherit;
-	}
-
-	:global(.source-highlight .hljs-emphasis) {
-		color: color-mix(in srgb, var(--accent) 60%, var(--text-primary));
-		font-style: inherit;
-	}
 
 	.tiptap-wrapper {
 		height: 100%;
@@ -9707,10 +9557,6 @@
 		}
 	}
 
-	.source-editor.task-target-source::selection {
-		background: color-mix(in srgb, var(--accent) 36%, transparent);
-		color: inherit;
-	}
 
 	@media (prefers-reduced-motion: reduce) {
 		:global(.tiptap-wrapper .tiptap ul[data-type="taskList"] li.task-target-reveal) {
@@ -11337,14 +11183,6 @@
 		font-size: var(--editor-font-size, 16px) !important;
 	}
 
-	.editor-container.mobile .source-highlight,
-	.editor-container.mobile .source-editor {
-		padding: 8px 16px 220px;
-		font-size: var(--editor-font-size, 15px);
-		white-space: pre-wrap;
-		word-break: break-word;
-		overflow-x: hidden;
-	}
 
 	.editor-container.mobile .editor-body-row {
 		position: relative;

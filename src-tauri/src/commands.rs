@@ -4,36 +4,27 @@ use crate::state::AppState;
 use crate::types::*;
 use crate::vault::{operations, watcher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tauri::{AppHandle, Manager, Runtime, State};
 use tauri_plugin_fs::FsExt;
 
-fn index_note_bg(state: &State<'_, AppState>, path: &str) {
-    let search = state.search_index.lock().ok().and_then(|g| g.clone());
+fn index_note_bg(search: Option<Arc<SearchIndex>>, path: &str) {
     if let Some(search) = search {
-        let p = path.to_string();
-        std::thread::spawn(move || {
-            let _ = search.index_note(&p);
-        });
+        if let Err(error) = search.queue_index_note(path) {
+            log::error!("Failed to queue note indexing: {error}");
+        }
     }
 }
 
-fn remove_note_bg(state: &State<'_, AppState>, path: &str) {
-    let search = state.search_index.lock().ok().and_then(|g| g.clone());
+fn remove_note_bg(search: Option<Arc<SearchIndex>>, path: &str) {
     if let Some(search) = search {
         let p = path.to_string();
         std::thread::spawn(move || {
-            let _ = search.remove_note(&p);
+            if let Err(error) = search.remove_note(&p) {
+                log::error!("Failed to remove note from search index: {error}");
+            }
         });
     }
-}
-
-fn clear_vault_runtime(state: &State<'_, AppState>) -> Result<(), String> {
-    *state.watcher.lock().map_err(|error| error.to_string())? = None;
-    *state
-        .search_index
-        .lock()
-        .map_err(|error| error.to_string())? = None;
-    Ok(())
 }
 
 // ── Vault Management ──
@@ -65,35 +56,11 @@ fn open_vault_path(
     state: &State<'_, AppState>,
     path: String,
     external: Option<(String, String)>,
-) -> Result<(), String> {
+) -> Result<std::sync::Arc<SearchIndex>, String> {
     operations::ensure_vault_structure(&path)?;
 
     // Stage the search index and watcher before replacing the active runtime.
-    let search = std::sync::Arc::new(SearchIndex::new(&path)?);
-    #[cfg(target_os = "ios")]
-    {
-        if external.is_some() {
-            search.rebuild(&path)?;
-        } else {
-            let search_bg = search.clone();
-            let vault = path.clone();
-            std::thread::spawn(move || {
-                let _ = search_bg.rebuild(&vault);
-                log::info!("mobile: search index rebuild complete");
-            });
-        }
-    }
-    #[cfg(all(mobile, not(target_os = "ios")))]
-    {
-        let search_bg = search.clone();
-        let vault = path.clone();
-        std::thread::spawn(move || {
-            let _ = search_bg.rebuild(&vault);
-            log::info!("mobile: search index rebuild complete");
-        });
-    }
-    #[cfg(desktop)]
-    search.rebuild(&path)?;
+    let search = state.search_index_for_vault(&path)?;
 
     let new_watcher = watcher::start_watcher(app.clone(), path.clone())?;
     asset_scope::allow_vault_assets(&app, Path::new(&path))?;
@@ -142,11 +109,18 @@ fn open_vault_path(
     next.active_vault = Some(path);
     next.active_bookmark_id = active_bookmark_id;
     save_app_config(&next)?;
-    *search_slot = Some(search);
-    *watcher_slot = Some(new_watcher);
+    let old_search = search_slot.replace(search.clone());
+    let old_watcher = watcher_slot.replace(new_watcher);
     *config = next;
+    drop(config);
+    drop(watcher_slot);
+    drop(search_slot);
+    // Watcher shutdown and index disposal may block; never do either while a
+    // global state slot is locked.
+    drop(old_watcher);
+    drop(old_search);
 
-    Ok(())
+    Ok(search)
 }
 
 #[tauri::command]
@@ -156,10 +130,18 @@ pub async fn open_vault(
     path: String,
 ) -> Result<(), String> {
     let _transition = state.vault_transition.lock().await;
-    open_vault_path(app.clone(), &state, path, None)?;
-    #[cfg(target_os = "ios")]
-    app.ios_vault_access().release_active()?;
-    Ok(())
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let search = open_vault_path(app.clone(), &state, path.clone(), None)?;
+        #[cfg(target_os = "ios")]
+        app.ios_vault_access().release_active()?;
+        if let Err(error) = search.queue_vault_refresh(&path) {
+            log::error!("Failed to queue opened vault search refresh: {error}");
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -180,28 +162,44 @@ pub async fn choose_external_vault(
             return Ok(None);
         }
         let result = ExternalVaultResult::from(selection);
-        let bookmark_was_registered = state
-            .config
-            .lock()
-            .map_err(|error| error.to_string())?
-            .vaults
-            .iter()
-            .any(|vault| vault.bookmark_id.as_deref() == Some(result.bookmark_id.as_str()));
-        if let Err(error) = open_vault_path(
-            app.clone(),
-            &state,
-            result.path.clone(),
-            Some((result.bookmark_id.clone(), result.name.clone())),
-        ) {
-            if bookmark_was_registered {
-                let _ = app.ios_vault_access().rollback_staged();
-            } else {
-                let _ = app.ios_vault_access().forget_bookmark(&result.bookmark_id);
+        tauri::async_runtime::spawn_blocking(move || {
+            let state = app.state::<AppState>();
+            let bookmark_was_registered = state
+                .config
+                .lock()
+                .map_err(|error| error.to_string())?
+                .vaults
+                .iter()
+                .any(|vault| vault.bookmark_id.as_deref() == Some(result.bookmark_id.as_str()));
+            let search = match open_vault_path(
+                app.clone(),
+                &state,
+                result.path.clone(),
+                Some((result.bookmark_id.clone(), result.name.clone())),
+            ) {
+                Ok(search) => search,
+                Err(error) => {
+                    let rollback = if bookmark_was_registered {
+                        app.ios_vault_access().rollback_staged()
+                    } else {
+                        app.ios_vault_access().forget_bookmark(&result.bookmark_id)
+                    };
+                    return Err(match rollback {
+                        Ok(()) => error,
+                        Err(rollback_error) => {
+                            format!("{error} Bookmark rollback also failed: {rollback_error}")
+                        }
+                    });
+                }
+            };
+            app.ios_vault_access().commit_staged()?;
+            if let Err(error) = search.queue_vault_refresh(&result.path) {
+                log::error!("Failed to queue opened vault search refresh: {error}");
             }
-            return Err(error);
-        }
-        app.ios_vault_access().commit_staged()?;
-        Ok(Some(result))
+            Ok(Some(result))
+        })
+        .await
+        .map_err(|error| error.to_string())?
     }
     #[cfg(not(target_os = "ios"))]
     {
@@ -226,17 +224,32 @@ pub async fn restore_external_vault(
         .await
         .map_err(|error| error.to_string())??;
         let result = ExternalVaultResult::from(selection);
-        if let Err(error) = open_vault_path(
-            app.clone(),
-            &state,
-            result.path.clone(),
-            Some((result.bookmark_id.clone(), result.name.clone())),
-        ) {
-            let _ = app.ios_vault_access().rollback_staged();
-            return Err(error);
-        }
-        app.ios_vault_access().commit_staged()?;
-        Ok(result)
+        tauri::async_runtime::spawn_blocking(move || {
+            let state = app.state::<AppState>();
+            let search = match open_vault_path(
+                app.clone(),
+                &state,
+                result.path.clone(),
+                Some((result.bookmark_id.clone(), result.name.clone())),
+            ) {
+                Ok(search) => search,
+                Err(error) => {
+                    return Err(match app.ios_vault_access().rollback_staged() {
+                        Ok(()) => error,
+                        Err(rollback_error) => {
+                            format!("{error} Bookmark rollback also failed: {rollback_error}")
+                        }
+                    });
+                }
+            };
+            app.ios_vault_access().commit_staged()?;
+            if let Err(error) = search.queue_vault_refresh(&result.path) {
+                log::error!("Failed to queue opened vault search refresh: {error}");
+            }
+            Ok(result)
+        })
+        .await
+        .map_err(|error| error.to_string())?
     }
     #[cfg(not(target_os = "ios"))]
     {
@@ -253,6 +266,27 @@ pub async fn remove_vault(
     bookmark_id: Option<String>,
 ) -> Result<(), String> {
     let _transition = state.vault_transition.lock().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let config_path = app_config_path()?;
+        remove_vault_path(&app, &state, path, bookmark_id, &config_path)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn remove_vault_path<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    path: String,
+    bookmark_id: Option<String>,
+    config_path: &Path,
+) -> Result<(), String> {
+    let mut search_slot = state
+        .search_index
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let mut watcher_slot = state.watcher.lock().map_err(|error| error.to_string())?;
     let mut config = state.config.lock().map_err(|error| error.to_string())?;
     let target = if let Some(bookmark_id) = bookmark_id.as_deref() {
         config
@@ -292,12 +326,12 @@ pub async fn remove_vault(
         next.active_vault = None;
         next.active_bookmark_id = None;
     }
-    save_app_config(&next)?;
+    save_app_config_to(&next, config_path)?;
 
     #[cfg(target_os = "ios")]
     if let Some(id) = target_bookmark.as_deref() {
         if let Err(error) = app.ios_vault_access().forget_bookmark(id) {
-            return match save_app_config(&old) {
+            return match save_app_config_to(&old, config_path) {
                 Ok(()) => Err(error),
                 Err(rollback_error) => Err(format!(
                     "{error} Configuration rollback also failed: {rollback_error}"
@@ -306,12 +340,16 @@ pub async fn remove_vault(
         }
     }
     #[cfg(not(target_os = "ios"))]
-    let _ = (&app, &target_bookmark);
+    let _ = (app, &target_bookmark);
 
-    if is_active {
-        clear_vault_runtime(&state)?;
-    }
+    let old_search = if is_active { search_slot.take() } else { None };
+    let old_watcher = if is_active { watcher_slot.take() } else { None };
     *config = next;
+    drop(config);
+    drop(watcher_slot);
+    drop(search_slot);
+    drop(old_watcher);
+    drop(old_search);
 
     Ok(())
 }
@@ -326,6 +364,24 @@ pub fn get_app_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
 pub fn get_pending_open_file(state: State<'_, AppState>) -> Result<Option<String>, String> {
     let mut pending = state.pending_open_file.lock().map_err(|e| e.to_string())?;
     Ok(pending.take())
+}
+
+/// Finish a close request only after the frontend has flushed its editor.
+#[tauri::command]
+pub fn complete_window_close<R: Runtime>(
+    window: tauri::Window<R>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    #[cfg(desktop)]
+    if state.should_hide_to_tray(
+        window.label(),
+        window.app_handle().tray_by_id("helixnotes").is_some(),
+    )? {
+        return window.hide().map_err(|error| error.to_string());
+    }
+    #[cfg(mobile)]
+    let _ = state;
+    window.destroy().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -525,59 +581,83 @@ pub fn set_content_width(state: State<'_, AppState>, width: Option<u32>) -> Resu
 // ── Notebooks ──
 
 #[tauri::command]
-pub fn get_notebooks(state: State<'_, AppState>) -> Result<Vec<NotebookEntry>, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::scan_notebooks(vault_path)
+pub async fn get_notebooks(state: State<'_, AppState>) -> Result<Vec<NotebookEntry>, String> {
+    let vault_path = state
+        .config
+        .lock()
+        .map_err(|error| error.to_string())?
+        .active_vault
+        .clone()
+        .ok_or("No active vault")?;
+    tauri::async_runtime::spawn_blocking(move || operations::scan_notebooks(&vault_path))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn count_root_notes(state: State<'_, AppState>) -> Result<usize, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::count_root_notes(vault_path)
+pub async fn count_root_notes(state: State<'_, AppState>) -> Result<usize, String> {
+    let vault_path = state
+        .config
+        .lock()
+        .map_err(|error| error.to_string())?
+        .active_vault
+        .clone()
+        .ok_or("No active vault")?;
+    tauri::async_runtime::spawn_blocking(move || operations::count_root_notes(&vault_path))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn create_notebook(
+pub async fn create_notebook(
     state: State<'_, AppState>,
+    vault_path: String,
     parent_relative: Option<String>,
     name: String,
 ) -> Result<NotebookEntry, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::create_notebook(vault_path, parent_relative.as_deref(), &name)
+    state.validate_vault(&vault_path)?;
+    let _write_guard = state.note_save.lock().await;
+    operations::create_notebook(&vault_path, parent_relative.as_deref(), &name)
 }
 
 #[tauri::command]
-pub fn rename_notebook(
+pub async fn rename_notebook(
     state: State<'_, AppState>,
+    vault_path: String,
     path: String,
     new_name: String,
 ) -> Result<String, String> {
-    let config = state.config.lock().map_err(|error| error.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::rename_notebook(vault_path, &path, &new_name)
+    let search = state.vault_snapshot(&vault_path)?;
+    let _write_guard = state.note_save.lock().await;
+    let renamed = operations::rename_notebook(&vault_path, &path, &new_name)?;
+    if let Some(search) = search {
+        if let Err(error) = search.queue_vault_refresh(&vault_path) {
+            log::error!("Failed to queue renamed notebook search refresh: {error}");
+        }
+    }
+    Ok(renamed)
 }
 
 #[tauri::command]
-pub fn move_notebook(
+pub async fn move_notebook(
     state: State<'_, AppState>,
+    vault_path: String,
     notebook_path: String,
     dest_parent: String,
 ) -> Result<String, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
+    let search = state.vault_snapshot(&vault_path)?;
+    let _write_guard = state.note_save.lock().await;
+    let vault_path = vault_path.as_str();
 
     let old_relative = Path::new(&notebook_path)
-        .strip_prefix(vault_path.as_str())
+        .strip_prefix(vault_path)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
 
     let new_full_path = operations::move_notebook(vault_path, &notebook_path, &dest_parent)?;
 
     let new_relative = Path::new(&new_full_path)
-        .strip_prefix(vault_path.as_str())
+        .strip_prefix(vault_path)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
 
@@ -596,37 +676,10 @@ pub fn move_notebook(
         }
     }
 
-    // Update notebook icon mappings
-    if let Ok(icons) = operations::load_notebook_icons(vault_path) {
-        let old_icon_key = operations::normalize_notebook_icon_key(&old_relative);
-        let new_icon_key = operations::normalize_notebook_icon_key(&new_relative);
-        let old_prefix = format!("{}/", old_icon_key);
-        let mut new_icons = std::collections::HashMap::new();
-        let mut changed = false;
-        for (key, value) in &icons {
-            if *key == old_icon_key {
-                new_icons.insert(new_icon_key.clone(), value.clone());
-                changed = true;
-            } else if key.starts_with(&old_prefix) {
-                let new_key = format!("{}/{}", new_icon_key, &key[old_prefix.len()..]);
-                new_icons.insert(new_key, value.clone());
-                changed = true;
-            } else {
-                new_icons.insert(key.clone(), value.clone());
-            }
-        }
-        if changed {
-            let icons_path = operations::helixnotes_dir(vault_path).join("notebook_icons.json");
-            if let Ok(data) = serde_json::to_string_pretty(&new_icons) {
-                let _ = std::fs::write(&icons_path, data);
-            }
-        }
-    }
-
-    // Rebuild search index (paths changed for all contained notes)
-    if let Ok(search_guard) = state.search_index.lock() {
-        if let Some(ref search) = *search_guard {
-            let _ = search.rebuild(vault_path);
+    // Reconcile renamed paths without blocking the move on a full rebuild.
+    if let Some(search) = search {
+        if let Err(error) = search.queue_vault_refresh(vault_path) {
+            log::error!("Failed to queue moved notebook search refresh: {error}");
         }
     }
 
@@ -634,153 +687,186 @@ pub fn move_notebook(
 }
 
 #[tauri::command]
-pub fn delete_notebook(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    let vault_path = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        config
-            .active_vault
-            .as_ref()
-            .ok_or("No active vault")?
-            .clone()
-    };
-    operations::delete_notebook(&vault_path, &path)
+pub async fn delete_notebook(
+    state: State<'_, AppState>,
+    vault_path: String,
+    path: String,
+) -> Result<(), String> {
+    let search = state.vault_snapshot(&vault_path)?;
+    let _write_guard = state.note_save.lock().await;
+    operations::delete_notebook(&vault_path, &path)?;
+    if let Some(search) = search {
+        if let Err(error) = search.queue_vault_refresh(&vault_path) {
+            log::error!("Failed to queue deleted notebook search refresh: {error}");
+        }
+    }
+    Ok(())
 }
 
 // ── Notes ──
 
 #[tauri::command]
-pub fn get_notes(
+pub async fn get_notes(
     state: State<'_, AppState>,
     notebook_path: Option<String>,
 ) -> Result<Vec<NoteEntry>, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::scan_notes(vault_path, notebook_path.as_deref())
+    let vault_path = state
+        .config
+        .lock()
+        .map_err(|error| error.to_string())?
+        .active_vault
+        .clone()
+        .ok_or("No active vault")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        operations::scan_notes(&vault_path, notebook_path.as_deref())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn read_note(state: State<'_, AppState>, path: String) -> Result<NoteContent, String> {
-    let config = state.config.lock().map_err(|error| error.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::read_note(vault_path, &path)
-}
-
-#[tauri::command]
-pub fn save_note(
+pub async fn read_note(
     state: State<'_, AppState>,
+    vault_path: String,
+    path: String,
+) -> Result<NoteContent, String> {
+    state.validate_vault(&vault_path)?;
+    tauri::async_runtime::spawn_blocking(move || operations::read_note(&vault_path, &path))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn save_note(
+    state: State<'_, AppState>,
+    vault_path: String,
     path: String,
     meta: NoteMeta,
     body: String,
 ) -> Result<(), String> {
-    let config = state.config.lock().map_err(|error| error.to_string())?;
-    let vault_path = config
-        .active_vault
-        .as_ref()
-        .ok_or("No active vault")?
-        .clone();
-    let max_versions = config.max_versions_per_note;
-    let old_raw = operations::read_vault_note(&vault_path, &path)?.raw;
-    drop(config);
+    let search = state.vault_snapshot(&vault_path)?;
+    let max_versions = state
+        .config
+        .lock()
+        .map_err(|error| error.to_string())?
+        .max_versions_per_note;
+    // Capture the origin before queueing. Waiting must not retarget the write
+    // when the main window switches vaults or the calling window closes.
+    let save_guard = state.note_save.clone().lock_owned().await;
 
-    let note_id = meta.id.clone();
-    let snapshot_vault = vault_path.clone();
-    std::thread::spawn(move || {
-        crate::history::maybe_snapshot(&snapshot_vault, &note_id, &old_raw, max_versions);
-    });
-
-    operations::save_note(&vault_path, &path, &meta, &body)?;
-
-    // Re-index note so search picks up changes (background to avoid blocking on FUSE fsync)
-    index_note_bg(&state, &path);
-
-    Ok(())
+    tauri::async_runtime::spawn_blocking(move || {
+        // Keep ordering even if the calling window closes while its save runs.
+        let _save_guard = save_guard;
+        if let Some(saved) = operations::save_note(&vault_path, &path, &meta, &body)? {
+            crate::history::maybe_snapshot(
+                &vault_path,
+                &saved.id,
+                &saved.previous_raw,
+                max_versions,
+            );
+            index_note_bg(search, &path);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn duplicate_note(
+pub async fn duplicate_note(
     state: State<'_, AppState>,
+    vault_path: String,
     path: String,
 ) -> Result<crate::types::NoteEntry, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault = config
-        .active_vault
-        .as_ref()
-        .ok_or("No active vault")?
-        .clone();
-    drop(config);
-
-    let entry = operations::duplicate_note(&path, &vault)?;
-    index_note_bg(&state, &entry.path);
+    let search = state.vault_snapshot(&vault_path)?;
+    let _write_guard = state.note_save.lock().await;
+    let entry = operations::duplicate_note(&path, &vault_path)?;
+    index_note_bg(search, &entry.path);
     Ok(entry)
 }
 
 #[tauri::command]
-pub fn create_note(
+pub async fn create_note(
     state: State<'_, AppState>,
+    vault_path: String,
     notebook_relative: Option<String>,
     title: String,
 ) -> Result<NoteEntry, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    let entry = operations::create_note(vault_path, notebook_relative.as_deref(), &title)?;
+    let search = state.vault_snapshot(&vault_path)?;
+    let _write_guard = state.note_save.lock().await;
+    let entry = operations::create_note(&vault_path, notebook_relative.as_deref(), &title)?;
 
     // Index new note (background to avoid blocking on FUSE fsync)
-    index_note_bg(&state, &entry.path);
+    index_note_bg(search, &entry.path);
 
     Ok(entry)
 }
 
 #[tauri::command]
-pub fn create_daily_note(
+pub async fn create_daily_note(
     state: State<'_, AppState>,
+    vault_path: String,
     date: Option<String>,
 ) -> Result<NoteEntry, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    let entry =
-        operations::create_daily_note(vault_path, date.as_deref(), &config.daily_title_format)?;
+    let search = state.vault_snapshot(&vault_path)?;
+    let title_format = state
+        .config
+        .lock()
+        .map_err(|error| error.to_string())?
+        .daily_title_format
+        .clone();
+    let _write_guard = state.note_save.lock().await;
+    let entry = operations::create_daily_note(&vault_path, date.as_deref(), &title_format)?;
 
-    index_note_bg(&state, &entry.path);
+    index_note_bg(search, &entry.path);
 
     Ok(entry)
 }
 
 #[tauri::command]
-pub fn rename_note(
+pub async fn rename_note(
     state: State<'_, AppState>,
+    vault_path: String,
     path: String,
     new_title: String,
 ) -> Result<String, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config
-        .active_vault
-        .as_ref()
-        .ok_or("No active vault")?
-        .clone();
-    drop(config);
-    operations::rename_note(&path, &new_title, &vault_path)
+    let search = state.vault_snapshot(&vault_path)?;
+    let _write_guard = state.note_save.lock().await;
+    let renamed = operations::rename_note(&path, &new_title, &vault_path)?;
+    if let Some(search) = search {
+        if let Err(error) = search.queue_vault_refresh(&vault_path) {
+            log::error!("Failed to queue renamed note search refresh: {error}");
+        }
+    }
+    Ok(renamed)
 }
 
 #[tauri::command]
-pub fn delete_note(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::delete_note(vault_path, &path)?;
+pub async fn delete_note(
+    state: State<'_, AppState>,
+    vault_path: String,
+    path: String,
+) -> Result<(), String> {
+    let search = state.vault_snapshot(&vault_path)?;
+    let _write_guard = state.note_save.lock().await;
+    operations::delete_note(&vault_path, &path)?;
 
     // Remove from index (background to avoid blocking on FUSE fsync)
-    remove_note_bg(&state, &path);
+    remove_note_bg(search, &path);
 
     Ok(())
 }
 
 #[tauri::command]
-pub fn move_note(
+pub async fn move_note(
     state: State<'_, AppState>,
+    vault_path: String,
     note_path: String,
     dest_notebook: String,
 ) -> Result<String, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
+    let search = state.vault_snapshot(&vault_path)?;
+    let _write_guard = state.note_save.lock().await;
+    let vault_path = vault_path.as_str();
 
     // Compute old relative path before move
     let old_relative = Path::new(&note_path)
@@ -805,6 +891,8 @@ pub fn move_note(
             }
         }
     }
+    index_note_bg(search.clone(), &note_path);
+    index_note_bg(search, &new_full_path);
 
     Ok(new_full_path)
 }
@@ -812,18 +900,33 @@ pub fn move_note(
 // ── Tags ──
 
 #[tauri::command]
-pub fn get_all_tags(state: State<'_, AppState>) -> Result<Vec<(String, usize)>, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::get_all_tags(vault_path)
+pub async fn get_all_tags(state: State<'_, AppState>) -> Result<Vec<(String, usize)>, String> {
+    let vault_path = state
+        .config
+        .lock()
+        .map_err(|error| error.to_string())?
+        .active_vault
+        .clone()
+        .ok_or("No active vault")?;
+    tauri::async_runtime::spawn_blocking(move || operations::get_all_tags(&vault_path))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 // ── Wiki-links ──
 
 #[tauri::command]
-pub fn get_all_note_titles(state: State<'_, AppState>) -> Result<Vec<NoteTitleEntry>, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
+pub async fn get_all_note_titles(
+    state: State<'_, AppState>,
+    vault_path: String,
+) -> Result<Vec<NoteTitleEntry>, String> {
+    state.validate_vault(&vault_path)?;
+    tauri::async_runtime::spawn_blocking(move || scan_all_note_titles(&vault_path))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn scan_all_note_titles(vault_path: &str) -> Result<Vec<NoteTitleEntry>, String> {
     let vault = std::path::Path::new(vault_path);
     let hn_dir = operations::helixnotes_dir(vault_path);
     let mut entries = Vec::new();
@@ -893,11 +996,14 @@ pub async fn get_note_switcher_titles(
 // ── Graph ──
 
 #[tauri::command]
-pub fn get_graph_data(state: State<'_, AppState>) -> Result<crate::types::GraphData, String> {
+pub fn get_graph_data(
+    state: State<'_, AppState>,
+    vault_path: String,
+) -> Result<crate::types::GraphData, String> {
     use std::collections::{HashMap, HashSet};
 
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
+    state.validate_vault(&vault_path)?;
+    let vault_path = vault_path.as_str();
     let vault = std::path::Path::new(vault_path);
 
     // Pass 1: collect ALL notes as nodes (no title deduplication - every note must appear)
@@ -1085,92 +1191,155 @@ fn extract_title_fast(raw: &str) -> Option<String> {
 // ── Tasks ──
 
 #[tauri::command]
-pub fn get_tasks(state: State<'_, AppState>) -> Result<Vec<crate::types::TaskItem>, String> {
-    use rayon::prelude::*;
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    let vault = std::path::Path::new(vault_path);
-    let hn_dir = operations::helixnotes_dir(vault_path);
-
-    let task_re = regex::Regex::new(r"^\s*[-*]\s\[([ xX])\]\s+(.+?)\s*$").unwrap();
-    let due_re = regex::Regex::new(r"\bdue:(\d{4}-\d{2}-\d{2})\b").unwrap();
-    let prio_re = regex::Regex::new(r"(?i)(?:^|\s)!(high|medium|med|low)\b").unwrap();
-
-    let paths: Vec<std::path::PathBuf> = walkdir::WalkDir::new(vault)
-        .into_iter()
-        .filter_entry(|e| !operations::is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_type().is_file() && e.path().extension().and_then(|x| x.to_str()) == Some("md")
-        })
-        .map(|e| e.into_path())
-        .collect();
-
-    // Read and parse each note in parallel; on Android every read_to_string is a FUSE round-trip.
-    let tasks: Vec<crate::types::TaskItem> = paths
-        .par_iter()
-        .flat_map(|path| {
-            let mut out: Vec<crate::types::TaskItem> = Vec::new();
-            let raw = match std::fs::read_to_string(path) {
-                Ok(r) => r,
-                Err(_) => return out,
-            };
-            let filename = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let (meta, body) = crate::vault::frontmatter::parse_note(&raw, &filename);
-            let note_path = path.to_string_lossy().to_string();
-            for (i, line) in body.lines().enumerate() {
-                let caps = match task_re.captures(line) {
-                    Some(c) => c,
-                    None => continue,
-                };
-                let completed = !caps[1].trim().is_empty();
-                let content = caps[2].to_string();
-                let due = due_re.captures(&content).map(|c| c[1].to_string());
-                let priority = prio_re.captures(&content).map(|c| {
-                    let p = c[1].to_lowercase();
-                    if p == "medium" {
-                        "med".to_string()
-                    } else {
-                        p
-                    }
-                });
-                let mut text = due_re.replace_all(&content, "").to_string();
-                text = prio_re.replace_all(&text, " ").to_string();
-                let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                out.push(crate::types::TaskItem {
-                    note_path: note_path.clone(),
-                    note_title: meta.title.clone(),
-                    line: i,
-                    raw_line: line.to_string(),
-                    text,
-                    completed,
-                    due,
-                    priority,
-                });
-            }
-            out
-        })
-        .collect();
-    Ok(tasks)
+pub async fn get_tasks(
+    state: State<'_, AppState>,
+    note_path: Option<String>,
+) -> Result<Vec<TaskItem>, String> {
+    let vault_path = state
+        .config
+        .lock()
+        .map_err(|error| error.to_string())?
+        .active_vault
+        .clone()
+        .ok_or("No active vault")?;
+    tauri::async_runtime::spawn_blocking(move || scan_tasks(&vault_path, note_path.as_deref()))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
-fn read_task_note(
-    state: &State<'_, AppState>,
-    note_path: &str,
-) -> Result<(String, NoteMeta, String), String> {
-    let config = state.config.lock().map_err(|error| error.to_string())?;
-    let vault_path = config
-        .active_vault
-        .as_ref()
-        .ok_or("No active vault")?
-        .clone();
-    drop(config);
-    let note = operations::read_vault_note(&vault_path, note_path)?;
-    Ok((vault_path, note.meta, note.content))
+fn scan_tasks(vault_path: &str, note_path: Option<&str>) -> Result<Vec<TaskItem>, String> {
+    use rayon::prelude::*;
+
+    if let Some(path) = note_path {
+        let note = operations::read_vault_note(vault_path, path)?;
+        return Ok(parse_note_tasks(path, &note.meta.title, &note.content));
+    }
+
+    let vault = Path::new(vault_path);
+    let hn_dir = operations::helixnotes_dir(vault_path);
+    let paths: Vec<PathBuf> = walkdir::WalkDir::new(vault)
+        .into_iter()
+        .filter_entry(|entry| {
+            !operations::is_hidden(entry.path()) && !entry.path().starts_with(&hn_dir)
+        })
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    == Some("md")
+        })
+        .map(|entry| entry.into_path())
+        .collect();
+
+    Ok(paths
+        .par_iter()
+        .flat_map(|path| {
+            let Ok(raw) = std::fs::read_to_string(path) else {
+                return Vec::new();
+            };
+            let filename = path.file_name().unwrap_or_default().to_string_lossy();
+            let (meta, body) = crate::vault::frontmatter::parse_note(&raw, &filename);
+            parse_note_tasks(&path.to_string_lossy(), &meta.title, &body)
+        })
+        .collect())
+}
+
+fn parse_note_tasks(note_path: &str, note_title: &str, body: &str) -> Vec<TaskItem> {
+    use std::sync::LazyLock;
+
+    static TASK_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^\s*[-*]\s\[([ xX])\]\s+(.+?)\s*$").unwrap());
+    static DUE_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\bdue:(\d{4}-\d{2}-\d{2})\b").unwrap());
+    static PRIORITY_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?i)(?:^|\s)!(high|medium|med|low)\b").unwrap());
+
+    let mut tasks = Vec::new();
+    for (line_number, line) in body.lines().enumerate() {
+        let Some(caps) = TASK_RE.captures(line) else {
+            continue;
+        };
+        let completed = !caps[1].trim().is_empty();
+        let content = &caps[2];
+        let due = DUE_RE
+            .captures(content)
+            .map(|captures| captures[1].to_string());
+        let priority = PRIORITY_RE.captures(content).map(|captures| {
+            let priority = captures[1].to_lowercase();
+            if priority == "medium" {
+                "med".to_string()
+            } else {
+                priority
+            }
+        });
+        let text = DUE_RE.replace_all(content, "");
+        let text = PRIORITY_RE.replace_all(&text, " ");
+        tasks.push(TaskItem {
+            note_path: note_path.to_string(),
+            note_title: note_title.to_string(),
+            line: line_number,
+            raw_line: line.to_string(),
+            text: text.split_whitespace().collect::<Vec<_>>().join(" "),
+            completed,
+            due,
+            priority,
+        });
+    }
+    tasks
+}
+
+#[cfg(test)]
+mod task_tests {
+    use super::scan_tasks;
+
+    #[test]
+    fn targeted_task_scan_limits_results_and_keeps_task_metadata() {
+        let vault = tempfile::tempdir().unwrap();
+        let selected = vault.path().join("Selected.md");
+        std::fs::write(
+            &selected,
+            "---\ntitle: Selected title\n---\n# Selected title\n\n- [x] Ship !medium due:2026-09-30\n",
+        )
+        .unwrap();
+        std::fs::write(vault.path().join("Other.md"), "- [ ] Unrelated task\n").unwrap();
+
+        let tasks = scan_tasks(
+            &vault.path().to_string_lossy(),
+            Some(&selected.to_string_lossy()),
+        )
+        .unwrap();
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].note_path, selected.to_string_lossy());
+        assert_eq!(tasks[0].note_title, "Selected title");
+        assert_eq!(tasks[0].line, 2);
+        assert_eq!(tasks[0].text, "Ship");
+        assert_eq!(tasks[0].priority.as_deref(), Some("med"));
+        assert_eq!(tasks[0].due.as_deref(), Some("2026-09-30"));
+        assert!(tasks[0].completed);
+
+        std::fs::write(&selected, "No tasks remain.\n").unwrap();
+        assert!(scan_tasks(
+            &vault.path().to_string_lossy(),
+            Some(&selected.to_string_lossy()),
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
+    fn targeted_task_scan_rejects_notes_outside_the_active_vault() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = root.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        let outside = root.path().join("Outside.md");
+        std::fs::write(&outside, "- [ ] Outside task\n").unwrap();
+
+        assert!(scan_tasks(&vault.to_string_lossy(), Some(&outside.to_string_lossy())).is_err());
+    }
 }
 
 fn toggle_checkbox_line(line: &str, done: bool) -> String {
@@ -1191,14 +1360,21 @@ fn toggle_checkbox_line(line: &str, done: bool) -> String {
 }
 
 #[tauri::command]
-pub fn set_task_done(
+pub async fn set_task_done(
     state: State<'_, AppState>,
+    vault_path: String,
     note_path: String,
     line: usize,
     raw_line: String,
     done: bool,
 ) -> Result<(), String> {
-    let (vault_path, meta, body) = read_task_note(&state, &note_path)?;
+    let search = state.vault_snapshot(&vault_path)?;
+    let _write_guard = state.note_save.lock().await;
+    let NoteContent {
+        meta,
+        content: body,
+        ..
+    } = operations::read_vault_note(&vault_path, &note_path)?;
     let mut lines: Vec<String> = body.lines().map(|l| l.to_string()).collect();
     // Verify the expected line; if the note drifted, fall back to the first exact match.
     let idx = if lines.get(line).map(|l| *l == raw_line).unwrap_or(false) {
@@ -1219,9 +1395,9 @@ pub fn set_task_done(
     if body.ends_with('\n') && !new_body.ends_with('\n') {
         new_body.push('\n');
     }
-    operations::save_note(&vault_path, &note_path, &meta, &new_body)?;
-
-    index_note_bg(&state, &note_path);
+    if operations::save_note(&vault_path, &note_path, &meta, &new_body)?.is_some() {
+        index_note_bg(search, &note_path);
+    }
     Ok(())
 }
 
@@ -1236,8 +1412,9 @@ fn set_priority_on_line(line: &str, priority: Option<&str>) -> String {
 }
 
 #[tauri::command]
-pub fn set_task_priority(
+pub async fn set_task_priority(
     state: State<'_, AppState>,
+    vault_path: String,
     note_path: String,
     line: usize,
     raw_line: String,
@@ -1252,7 +1429,13 @@ pub fn set_task_priority(
         Some(_) => return Err("Invalid priority".to_string()),
     };
 
-    let (vault_path, meta, body) = read_task_note(&state, &note_path)?;
+    let search = state.vault_snapshot(&vault_path)?;
+    let _write_guard = state.note_save.lock().await;
+    let NoteContent {
+        meta,
+        content: body,
+        ..
+    } = operations::read_vault_note(&vault_path, &note_path)?;
     let mut lines: Vec<String> = body.lines().map(|l| l.to_string()).collect();
     let idx = if lines.get(line).map(|l| *l == raw_line).unwrap_or(false) {
         line
@@ -1272,9 +1455,9 @@ pub fn set_task_priority(
     if body.ends_with('\n') && !new_body.ends_with('\n') {
         new_body.push('\n');
     }
-    operations::save_note(&vault_path, &note_path, &meta, &new_body)?;
-
-    index_note_bg(&state, &note_path);
+    if operations::save_note(&vault_path, &note_path, &meta, &new_body)?.is_some() {
+        index_note_bg(search, &note_path);
+    }
     Ok(())
 }
 
@@ -1289,8 +1472,9 @@ fn set_due_on_line(line: &str, due: Option<&str>) -> String {
 }
 
 #[tauri::command]
-pub fn set_task_due(
+pub async fn set_task_due(
     state: State<'_, AppState>,
+    vault_path: String,
     note_path: String,
     line: usize,
     raw_line: String,
@@ -1304,7 +1488,13 @@ pub fn set_task_due(
         Some(_) => return Err("Invalid due date".to_string()),
     };
 
-    let (vault_path, meta, body) = read_task_note(&state, &note_path)?;
+    let search = state.vault_snapshot(&vault_path)?;
+    let _write_guard = state.note_save.lock().await;
+    let NoteContent {
+        meta,
+        content: body,
+        ..
+    } = operations::read_vault_note(&vault_path, &note_path)?;
     let mut lines: Vec<String> = body.lines().map(|l| l.to_string()).collect();
     let idx = if lines.get(line).map(|l| *l == raw_line).unwrap_or(false) {
         line
@@ -1324,111 +1514,229 @@ pub fn set_task_due(
     if body.ends_with('\n') && !new_body.ends_with('\n') {
         new_body.push('\n');
     }
-    operations::save_note(&vault_path, &note_path, &meta, &new_body)?;
-
-    index_note_bg(&state, &note_path);
+    if operations::save_note(&vault_path, &note_path, &meta, &new_body)?.is_some() {
+        index_note_bg(search, &note_path);
+    }
     Ok(())
 }
 
 // ── Search ──
 
 #[tauri::command]
-pub fn search_notes(
+pub async fn search_notes(
     state: State<'_, AppState>,
     query: String,
     limit: Option<usize>,
-) -> Result<Vec<SearchResult>, String> {
-    let search_guard = state.search_index.lock().map_err(|e| e.to_string())?;
-    let search = search_guard
-        .as_ref()
+    offset: Option<usize>,
+) -> Result<SearchPage, String> {
+    let search = state
+        .search_index
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone()
         .ok_or("Search index not initialized")?;
-    search.search(&query, limit.unwrap_or(20))
+    tauri::async_runtime::spawn_blocking(move || {
+        search.search(&query, limit.unwrap_or(20), offset.unwrap_or(0))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn reindex(state: State<'_, AppState>) -> Result<(), String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    let search_guard = state.search_index.lock().map_err(|e| e.to_string())?;
-    let search = search_guard
-        .as_ref()
-        .ok_or("Search index not initialized")?;
-    search.rebuild(vault_path)
+pub async fn reindex(state: State<'_, AppState>) -> Result<(), String> {
+    let (search, vault_path) = state.active_search()?;
+    tauri::async_runtime::spawn_blocking(move || search.rebuild(&vault_path))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 // ── Trash ──
 
 #[tauri::command]
-pub fn get_trash(state: State<'_, AppState>) -> Result<TrashContents, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::get_trash_contents(vault_path)
+pub async fn get_trash(state: State<'_, AppState>) -> Result<TrashContents, String> {
+    let vault_path = state
+        .config
+        .lock()
+        .map_err(|error| error.to_string())?
+        .active_vault
+        .clone()
+        .ok_or("No active vault")?;
+    tauri::async_runtime::spawn_blocking(move || operations::get_trash_contents(&vault_path))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn restore_note(
+pub async fn restore_note(
     state: State<'_, AppState>,
+    vault_path: String,
     trash_path: String,
     dest_notebook: Option<String>,
 ) -> Result<String, String> {
-    let vault_path = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        config
-            .active_vault
-            .as_ref()
-            .ok_or("No active vault")?
-            .clone()
-    };
-    operations::restore_note(&vault_path, &trash_path, dest_notebook.as_deref())
+    let search = state.vault_snapshot(&vault_path)?;
+    let _write_guard = state.note_save.lock().await;
+    let restored = operations::restore_note(&vault_path, &trash_path, dest_notebook.as_deref())?;
+    index_note_bg(search, &restored);
+    Ok(restored)
 }
 
 #[tauri::command]
-pub fn restore_notebook(state: State<'_, AppState>, trash_path: String) -> Result<String, String> {
-    let vault_path = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        config
-            .active_vault
-            .as_ref()
-            .ok_or("No active vault")?
-            .clone()
-    };
-    operations::restore_notebook(&vault_path, &trash_path)
+pub async fn restore_notebook(
+    state: State<'_, AppState>,
+    vault_path: String,
+    trash_path: String,
+) -> Result<String, String> {
+    let search = state.vault_snapshot(&vault_path)?;
+    let _write_guard = state.note_save.lock().await;
+    let restored = operations::restore_notebook(&vault_path, &trash_path)?;
+    if let Some(search) = search {
+        if let Err(error) = search.queue_vault_refresh(&vault_path) {
+            log::error!("Failed to queue restored notebook search refresh: {error}");
+        }
+    }
+    Ok(restored)
 }
 
 #[tauri::command]
-pub fn permanent_delete(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    let vault_path = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        config
-            .active_vault
-            .as_ref()
-            .ok_or("No active vault")?
-            .clone()
-    };
+pub async fn permanent_delete(
+    state: State<'_, AppState>,
+    vault_path: String,
+    path: String,
+) -> Result<(), String> {
+    state.validate_vault(&vault_path)?;
+    let _write_guard = state.note_save.lock().await;
     operations::permanent_delete(&vault_path, &path)
 }
 
 #[tauri::command]
-pub fn empty_trash(state: State<'_, AppState>) -> Result<(), String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::empty_trash(vault_path)
+pub async fn empty_trash(state: State<'_, AppState>, vault_path: String) -> Result<(), String> {
+    state.validate_vault(&vault_path)?;
+    let _write_guard = state.note_save.lock().await;
+    operations::empty_trash(&vault_path)
 }
 
 // ── Vault State ──
 
 #[tauri::command]
-pub fn load_vault_state(state: State<'_, AppState>) -> Result<VaultState, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::load_vault_state(vault_path)
+pub async fn load_vault_state(
+    state: State<'_, AppState>,
+    vault_path: String,
+) -> Result<VaultState, String> {
+    if state
+        .config
+        .lock()
+        .map_err(|error| error.to_string())?
+        .active_vault
+        .as_deref()
+        != Some(vault_path.as_str())
+    {
+        return Err("Vault changed before loading its state".to_string());
+    }
+    let read_guard = state.note_save.clone().lock_owned().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _read_guard = read_guard;
+        operations::load_vault_state(&vault_path)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn save_vault_state(state: State<'_, AppState>, vault_state: VaultState) -> Result<(), String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::save_vault_state(vault_path, &vault_state)
+pub async fn save_vault_state(
+    state: State<'_, AppState>,
+    vault_path: String,
+    vault_state: VaultState,
+) -> Result<(), String> {
+    if state
+        .config
+        .lock()
+        .map_err(|error| error.to_string())?
+        .active_vault
+        .as_deref()
+        != Some(vault_path.as_str())
+    {
+        return Err("Vault changed before saving its state".to_string());
+    }
+    // Serialize state writes with the existing vault write queue so concurrent
+    // navigation updates cannot finish out of order or race a state read.
+    let save_guard = state.note_save.clone().lock_owned().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _save_guard = save_guard;
+        operations::save_vault_state(&vault_path, &vault_state)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[cfg(test)]
+mod vault_state_scope_tests {
+    use super::*;
+    use futures::FutureExt;
+
+    #[tokio::test]
+    async fn queued_state_write_keeps_its_originating_vault() -> Result<(), String> {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::create_dir(first.path().join(".helixnotes")).unwrap();
+        std::fs::create_dir(second.path().join(".helixnotes")).unwrap();
+        let first_path = first.path().to_string_lossy().into_owned();
+        let second_path = second.path().to_string_lossy().into_owned();
+        let first_state = VaultState {
+            sidebar_width: 240.0,
+            last_open_note: Some(first.path().join("A.md").to_string_lossy().into_owned()),
+            ..VaultState::default()
+        };
+        let second_state = VaultState {
+            sidebar_width: 360.0,
+            ..VaultState::default()
+        };
+        operations::save_vault_state(&second_path, &second_state).unwrap();
+        let app = tauri::test::mock_builder()
+            .manage(AppState::new(AppConfig {
+                active_vault: Some(first_path.clone()),
+                ..AppConfig::default()
+            }))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = app.state::<AppState>();
+        let saving_note = state.note_save.lock().await;
+        let mut pending = Box::pin(save_vault_state(
+            app.state(),
+            first_path.clone(),
+            first_state.clone(),
+        ));
+        assert!(pending.as_mut().now_or_never().is_none());
+        state
+            .config
+            .lock()
+            .map_err(|error| error.to_string())?
+            .active_vault = Some(second_path.clone());
+        drop(saving_note);
+        pending.await?;
+
+        let saved_first = operations::load_vault_state(&first_path).unwrap();
+        assert_eq!(saved_first.sidebar_width, 240.0);
+        assert_eq!(saved_first.last_open_note, first_state.last_open_note);
+        assert_eq!(
+            operations::load_vault_state(&second_path)
+                .unwrap()
+                .sidebar_width,
+            360.0
+        );
+        assert!(
+            save_vault_state(app.state(), first_path.clone(), first_state)
+                .await
+                .is_err()
+        );
+        assert!(load_vault_state(app.state(), first_path).await.is_err());
+        assert_eq!(
+            load_vault_state(app.state(), second_path)
+                .await?
+                .sidebar_width,
+            360.0
+        );
+        Ok(())
+    }
 }
 
 // ── Clipboard ──
@@ -1454,160 +1762,236 @@ pub fn copy_text_to_clipboard(_text: String) -> Result<(), String> {
 /// Returns PNG bytes as Vec<u8>, or error if no image on clipboard.
 #[cfg(desktop)]
 #[tauri::command]
-pub fn read_clipboard_image() -> Result<Vec<u8>, String> {
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|e| format!("Clipboard init failed: {}", e))?;
-    let img = clipboard
-        .get_image()
-        .map_err(|_| "No image on clipboard".to_string())?;
-    // Encode RGBA data to PNG
-    let mut buf: Vec<u8> = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(
-            std::io::Cursor::new(&mut buf),
-            img.width as u32,
-            img.height as u32,
-        );
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder
-            .write_header()
-            .map_err(|e| format!("PNG header failed: {}", e))?;
-        writer
-            .write_image_data(&img.bytes)
-            .map_err(|e| format!("PNG encode failed: {}", e))?;
-    }
-    Ok(buf)
+pub async fn read_clipboard_image() -> Result<Vec<u8>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|e| format!("Clipboard init failed: {}", e))?;
+        let img = clipboard
+            .get_image()
+            .map_err(|_| "No image on clipboard".to_string())?;
+        // Encode RGBA data to PNG
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(
+                std::io::Cursor::new(&mut buf),
+                img.width as u32,
+                img.height as u32,
+            );
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder
+                .write_header()
+                .map_err(|e| format!("PNG header failed: {}", e))?;
+            writer
+                .write_image_data(&img.bytes)
+                .map_err(|e| format!("PNG encode failed: {}", e))?;
+        }
+        Ok(buf)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[cfg(mobile)]
 #[tauri::command]
-pub fn read_clipboard_image() -> Result<Vec<u8>, String> {
+pub async fn read_clipboard_image() -> Result<Vec<u8>, String> {
     Err("Clipboard image reading not supported on Android".to_string())
 }
 
 /// Copy an image file to the system clipboard.
 #[cfg(desktop)]
 #[tauri::command]
-pub fn copy_image_to_clipboard(app: AppHandle, path: String) -> Result<(), String> {
+pub async fn copy_image_to_clipboard(app: AppHandle, path: String) -> Result<(), String> {
     ensure_readable_path(&app, Path::new(&path))?;
-    let data = std::fs::read(&path).map_err(|e| format!("Failed to read image: {}", e))?;
-    let img =
-        image::load_from_memory(&data).map_err(|e| format!("Failed to decode image: {}", e))?;
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    let img_data = arboard::ImageData {
-        width: w as usize,
-        height: h as usize,
-        bytes: std::borrow::Cow::Owned(rgba.into_raw()),
-    };
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|e| format!("Clipboard init failed: {}", e))?;
-    clipboard
-        .set_image(img_data)
-        .map_err(|e| format!("Failed to set clipboard image: {}", e))?;
-    Ok(())
+    tauri::async_runtime::spawn_blocking(move || {
+        let data = std::fs::read(&path).map_err(|e| format!("Failed to read image: {}", e))?;
+        let img =
+            image::load_from_memory(&data).map_err(|e| format!("Failed to decode image: {}", e))?;
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let img_data = arboard::ImageData {
+            width: w as usize,
+            height: h as usize,
+            bytes: std::borrow::Cow::Owned(rgba.into_raw()),
+        };
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|e| format!("Clipboard init failed: {}", e))?;
+        clipboard
+            .set_image(img_data)
+            .map_err(|e| format!("Failed to set clipboard image: {}", e))?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[cfg(mobile)]
 #[tauri::command]
-pub fn copy_image_to_clipboard(_app: AppHandle, _path: String) -> Result<(), String> {
+pub async fn copy_image_to_clipboard(_app: AppHandle, _path: String) -> Result<(), String> {
     Err("Clipboard image copy not supported on Android".to_string())
 }
 
 /// Copy PNG bytes directly to the system clipboard.
 #[cfg(desktop)]
 #[tauri::command]
-pub fn copy_png_to_clipboard(data: Vec<u8>) -> Result<(), String> {
-    let img =
-        image::load_from_memory(&data).map_err(|e| format!("Failed to decode image: {}", e))?;
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    let img_data = arboard::ImageData {
-        width: w as usize,
-        height: h as usize,
-        bytes: std::borrow::Cow::Owned(rgba.into_raw()),
-    };
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|e| format!("Clipboard init failed: {}", e))?;
-    clipboard
-        .set_image(img_data)
-        .map_err(|e| format!("Failed to set clipboard image: {}", e))?;
-    Ok(())
+pub async fn copy_png_to_clipboard(data: Vec<u8>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let img =
+            image::load_from_memory(&data).map_err(|e| format!("Failed to decode image: {}", e))?;
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let img_data = arboard::ImageData {
+            width: w as usize,
+            height: h as usize,
+            bytes: std::borrow::Cow::Owned(rgba.into_raw()),
+        };
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|e| format!("Clipboard init failed: {}", e))?;
+        clipboard
+            .set_image(img_data)
+            .map_err(|e| format!("Failed to set clipboard image: {}", e))?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[cfg(mobile)]
 #[tauri::command]
-pub fn copy_png_to_clipboard(_data: Vec<u8>) -> Result<(), String> {
+pub async fn copy_png_to_clipboard(_data: Vec<u8>) -> Result<(), String> {
     Err("Clipboard image copy not supported on Android".to_string())
 }
 
 // ── Attachments ──
 
 #[tauri::command]
-pub fn save_image(
+pub async fn save_image(
     state: State<'_, AppState>,
+    vault_path: String,
     name: String,
     data: Vec<u8>,
 ) -> Result<String, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::save_image(vault_path, &name, &data)
+    state.validate_vault(&vault_path)?;
+    let write_guard = state.note_save.clone().lock_owned().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _write_guard = write_guard;
+        operations::save_image(&vault_path, &name, &data)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn save_attachment(
+pub async fn save_attachment(
     state: State<'_, AppState>,
+    vault_path: String,
     name: String,
     data: Vec<u8>,
 ) -> Result<String, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::save_attachment(vault_path, &name, &data)
+    state.validate_vault(&vault_path)?;
+    let write_guard = state.note_save.clone().lock_owned().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _write_guard = write_guard;
+        operations::save_attachment(&vault_path, &name, &data)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 // ── Notebook Icons ──
 
 #[tauri::command]
-pub fn get_notebook_icons(
+pub async fn get_notebook_icons(
     state: State<'_, AppState>,
+    vault_path: String,
 ) -> Result<std::collections::HashMap<String, String>, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::load_notebook_icons(vault_path)
+    state.validate_vault(&vault_path)?;
+    tauri::async_runtime::spawn_blocking(move || operations::load_notebook_icons(&vault_path))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn set_notebook_icon(
+pub async fn set_notebook_icon(
     state: State<'_, AppState>,
+    vault_path: String,
     notebook_relative: String,
     icon_relative: Option<String>,
 ) -> Result<(), String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::set_notebook_icon(vault_path, &notebook_relative, icon_relative.as_deref())
+    state.validate_vault(&vault_path)?;
+    let write_guard = state.note_save.clone().lock_owned().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _write_guard = write_guard;
+        operations::set_notebook_icon(&vault_path, &notebook_relative, icon_relative.as_deref())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn import_notebook_icon(
+    state: State<'_, AppState>,
+    vault_path: String,
+    notebook_relative: String,
+    name: String,
+    data: Vec<u8>,
+) -> Result<String, String> {
+    state.validate_vault(&vault_path)?;
+    let write_guard = state.note_save.clone().lock_owned().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _write_guard = write_guard;
+        operations::import_notebook_icon(&vault_path, &notebook_relative, &name, &data)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 // ── Tag Styles ──
 
 #[tauri::command]
-pub fn get_tag_styles(
+pub async fn get_tag_styles(
     state: State<'_, AppState>,
+    vault_path: String,
 ) -> Result<std::collections::HashMap<String, crate::types::TagStyle>, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::load_tag_styles(vault_path)
+    state.validate_vault(&vault_path)?;
+    tauri::async_runtime::spawn_blocking(move || operations::load_tag_styles(&vault_path))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn set_tag_style(
+pub async fn set_tag_style(
     state: State<'_, AppState>,
+    vault_path: String,
     tag: String,
-    style: Option<crate::types::TagStyle>,
-) -> Result<(), String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::set_tag_style(vault_path, &tag, style)
+    change: TagStyleChange,
+) -> Result<Option<TagStyle>, String> {
+    state.validate_vault(&vault_path)?;
+    let write_guard = state.note_save.clone().lock_owned().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _write_guard = write_guard;
+        operations::patch_tag_style(&vault_path, &tag, change)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn import_tag_icon(
+    state: State<'_, AppState>,
+    vault_path: String,
+    tag: String,
+    name: String,
+    data: Vec<u8>,
+) -> Result<TagStyle, String> {
+    state.validate_vault(&vault_path)?;
+    let write_guard = state.note_save.clone().lock_owned().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _write_guard = write_guard;
+        operations::import_tag_icon(&vault_path, &tag, &name, &data)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 // ── General Settings ──
@@ -1677,42 +2061,56 @@ pub fn set_general_settings(
 // ── Quick Access ──
 
 #[tauri::command]
-pub async fn get_quick_access(state: State<'_, AppState>) -> Result<Vec<NoteEntry>, String> {
+pub async fn get_quick_access(
+    state: State<'_, AppState>,
+    vault_path: String,
+) -> Result<Vec<NoteEntry>, String> {
+    state.validate_vault(&vault_path)?;
+    let read_guard = state.note_save.clone().lock_owned().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _read_guard = read_guard;
+        operations::get_quick_access_notes(&vault_path)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn add_quick_access(
+    state: State<'_, AppState>,
+    vault_path: String,
+    note_relative: String,
+) -> Result<(), String> {
+    state.validate_vault(&vault_path)?;
+    let _write_guard = state.note_save.lock().await;
+    operations::add_quick_access(&vault_path, &note_relative)
+}
+
+#[tauri::command]
+pub async fn remove_quick_access(
+    state: State<'_, AppState>,
+    vault_path: String,
+    note_relative: String,
+) -> Result<(), String> {
+    state.validate_vault(&vault_path)?;
+    let _write_guard = state.note_save.lock().await;
+    operations::remove_quick_access(&vault_path, &note_relative)
+}
+
+#[tauri::command]
+pub async fn reorder_quick_access(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<(), String> {
     let vault_path = state
         .config
         .lock()
         .map_err(|error| error.to_string())?
         .active_vault
         .clone()
-        .ok_or_else(|| "No active vault".to_string())?;
-
-    tauri::async_runtime::spawn_blocking(move || operations::get_quick_access_notes(&vault_path))
-        .await
-        .map_err(|error| error.to_string())?
-}
-
-#[tauri::command]
-pub fn add_quick_access(state: State<'_, AppState>, note_relative: String) -> Result<(), String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::add_quick_access(vault_path, &note_relative)
-}
-
-#[tauri::command]
-pub fn remove_quick_access(
-    state: State<'_, AppState>,
-    note_relative: String,
-) -> Result<(), String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::remove_quick_access(vault_path, &note_relative)
-}
-
-#[tauri::command]
-pub fn reorder_quick_access(state: State<'_, AppState>, paths: Vec<String>) -> Result<(), String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    operations::save_quick_access(vault_path, &paths)
+        .ok_or("No active vault")?;
+    let _write_guard = state.note_save.lock().await;
+    operations::save_quick_access(&vault_path, &paths)
 }
 
 #[tauri::command]
@@ -1802,6 +2200,8 @@ pub fn import_obsidian(app: AppHandle) -> Result<(), String> {
 
 fn do_import_obsidian(app: AppHandle, vault_path: &str) -> Result<ImportResult, String> {
     let state = app.state::<AppState>();
+    let _write_guard = state.note_save.blocking_lock();
+    ensure_cleanup_idle(&state)?;
     state
         .importing
         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1825,92 +2225,141 @@ pub struct OrphanAttachment {
 
 // Conservatively find files in .helixnotes/attachments not referenced by ANY note. Scans every
 // .md in the vault (including .helixnotes/trash, so a restorable trashed note keeps its files)
-// plus notebook_icons.json and tag_styles.json, and matches each filename against both the raw text and a
-// percent-decoded copy (so a URL-encoded path like `my%20file.png` still counts as a reference).
+// plus notebook_icons.json and tag_styles.json. A single matcher finds all basename substrings
+// in each source, first raw and then decoded in place (including URL-encoded paths).
 // When in doubt a file is KEPT: a leftover orphan is harmless, a wrong deletion is not.
 fn scan_orphaned_attachments(vault: &str) -> Result<Vec<(String, u64)>, String> {
     let attachments_dir = operations::helixnotes_dir(vault).join("attachments");
-    if !attachments_dir.is_dir() {
-        return Ok(Vec::new());
-    }
+    let entries = match std::fs::read_dir(&attachments_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
     let mut files: Vec<(String, u64)> = Vec::new();
-    for entry in std::fs::read_dir(&attachments_dir).map_err(|e| e.to_string())? {
+    for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;
         let p = entry.path();
-        if p.is_file() {
+        let metadata = p.metadata().map_err(|error| error.to_string())?;
+        if metadata.is_file() {
             let name = p
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let size = metadata.len();
             files.push((name, size));
         }
     }
     if files.is_empty() {
         return Ok(Vec::new());
     }
-    let mut haystack = String::new();
-    for entry in walkdir::WalkDir::new(vault)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
+    let matcher = aho_corasick::AhoCorasick::new(files.iter().map(|(name, _)| name.as_str()))
+        .map_err(|error| error.to_string())?;
+    let mut referenced = vec![false; files.len()];
+    let mut scan_source = |content: String| {
+        // Overlapping matches retain shorter names contained in another attachment's name.
+        for found in matcher.find_overlapping_iter(content.as_bytes()) {
+            referenced[found.pattern().as_usize()] = true;
+        }
+        if !content.contains('%') {
+            return;
+        }
+        let decoded = percent_decode(content);
+        for found in matcher.find_overlapping_iter(&decoded) {
+            referenced[found.pattern().as_usize()] = true;
+        }
+    };
+    for entry in walkdir::WalkDir::new(vault) {
+        let entry = entry.map_err(|error| error.to_string())?;
         let p = entry.path();
-        if p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("md") {
-            if let Ok(content) = std::fs::read_to_string(p) {
-                haystack.push_str(&content);
-                haystack.push('\n');
-            }
+        if p.extension().and_then(|x| x.to_str()) == Some("md")
+            && p.metadata().map_err(|error| error.to_string())?.is_file()
+        {
+            let content = std::fs::read_to_string(p).map_err(|error| error.to_string())?;
+            scan_source(content);
         }
     }
     // Folder and tag icons live in attachments but are referenced here, not in notes. (#157)
     for mapping in ["notebook_icons.json", "tag_styles.json"] {
         let mapping_path = operations::helixnotes_dir(vault).join(mapping);
-        if let Ok(content) = std::fs::read_to_string(&mapping_path) {
-            haystack.push_str(&content);
-            haystack.push('\n');
+        match std::fs::read_to_string(&mapping_path) {
+            Ok(content) => {
+                let references = operations::attachment_metadata_references(mapping, &content)
+                    .map_err(|error| format!("Invalid {mapping}: {error}"))?;
+                scan_source(content);
+                // JSON escapes (including Unicode) are references too. Retain
+                // both the raw representation and decoded string values.
+                for reference in references {
+                    scan_source(reference);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
         }
     }
-    let decoded = percent_decode(&haystack);
     let orphans = files
         .into_iter()
-        .filter(|(name, _)| !haystack.contains(name.as_str()) && !decoded.contains(name.as_str()))
+        .enumerate()
+        .filter_map(|(id, file)| (!referenced[id]).then_some(file))
         .collect();
     Ok(orphans)
 }
 
 #[tauri::command]
-pub fn find_orphaned_attachments(
+pub async fn find_orphaned_attachments(
     state: State<'_, AppState>,
+    vault_path: String,
 ) -> Result<Vec<OrphanAttachment>, String> {
-    let vault = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        config.active_vault.clone().ok_or("No active vault")?
-    };
-    let orphans = scan_orphaned_attachments(&vault)?;
-    Ok(orphans
-        .into_iter()
-        .map(|(name, size)| OrphanAttachment { name, size })
-        .collect())
+    state.validate_vault(&vault_path)?;
+    let save_guard = state.note_save.clone().lock_owned().await;
+    ensure_cleanup_idle(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _save_guard = save_guard;
+        let orphans = scan_orphaned_attachments(&vault_path)?;
+        Ok(orphans
+            .into_iter()
+            .map(|(name, size)| OrphanAttachment { name, size })
+            .collect())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn trash_orphaned_attachments(
+pub async fn trash_orphaned_attachments(
     state: State<'_, AppState>,
+    vault_path: String,
     names: Vec<String>,
 ) -> Result<u32, String> {
-    let vault = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        config.active_vault.clone().ok_or("No active vault")?
-    };
+    state.validate_vault(&vault_path)?;
+    let save_guard = state.note_save.clone().lock_owned().await;
+    ensure_cleanup_idle(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _save_guard = save_guard;
+        trash_orphaned_files(&vault_path, &names)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn ensure_cleanup_idle(state: &AppState) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    if state.importing.load(Ordering::Acquire) || state.syncing.load(Ordering::Acquire) {
+        Err("Attachment cleanup is unavailable while import or sync is running".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn trash_orphaned_files(vault: &str, names: &[String]) -> Result<u32, String> {
     // Re-scan now and only move files that are STILL orphaned (guards against a reference added
     // between scan and confirm), intersected with the caller's selection.
-    let current: std::collections::HashSet<String> = scan_orphaned_attachments(&vault)?
+    let current: std::collections::HashSet<String> = scan_orphaned_attachments(vault)?
         .into_iter()
         .map(|(n, _)| n)
         .collect();
-    let attachments_dir = operations::helixnotes_dir(&vault).join("attachments");
-    let trash_dir = operations::helixnotes_dir(&vault).join("trash");
+    let attachments_dir = operations::helixnotes_dir(vault).join("attachments");
+    let trash_dir = operations::helixnotes_dir(vault).join("trash");
     std::fs::create_dir_all(&trash_dir).map_err(|e| e.to_string())?;
     let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S%3f").to_string();
     let mut moved = 0u32;
@@ -1928,36 +2377,287 @@ pub fn trash_orphaned_attachments(
             continue;
         }
         let src = attachments_dir.join(name);
-        if !src.is_file() {
-            continue;
+        match src.metadata() {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
         }
         let dest = trash_dir.join(format!("{}_{}_attachment_{}", stamp, i, name));
-        if std::fs::rename(&src, &dest).is_ok() {
-            moved += 1;
-        }
+        std::fs::rename(&src, &dest).map_err(|error| error.to_string())?;
+        moved += 1;
     }
     Ok(moved)
 }
 
-fn percent_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        if b == b'%' {
-            let hi = chars.next();
-            let lo = chars.next();
-            if let (Some(h), Some(l)) = (hi, lo) {
-                if let Ok(byte) = u8::from_str_radix(&format!("{}{}", h as char, l as char), 16) {
-                    result.push(byte as char);
-                    continue;
-                }
-            }
-            result.push('%');
-        } else {
-            result.push(b as char);
+#[cfg(test)]
+mod orphan_attachment_tests {
+    use super::{scan_orphaned_attachments, trash_orphaned_files};
+    use crate::vault::operations;
+
+    #[test]
+    fn invalid_icon_metadata_aborts_scan_and_removal_without_losing_attachments() {
+        for (mapping, content) in [
+            ("notebook_icons.json", "{"),
+            ("notebook_icons.json", r#"{"Notebook":42}"#),
+            ("tag_styles.json", r#"{"Work":"not a style"}"#),
+            ("tag_styles.json", r#"{"Work":{"icon":false}}"#),
+            ("tag_styles.json", r#"{"Work":{"color":"red"}}"#),
+            ("tag_styles.json", r#"{"Work":{"unexpected":"keep.png"}}"#),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let vault = root.path().to_str().unwrap();
+            operations::ensure_vault_structure(vault).unwrap();
+            let storage = operations::helixnotes_dir(vault);
+            let attachment = storage.join("attachments/keep.png");
+            std::fs::write(&attachment, b"preserved").unwrap();
+            std::fs::write(storage.join(mapping), content).unwrap();
+            assert!(
+                scan_orphaned_attachments(vault).is_err(),
+                "{mapping}: {content}"
+            );
+            assert!(trash_orphaned_files(vault, &["keep.png".into()]).is_err());
+            assert_eq!(std::fs::read(&attachment).unwrap(), b"preserved");
         }
     }
-    result
+
+    #[test]
+    fn json_escaped_unicode_icon_references_survive_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = root.path().to_str().unwrap();
+        operations::ensure_vault_structure(vault).unwrap();
+        let storage = operations::helixnotes_dir(vault);
+        std::fs::write(storage.join("attachments/猫.png"), b"notebook").unwrap();
+        std::fs::write(storage.join("attachments/é.png"), b"tag").unwrap();
+        std::fs::write(
+            storage.join("notebook_icons.json"),
+            r#"{"Book":"attachments/\u732b.png"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            storage.join("tag_styles.json"),
+            r#"{"Work":{"icon":"attachments/\u00e9.png"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            trash_orphaned_files(vault, &["猫.png".into(), "é.png".into()]).unwrap(),
+            0
+        );
+        assert_eq!(
+            std::fs::read(storage.join("attachments/猫.png")).unwrap(),
+            b"notebook"
+        );
+        assert_eq!(
+            std::fs::read(storage.join("attachments/é.png")).unwrap(),
+            b"tag"
+        );
+    }
+
+    #[test]
+    fn cleanup_keeps_plain_overlapping_and_literal_percent_basenames() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = root.path().to_str().unwrap();
+        operations::ensure_vault_structure(vault).unwrap();
+        let attachments = operations::helixnotes_dir(vault).join("attachments");
+        for name in [
+            "plain.txt",
+            "icon.png",
+            "folder-icon.png",
+            "folder-icon.png.backup",
+            "literal%20space.png",
+            "literal space.png",
+            "orphan.png",
+        ] {
+            std::fs::write(attachments.join(name), b"image").unwrap();
+        }
+        std::fs::write(
+            root.path().join("Mentions.md"),
+            "Not links: prefixplain.txtsuffix folder-icon.png.backup literal%20space.png",
+        )
+        .unwrap();
+
+        assert_eq!(
+            scan_orphaned_attachments(vault).unwrap(),
+            vec![("orphan.png".into(), 5)]
+        );
+    }
+
+    #[test]
+    fn cleanup_keeps_unicode_and_encoded_references_from_every_source() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = root.path().to_str().unwrap();
+        operations::ensure_vault_structure(vault).unwrap();
+        let storage = operations::helixnotes_dir(vault);
+        let attachments = storage.join("attachments");
+        for name in [
+            "raw 猫.png",
+            "猫 spaced.png",
+            "café.png",
+            "%Q猫 image.png",
+            "%G1broken image.png",
+            "after-bad image.png",
+            "trailing%",
+            "trash ü.png",
+            "history ね.png",
+            "📁 icon.png",
+            "é tag.png",
+            "映像.png",
+            "orphan.png",
+        ] {
+            std::fs::write(attachments.join(name), b"image").unwrap();
+        }
+        std::fs::write(
+            root.path().join("Unicode.md"),
+            "raw 猫.png 猫%20spaced.png %63%61%66%c3%a9.png\n\
+             %Q猫%20image.png %G1broken%20image.png %FFafter-bad%20image.png trailing%",
+        )
+        .unwrap();
+        std::fs::write(storage.join("trash/old.md"), "![trash](trash%20%C3%BC.png)").unwrap();
+        std::fs::create_dir_all(storage.join("history/Old")).unwrap();
+        std::fs::write(
+            storage.join("history/Old/1.md"),
+            "![history](history%20%E3%81%AD.png)",
+        )
+        .unwrap();
+        std::fs::write(
+            storage.join("notebook_icons.json"),
+            r#"{"Notebook":"attachments/%F0%9F%93%81%20icon.png"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            storage.join("tag_styles.json"),
+            r#"{"encoded":{"icon":"attachments/%C3%A9%20tag.png"},"raw":{"icon":"attachments/映像.png"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            scan_orphaned_attachments(vault).unwrap(),
+            vec![("orphan.png".into(), 5)]
+        );
+    }
+
+    #[test]
+    fn unreadable_mapping_aborts_even_after_all_attachments_are_referenced() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = root.path().to_str().unwrap();
+        operations::ensure_vault_structure(vault).unwrap();
+        let storage = operations::helixnotes_dir(vault);
+        let attachment = storage.join("attachments/keep.png");
+        std::fs::write(&attachment, b"image").unwrap();
+        std::fs::write(root.path().join("Note.md"), "keep.png").unwrap();
+        std::fs::write(storage.join("notebook_icons.json"), [0xff]).unwrap();
+
+        assert!(trash_orphaned_files(vault, &["keep.png".into()]).is_err());
+        assert_eq!(std::fs::read(attachment).unwrap(), b"image");
+    }
+
+    #[test]
+    fn cleanup_revalidates_references_and_only_trashes_selected_orphans() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = root.path().to_str().unwrap();
+        operations::ensure_vault_structure(vault).unwrap();
+        let storage = operations::helixnotes_dir(vault);
+        let attachments = storage.join("attachments");
+        for name in [
+            "late.png",
+            "trashed image.png",
+            "icon.png",
+            "orphan.png",
+            "unselected.png",
+        ] {
+            std::fs::write(attachments.join(name), b"image").unwrap();
+        }
+        std::fs::write(
+            storage.join("trash/old.md"),
+            "![kept](../attachments/trashed%20image.png)",
+        )
+        .unwrap();
+        std::fs::write(
+            storage.join("notebook_icons.json"),
+            r#"{"Notebook":"attachments/icon.png"}"#,
+        )
+        .unwrap();
+        let mut found: Vec<_> = scan_orphaned_attachments(vault)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        found.sort();
+        assert_eq!(found, ["late.png", "orphan.png", "unselected.png"]);
+
+        std::fs::write(root.path().join("New.md"), "![added](late.png)").unwrap();
+        let selected = vec!["late.png".into(), "orphan.png".into(), "../New.md".into()];
+        assert_eq!(trash_orphaned_files(vault, &selected).unwrap(), 1);
+        for name in [
+            "late.png",
+            "trashed image.png",
+            "icon.png",
+            "unselected.png",
+        ] {
+            assert_eq!(std::fs::read(attachments.join(name)).unwrap(), b"image");
+        }
+        assert!(!attachments.join("orphan.png").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("New.md")).unwrap(),
+            "![added](late.png)"
+        );
+        let trashed = std::fs::read_dir(storage.join("trash"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with("_attachment_orphan.png")
+            })
+            .unwrap();
+        assert_eq!(std::fs::read(trashed).unwrap(), b"image");
+    }
+
+    #[test]
+    fn unreadable_reference_sources_abort_cleanup_without_moving_files() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = root.path().to_str().unwrap();
+        operations::ensure_vault_structure(vault).unwrap();
+        let storage = operations::helixnotes_dir(vault);
+        let attachment = storage.join("attachments/keep.png");
+        std::fs::write(&attachment, b"image").unwrap();
+        let note = root.path().join("Unreadable.md");
+        std::fs::write(&note, [0xff, 0xfe]).unwrap();
+        assert!(trash_orphaned_files(vault, &["keep.png".into()]).is_err());
+        assert_eq!(std::fs::read(&attachment).unwrap(), b"image");
+
+        std::fs::remove_file(note).unwrap();
+        std::fs::create_dir(storage.join("tag_styles.json")).unwrap();
+        assert!(trash_orphaned_files(vault, &["keep.png".into()]).is_err());
+        assert_eq!(std::fs::read(attachment).unwrap(), b"image");
+    }
+}
+
+fn percent_decode(s: String) -> Vec<u8> {
+    // Reuse the source buffer and match bytes, so Unicode is neither re-encoded nor made lossy.
+    // Invalid/truncated escapes remain literal; only a complete %HH consumes three bytes.
+    let mut bytes = s.into_bytes();
+    let mut read = 0;
+    let mut write = 0;
+    while read < bytes.len() {
+        if bytes[read] == b'%' && read + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                (bytes[read + 1] as char).to_digit(16),
+                (bytes[read + 2] as char).to_digit(16),
+            ) {
+                bytes[write] = ((hi << 4) | lo) as u8;
+                read += 3;
+                write += 1;
+                continue;
+            }
+        }
+        bytes[write] = bytes[read];
+        read += 1;
+        write += 1;
+    }
+    bytes.truncate(write);
+    bytes
 }
 
 // ── Open files and URLs with the system default handler ──
@@ -2284,37 +2984,59 @@ pub fn set_backup_settings(
 // ── Version History ──
 
 #[tauri::command]
-pub fn get_note_versions(
+pub async fn get_note_versions(
     state: State<'_, AppState>,
+    vault_path: String,
     note_id: String,
 ) -> Result<Vec<crate::types::VersionEntry>, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    crate::history::list_versions(vault_path, &note_id)
+    state.validate_vault(&vault_path)?;
+    let read_guard = state.note_save.clone().lock_owned().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _read_guard = read_guard;
+        crate::history::list_versions(&vault_path, &note_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn create_version(
+pub async fn create_version(
     state: State<'_, AppState>,
+    vault_path: String,
     path: String,
     note_id: String,
 ) -> Result<(), String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    let max_versions = config.max_versions_per_note;
-    let raw = operations::read_vault_note(vault_path, &path)?.raw;
-    crate::history::force_snapshot(vault_path, &note_id, &raw, max_versions)
+    state.validate_vault(&vault_path)?;
+    let max_versions = state
+        .config
+        .lock()
+        .map_err(|error| error.to_string())?
+        .max_versions_per_note;
+    let save_guard = state.note_save.clone().lock_owned().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _save_guard = save_guard;
+        let raw = operations::read_vault_note(&vault_path, &path)?.raw;
+        crate::history::force_snapshot(&vault_path, &note_id, &raw, max_versions)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn get_note_version_content(
+pub async fn get_note_version_content(
     state: State<'_, AppState>,
+    vault_path: String,
     note_id: String,
     timestamp: String,
 ) -> Result<String, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
-    crate::history::get_version(vault_path, &note_id, &timestamp)
+    state.validate_vault(&vault_path)?;
+    let read_guard = state.note_save.clone().lock_owned().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _read_guard = read_guard;
+        crate::history::get_version(&vault_path, &note_id, &timestamp)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 // ── AI ──
@@ -2796,8 +3518,12 @@ mod config_permission_tests {
 
 fn save_app_config(config: &AppConfig) -> Result<(), String> {
     let path = app_config_path()?;
+    save_app_config_to(config, &path)
+}
+
+fn save_app_config_to(config: &AppConfig, path: &Path) -> Result<(), String> {
     let data = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
-    write_private_file(&path, data.as_bytes())?;
+    write_private_file(path, data.as_bytes())?;
     Ok(())
 }
 
@@ -2849,5 +3575,596 @@ pub fn get_install_type() -> String {
         "appimage".to_string()
     } else {
         "native".to_string()
+    }
+}
+
+#[cfg(test)]
+mod vault_runtime_tests {
+    use super::*;
+    use std::sync::{Arc, TryLockError};
+    use std::time::{Duration, Instant};
+
+    fn activate(state: &AppState, path: &str, index: Arc<SearchIndex>) {
+        let mut search = state.search_index.lock().unwrap();
+        let mut config = state.config.lock().unwrap();
+        *search = Some(index);
+        config.active_vault = Some(path.to_string());
+    }
+
+    fn wait_for_search_lock(state: &AppState) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match state.search_index.try_lock() {
+                Err(TryLockError::WouldBlock) => return,
+                Err(TryLockError::Poisoned(error)) => panic!("{error}"),
+                Ok(_) => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "runtime operation did not acquire search before config"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn reopening_a_vault_reuses_the_index_retained_by_background_work() {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("A").to_string_lossy().into_owned();
+        let b = root.path().join("B").to_string_lossy().into_owned();
+        operations::ensure_vault_structure(&a).unwrap();
+        operations::ensure_vault_structure(&b).unwrap();
+        let note = operations::create_note(&a, None, "Alpha").unwrap();
+        let state = AppState::new(AppConfig::default());
+        let first = state.search_index_for_vault(&a).unwrap();
+        first.rebuild(&a).unwrap();
+        activate(&state, &a, first.clone());
+
+        let background_work = first;
+        let second = state.search_index_for_vault(&b).unwrap();
+        activate(&state, &b, second);
+        let reopened = state.search_index_for_vault(&a).unwrap();
+        assert_eq!(
+            reopened.search("Alpha", 10, 0).unwrap().results[0].path,
+            note.path
+        );
+        activate(&state, &a, reopened.clone());
+        drop(background_work);
+        state.search_index.lock().unwrap().take();
+        drop(reopened);
+
+        // Expired weak entries do not retain a writer or prevent a later open.
+        let reopened_after_shutdown = state.search_index_for_vault(&a).unwrap();
+        assert_eq!(
+            reopened_after_shutdown
+                .search("Alpha", 10, 0)
+                .unwrap()
+                .results[0]
+                .path,
+            note.path
+        );
+    }
+
+    #[test]
+    fn reindex_snapshot_cannot_mix_vaults_during_a_switch() {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("A").to_string_lossy().into_owned();
+        let b = root.path().join("B").to_string_lossy().into_owned();
+        operations::ensure_vault_structure(&a).unwrap();
+        operations::ensure_vault_structure(&b).unwrap();
+        let alpha = operations::create_note(&a, None, "Alpha").unwrap();
+        let beta = operations::create_note(&b, None, "Beta").unwrap();
+        let state = Arc::new(AppState::new(AppConfig::default()));
+        let first = state.search_index_for_vault(&a).unwrap();
+        let second = state.search_index_for_vault(&b).unwrap();
+        first.rebuild(&a).unwrap();
+        second.rebuild(&b).unwrap();
+        activate(&state, &a, first.clone());
+
+        // Stop the snapshot at its config read, then queue a switch behind it.
+        let config = state.config.lock().unwrap();
+        let snapshot_state = state.clone();
+        let snapshot = std::thread::spawn(move || snapshot_state.active_search().unwrap());
+        wait_for_search_lock(&state);
+        let switch_state = state.clone();
+        let switch_index = second.clone();
+        let switch = std::thread::spawn(move || activate(&switch_state, &b, switch_index));
+        drop(config);
+        let (index, vault_path) = snapshot.join().unwrap();
+        switch.join().unwrap();
+        index.rebuild(&vault_path).unwrap();
+
+        assert_eq!(
+            first.search("Alpha", 10, 0).unwrap().results[0].path,
+            alpha.path
+        );
+        assert!(first.search("Beta", 10, 0).unwrap().results.is_empty());
+        assert_eq!(
+            second.search("Beta", 10, 0).unwrap().results[0].path,
+            beta.path
+        );
+    }
+
+    #[test]
+    fn removing_a_vault_preserves_concurrent_settings_and_rolls_back_write_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = root.path().join("vault").to_string_lossy().into_owned();
+        operations::ensure_vault_structure(&vault).unwrap();
+        let app = tauri::test::mock_builder()
+            .manage(AppState::new(AppConfig {
+                active_vault: Some(vault.clone()),
+                vaults: vec![VaultConfig {
+                    path: vault.clone(),
+                    name: "Vault".into(),
+                    ..VaultConfig::default()
+                }],
+                ..AppConfig::default()
+            }))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = app.state::<AppState>();
+        let index = state.search_index_for_vault(&vault).unwrap();
+        *state.search_index.lock().unwrap() = Some(index.clone());
+
+        assert!(
+            remove_vault_path(app.handle(), &state, vault.clone(), None, root.path(),).is_err()
+        );
+        let (retained_index, retained_path) = state.active_search().unwrap();
+        assert!(Arc::ptr_eq(&retained_index, &index));
+        assert_eq!(retained_path, vault);
+
+        let config_path = root.path().join("app-config.json");
+        let saved_path = config_path.clone();
+        let handle = app.handle().clone();
+        let mut config = state.config.lock().unwrap();
+        let removal = std::thread::spawn(move || {
+            let state = handle.state::<AppState>();
+            remove_vault_path(&handle, &state, vault, None, &config_path)
+        });
+        wait_for_search_lock(&state);
+        config.theme = "nord".into();
+        drop(config);
+        removal.join().unwrap().unwrap();
+
+        assert!(state.search_index.lock().unwrap().is_none());
+        let saved: AppConfig = serde_json::from_slice(&std::fs::read(saved_path).unwrap()).unwrap();
+        assert_eq!(saved.theme, "nord");
+        assert!(saved.active_vault.is_none());
+        assert!(saved.vaults.is_empty());
+        assert_eq!(state.config.lock().unwrap().theme, "nord");
+    }
+}
+
+#[cfg(test)]
+mod mutation_order_tests {
+    use super::*;
+    use futures::FutureExt;
+
+    #[tokio::test]
+    async fn detached_history_quick_access_titles_and_graph_keep_their_origin() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let a = first
+            .path()
+            .join("AlphaVault")
+            .to_string_lossy()
+            .into_owned();
+        let b = second
+            .path()
+            .join("BetaVault")
+            .to_string_lossy()
+            .into_owned();
+        operations::ensure_vault_structure(&a).unwrap();
+        operations::ensure_vault_structure(&b).unwrap();
+        let alpha = operations::create_note(&a, None, "Alpha").unwrap();
+        let beta = operations::create_note(&b, None, "Beta").unwrap();
+        let alpha_raw = operations::read_note(&a, &alpha.path).unwrap().raw;
+        operations::add_quick_access(&b, "Beta.md").unwrap();
+        // The same ID may legitimately exist in a copied vault. Its history
+        // must still be looked up using the window's explicit vault origin.
+        crate::history::force_snapshot(&b, &alpha.meta.id, "Beta history", 20).unwrap();
+        let app = tauri::test::mock_builder()
+            .manage(AppState::new(AppConfig {
+                active_vault: Some(a.clone()),
+                vaults: vec![
+                    VaultConfig {
+                        path: a.clone(),
+                        ..VaultConfig::default()
+                    },
+                    VaultConfig {
+                        path: b.clone(),
+                        ..VaultConfig::default()
+                    },
+                ],
+                ..AppConfig::default()
+            }))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = app.state::<AppState>();
+        let held = state.note_save.lock().await;
+        let mut snapshot = Box::pin(create_version(
+            app.state(),
+            a.clone(),
+            alpha.path.clone(),
+            alpha.meta.id.clone(),
+        ));
+        let mut adding = Box::pin(add_quick_access(app.state(), a.clone(), "Alpha.md".into()));
+        assert!(snapshot.as_mut().now_or_never().is_none());
+        assert!(adding.as_mut().now_or_never().is_none());
+        state.config.lock().unwrap().active_vault = Some(b.clone());
+        drop(held);
+        snapshot.await.unwrap();
+        adding.await.unwrap();
+
+        let versions = get_note_versions(app.state(), a.clone(), alpha.meta.id.clone())
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+        let restored = get_note_version_content(
+            app.state(),
+            a.clone(),
+            alpha.meta.id.clone(),
+            versions[0].timestamp.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored, alpha_raw);
+        let beta_versions = get_note_versions(app.state(), b.clone(), alpha.meta.id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            get_note_version_content(
+                app.state(),
+                b.clone(),
+                alpha.meta.id,
+                beta_versions[0].timestamp.clone(),
+            )
+            .await
+            .unwrap(),
+            "Beta history"
+        );
+
+        let shortcuts = get_quick_access(app.state(), a.clone()).await.unwrap();
+        assert_eq!(
+            shortcuts
+                .iter()
+                .map(|note| note.path.as_str())
+                .collect::<Vec<_>>(),
+            [alpha.path.as_str()]
+        );
+        let titles = get_all_note_titles(app.state(), a.clone()).await.unwrap();
+        assert_eq!(
+            titles
+                .iter()
+                .map(|note| note.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Alpha"]
+        );
+        let graph = get_graph_data(app.state(), a.clone()).unwrap();
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .map(|note| note.path.as_str())
+                .collect::<Vec<_>>(),
+            [alpha.path.as_str()]
+        );
+        remove_quick_access(app.state(), a.clone(), "Alpha.md".into())
+            .await
+            .unwrap();
+        assert!(get_quick_access(app.state(), a).await.unwrap().is_empty());
+        let beta_shortcuts = get_quick_access(app.state(), b).await.unwrap();
+        assert_eq!(
+            beta_shortcuts
+                .iter()
+                .map(|note| note.path.as_str())
+                .collect::<Vec<_>>(),
+            [beta.path.as_str()]
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_writes_and_detached_saves_keep_the_authorized_origin() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let a = first.path().to_string_lossy().into_owned();
+        let b = second.path().to_string_lossy().into_owned();
+        operations::ensure_vault_structure(&a).unwrap();
+        operations::ensure_vault_structure(&b).unwrap();
+        let alpha = operations::create_note(&a, None, "Shared").unwrap();
+        let beta = operations::create_note(&b, None, "Shared").unwrap();
+        let beta_before = std::fs::read(&beta.path).unwrap();
+        let app = tauri::test::mock_builder()
+            .manage(AppState::new(AppConfig {
+                active_vault: Some(a.clone()),
+                vaults: vec![
+                    VaultConfig {
+                        path: a.clone(),
+                        ..VaultConfig::default()
+                    },
+                    VaultConfig {
+                        path: b.clone(),
+                        ..VaultConfig::default()
+                    },
+                ],
+                ..AppConfig::default()
+            }))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = app.state::<AppState>();
+        let held = state.note_save.lock().await;
+        let mut creating = Box::pin(create_note(app.state(), a.clone(), None, "Queued".into()));
+        let mut saving = Box::pin(save_note(
+            app.state(),
+            a.clone(),
+            alpha.path.clone(),
+            alpha.meta.clone(),
+            "# Shared\n\nQueued save".into(),
+        ));
+        assert!(creating.as_mut().now_or_never().is_none());
+        assert!(saving.as_mut().now_or_never().is_none());
+        state.config.lock().unwrap().active_vault = Some(b.clone());
+        // Authorization fails before entering the write queue, not after disk access.
+        let rejected = create_note(
+            app.state(),
+            outside.path().to_string_lossy().into_owned(),
+            None,
+            "Forbidden".into(),
+        )
+        .now_or_never()
+        .unwrap();
+        assert!(rejected.is_err());
+        drop(held);
+        let created = creating.await.unwrap();
+        saving.await.unwrap();
+        assert_eq!(Path::new(&created.path).parent(), Some(first.path()));
+        assert!(!second.path().join("Queued.md").exists());
+        assert_eq!(
+            operations::read_note(&a, &alpha.path).unwrap().content,
+            "# Shared\n\nQueued save"
+        );
+        assert_eq!(std::fs::read(&beta.path).unwrap(), beta_before);
+
+        // A configured but inactive origin is valid for a later detached-window save.
+        save_note(
+            app.state(),
+            a.clone(),
+            alpha.path.clone(),
+            alpha.meta,
+            "# Shared\n\nDetached save".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_note(app.state(), a.clone(), alpha.path.clone())
+                .await
+                .unwrap()
+                .content,
+            "# Shared\n\nDetached save"
+        );
+        assert!(read_note(app.state(), b.clone(), alpha.path).await.is_err());
+        assert_eq!(std::fs::read(&beta.path).unwrap(), beta_before);
+    }
+
+    #[tokio::test]
+    async fn icon_imports_and_field_patches_serialize_with_cleanup_and_notebook_moves() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().to_string_lossy().into_owned();
+        operations::ensure_vault_structure(&path).unwrap();
+        operations::create_notebook(&path, None, "Projects").unwrap();
+        operations::create_notebook(&path, Some("Projects"), "Child").unwrap();
+        operations::create_notebook(&path, None, "Archive").unwrap();
+        let app = tauri::test::mock_builder()
+            .manage(AppState::new(AppConfig {
+                active_vault: Some(path.clone()),
+                ..AppConfig::default()
+            }))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = app.state::<AppState>();
+        let held = state.note_save.lock().await;
+        let mut color = Box::pin(set_tag_style(
+            app.state(),
+            path.clone(),
+            "Work".into(),
+            TagStyleChange::Color(Some("#AABBCC".into())),
+        ));
+        let mut tag_import = Box::pin(import_tag_icon(
+            app.state(),
+            path.clone(),
+            "work".into(),
+            "same.png".into(),
+            vec![1, 2, 3],
+        ));
+        let mut notebook_import = Box::pin(import_notebook_icon(
+            app.state(),
+            path.clone(),
+            "Projects/Child".into(),
+            "same.png".into(),
+            vec![4, 5, 6],
+        ));
+        let mut scan = Box::pin(find_orphaned_attachments(app.state(), path.clone()));
+        assert!(color.as_mut().now_or_never().is_none());
+        assert!(tag_import.as_mut().now_or_never().is_none());
+        assert!(notebook_import.as_mut().now_or_never().is_none());
+        assert!(scan.as_mut().now_or_never().is_none());
+        drop(held);
+        assert_eq!(
+            color.await.unwrap().unwrap().color.as_deref(),
+            Some("#aabbcc")
+        );
+        let tag = tag_import.await.unwrap();
+        let icon = notebook_import.await.unwrap();
+        assert_eq!(tag.color.as_deref(), Some("#aabbcc"));
+        assert!(scan.await.unwrap().is_empty());
+        let tag_icon = tag.icon.unwrap();
+        assert_ne!(icon, tag_icon);
+        assert_eq!(std::fs::read(vault.path().join(&icon)).unwrap(), [4, 5, 6]);
+        assert_eq!(
+            std::fs::read(vault.path().join(&tag_icon)).unwrap(),
+            [1, 2, 3]
+        );
+        let recolored = set_tag_style(
+            app.state(),
+            path.clone(),
+            "WORK".into(),
+            TagStyleChange::Color(Some("#112233".into())),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(recolored.icon.as_deref(), Some(tag_icon.as_str()));
+        assert_eq!(recolored.color.as_deref(), Some("#112233"));
+        assert_eq!(
+            get_tag_styles(app.state(), path.clone()).await.unwrap()["Work"],
+            recolored
+        );
+
+        let held = state.note_save.lock().await;
+        let mut changing = Box::pin(set_notebook_icon(
+            app.state(),
+            path.clone(),
+            "Projects".into(),
+            Some("builtin:briefcase".into()),
+        ));
+        let mut renaming = Box::pin(rename_notebook(
+            app.state(),
+            path.clone(),
+            vault.path().join("Projects").to_string_lossy().into_owned(),
+            "Renamed".into(),
+        ));
+        assert!(changing.as_mut().now_or_never().is_none());
+        assert!(renaming.as_mut().now_or_never().is_none());
+        drop(held);
+        changing.await.unwrap();
+        let renamed = renaming.await.unwrap();
+        move_notebook(
+            app.state(),
+            path.clone(),
+            renamed,
+            vault.path().join("Archive").to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        let icons = get_notebook_icons(app.state(), path.clone()).await.unwrap();
+        assert_eq!(icons.get("Archive/Renamed/Child"), Some(&icon));
+        assert_eq!(
+            icons.get("Archive/Renamed").map(String::as_str),
+            Some("builtin:briefcase")
+        );
+        assert!(!icons.contains_key("Projects/Child"));
+        let names = [&icon, &tag_icon]
+            .map(|relative| {
+                Path::new(relative)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .to_vec();
+        assert_eq!(
+            trash_orphaned_attachments(app.state(), path.clone(), names)
+                .await
+                .unwrap(),
+            0
+        );
+
+        state
+            .syncing
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(find_orphaned_attachments(app.state(), path.clone())
+            .await
+            .is_err());
+        assert!(trash_orphaned_attachments(app.state(), path, Vec::new())
+            .await
+            .is_err());
+        state
+            .syncing
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn note_creation_and_save_work_without_an_initialized_search_index() {
+        let vault = tempfile::tempdir().unwrap();
+        let vault_path = vault.path().to_string_lossy().into_owned();
+        operations::ensure_vault_structure(&vault_path).unwrap();
+        let app = tauri::test::mock_builder()
+            .manage(AppState::new(AppConfig {
+                active_vault: Some(vault_path.clone()),
+                ..AppConfig::default()
+            }))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let note = create_note(app.state(), vault_path.clone(), None, "Draft".into())
+            .await
+            .unwrap();
+        save_note(
+            app.state(),
+            vault_path.clone(),
+            note.path.clone(),
+            note.meta,
+            "# Draft\n\nSaved before search is ready.".into(),
+        )
+        .await
+        .unwrap();
+        let saved = operations::read_note(&vault_path, &note.path).unwrap();
+        assert_eq!(saved.meta.title, "Draft");
+        assert_eq!(saved.content, "# Draft\n\nSaved before search is ready.");
+    }
+
+    #[tokio::test]
+    async fn move_and_trash_wait_for_pending_saves_and_keep_the_latest_content() {
+        let vault = tempfile::tempdir().unwrap();
+        let vault_path = vault.path().to_string_lossy().into_owned();
+        let archive = vault.path().join("Archive");
+        std::fs::create_dir(&archive).unwrap();
+        let entry = operations::create_note(&vault_path, None, "Note").unwrap();
+        let app = tauri::test::mock_builder()
+            .manage(AppState::new(AppConfig {
+                active_vault: Some(vault_path.clone()),
+                ..AppConfig::default()
+            }))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = app.state::<AppState>();
+
+        let saving = state.note_save.lock().await;
+        let mut moving = Box::pin(move_note(
+            app.state(),
+            vault_path.clone(),
+            entry.path.clone(),
+            archive.to_string_lossy().into_owned(),
+        ));
+        assert!(moving.as_mut().now_or_never().is_none());
+        operations::save_note(&vault_path, &entry.path, &entry.meta, "Latest saved text").unwrap();
+        drop(saving);
+        let moved_path = moving.await.unwrap();
+        assert!(!Path::new(&entry.path).exists());
+        let moved = operations::read_note(&vault_path, &moved_path).unwrap();
+        assert_eq!(moved.content, "# Note\n\nLatest saved text");
+
+        let saving = state.note_save.lock().await;
+        let mut deleting = Box::pin(delete_note(
+            app.state(),
+            vault_path.clone(),
+            moved_path.clone(),
+        ));
+        assert!(deleting.as_mut().now_or_never().is_none());
+        operations::save_note(
+            &vault_path,
+            &moved_path,
+            &moved.meta,
+            "Latest text before trash",
+        )
+        .unwrap();
+        drop(saving);
+        deleting.await.unwrap();
+        assert!(!Path::new(&moved_path).exists());
+        let trash = operations::get_trash_contents(&vault_path).unwrap();
+        assert_eq!(trash.notes.len(), 1);
+        let raw = std::fs::read_to_string(&trash.notes[0].path).unwrap();
+        let (_, content) = crate::vault::frontmatter::parse_note(&raw, "Note.md");
+        assert_eq!(content, "# Note\n\nLatest text before trash");
     }
 }

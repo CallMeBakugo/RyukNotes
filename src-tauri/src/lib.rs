@@ -37,8 +37,6 @@ pub fn run() {
     let config = commands::load_app_config();
     #[cfg(desktop)]
     let show_tray = config.show_tray_icon;
-    #[cfg(desktop)]
-    let close_to_tray = config.close_to_tray && show_tray;
     let app_state = AppState::new(config);
 
     // Inject the compile-time platform so the frontend never sniffs the (sometimes
@@ -164,6 +162,7 @@ pub fn run() {
             commands::restore_external_vault,
             commands::remove_vault,
             commands::get_app_config,
+            commands::complete_window_close,
             commands::set_theme,
             commands::set_system_themes,
             commands::set_accent_color,
@@ -216,8 +215,10 @@ pub fn run() {
             commands::save_attachment,
             commands::get_notebook_icons,
             commands::set_notebook_icon,
+            commands::import_notebook_icon,
             commands::get_tag_styles,
             commands::set_tag_style,
+            commands::import_tag_icon,
             commands::set_general_settings,
             commands::get_quick_access,
             commands::add_quick_access,
@@ -337,32 +338,44 @@ pub fn run() {
                 queue_macos_traffic_light_fix(window);
             }
 
-            match event {
-                tauri::WindowEvent::CloseRequested { api, .. } => {
-                    // Only hide to tray for the main window
-                    if close_to_tray && window.label() == "main" {
-                        api.prevent_close();
-                        let _ = window.hide();
+            // Closing the main window also requests a save-aware close of note windows.
+            if matches!(event, tauri::WindowEvent::Destroyed) && window.label() == "main" {
+                for (label, win) in window.app_handle().webview_windows() {
+                    if label.starts_with("note-") {
+                        let _ = win.close();
                     }
                 }
-                tauri::WindowEvent::Destroyed
-                    // When main window is destroyed, close all note windows
-                    if window.label() == "main" => {
-                        let app = window.app_handle();
-                        for (label, win) in app.webview_windows() {
-                            if label.starts_with("note-") {
-                                let _ = win.close();
-                            }
-                        }
-                    }
-                _ => {}
             }
         });
     }
 
-    builder
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+    let app = builder
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+    app.run(|app, event| {
+        #[cfg(desktop)]
+        if let tauri::RunEvent::ExitRequested {
+            code: Some(_), api, ..
+        } = event
+        {
+            let windows = app.webview_windows();
+            if !windows.is_empty() {
+                // Menu/tray Quit must give each editor the same save opportunity
+                // as a window close. The app exits once the last window closes.
+                api.prevent_exit();
+                app.state::<AppState>()
+                    .quitting
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                for window in windows.values() {
+                    if let Err(error) = window.close() {
+                        log::error!("Failed to close window during quit: {error}");
+                    }
+                }
+            }
+        }
+        #[cfg(mobile)]
+        let _ = (app, event);
+    });
 }
 
 #[cfg(desktop)]
@@ -371,7 +384,7 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
     let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
 
-    let _tray = TrayIconBuilder::new()
+    let _tray = TrayIconBuilder::with_id("helixnotes")
         .icon(
             Image::from_path("icons/32x32.png")
                 .unwrap_or_else(|_| app.default_window_icon().cloned().unwrap()),

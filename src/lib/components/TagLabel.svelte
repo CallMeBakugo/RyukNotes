@@ -40,15 +40,15 @@
 	style:--tag-color={color}
 	title={`#${name}`}
 >
-	{#if builtinIcon}
-		<span class="tag-icon">
+	<span class="tag-icon" style:width={`${size}px`} style:height={`${size}px`}>
+		{#if builtinIcon}
 			<NotebookGlyph icon={builtinIcon} {size} />
-		</span>
-	{:else if imageSrc}
-		<img class="tag-image" src={imageSrc} alt="" width={size} height={size} />
-	{:else}
-		<span class="tag-hash">#</span>
-	{/if}
+		{:else if imageSrc}
+			<img class="tag-image" crossorigin="anonymous" src={imageSrc} alt="" width={size} height={size} />
+		{:else}
+			<span class="tag-hash">#</span>
+		{/if}
+	</span>
 	{#if showName}<span class="tag-name">{name}</span>{/if}
 </span>
 
@@ -74,8 +74,10 @@
 	}
 
 	.tag-icon {
-		display: grid;
-		place-items: center;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		line-height: 1;
 		color: inherit;
 	}
 

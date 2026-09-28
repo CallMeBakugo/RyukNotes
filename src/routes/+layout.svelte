@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import '../app.css';
-	import { resolvedTheme, appConfig, activeNote, activeNotePath, installType, platformIsMobile, checkForUpdate, checkForUpdateMobile, isManagedInstall, customThemes } from '$lib/stores/app';
-	import { openFile, openUrl, readNote, getInstallType, isMobilePlatform } from '$lib/api';
+	import { resolvedTheme, appConfig, activeNotePath, installType, platformIsMobile, checkForUpdate, checkForUpdateMobile, isManagedInstall, customThemes } from '$lib/stores/app';
+	import { openFile, openUrl, getInstallType, isMobilePlatform } from '$lib/api';
 	import { get } from 'svelte/store';
 	import { darkThemes, isMobile, isAndroid } from '$lib/platform';
 	import type { CustomTheme } from '$lib/types';
@@ -97,10 +97,7 @@
 			);
 			// Internal .md note link - navigate within the app
 			if (absPath.endsWith('.md')) {
-				readNote(absPath).then((content) => {
-					activeNote.set({ ...content, content: content.content });
-					activeNotePath.set(absPath);
-				}).catch((err) => console.error('Failed to navigate to note:', err));
+				window.dispatchEvent(new CustomEvent('helixnotes-open-note', { detail: absPath }));
 			} else {
 				openLocalFile(absPath);
 			}

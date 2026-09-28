@@ -125,3 +125,19 @@ export function resolvePathFromFile(filePath: string, targetPath: string): strin
 
 	return prefix + resolved.join('/');
 }
+
+/** Lexical ownership for the UI; native code enforces filesystem access. */
+export function isPathInDirectory(path: string, directory: string | null): boolean {
+	if (!directory) return false;
+	let root = resolvePathFromFile('', directory).replace(/\/+$/, '');
+	let target = resolvePathFromFile('', path);
+	if (/^[A-Za-z]:\//.test(root) || root.startsWith('//')) {
+		root = root.toLowerCase();
+		target = target.toLowerCase();
+	}
+	return target.startsWith(`${root}/`);
+}
+
+export function isTrashedNote(path: string | null, vaultRoot: string | null | undefined): boolean {
+	return !!path && !!vaultRoot && isPathInDirectory(path, `${vaultRoot}/.helixnotes/trash`);
+}

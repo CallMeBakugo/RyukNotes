@@ -2,7 +2,7 @@ import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 
 const openNoteWindows = new Map<string, string>();
 
-export async function openNoteWindow(notePath: string, noteTitle: string) {
+export async function openNoteWindow(vaultPath: string, notePath: string, noteTitle: string) {
 	const existingLabel = openNoteWindows.get(notePath);
 	if (existingLabel) {
 		const existing = await WebviewWindow.getByLabel(existingLabel);
@@ -15,8 +15,8 @@ export async function openNoteWindow(notePath: string, noteTitle: string) {
 		openNoteWindows.delete(notePath);
 	}
 
-	const label = `note-${Date.now()}`;
-	const url = `/?note=${encodeURIComponent(notePath)}`;
+	const label = `note-${crypto.randomUUID()}`;
+	const url = `/?note=${encodeURIComponent(notePath)}&vault=${encodeURIComponent(vaultPath)}`;
 
 	const noteWindow = new WebviewWindow(label, {
 		url,

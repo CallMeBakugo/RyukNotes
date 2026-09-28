@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount, onDestroy } from 'svelte';
+	import { onMount, onDestroy, untrack } from 'svelte';
 	import { listen } from '@tauri-apps/api/event';
 	import { getCurrentWebview } from '@tauri-apps/api/webview';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -13,11 +13,14 @@
 		sourceMode,
 		tagStyles
 	} from '$lib/stores/app';
-	import { getTagStyles, readNote } from '$lib/api';
+	import { completeWindowClose, getTagStyles, readNote } from '$lib/api';
 	import { keybindings, matchAction } from '$lib/keybindings';
 	import type { FileEvent } from '$lib/types';
+	import { isCurrentVaultEvent } from '$lib/utils/note-list-updates';
+	import { beginNoteNavigation, isCurrentNoteNavigation, cancelNoteNavigation } from '$lib/utils/note-navigation';
 
-	let { notePath }: { notePath: string } = $props();
+	let { notePath, vaultPath }: { notePath: string; vaultPath: string | null } = $props();
+	const ownerVault = untrack(() => vaultPath);
 
 	const appWindow = getCurrentWindow();
 	const appWebview = getCurrentWebview();
@@ -25,11 +28,17 @@
 	let editor = $state<Editor>(null!);
 	let unlistenFileChange: (() => void) | null = null;
 	let unlistenUiScale: (() => void) | null = null;
+	let unlistenClose: (() => void) | null = null;
 	let maximized = $state(false);
 	let loadError = $state<string | null>(null);
+	let disposed = false;
+	let initialNavigationToken: number | null = null;
+	let initialLoadTimer: ReturnType<typeof setTimeout> | null = null;
+	let fileRefreshRequest = 0;
 
 	async function checkMaximized() {
-		maximized = await appWindow.isMaximized();
+		const value = await appWindow.isMaximized();
+		if (!disposed) maximized = value;
 	}
 
 	$effect(() => {
@@ -80,50 +89,115 @@
 		}
 	}
 
-	onMount(async () => {
-		unlistenUiScale = await listen<number>('ui-scale-changed', (event) => {
-			void applyUiScale(event.payload);
-		});
-		await applyUiScale($appConfig?.ui_scale ?? 1);
+	onMount(() => {
+		const vault = ownerVault;
+		const path = notePath;
+		const token = beginNoteNavigation();
+		initialNavigationToken = token;
+		const isCurrentOwner = () => !disposed && (vault === null || vault === $appConfig?.active_vault);
 
-		try {
-			$tagStyles = await getTagStyles();
-		} catch (e) {
-			console.error('Failed to load tag styles:', e);
-		}
+		async function initialize() {
+			const closeListener = await appWindow.onCloseRequested(async (event) => {
+				event.preventDefault();
+				if (!isCurrentOwner()) return;
+				try {
+					if (editor && !(await editor.flushSave())) return;
+					if (!isCurrentOwner()) return;
+					await completeWindowClose();
+				} catch (error) {
+					console.error('Failed to close window:', error);
+				}
+			});
+			if (!isCurrentOwner()) {
+				closeListener();
+				return;
+			}
+			unlistenClose = closeListener;
+			if (!ownerVault) {
+				loadError = 'This note window has no valid originating vault.';
+				return;
+			}
 
-		try {
-			const content = await readNote(notePath);
-			$activeNote = content;
-			$activeNotePath = notePath;
-			$editorDirty = false;
-			setTimeout(() => {
-				editor?.loadNote(notePath, content.content);
-				appWindow.setTitle(`${content.meta.title} - HelixNotes`);
-			}, 50);
-		} catch (e) {
-			loadError = String(e);
-		}
+			const scaleListener = await listen<number>('ui-scale-changed', (event) => {
+				if (isCurrentOwner()) void applyUiScale(event.payload);
+			});
+			if (!isCurrentOwner()) {
+				scaleListener();
+				return;
+			}
+			unlistenUiScale = scaleListener;
+			await applyUiScale($appConfig?.ui_scale ?? 1);
+			if (!isCurrentOwner()) return;
 
-		unlistenFileChange = await listen<FileEvent>('file-changed', async (event) => {
-			if (event.payload.path === notePath && event.payload.event_type === 'modify') {
-				if (!$editorDirty) {
-					try {
-						const content = await readNote(notePath);
-						// Ignore the file-watcher echo of our own save; only reload genuine external edits.
-						if (content.content.trim() !== (editor?.getCurrentBody() ?? '').trim()) {
-							$activeNote = content;
-							editor?.loadNote(notePath, content.content);
-						}
-					} catch (_) {}
+			try {
+				const styles = await getTagStyles(ownerVault!);
+				if (!isCurrentOwner()) return;
+				$tagStyles = styles;
+			} catch (e) {
+				console.error('Failed to load tag styles:', e);
+			}
+			if (!isCurrentOwner()) return;
+
+			if (isCurrentNoteNavigation(token)) {
+				try {
+					const content = await readNote(ownerVault!, path);
+					if (!isCurrentOwner()) return;
+					if (isCurrentNoteNavigation(token)) {
+						$activeNote = content;
+						$activeNotePath = path;
+						$editorDirty = false;
+						initialLoadTimer = setTimeout(() => {
+							initialLoadTimer = null;
+							if (!isCurrentOwner() || !isCurrentNoteNavigation(token)
+								|| $activeNotePath !== path || $activeNote !== content || $editorDirty) return;
+							editor?.loadNote(path, content.content);
+							void appWindow.setTitle(`${content.meta.title} - HelixNotes`);
+						}, 50);
+					}
+				} catch (e) {
+					if (isCurrentOwner() && isCurrentNoteNavigation(token)) loadError = String(e);
 				}
 			}
+			if (!isCurrentOwner()) return;
+
+			const fileListener = await listen<FileEvent>('file-changed', async (event) => {
+				if (!isCurrentOwner() || !isCurrentVaultEvent(event.payload, vault ?? null)) return;
+				const path = $activeNotePath;
+				const openingNote = $activeNote;
+				if (!path || event.payload.path !== path || !event.payload.note || $editorDirty) return;
+				const request = ++fileRefreshRequest;
+				try {
+					const content = await readNote(ownerVault!, path);
+					if (!isCurrentOwner() || request !== fileRefreshRequest
+						|| $activeNotePath !== path || $activeNote !== openingNote || $editorDirty) return;
+					// Compare only this note; never reload an editor that changed during the read.
+					if (content.content.trim() !== (editor?.getCurrentBody() ?? '').trim()) {
+						$activeNote = content;
+						editor?.loadNote(path, content.content);
+					}
+				} catch (e) {
+					console.error('Failed to refresh note window:', e);
+				}
+			});
+			if (!isCurrentOwner()) {
+				fileListener();
+				return;
+			}
+			unlistenFileChange = fileListener;
+		}
+
+		void initialize().catch(error => {
+			if (isCurrentOwner()) console.error('Failed to initialize note window:', error);
 		});
 	});
 
 	onDestroy(() => {
+		disposed = true;
+		if (initialNavigationToken !== null) cancelNoteNavigation(initialNavigationToken);
+		if (initialLoadTimer !== null) clearTimeout(initialLoadTimer);
 		unlistenFileChange?.();
 		unlistenUiScale?.();
+		unlistenClose?.();
 	});
 </script>
 

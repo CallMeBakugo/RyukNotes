@@ -11,6 +11,8 @@
 	import type { ImportResult, BackupEntry, CustomTheme, CustomThemeColors, StartupView, VaultStats } from '$lib/types';
 	import { normalizeStartupView } from '$lib/utils/startup-view';
 
+	let { onBeforeVaultSwitch }: { onBeforeVaultSwitch: () => Promise<boolean> } = $props();
+
 	const modKey = navigator.platform.startsWith('Mac') ? '⌘' : 'Ctrl';
 
 	type Tab = 'general' | 'editor' | 'styling' | 'import' | 'backup' | 'maintenance' | 'ai' | 'sync' | 'updates';
@@ -123,9 +125,20 @@
 	let orphanedAttachments = $state<OrphanAttachment[] | null>(null);
 	let scanningOrphanedAttachments = $state(false);
 	let trashingOrphanedAttachments = $state(false);
+	let orphanedVault: string | null = null;
+	let orphanError = $state('');
+	let cleanupRequest = 0;
+	const maintenanceVault = $derived($appConfig?.active_vault ?? null);
 	const orphanedAttachmentTotal = $derived((orphanedAttachments ?? []).reduce((total, attachment) => total + attachment.size, 0));
 
 	$effect(() => {
+		void maintenanceVault;
+		cleanupRequest++;
+		orphanedAttachments = null;
+		orphanedVault = null;
+		orphanError = '';
+		scanningOrphanedAttachments = false;
+		trashingOrphanedAttachments = false;
 		if (!$showSettings) {
 			vaultStats = null;
 			vaultStatsError = false;
@@ -136,10 +149,13 @@
 	});
 
 	async function loadVaultStats() {
+		const vault = maintenanceVault;
 		vaultStatsError = false;
 		try {
-			vaultStats = await getVaultStats();
+			const stats = await getVaultStats();
+			if ($showSettings && maintenanceVault === vault) vaultStats = stats;
 		} catch (error) {
+			if (!$showSettings || maintenanceVault !== vault) return;
 			vaultStats = null;
 			vaultStatsError = true;
 			console.error('Failed to load vault statistics:', error);
@@ -154,27 +170,46 @@
 	}
 
 	async function scanOrphanedAttachments() {
+		const vault = maintenanceVault;
+		if (!vault) return;
+		const request = ++cleanupRequest;
+		const current = () => request === cleanupRequest && $showSettings && maintenanceVault === vault;
 		scanningOrphanedAttachments = true;
+		orphanError = '';
 		try {
-			orphanedAttachments = await findOrphanedAttachments();
+			if (!(await onBeforeVaultSwitch())) throw new Error('Save the current note before scanning attachments.');
+			if (!current()) return;
+			const found = await findOrphanedAttachments(vault);
+			if (!current()) return;
+			orphanedVault = vault;
+			orphanedAttachments = found;
 		} catch (error) {
-			console.error(error);
+			if (current()) orphanError = String(error);
 		} finally {
-			scanningOrphanedAttachments = false;
+			if (current()) scanningOrphanedAttachments = false;
 		}
 	}
 
 	async function trashFoundOrphanedAttachments() {
-		if (!orphanedAttachments || orphanedAttachments.length === 0) return;
+		const vault = orphanedVault;
+		if (!vault || vault !== maintenanceVault || !orphanedAttachments?.length) return;
+		const names = orphanedAttachments.map(attachment => attachment.name);
+		const request = ++cleanupRequest;
+		const current = () => request === cleanupRequest && $showSettings && maintenanceVault === vault;
 		trashingOrphanedAttachments = true;
+		orphanError = '';
 		try {
-			await trashOrphanedAttachments(orphanedAttachments.map((attachment) => attachment.name));
+			if (!(await onBeforeVaultSwitch())) throw new Error('Save the current note before cleaning attachments.');
+			if (!current()) return;
+			await trashOrphanedAttachments(vault, names);
+			if (!current()) return;
 			orphanedAttachments = null;
+			orphanedVault = null;
 			void loadVaultStats();
 		} catch (error) {
-			console.error(error);
+			if (current()) orphanError = String(error);
 		} finally {
-			trashingOrphanedAttachments = false;
+			if (current()) trashingOrphanedAttachments = false;
 		}
 	}
 
@@ -293,7 +328,7 @@
 	let _ollamaApiKey = $state($appConfig?.ollama_api_key ?? '');
 	let _openaiCompatibleBaseUrl = $state($appConfig?.openai_compatible_base_url ?? '');
 	let _openaiCompatibleKey = $state($appConfig?.openai_compatible_api_key ?? '');
-	let aiModel = $state($appConfig?.ai_model ?? 'claude-sonnet-4-6');
+	let aiModel = $state($appConfig?.ai_model ?? 'claude-sonnet-5');
 	let aiWritingStyle = $state($appConfig?.ai_writing_style ?? '');
 	let aiShowKey = $state(false);
 	let aiShowCompatibleKey = $state(false);
@@ -301,16 +336,17 @@
 	let aiTestLoading = $state(false);
 	let aiTestMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
 
+	// General-purpose text models verified against provider catalogs on 2026-09-27.
 	const anthropicModels = [
-		{ value: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6', desc: 'Balanced' },
-		{ value: 'claude-opus-4-8', label: 'Claude Opus 4.8', desc: 'Most capable' },
+		{ value: 'claude-sonnet-5', label: 'Claude Sonnet 5', desc: 'Balanced' },
+		{ value: 'claude-opus-5-5', label: 'Claude Opus 5.5', desc: 'Complex work' },
+		{ value: 'claude-fable-5-1', label: 'Claude Fable 5.1', desc: 'Deep reasoning' },
 		{ value: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5', desc: 'Fast' },
 	];
 	const openaiModels = [
-		{ value: 'gpt-5.5', label: 'GPT-5.5', desc: 'Most capable' },
-		{ value: 'gpt-5.4', label: 'GPT-5.4', desc: 'Balanced' },
-		{ value: 'gpt-5-mini', label: 'GPT-5 Mini', desc: 'Fast' },
-		{ value: 'gpt-5.2', label: 'GPT-5.2', desc: 'Previous gen' },
+		{ value: 'gpt-6-sol', label: 'GPT-6 Sol', desc: 'Balanced' },
+		{ value: 'gpt-6-astra', label: 'GPT-6 Astra', desc: 'Deep reasoning' },
+		{ value: 'gpt-6-luna', label: 'GPT-6 Luna', desc: 'Fast' },
 	];
 	let aiModels = $derived(aiProvider === 'openai' ? openaiModels : anthropicModels);
 
@@ -1390,7 +1426,7 @@
 							<div class="settings-section">
 								<h3>Vault</h3>
 								<p class="setting-desc" style="margin-bottom: 12px; color: var(--text-tertiary); font-size: 13px;">Current: <strong style="color: var(--text-primary);">{$appConfig?.active_vault?.split('/').pop() ?? 'Unknown'}</strong></p>
-								<button class="import-btn" onclick={() => { $showSettings = false; $vaultReady = false; }}>
+								<button class="import-btn" onclick={async () => { if (!(await onBeforeVaultSwitch())) return; $showSettings = false; $vaultReady = false; }}>
 									<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 										<path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/>
 									</svg>
@@ -1438,7 +1474,7 @@
 								<label class="setting-toggle">
 									<span class="setting-label">
 										<span class="setting-name">Close to tray</span>
-										<span class="setting-desc">Minimize to tray instead of quitting when closing the window (requires restart)</span>
+										<span class="setting-desc">Minimize to tray instead of quitting when closing the window</span>
 									</span>
 									<button class="toggle-switch" class:on={closeToTray} role="switch" aria-checked={closeToTray} aria-label="Close to tray" onclick={() => { closeToTray = !closeToTray; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
@@ -1485,7 +1521,8 @@
 							<div class="settings-section">
 								<h3>Orphaned Attachments</h3>
 								<div class="vault-maintenance">
-									<p class="setting-desc">Find files in the vault's attachments folder that are not referenced by any note.</p>
+									<p class="setting-desc">Review attachment files not referenced by saved notes or icon settings. Save changes in other note windows before scanning.</p>
+									{#if orphanError}<p class="cleanup-message" role="alert">{orphanError}</p>{/if}
 									{#if orphanedAttachments === null}
 										<button class="import-btn cleanup-action" onclick={scanOrphanedAttachments} disabled={scanningOrphanedAttachments}>
 											{#if scanningOrphanedAttachments}
@@ -2208,8 +2245,8 @@
 								<div class="setting-options" style="flex-wrap: wrap;">
 									<button class="option-btn" class:active={!aiProvider} onclick={() => { if (!aiProvider) return; aiProvider = null; aiTestMessage = null; saveAiSettings(); }}>Disabled</button>
 									<button class="option-btn" class:active={aiProvider === 'ollama'} onclick={() => { if (aiProvider === 'ollama') return; aiProvider = 'ollama'; aiModel = 'gemma3:4b'; aiTestMessage = null; saveAiSettings(); }}>Ollama</button>
-									<button class="option-btn" class:active={aiProvider === 'anthropic'} onclick={() => { if (aiProvider === 'anthropic') return; aiProvider = 'anthropic'; aiModel = 'claude-sonnet-4-6'; aiTestMessage = null; saveAiSettings(); }}>Anthropic</button>
-									<button class="option-btn" class:active={aiProvider === 'openai'} onclick={() => { if (aiProvider === 'openai') return; aiProvider = 'openai'; aiModel = 'gpt-5.5'; aiTestMessage = null; saveAiSettings(); }}>OpenAI</button>
+									<button class="option-btn" class:active={aiProvider === 'anthropic'} onclick={() => { if (aiProvider === 'anthropic') return; aiProvider = 'anthropic'; aiModel = 'claude-sonnet-5'; aiTestMessage = null; saveAiSettings(); }}>Anthropic</button>
+									<button class="option-btn" class:active={aiProvider === 'openai'} onclick={() => { if (aiProvider === 'openai') return; aiProvider = 'openai'; aiModel = 'gpt-6-sol'; aiTestMessage = null; saveAiSettings(); }}>OpenAI</button>
 									<button class="option-btn" class:active={aiProvider === 'openai_compatible'} onclick={() => { if (aiProvider === 'openai_compatible') return; aiProvider = 'openai_compatible'; aiModel = ''; aiTestMessage = null; saveAiSettings(); }}>OpenAI Compatible</button>
 								</div>
 							</div>
@@ -2340,6 +2377,9 @@
 												</button>
 											{/each}
 										</div>
+										{#if aiModel && !aiModels.some(model => model.value === aiModel)}
+											<p class="setting-hint">Saved model: <code>{aiModel}</code>. It remains selected until you choose another model.</p>
+										{/if}
 									{/if}
 								</div>
 

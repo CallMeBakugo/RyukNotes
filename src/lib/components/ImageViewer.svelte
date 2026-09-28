@@ -236,6 +236,7 @@
 		<img
 			bind:this={imageElement}
 			class:interacting
+			crossorigin="anonymous"
 			src={src}
 			alt={alt}
 			draggable="false"

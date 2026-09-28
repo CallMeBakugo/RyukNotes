@@ -43,11 +43,20 @@ pub struct NotebookEntry {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TagStyle {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "lowercase")]
+pub enum TagStyleChange {
+    Icon(Option<String>),
+    Color(Option<String>),
+    Reset,
 }
 
 impl TagStyle {
@@ -298,7 +307,7 @@ fn default_max_versions() -> u32 {
 }
 
 fn default_ai_model() -> String {
-    "claude-sonnet-4-6".to_string()
+    "claude-sonnet-5".to_string()
 }
 
 fn default_system_light_theme() -> String {
@@ -358,7 +367,7 @@ impl Default for AppConfig {
             ollama_api_key: None,
             openai_compatible_base_url: None,
             openai_compatible_api_key: None,
-            ai_model: "claude-sonnet-4-6".to_string(),
+            ai_model: default_ai_model(),
             ai_writing_style: None,
             default_view_mode: false,
             new_notes_in_source_mode: false,
@@ -441,18 +450,35 @@ impl Default for VaultState {
     }
 }
 
+/// Half-open UTF-16 offsets into the corresponding plain-text result field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub start: usize,
+    pub end: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub path: String,
     pub title: String,
     pub snippet: String,
     pub score: f32,
+    pub title_matches: Vec<SearchMatch>,
+    pub snippet_matches: Vec<SearchMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SearchPage {
+    pub results: Vec<SearchResult>,
+    pub total: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEvent {
+    pub vault_path: String,
     pub event_type: String,
     pub path: String,
+    pub note: Option<NoteEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -489,6 +515,7 @@ pub struct VersionEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiStreamEvent {
+    pub request_id: String,
     pub event_type: String, // "text", "done", "error"
     pub text: Option<String>,
     pub error: Option<String>,

@@ -1,17 +1,20 @@
 <script lang="ts">
 	import { getCurrentWindow } from '@tauri-apps/api/window';
-	import { vaultReady, focusMode, readOnly, updateAvailable, showSettings, settingsTab, appConfig, activeVaultConfig, syncState } from '$lib/stores/app';
+	import { vaultReady, focusMode, readOnly, updateAvailable, showSettings, settingsTab, appConfig, activeNotePath, activeVaultConfig, syncState } from '$lib/stores/app';
 	import { syncNow } from '$lib/api';
 	import NoteSwitcher from './NoteSwitcher.svelte';
+	import { isTrashedNote } from '$lib/utils/paths';
 
 	let {
 		onNewNote = () => {},
 		onDailyNote = () => {},
-		onSelectNote
+		onSelectNote,
+		onBeforeVaultSwitch
 	}: {
 		onNewNote?: () => void;
 		onDailyNote?: () => void;
 		onSelectNote?: (path: string) => Promise<boolean>;
+		onBeforeVaultSwitch: () => Promise<boolean>;
 	} = $props();
 
 	const appWindow = getCurrentWindow();
@@ -93,7 +96,7 @@
 		</div>
 	{/if}
 	<div class="titlebar-actions">
-		<button class="switch-vault-btn" onclick={() => ($vaultReady = false)} title="Switch Vault">
+		<button class="switch-vault-btn" onclick={async () => { if (await onBeforeVaultSwitch()) $vaultReady = false; }} title="Switch Vault">
 			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 				<path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
 			</svg>
@@ -103,7 +106,7 @@
 				<path d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3m0 18h3a2 2 0 002-2v-3M3 16v3a2 2 0 002 2h3"/>
 			</svg>
 		</button>
-		<button class="switch-vault-btn" class:active={$readOnly} onclick={() => ($readOnly = !$readOnly)} title={$readOnly ? 'Switch to Edit Mode' : 'Switch to View Mode'}>
+		<button class="switch-vault-btn" class:active={$readOnly} disabled={isTrashedNote($activeNotePath, $appConfig?.active_vault)} onclick={() => ($readOnly = !$readOnly)} title={$readOnly ? 'Switch to Edit Mode' : 'Switch to View Mode'}>
 			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 				{#if $readOnly}
 					<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />

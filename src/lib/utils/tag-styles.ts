@@ -71,17 +71,6 @@ export function tagCustomImagePath(
   return icon;
 }
 
-export function nextTagStyle(
-  current: TagStyleFields | undefined,
-  patch: TagStyleFields
-): TagStyleFields | null {
-  const icon = patch.icon === undefined ? current?.icon : patch.icon;
-  const color = patch.color === undefined ? current?.color : patch.color;
-  const next: TagStyleFields = {};
-  if (typeof icon === 'string' && icon.trim()) next.icon = icon;
-  if (isValidTagColor(color)) next.color = color;
-  return next.icon || next.color ? next : null;
-}
 
 export function applyCommittedTagStyle(
   styles: Record<string, TagStyleFields>,
@@ -101,26 +90,4 @@ export function applyCommittedTagStyle(
     result[storedKey] = next;
   }
   return result;
-}
-
-export function createTagStylePersister(options: {
-  getCurrent: () => TagStyleFields | undefined;
-  save: (next: TagStyleFields | null) => Promise<void>;
-}) {
-  let draft: TagStyleFields | null | undefined;
-  let queue = Promise.resolve();
-
-  return {
-    apply(patch: TagStyleFields): TagStyleFields | null {
-      const current = draft === undefined ? options.getCurrent() : (draft ?? undefined);
-      draft = nextTagStyle(current, patch);
-      const snapshot = draft;
-      const write = () => options.save(snapshot);
-      queue = queue.then(write, write);
-      return snapshot;
-    },
-    flush() {
-      return queue;
-    }
-  };
 }

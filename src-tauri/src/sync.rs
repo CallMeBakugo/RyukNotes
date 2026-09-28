@@ -12,10 +12,12 @@
 
 use crate::state::AppState;
 use crate::vault::operations::helixnotes_dir;
+use crate::vault::watcher::changed_entry;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use tauri::{Emitter, Manager};
 use walkdir::WalkDir;
@@ -69,15 +71,25 @@ fn save_manifest(vault: &str, m: &SyncManifest) {
 
 // ───────────────────────── helpers ─────────────────────────
 
+const HASH_BUFFER_SIZE: usize = 64 * 1024;
+
 fn sha256_hex(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    let digest = h.finalize();
-    let mut s = String::with_capacity(64);
-    for b in digest {
-        s.push_str(&format!("{:02x}", b));
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn sha256_reader(
+    reader: &mut impl Read,
+    buffer: &mut [u8; HASH_BUFFER_SIZE],
+) -> io::Result<String> {
+    let mut hasher = Sha256::new();
+    loop {
+        match reader.read(buffer) {
+            Ok(0) => return Ok(format!("{:x}", hasher.finalize())),
+            Ok(count) => hasher.update(&buffer[..count]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
     }
-    s
 }
 
 fn normalize_etag(s: &str) -> String {
@@ -109,12 +121,63 @@ fn conflict_relpath(relpath: &str, stamp: &str) -> String {
     format!("{}{} (conflict {}){}", dir, stem, stamp, ext)
 }
 
-fn write_local(vault: &Path, relpath: &str, bytes: &[u8]) -> Result<(), String> {
+fn write_local(
+    vault: &Path,
+    relpath: &str,
+    bytes: &[u8],
+    changes: &mut HashMap<PathBuf, &'static str>,
+) -> Result<(), String> {
     let target = vault.join(relpath);
+    if fs::read(&target).is_ok_and(|current| current == bytes) {
+        return Ok(());
+    }
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    fs::write(&target, bytes).map_err(|e| e.to_string())
+    if matches!(
+        relpath,
+        ".helixnotes/notebook_icons.json" | ".helixnotes/tag_styles.json"
+    ) {
+        let content = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+        crate::vault::operations::attachment_metadata_references(
+            target.file_name().and_then(|name| name.to_str()).unwrap(),
+            content,
+        )?;
+    }
+    crate::vault::operations::replace_file_atomically(&target, bytes)?;
+    changes.insert(target, "modify");
+    Ok(())
+}
+
+fn require_unchanged_local(path: &Path, expected_hash: Option<&str>) -> Result<(), String> {
+    let actual = match fs::File::open(path) {
+        Ok(mut file) => Some(
+            sha256_reader(&mut file, &mut [0; HASH_BUFFER_SIZE])
+                .map_err(|error| error.to_string())?,
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    if actual.as_deref() != expected_hash {
+        return Err(format!(
+            "Sync stopped because {} changed locally during sync",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn write_local_if_unchanged(
+    write_guard: &tokio::sync::Mutex<()>,
+    vault: &Path,
+    relpath: &str,
+    bytes: &[u8],
+    expected_hash: Option<&str>,
+    changes: &mut HashMap<PathBuf, &'static str>,
+) -> Result<(), String> {
+    let _guard = write_guard.blocking_lock();
+    require_unchanged_local(&vault.join(relpath), expected_hash)?;
+    write_local(vault, relpath, bytes, changes)
 }
 
 struct LocalFile {
@@ -138,6 +201,7 @@ fn is_synced_relpath(rel: &str) -> bool {
 fn scan_local(vault: &str) -> Result<HashMap<String, LocalFile>, String> {
     let vault_path = Path::new(vault);
     let mut map = HashMap::new();
+    let mut buffer = [0; HASH_BUFFER_SIZE];
     for entry in WalkDir::new(vault_path).into_iter().filter_map(|e| e.ok()) {
         let p = entry.path();
         if !p.is_file() {
@@ -150,14 +214,15 @@ fn scan_local(vault: &str) -> Result<HashMap<String, LocalFile>, String> {
         if !is_synced_relpath(&rel) {
             continue;
         }
-        let bytes = match fs::read(p) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
+        let hash =
+            match fs::File::open(p).and_then(|mut file| sha256_reader(&mut file, &mut buffer)) {
+                Ok(hash) => hash,
+                Err(_) => continue,
+            };
         map.insert(
             rel,
             LocalFile {
-                hash: sha256_hex(&bytes),
+                hash,
                 path: p.to_path_buf(),
             },
         );
@@ -511,6 +576,8 @@ fn apply_changes(
     local: &HashMap<String, LocalFile>,
     remote: &HashMap<String, String>,
     manifest: &SyncManifest,
+    changes: &mut HashMap<PathBuf, &'static str>,
+    write_guard: &tokio::sync::Mutex<()>,
 ) -> Result<(SyncManifest, SyncSummary), String> {
     let vault_path = Path::new(vault);
     let mut new_m = SyncManifest::default();
@@ -559,7 +626,14 @@ fn apply_changes(
                     sum.uploaded += 1;
                 } else if !local_changed && remote_changed {
                     let bytes = client.get(key)?;
-                    write_local(vault_path, key, &bytes)?;
+                    write_local_if_unchanged(
+                        write_guard,
+                        vault_path,
+                        key,
+                        &bytes,
+                        Some(&lf.hash),
+                        changes,
+                    )?;
                     new_m.files.insert(
                         key.clone(),
                         ManifestEntry {
@@ -582,8 +656,17 @@ fn apply_changes(
                         );
                     } else {
                         // keep-both: remote becomes canonical; local saved as a conflict copy.
-                        let lbytes = fs::read(&lf.path).map_err(|e| e.to_string())?;
-                        write_local(vault_path, key, &rbytes)?;
+                        let ckey = conflict_relpath(key, &stamp);
+                        let lbytes = {
+                            let _guard = write_guard.blocking_lock();
+                            require_unchanged_local(&lf.path, Some(&lf.hash))?;
+                            require_unchanged_local(&vault_path.join(&ckey), None)?;
+                            let lbytes = fs::read(&lf.path).map_err(|e| e.to_string())?;
+                            // Preserve the local bytes before replacing their canonical path.
+                            write_local(vault_path, &ckey, &lbytes, changes)?;
+                            write_local(vault_path, key, &rbytes, changes)?;
+                            lbytes
+                        };
                         new_m.files.insert(
                             key.clone(),
                             ManifestEntry {
@@ -591,8 +674,6 @@ fn apply_changes(
                                 remote_etag: re.clone(),
                             },
                         );
-                        let ckey = conflict_relpath(key, &stamp);
-                        write_local(vault_path, &ckey, &lbytes)?;
                         let cetag = client.upload(&ckey, &lbytes, &mut created)?;
                         new_m.files.insert(
                             ckey,
@@ -634,7 +715,10 @@ fn apply_changes(
                         sum.uploaded += 1;
                     } else {
                         // remote deleted, local unchanged -> delete local
-                        let _ = fs::remove_file(&lf.path);
+                        let _guard = write_guard.blocking_lock();
+                        require_unchanged_local(&lf.path, Some(&lf.hash))?;
+                        fs::remove_file(&lf.path).map_err(|e| e.to_string())?;
+                        changes.insert(lf.path.clone(), "remove");
                         sum.deleted_local += 1;
                     }
                 }
@@ -643,7 +727,7 @@ fn apply_changes(
                 None => {
                     // new remote -> download
                     let bytes = client.get(key)?;
-                    write_local(vault_path, key, &bytes)?;
+                    write_local_if_unchanged(write_guard, vault_path, key, &bytes, None, changes)?;
                     new_m.files.insert(
                         key.clone(),
                         ManifestEntry {
@@ -657,7 +741,14 @@ fn apply_changes(
                     if &me.remote_etag != re {
                         // local deleted but remote changed -> resurrect (download)
                         let bytes = client.get(key)?;
-                        write_local(vault_path, key, &bytes)?;
+                        write_local_if_unchanged(
+                            write_guard,
+                            vault_path,
+                            key,
+                            &bytes,
+                            None,
+                            changes,
+                        )?;
                         new_m.files.insert(
                             key.clone(),
                             ManifestEntry {
@@ -689,7 +780,7 @@ pub fn test_connection(cfg: WebdavConfig) -> Result<String, String> {
 }
 
 /// Run a full sync. Mutes the file watcher while applying local writes, then
-/// rebuilds the search index. Returns a summary of what changed.
+/// queues only changed notes for search and publishes their final local state.
 pub fn run_sync(
     app: tauri::AppHandle,
     vault: String,
@@ -698,6 +789,9 @@ pub fn run_sync(
     use std::sync::atomic::Ordering;
 
     let state = app.state::<AppState>();
+    // Keep the original vault's index even if the user switches vaults while
+    // WebDAV is working. No config lock is held during network or file I/O.
+    let search = state.vault_snapshot(&vault)?;
     let client = WebdavClient::new(cfg)?;
 
     let _ = app.emit("sync-progress", serde_json::json!({ "status": "listing" }));
@@ -706,8 +800,10 @@ pub fn run_sync(
         .into_iter()
         .filter(|(k, _)| is_synced_relpath(k))
         .collect();
-    let local = scan_local(&vault)?;
-    let manifest = load_manifest(&vault);
+    let (local, manifest) = {
+        let _guard = state.note_save.blocking_lock();
+        (scan_local(&vault)?, load_manifest(&vault))
+    };
 
     // Safety guard (issue #102): never treat an empty remote listing as "everything was
     // deleted remotely". If a prior sync exists (non-empty manifest) but the remote came back
@@ -724,35 +820,241 @@ pub fn run_sync(
     }
 
     let _ = app.emit("sync-progress", serde_json::json!({ "status": "syncing" }));
-    // Mute the watcher across local writes so a pull doesn't storm the reindex path.
-    state.importing.store(true, Ordering::Relaxed);
-    let applied = apply_changes(&client, &vault, &local, &remote, &manifest);
-    state.importing.store(false, Ordering::Relaxed);
+    let mut changes = HashMap::new();
+    // Mute the watcher across local writes; its deferred batch also preserves
+    // external edits that arrive while the network operation is in progress.
+    {
+        let _guard = state.note_save.blocking_lock();
+        state.importing.store(true, Ordering::Release);
+    }
+    let applied = apply_changes(
+        &client,
+        &vault,
+        &local,
+        &remote,
+        &manifest,
+        &mut changes,
+        &state.note_save,
+    );
+    state.importing.store(false, Ordering::Release);
+
+    // Publish even a partial apply: a later network failure must not leave
+    // successfully downloaded/deleted notes absent from search or the UI.
+    let active = state
+        .config
+        .lock()
+        .ok()
+        .is_some_and(|config| config.active_vault.as_deref() == Some(vault.as_str()));
+    let metadata_root = helixnotes_dir(&vault);
+    for (path, event_type) in changes {
+        let is_note = path.extension().and_then(|extension| extension.to_str()) == Some("md")
+            && !path.starts_with(&metadata_root);
+        if is_note {
+            if let Some(search) = &search {
+                if let Err(error) = search.queue_index_note(&path.to_string_lossy()) {
+                    log::error!("Could not queue synced note for search: {error}");
+                }
+            }
+        }
+        if !active {
+            continue;
+        }
+        let event = if is_note {
+            changed_entry(path, event_type, Path::new(&vault))
+        } else {
+            crate::types::FileEvent {
+                vault_path: vault.clone(),
+                event_type: event_type.to_string(),
+                path: path.to_string_lossy().to_string(),
+                note: None,
+            }
+        };
+        let _ = app.emit("file-changed", event);
+    }
 
     let (new_manifest, summary) = applied?;
     save_manifest(&vault, &new_manifest);
-
-    // Re-index after files changed (search is non-critical; ignore failures).
-    if let Ok(guard) = state.search_index.lock() {
-        if let Some(search) = guard.as_ref() {
-            let _ = search.rebuild(&vault);
-        }
-    }
-
-    // The watcher was muted during apply, so nudge the UI to refresh its lists.
-    let _ = app.emit(
-        "file-changed",
-        crate::types::FileEvent {
-            event_type: "modify".to_string(),
-            path: vault.clone(),
-        },
-    );
     Ok(summary)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_synced_relpath;
+    use super::*;
+
+    #[test]
+    fn synced_metadata_waits_for_local_patches_and_never_overwrites_a_newer_style() {
+        use crate::types::TagStyleChange;
+        use crate::vault::operations;
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().to_str().unwrap();
+        operations::ensure_vault_structure(root).unwrap();
+        operations::patch_tag_style(root, "Work", TagStyleChange::Color(Some("#123456".into())))
+            .unwrap();
+        let rel = ".helixnotes/tag_styles.json";
+        let path = vault.path().join(rel);
+        let hash = sha256_hex(&fs::read(&path).unwrap());
+        let guard = tokio::sync::Mutex::new(());
+        let held = guard.blocking_lock();
+        std::thread::scope(|scope| {
+            let pending = scope.spawn(|| {
+                let mut changes = HashMap::new();
+                let result = write_local_if_unchanged(
+                    &guard,
+                    vault.path(),
+                    rel,
+                    br##"{"Work":{"color":"#ffffff"}}"##,
+                    Some(&hash),
+                    &mut changes,
+                );
+                assert!(result.is_err());
+                assert!(changes.is_empty());
+            });
+            operations::patch_tag_style(
+                root,
+                "Work",
+                TagStyleChange::Icon(Some("builtin:star".into())),
+            )
+            .unwrap();
+            drop(held);
+            pending.join().unwrap();
+        });
+        let persisted = operations::load_tag_styles(root).unwrap();
+        assert_eq!(persisted["Work"].icon.as_deref(), Some("builtin:star"));
+        assert_eq!(persisted["Work"].color.as_deref(), Some("#123456"));
+
+        let current = fs::read(&path).unwrap();
+        let mut original = fs::File::open(&path).unwrap();
+        let mut changes = HashMap::new();
+        write_local_if_unchanged(
+            &guard,
+            vault.path(),
+            rel,
+            br##"{"Work":{"color":"#abcdef","icon":"builtin:star"}}"##,
+            Some(&sha256_hex(&current)),
+            &mut changes,
+        )
+        .unwrap();
+        let mut old_bytes = Vec::new();
+        original.read_to_end(&mut old_bytes).unwrap();
+        assert_eq!(old_bytes, current);
+        assert_eq!(
+            operations::load_tag_styles(root).unwrap()["Work"]
+                .color
+                .as_deref(),
+            Some("#abcdef")
+        );
+
+        let before = fs::read(&path).unwrap();
+        assert!(write_local_if_unchanged(
+            &guard,
+            vault.path(),
+            rel,
+            b"{broken",
+            Some(&sha256_hex(&before)),
+            &mut HashMap::new()
+        )
+        .is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn streaming_hash_matches_bytes_across_buffer_boundaries() {
+        let mut buffer = [0; HASH_BUFFER_SIZE];
+        for len in [0, 256, HASH_BUFFER_SIZE, HASH_BUFFER_SIZE * 2 + 137] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
+            assert_eq!(
+                sha256_reader(&mut bytes.as_slice(), &mut buffer).unwrap(),
+                sha256_hex(&bytes),
+                "hash mismatch for {len} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_hash_retries_interruptions_and_accepts_short_reads() {
+        struct InterruptedShortReader<'a> {
+            remaining: &'a [u8],
+            interrupt_next: bool,
+        }
+
+        impl Read for InterruptedShortReader<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.interrupt_next = !self.interrupt_next;
+                if self.interrupt_next {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let len = buffer.len().min(7);
+                self.remaining.read(&mut buffer[..len])
+            }
+        }
+
+        let bytes: Vec<u8> = (0..513).map(|i| (i % 256) as u8).collect();
+        let mut reader = InterruptedShortReader {
+            remaining: &bytes,
+            interrupt_next: false,
+        };
+        let mut buffer = [0; HASH_BUFFER_SIZE];
+        assert_eq!(
+            sha256_reader(&mut reader, &mut buffer).unwrap(),
+            sha256_hex(&bytes)
+        );
+    }
+
+    #[test]
+    fn streaming_hash_rejects_partial_content_after_read_error() {
+        struct FailingReader;
+
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::PermissionDenied.into())
+            }
+        }
+
+        let mut reader = b"partial content".as_slice().chain(FailingReader);
+        let mut buffer = [0; HASH_BUFFER_SIZE];
+        assert_eq!(
+            sha256_reader(&mut reader, &mut buffer).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn local_scan_hashes_large_attachments_and_independent_files() {
+        let vault = tempfile::tempdir().unwrap();
+        fs::create_dir_all(vault.path().join(".helixnotes/attachments")).unwrap();
+        let attachment: Vec<u8> = (0..HASH_BUFFER_SIZE * 2 + 31)
+            .map(|i| (i % 256) as u8)
+            .collect();
+        let files = [
+            (".helixnotes/attachments/large.bin", attachment.as_slice()),
+            (
+                ".helixnotes/attachments/small.bin",
+                b"\0\xff\x80".as_slice(),
+            ),
+            ("empty.md", b"".as_slice()),
+            ("note.md", b"note content".as_slice()),
+        ];
+        for (relpath, bytes) in files {
+            fs::write(vault.path().join(relpath), bytes).unwrap();
+        }
+        fs::write(vault.path().join("ignored.bin"), b"not synced").unwrap();
+
+        let local = scan_local(vault.path().to_str().unwrap()).unwrap();
+        let actual: HashMap<_, _> = local
+            .into_iter()
+            .map(|(relpath, file)| (relpath, (file.hash, file.path)))
+            .collect();
+        let expected: HashMap<_, _> = files
+            .into_iter()
+            .map(|(relpath, bytes)| {
+                (
+                    relpath.to_string(),
+                    (sha256_hex(bytes), vault.path().join(relpath)),
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn syncs_notebook_icon_mapping_and_assets_only() {
@@ -774,5 +1076,135 @@ mod tests {
         ] {
             assert!(!is_synced_relpath(path), "expected {path} to stay local");
         }
+    }
+
+    #[test]
+    fn unchanged_sync_has_no_local_mutations() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().join("note.md");
+        fs::write(&path, "unchanged content").unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let vault_path = vault.path().to_str().unwrap();
+        let local = scan_local(vault_path).unwrap();
+        let remote = HashMap::from([("note.md".to_string(), "etag".to_string())]);
+        let manifest = SyncManifest {
+            files: HashMap::from([(
+                "note.md".to_string(),
+                ManifestEntry {
+                    local_hash: local["note.md"].hash.clone(),
+                    remote_etag: "etag".to_string(),
+                },
+            )]),
+        };
+        let client = WebdavClient::new(WebdavConfig {
+            url: "http://127.0.0.1:0/".to_string(),
+            username: String::new(),
+            password: String::new(),
+        })
+        .unwrap();
+        let mut changes = HashMap::new();
+        let (next, summary) = apply_changes(
+            &client,
+            vault_path,
+            &local,
+            &remote,
+            &manifest,
+            &mut changes,
+            &tokio::sync::Mutex::new(()),
+        )
+        .unwrap();
+        assert!(changes.is_empty());
+        assert_eq!(summary.uploaded, 0);
+        assert_eq!(summary.downloaded, 0);
+        assert_eq!(summary.deleted_local, 0);
+        assert_eq!(summary.deleted_remote, 0);
+        assert_eq!(summary.conflicts, 0);
+        assert_eq!(next.files["note.md"].local_hash, local["note.md"].hash);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert_eq!(fs::read_to_string(path).unwrap(), "unchanged content");
+    }
+
+    #[test]
+    fn remote_deletion_records_only_the_removed_local_note() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().join("note.md");
+        fs::write(&path, "unchanged content").unwrap();
+        let vault_path = vault.path().to_str().unwrap();
+        let local = scan_local(vault_path).unwrap();
+        let manifest = SyncManifest {
+            files: HashMap::from([(
+                "note.md".to_string(),
+                ManifestEntry {
+                    local_hash: local["note.md"].hash.clone(),
+                    remote_etag: "etag".to_string(),
+                },
+            )]),
+        };
+        let client = WebdavClient::new(WebdavConfig {
+            url: "http://127.0.0.1:0/".to_string(),
+            username: String::new(),
+            password: String::new(),
+        })
+        .unwrap();
+        let mut changes = HashMap::new();
+        let (next, summary) = apply_changes(
+            &client,
+            vault_path,
+            &local,
+            &HashMap::new(),
+            &manifest,
+            &mut changes,
+            &tokio::sync::Mutex::new(()),
+        )
+        .unwrap();
+        assert!(!path.exists());
+        assert!(!next.files.contains_key("note.md"));
+        assert_eq!(summary.deleted_local, 1);
+        assert_eq!(changes, HashMap::from([(path, "remove")]));
+    }
+
+    #[test]
+    fn local_download_journal_ignores_identical_bytes_and_preserves_partial_changes() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().join("Notes/note.md");
+        let mut changes = HashMap::new();
+        write_local(
+            vault.path(),
+            "Notes/note.md",
+            b"first content",
+            &mut changes,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first content");
+        changes.clear();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        write_local(
+            vault.path(),
+            "Notes/note.md",
+            b"first content",
+            &mut changes,
+        )
+        .unwrap();
+        assert!(changes.is_empty());
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+
+        write_local(
+            vault.path(),
+            "Notes/note.md",
+            b"remote content",
+            &mut changes,
+        )
+        .unwrap();
+        fs::write(vault.path().join("blocked"), b"not a directory").unwrap();
+        assert!(write_local(
+            vault.path(),
+            "blocked/note.md",
+            b"cannot write",
+            &mut changes
+        )
+        .is_err());
+        assert_eq!(changes, HashMap::from([(path.clone(), "modify")]));
+        let event = changed_entry(path, "modify", vault.path());
+        assert_eq!(event.note.unwrap().preview, "remote content");
     }
 }

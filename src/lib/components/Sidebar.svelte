@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { tick } from 'svelte';
+	import { onDestroy, tick } from 'svelte';
+	import { get } from 'svelte/store';
 	import {
 		notebooks,
 		notes,
@@ -7,6 +8,7 @@
 		viewMode,
 		activeNotebook,
 		activeNotePath,
+		editorDirty,
 		activeNote,
 		activeTag,
 		showSearch,
@@ -22,13 +24,14 @@
 		notebookSortMode,
 		notebookOrder
 	} from '$lib/stores/app';
-	import { getNotebooks, getAllTags, createNotebook, deleteNotebook, renameNotebook, moveNotebook, getNotebookIcons, setNotebookIcon, getTagStyles, saveAttachment, getQuickAccess, addQuickAccess, removeQuickAccess, emptyTrash, moveNote, readNote, countRootNotes } from '$lib/api';
+	import { getNotebooks, getAllTags, createNotebook, deleteNotebook, renameNotebook, moveNotebook, getNotebookIcons, setNotebookIcon, getTagStyles, importNotebookIcon, getQuickAccess, addQuickAccess, removeQuickAccess, emptyTrash, moveNote, readNote, countRootNotes } from '$lib/api';
 	import { open as openDialog } from '@tauri-apps/plugin-dialog';
 	import { readFile } from '@tauri-apps/plugin-fs';
 	import { convertFileSrc } from '@tauri-apps/api/core';
 	import type { NotebookEntry } from '$lib/types';
 	import { isMobile } from '$lib/platform';
 	import { decodeNoteDragPaths } from '$lib/utils/note-drag';
+	import { notebookAppearance, tagAppearance } from '$lib/utils/appearance-mutations';
 	import NotebookGlyph from './NotebookGlyph.svelte';
 	import TagLabel from './TagLabel.svelte';
 	import TagStylePicker from './TagStylePicker.svelte';
@@ -40,11 +43,26 @@
 		type NotebookIconId
 	} from '$lib/utils/notebook-icons';
 
-	let { onViewChanged = () => {} }: {
+	let { onViewChanged = () => {}, onBeforeNoteChange = async () => true }: {
 		onViewChanged?: () => void;
+		onBeforeNoteChange?: () => Promise<boolean>;
 	} = $props();
 
 	const modKey = navigator.platform.startsWith('Mac') ? '⌘' : 'Ctrl';
+	const ownerVault = get(appConfig)?.active_vault ?? null;
+	let disposed = false;
+	let refreshRequest = 0;
+	let tagRefreshRequest = 0;
+
+	function ownerIsCurrent() {
+		return !disposed && (get(appConfig)?.active_vault ?? null) === ownerVault;
+	}
+
+	onDestroy(() => {
+		disposed = true;
+		refreshRequest++;
+		nbStopDragListeners();
+	});
 
 	// Whether any top nav item (All Notes, Quick Access, Tasks, Daily Notes, Trash) is visible.
 	// When all are hidden we drop the empty <nav> and its divider so the tree sits flush.
@@ -61,6 +79,7 @@
 	let renameInput: HTMLInputElement | null = $state(null);
 	let newNotebookName = $state('');
 	let showNewNotebook = $state(false);
+	let iconError = $state('');
 	let newNotebookInput: HTMLInputElement | null = $state(null);
 	let dropTargetPath = $state<string | null>(null);
 	let dropPosition = $state<'above' | 'into' | 'below' | null>(null);
@@ -123,32 +142,46 @@
 	}
 
 
-	export async function refresh() {
+	export async function refreshTags() {
+		if (!ownerIsCurrent()) return;
+		const request = ++tagRefreshRequest;
 		try {
-			if (isMobile) {
-				// On mobile, parallelize and skip getAllTags (derive from $notes instead)
-				const [nbs, icons, styles, qaNotes, rootCount] = await Promise.all([
-					getNotebooks(),
-					getNotebookIcons(),
-					getTagStyles(),
-					getQuickAccess(),
-					countRootNotes(),
-				]);
-				$notebooks = nbs;
-				$notebookIcons = icons;
-				$tagStyles = styles;
-				$quickAccessPaths = qaNotes.map(n => n.relative_path);
-				$rootNoteCount = rootCount;
-			} else {
-				const [nbs, rootCount] = await Promise.all([getNotebooks(), countRootNotes()]);
-				$notebooks = nbs;
-				$rootNoteCount = rootCount;
-				$tags = await getAllTags();
-				$notebookIcons = await getNotebookIcons();
-				$tagStyles = await getTagStyles();
-				const qaNotes = await getQuickAccess();
-				$quickAccessPaths = qaNotes.map(n => n.relative_path);
+			const nextTags = await getAllTags();
+			if (ownerIsCurrent() && request === tagRefreshRequest) $tags = nextTags;
+		} catch (error) {
+			console.error('Failed to refresh tags:', error);
+		}
+	}
+
+	export async function refresh() {
+		if (!ownerIsCurrent()) return;
+		const request = ++refreshRequest;
+		const tagRequest = isMobile ? tagRefreshRequest : ++tagRefreshRequest;
+		const iconRevision = notebookAppearance.snapshot(ownerVault!);
+		const styleRevision = tagAppearance.snapshot(ownerVault!);
+		try {
+			// Mobile derives tags from notes instead of issuing another full-vault scan.
+			const [nbs, appearances, qaNotes, rootCount, nextTags] = await Promise.all([
+				getNotebooks(),
+				Promise.allSettled([getNotebookIcons(ownerVault!), getTagStyles(ownerVault!)]),
+				getQuickAccess(ownerVault!),
+				countRootNotes(),
+				isMobile ? Promise.resolve(null) : getAllTags(),
+			]);
+			if (!ownerIsCurrent() || request !== refreshRequest) return;
+			$notebooks = nbs;
+			const [icons, styles] = appearances;
+			if (notebookAppearance.acceptsSnapshot(ownerVault!, iconRevision)) {
+				if (icons.status === 'fulfilled') $notebookIcons = icons.value;
+				else iconError = `Could not read notebook icons: ${String(icons.reason)}`;
 			}
+			if (tagAppearance.acceptsSnapshot(ownerVault!, styleRevision)) {
+				if (styles.status === 'fulfilled') $tagStyles = styles.value;
+				else iconError = `Could not read tag appearances: ${String(styles.reason)}`;
+			}
+			$quickAccessPaths = qaNotes.map(n => n.relative_path);
+			$rootNoteCount = rootCount;
+			if (nextTags && tagRequest === tagRefreshRequest) $tags = nextTags;
 		} catch (e) {
 			console.error('Failed to refresh sidebar:', e);
 		}
@@ -241,6 +274,7 @@
 
 	async function focusNewNotebookInput() {
 		await tick();
+		if (!ownerIsCurrent()) return;
 		newNotebookInput?.focus();
 	}
 
@@ -276,7 +310,8 @@
 			const name = parentRel ? trimmedName : getNotebookNameSegments(trimmedName)?.join('/');
 			if (!name) return;
 
-			await createNotebook(parentRel, name);
+			await createNotebook(ownerVault!, parentRel, name);
+			if (!ownerIsCurrent()) return;
 			newNotebookName = '';
 			showNewNotebook = false;
 			newNotebookParent = null;
@@ -321,7 +356,10 @@
 			return;
 		}
 		try {
-			await renameNotebook(nb.path, editValue.trim());
+			if (!(await onBeforeNoteChange())) return;
+			if (!ownerIsCurrent()) return;
+			await renameNotebook(ownerVault!, nb.path, editValue.trim());
+			if (!ownerIsCurrent()) return;
 			editingNotebook = null;
 			await refresh();
 		} catch (e) {
@@ -350,7 +388,10 @@
 	async function confirmDelete(nb: NotebookEntry) {
 		deleteConfirm = null;
 		try {
-			await deleteNotebook(nb.path);
+			if (!(await onBeforeNoteChange())) return;
+			if (!ownerIsCurrent()) return;
+			await deleteNotebook(ownerVault!, nb.path);
+			if (!ownerIsCurrent()) return;
 			if ($activeNotebook?.path === nb.path) {
 				selectAllNotes();
 			}
@@ -367,14 +408,17 @@
 		const notePaths = [...new Set(decodeNoteDragPaths(payload))]
 			.filter((path) => norm(parentOf(path)) !== norm(nb.path));
 		if (notePaths.length === 0) return;
+		if (!(await onBeforeNoteChange())) return;
+		if (!ownerIsCurrent()) return;
 
 		const movedPaths = new Map<string, string>();
 		for (const notePath of notePaths) {
 			try {
-				movedPaths.set(notePath, await moveNote(notePath, nb.path));
+				movedPaths.set(notePath, await moveNote(ownerVault!, notePath, nb.path));
 			} catch (e) {
 				console.error('Failed to move note:', notePath, e);
 			}
+			if (!ownerIsCurrent()) return;
 		}
 		if (movedPaths.size === 0) return;
 
@@ -383,7 +427,11 @@
 		if (activeNewPath) {
 			$activeNotePath = activeNewPath;
 			try {
-				$activeNote = await readNote(activeNewPath);
+				const previous = $activeNote;
+				const content = await readNote(ownerVault!, activeNewPath);
+				if (ownerIsCurrent() && $activeNotePath === activeNewPath && $activeNote === previous && !$editorDirty) {
+					$activeNote = content;
+				}
 			} catch (e) {
 				console.error('Failed to reload moved note:', e);
 			}
@@ -407,9 +455,12 @@
 		const parentDir = parentOf(srcPath);
 		if (parentDir === destPath) return;
 		try {
+			if (!(await onBeforeNoteChange())) return;
+			if (!ownerIsCurrent()) return;
 			const oldName = baseOf(srcPath);
 			const newBasePath = joinPath(destPath, oldName);
-			await moveNotebook(srcPath, destPath);
+			await moveNotebook(ownerVault!, srcPath, destPath);
+			if (!ownerIsCurrent()) return;
 			// Update collapsedNotebooks paths
 			$collapsedNotebooks = $collapsedNotebooks.map(p => {
 				if (p === srcPath) return newBasePath;
@@ -423,9 +474,12 @@
 			if ($activeNotePath && isDescendant($activeNotePath, srcPath)) {
 				const newNotePath = newBasePath + $activeNotePath.slice(srcPath.length);
 				$activeNotePath = newNotePath;
-				$activeNote = await readNote(newNotePath);
+				const previous = $activeNote;
+				const content = await readNote(ownerVault!, newNotePath);
+				if (ownerIsCurrent() && $activeNotePath === newNotePath && $activeNote === previous && !$editorDirty) {
+					$activeNote = content;
+				}
 			}
-			$notebookIcons = await getNotebookIcons();
 			await refresh();
 		} catch (e) {
 			console.error('Failed to move notebook:', e);
@@ -524,9 +578,12 @@
 		try {
 			// Step 1: if different parents, move src into target's parent first
 			if (srcParent !== targetParent) {
+				if (!(await onBeforeNoteChange())) return;
+				if (!ownerIsCurrent()) return;
 				const oldName = baseOf(srcPath);
 				const newPath = joinPath(targetParent, oldName);
-				await moveNotebook(srcPath, targetParent);
+				await moveNotebook(ownerVault!, srcPath, targetParent);
+				if (!ownerIsCurrent()) return;
 				// Migrate paths in collapsedNotebooks
 				$collapsedNotebooks = $collapsedNotebooks.map(p => {
 					if (p === srcPath) return newPath;
@@ -548,10 +605,14 @@
 				if ($activeNotePath && isDescendant($activeNotePath, srcPath)) {
 					const newNotePath = newPath + $activeNotePath.slice(srcPath.length);
 					$activeNotePath = newNotePath;
-					$activeNote = await readNote(newNotePath);
+					const previous = $activeNote;
+					const content = await readNote(ownerVault!, newNotePath);
+					if (ownerIsCurrent() && $activeNotePath === newNotePath && $activeNote === previous && !$editorDirty) {
+						$activeNote = content;
+					}
 				}
-				$notebookIcons = await getNotebookIcons();
 				await refresh();
+				if (!ownerIsCurrent()) return;
 				actualSrcPath = newPath;
 			}
 
@@ -587,6 +648,7 @@
 		editingNotebook = nb.path;
 		editValue = nb.name;
 		await tick();
+		if (!ownerIsCurrent()) return;
 		renameInput?.focus();
 		renameInput?.select();
 	}
@@ -595,52 +657,71 @@
 		contextMenu = null;
 		iconPickerNotebook = nb;
 		await tick();
+		if (!ownerIsCurrent()) return;
 		iconPickerElement?.focus();
 	}
 
+	function publishNotebookIcon(key: string, value: string | null) {
+		if (get(appConfig)?.active_vault !== ownerVault) return;
+		const icons = { ...get(notebookIcons) };
+		if (value === null) delete icons[key];
+		else icons[key] = value;
+		notebookIcons.set(icons);
+	}
+
 	async function handleBuiltinIcon(nb: NotebookEntry, icon: NotebookIconId) {
+		if (!ownerVault || !ownerIsCurrent()) return;
+		const key = normalizeNotebookIconKey(nb.relative_path);
+		const latest = notebookAppearance.choose(ownerVault, key);
+		const value = encodeBuiltinNotebookIcon(icon);
+		iconError = '';
 		try {
-			const key = normalizeNotebookIconKey(nb.relative_path);
-			const value = encodeBuiltinNotebookIcon(icon);
-			await setNotebookIcon(key, value);
-			$notebookIcons = { ...$notebookIcons, [key]: value };
-			iconPickerNotebook = null;
+			await notebookAppearance.run(ownerVault, key, latest,
+				() => setNotebookIcon(ownerVault, key, value),
+				() => publishNotebookIcon(key, value));
+			if (ownerIsCurrent() && latest()) iconPickerNotebook = null;
 		} catch (e) {
-			console.error('Failed to set notebook icon:', e);
+			if (ownerIsCurrent() && latest()) iconError = String(e);
 		}
 	}
 
 	async function handleCustomIcon(nb: NotebookEntry) {
+		if (!ownerVault || !ownerIsCurrent()) return;
+		const key = normalizeNotebookIconKey(nb.relative_path);
+		const latest = notebookAppearance.choose(ownerVault, key);
 		iconPickerNotebook = null;
+		iconError = '';
 		try {
 			const selected = await openDialog({
 				multiple: false,
 				filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico'] }]
 			});
-			if (!selected) return;
+			if (!selected || !ownerIsCurrent() || !latest()) return;
 			const filePath = selected as string;
 			const data = await readFile(filePath);
+			if (!ownerIsCurrent() || !latest()) return;
 			const fileName = baseOf(filePath) || 'icon.png';
-			const iconRelative = await saveAttachment(`notebook-icon-${fileName}`, Array.from(data));
-			const key = normalizeNotebookIconKey(nb.relative_path);
-			await setNotebookIcon(key, iconRelative);
-			$notebookIcons = { ...$notebookIcons, [key]: iconRelative };
+			await notebookAppearance.run(ownerVault, key, latest,
+				() => importNotebookIcon(ownerVault, key, `notebook-icon-${fileName}`, Array.from(data)),
+				(value) => publishNotebookIcon(key, value));
 		} catch (e) {
-			console.error('Failed to set notebook icon:', e);
+			if (ownerIsCurrent() && latest()) iconError = String(e);
 		}
 	}
 
 	async function handleRemoveIcon(nb: NotebookEntry) {
+		if (!ownerVault || !ownerIsCurrent()) return;
+		const key = normalizeNotebookIconKey(nb.relative_path);
+		const latest = notebookAppearance.choose(ownerVault, key);
 		contextMenu = null;
 		iconPickerNotebook = null;
+		iconError = '';
 		try {
-			const key = normalizeNotebookIconKey(nb.relative_path);
-			await setNotebookIcon(key, null);
-			const icons = { ...$notebookIcons };
-			delete icons[key];
-			$notebookIcons = icons;
+			await notebookAppearance.run(ownerVault, key, latest,
+				() => setNotebookIcon(ownerVault, key, null),
+				() => publishNotebookIcon(key, null));
 		} catch (e) {
-			console.error('Failed to remove notebook icon:', e);
+			if (ownerIsCurrent() && latest()) iconError = String(e);
 		}
 	}
 
@@ -707,11 +788,16 @@
 
 	async function handleEmptyTrash() {
 		trashContextMenu = null;
+		const previous = $activeNote;
+		const path = $activeNotePath;
 		try {
-			await emptyTrash();
+			await emptyTrash(ownerVault!);
+			if (!ownerIsCurrent()) return;
 			// Clear selection and refresh the list (with cache invalidation)
-			$activeNote = null;
-			$activeNotePath = '';
+			if ($activeNotePath === path && $activeNote === previous) {
+				$activeNote = null;
+				$activeNotePath = '';
+			}
 			onViewChanged();
 		} catch (e) {
 			console.error('Failed to empty trash:', e);
@@ -886,6 +972,7 @@
 				</div>
 			{/if}
 
+			{#if iconError}<div class="sidebar-error" role="alert">{iconError}</div>{/if}
 			<div class="notebook-list">
 				{#if $rootNoteCount > 0}
 					<button
@@ -895,10 +982,12 @@
 						style="padding-left: 4px"
 					>
 					<span style="width:14px;flex-shrink:0"></span>
+					<span class="notebook-icon-slot">
 					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;opacity:0.6">
 						<path d="M22 12h-6l-2 3h-4l-2-3H2" />
 						<path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
 					</svg>
+					</span>
 					<span class="notebook-name">Unfiled Notes <span class="notebook-count">{$rootNoteCount}</span></span>
 					</button>
 				{/if}
@@ -1196,10 +1285,11 @@
 			{:else}
 				<span class="chevron-spacer"></span>
 			{/if}
+		<span class="notebook-icon-slot" class:notebook-builtin-icon={!!builtinIcon}>
 		{#if builtinIcon}
-			<span class="notebook-builtin-icon"><NotebookGlyph icon={builtinIcon} size={18} /></span>
+			<NotebookGlyph icon={builtinIcon} size={18} />
 		{:else if iconSrc}
-			<img class="notebook-icon" src={iconSrc} alt="" />
+			<img class="notebook-icon" crossorigin="anonymous" src={iconSrc} alt="" />
 		{:else if isCollapsed || nb.children.length === 0}
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.6;flex-shrink:0">
 				<path d="M2 6h4"/><path d="M2 10h4"/><path d="M2 14h4"/><path d="M2 18h4"/>
@@ -1212,6 +1302,7 @@
 				<path d="M10 9h8"/><path d="M10 13h8"/><path d="M10 17h5"/>
 			</svg>
 		{/if}
+		</span>
 			<span class="notebook-name">{nb.name} <span class="notebook-count">{nb.note_count}</span></span>
 			{#if $notebookSortMode === 'manual'}
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -1244,6 +1335,13 @@
 {/snippet}
 
 <style>
+	.sidebar-error {
+		padding: 8px;
+		font-size: 12px;
+		color: var(--text-secondary);
+		overflow-wrap: anywhere;
+	}
+
 	.sidebar {
 		display: flex;
 		flex-direction: column;
@@ -1553,13 +1651,17 @@
 		flex-shrink: 0;
 	}
 
-	.notebook-builtin-icon {
+	.notebook-icon-slot {
 		width: 20px;
 		height: 20px;
-		display: grid;
-		place-items: center;
-		color: var(--text-secondary);
+		display: flex;
+		align-items: center;
+		justify-content: center;
 		flex-shrink: 0;
+	}
+
+	.notebook-builtin-icon {
+		color: var(--text-secondary);
 	}
 
 	.notebook-name {
@@ -2050,7 +2152,7 @@
 		height: 24px;
 	}
 
-	.sidebar.mobile .notebook-builtin-icon {
+	.sidebar.mobile .notebook-icon-slot {
 		width: 24px;
 		height: 24px;
 	}

@@ -16,6 +16,8 @@ const {
   assetSourceToMarkdown,
   assetUrlToLocalPath,
   normalizeLocalAssetPath,
+  isPathInDirectory,
+  isTrashedNote,
   resolvePathFromFile,
   resolveVaultFilePath
 } = await import(
@@ -114,4 +116,28 @@ test('resolves vault files consistently across platforms', () => {
     resolveVaultFilePath('../assets/image.png', '\\\\server\\share\\Vault\\notes\\Note.md', '\\\\server\\share\\Vault'),
     '//server/share/Vault/assets/image.png'
   );
+});
+
+test('restored Windows and UNC notes remain vault-owned across separator and case differences', () => {
+  assert.equal(isPathInDirectory('C:\\NOTES\\Alpha.md', 'c:\\Notes\\'), true);
+  assert.equal(isPathInDirectory('C:/Notes/Folder/Alpha.md', 'C:\\Notes'), true);
+  assert.equal(isPathInDirectory('\\\\SERVER\\SHARE\\Notes\\Alpha.md', '//server/share/notes/'), true);
+});
+
+test('vault ownership normalizes trailing separators and dot segments without accepting siblings', () => {
+  assert.equal(isPathInDirectory('/vault/folder/../Alpha.md', '/vault/'), true);
+  assert.equal(isPathInDirectory('/vault/folder/../../Outside.md', '/vault'), false);
+  assert.equal(isPathInDirectory('/vault-extra/Alpha.md', '/vault'), false);
+  assert.equal(isPathInDirectory('D:\\Notes\\Alpha.md', 'C:\\Notes'), false);
+  assert.equal(isPathInDirectory('/Vault/Alpha.md', '/vault'), false);
+  assert.equal(isPathInDirectory('/vault/Alpha.md', null), false);
+});
+
+test('trash previews are protected without blocking ordinary notebooks or other vaults', () => {
+  assert.equal(isTrashedNote('/vault/.helixnotes/trash/deleted.md', '/vault'), true);
+  assert.equal(isTrashedNote('C:\\Vault\\.helixnotes\\trash\\deleted.md', 'c:/vault/'), true);
+  assert.equal(isTrashedNote('/vault/Trash/note.md', '/vault'), false);
+  assert.equal(isTrashedNote('/vault/.helixnotes/trash-backup/note.md', '/vault'), false);
+  assert.equal(isTrashedNote('/other/.helixnotes/trash/deleted.md', '/vault'), false);
+  assert.equal(isTrashedNote(null, '/vault'), false);
 });

@@ -1,8 +1,9 @@
 <script lang="ts">
-	import { onDestroy } from 'svelte';
+	import { onDestroy, untrack } from 'svelte';
 	import { getGraphData } from '$lib/api';
 	import { activeNotePath, appConfig } from '$lib/stores/app';
 	import { isMobile } from '$lib/platform';
+	import { applyGraphRepulsion } from '$lib/utils/graph-layout';
 
 	let { onclose, onnavigate }: {
 		onclose: () => void;
@@ -14,7 +15,7 @@
 	let searchQuery = $state('');
 	let localMode = $state(true); // default: show only active note's neighborhood
 
-	const dataPromise = getGraphData();
+	const dataPromise = getGraphData($appConfig!.active_vault!);
 
 	interface GraphNode { id: string; title: string; path: string; x: number; y: number; vx: number; vy: number; }
 	interface GraphEdge { sourceIdx: number; targetIdx: number; bidirectional: boolean; }
@@ -39,14 +40,15 @@
 	let hoveredIdx = -1;
 	let hoveredNeighborSet: Set<number> = new Set();
 	let hoveredEdgeSet: Set<number> = new Set();
-	let glowPhase = 0;
 	let activeNodeIdx = $state(-1);
 	let navigatedFromGraph = false;
 
-	// Combined animation loop
+	// Physics runs in short yielded batches; the completed graph is static.
 	let physicsRemaining = 0;
-	let animFrameId = 0;
-	let lastGlowTs = 0;
+	let physicsStep: Generator<void> | null = null;
+	const layoutChannel = new MessageChannel();
+	let layoutScheduled = false;
+	let disposed = false;
 
 	// DPI fix
 	let dpr = 1;
@@ -156,6 +158,7 @@
 		loading = true;
 		try {
 			const data = await dataPromise;
+			if (disposed) return;
 			const w = canvasW || 800;
 			const h = canvasH || 600;
 
@@ -188,7 +191,6 @@
 		} catch (e) {
 			console.error('Failed to build graph:', e);
 		}
-		loading = false;
 		startSimulation();
 	}
 
@@ -232,83 +234,60 @@
 	}
 
 	function startSimulation() {
-		// Initial settle - enough for a rough layout, camera set after full physics
-		for (let i = 0; i < 80; i++) simulate();
-
-		// Show the full graph while physics finishes settling
-		fitToView();
-		draw();
-
-		// Queue remaining physics - camera will snap to active note when done
-		physicsRemaining = Math.min(400, Math.max(150, nodes.length * 3));
-		startAnimLoop();
+		// Keep the original initial layout; omit the animated settling tail.
+		physicsRemaining = nodes.length > 0 ? 80 : 0;
+		physicsStep = null;
+		if (physicsRemaining === 0) {
+			loading = false;
+			draw();
+		} else {
+			startLayoutLoop();
+		}
 	}
 
-	function startAnimLoop() {
-		if (animFrameId) cancelAnimationFrame(animFrameId);
-		lastGlowTs = 0;
+	function startLayoutLoop() {
+		if (disposed || layoutScheduled || physicsRemaining === 0) return;
 
-		function loop(ts: number) {
-			let needsDraw = false;
-
-			// Physics batch
-			if (physicsRemaining > 0) {
-				const batch = Math.min(20, physicsRemaining);
-				for (let i = 0; i < batch; i++) simulate();
-				physicsRemaining -= batch;
-				// When physics is fully settled, snap camera to active note
-				if (physicsRemaining === 0) {
-					if (activeNodeIdx >= 0) centerOnActiveNote(); else fitToView();
+		function loop() {
+			layoutScheduled = false;
+			if (disposed) return;
+			// Yield between repulsion rows, including within a large physics step.
+			const deadline = performance.now() + 8;
+			do {
+				physicsStep ??= simulate();
+				if (physicsStep.next().done) {
+					physicsStep = null;
+					physicsRemaining--;
 				}
-				needsDraw = true;
-			}
+			} while (physicsRemaining > 0 && performance.now() < deadline);
 
-			// Glow pulse for active node - throttled to ~30fps
-			if (activeNodeIdx >= 0) {
-				const elapsed = lastGlowTs > 0 ? Math.min(ts - lastGlowTs, 100) : 16.67;
-				if (lastGlowTs === 0 || ts - lastGlowTs >= 33) {
-					glowPhase += 0.04 * (elapsed / 16.67);
-					lastGlowTs = ts;
-					needsDraw = true;
-				}
-			}
-
-			if (needsDraw) draw();
-
-			if (physicsRemaining > 0 || activeNodeIdx >= 0) {
-				animFrameId = requestAnimationFrame(loop);
+			if (physicsRemaining === 0) {
+				loading = false;
+				if (activeNodeIdx >= 0) centerOnActiveNote(); else fitToView();
+				draw();
 			} else {
-				animFrameId = 0;
+				layoutScheduled = true;
+				layoutChannel.port2.postMessage(null);
 			}
 		}
-		animFrameId = requestAnimationFrame(loop);
+		// A queued task yields to input without waiting for a display frame or timer clamp.
+		layoutChannel.port1.onmessage = loop;
+		layoutScheduled = true;
+		layoutChannel.port2.postMessage(null);
 	}
 
-	function simulate() {
-		const nodeCount = nodes.length;
+	function* simulate(): Generator<void> {
+		const graphNodes = nodes;
+		const nodeCount = graphNodes.length;
 		if (nodeCount === 0) return;
 		const w = canvasW || 800, h = canvasH || 600;
 		const centerX = w / 2, centerY = h / 2;
 
-		// Repulsion
-		for (let i = 0; i < nodeCount; i++) {
-			const a = nodes[i];
-			for (let j = i + 1; j < nodeCount; j++) {
-				const b = nodes[j];
-				const dx = b.x - a.x, dy = b.y - a.y;
-				const distSq = dx * dx + dy * dy;
-				if (distSq > 360000) continue;
-				const d = distSq || 1;
-				const force = 1500 / d;
-				const dist = Math.sqrt(d);
-				const fx = (dx / dist) * force, fy = (dy / dist) * force;
-				a.vx -= fx; a.vy -= fy; b.vx += fx; b.vy += fy;
-			}
-		}
+		yield* applyGraphRepulsion(graphNodes);
 
 		// Spring attraction along edges
 		for (const edge of edges) {
-			const a = nodes[edge.sourceIdx], b = nodes[edge.targetIdx];
+			const a = graphNodes[edge.sourceIdx], b = graphNodes[edge.targetIdx];
 			const dx = b.x - a.x, dy = b.y - a.y;
 			const dist = Math.sqrt(dx * dx + dy * dy) || 1;
 			const force = (dist - 130) * 0.012;
@@ -318,14 +297,14 @@
 
 		// Center gravity - weaker for isolated nodes so they spread instead of clustering
 		for (let i = 0; i < nodeCount; i++) {
-			const node = nodes[i];
+			const node = graphNodes[i];
 			const gravity = (nodeDegree[i] || 0) === 0 ? 0.0002 : 0.0008;
 			node.vx += (centerX - node.x) * gravity;
 			node.vy += (centerY - node.y) * gravity;
 		}
 
 		// Damping + integration
-		for (const node of nodes) {
+		for (const node of graphNodes) {
 			if (node === dragging) continue;
 			node.vx *= 0.85; node.vy *= 0.85;
 			node.x += node.vx; node.y += node.vy;
@@ -333,7 +312,7 @@
 	}
 
 	function draw() {
-		if (!canvas) return;
+		if (!canvas || loading) return;
 		const ctx = canvas.getContext('2d');
 		if (!ctx) return;
 
@@ -345,7 +324,6 @@
 
 		const { border: borderColor, text: textColor, textSec, accent, bg: bgColor } = getStyles();
 		const activePath = $activeNotePath || '';
-		const pulse = 0.5 + 0.5 * Math.sin(glowPhase);
 		const isHovering = hoveredIdx >= 0;
 		const isSearching = searchMatchSet !== null;
 
@@ -497,12 +475,11 @@
 
 			const radius = getNodeRadius(i, isActive);
 
-			// Active glow ring - opacity pulse, no radius change
+			// Keep the active note highlighted without redrawing an idle graph.
 			if (isActive) {
 				const glowR = radius + 12;
 				const glow = ctx.createRadialGradient(node.x, node.y, radius, node.x, node.y, glowR);
-				const glowAlpha = Math.round((0.25 + pulse * 0.45) * 255).toString(16).padStart(2, '0');
-				glow.addColorStop(0, accent + glowAlpha);
+				glow.addColorStop(0, accent + '80');
 				glow.addColorStop(1, accent + '00');
 				ctx.globalAlpha = 1;
 				ctx.beginPath();
@@ -524,9 +501,9 @@
 			}
 			ctx.fill();
 
-			// Active outer ring - static, alpha pulse only
+			// Static active outer ring.
 			if (isActive) {
-				ctx.globalAlpha = 0.35 + pulse * 0.3;
+				ctx.globalAlpha = 0.5;
 				ctx.beginPath();
 				ctx.arc(node.x, node.y, radius + 3, 0, Math.PI * 2);
 				ctx.strokeStyle = accent;
@@ -587,7 +564,7 @@
 	}
 
 	function getNodeAt(clientX: number, clientY: number): GraphNode | null {
-		if (!canvas) return null;
+		if (!canvas || loading) return null;
 		const rect = canvas.getBoundingClientRect();
 		const x = (clientX - rect.left - pan.x) / zoom;
 		const y = (clientY - rect.top - pan.y) / zoom;
@@ -627,8 +604,7 @@
 			if (node !== hoveredNode) {
 				updateHoveredState(node);
 				if (canvas) canvas.style.cursor = node ? 'pointer' : 'grab';
-				// Restart loop if it stopped (for immediate hover redraws)
-				if (!animFrameId) draw();
+				if (!layoutScheduled) draw();
 			}
 		}
 	}
@@ -754,20 +730,21 @@
 			navigatedFromGraph = false;
 			centerOnActiveNote();
 		}
-		if (newIdx >= 0 && !animFrameId && canvas) startAnimLoop();
-		else if (newIdx < 0 && !animFrameId && canvas) draw(); // remove stale glow immediately
+		if (!layoutScheduled && canvas) untrack(draw);
 	});
 
 	// React to search query changes
 	$effect(() => {
 		const _q = searchQuery; // track
 		updateSearchMatch();
-		if (canvas && !animFrameId) draw();
-		if (activeNodeIdx >= 0 && !animFrameId && canvas) startAnimLoop();
+		if (canvas && !layoutScheduled) untrack(draw);
 	});
 
 	onDestroy(() => {
-		if (animFrameId) cancelAnimationFrame(animFrameId);
+		disposed = true;
+		layoutChannel.port1.onmessage = null;
+		layoutChannel.port1.close();
+		layoutChannel.port2.close();
 	});
 </script>
 

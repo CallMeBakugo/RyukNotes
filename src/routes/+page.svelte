@@ -13,6 +13,7 @@
 
 	let loading = $state(true);
 	let noteWindowPath = $state<string | null>(null);
+	let noteWindowVault = $state<string | null>(null);
 	let startupVaultError = $state('');
 	let fontSizeSaveTimer: ReturnType<typeof setTimeout> | null = null;
 	let removeEditorZoomShortcuts: (() => void) | null = null;
@@ -45,16 +46,16 @@
 	const minEditorFontSize = 10;
 	const maxEditorFontSize = 32;
 
-	function getEditorScrollSurface(): HTMLElement | HTMLTextAreaElement | null {
-		const sourceEditor = document.querySelector<HTMLTextAreaElement>('.source-editor');
-		if (sourceEditor && getComputedStyle(sourceEditor).display !== 'none') return sourceEditor;
+	function getEditorScrollSurface(): HTMLElement | null {
+		const sourceEditor = document.querySelector<HTMLElement>('.source-editor .cm-scroller');
+		if (sourceEditor && sourceEditor.clientHeight > 0) return sourceEditor;
 		return document.querySelector<HTMLElement>('.editor-body');
 	}
 
-	function preserveEditorViewportAfterLayout(scrollSurface: HTMLElement | HTMLTextAreaElement | null) {
+	function preserveEditorViewportAfterLayout(scrollSurface: HTMLElement | null) {
 		if (!scrollSurface) return () => {};
 
-		const isSourceEditor = scrollSurface instanceof HTMLTextAreaElement;
+		const isSourceEditor = scrollSurface.classList.contains('cm-scroller');
 		const maxScroll = scrollSurface.scrollHeight - scrollSurface.clientHeight;
 		const scrollRatio = maxScroll > 0 ? scrollSurface.scrollTop / maxScroll : 0;
 		const rect = scrollSurface.getBoundingClientRect();
@@ -152,10 +153,21 @@
 		const notePath = params.get('note');
 		if (notePath) {
 			noteWindowPath = notePath;
+			noteWindowVault = params.get('vault');
 		}
 
 		try {
 			const config = await getAppConfig();
+			if (noteWindowPath) {
+				const origin = config.vaults.find(vault => vault.path === noteWindowVault);
+				if (noteWindowVault && (origin || config.active_vault === noteWindowVault)) {
+					// This is window-local state, not a native vault switch.
+					config.active_vault = noteWindowVault;
+					config.active_bookmark_id = origin?.bookmark_id ?? null;
+				} else {
+					noteWindowVault = null;
+				}
+			}
 			$appConfig = config;
 			removeFontSizeListener = await listen<number>('editor-font-size-changed', (event) => {
 				if ($appConfig?.font_size !== event.payload) applyEditorFontSize(event.payload);
@@ -308,7 +320,7 @@
 		<div class="spinner"></div>
 	</div>
 {:else if noteWindowPath}
-	<NoteWindow notePath={noteWindowPath} />
+	<NoteWindow notePath={noteWindowPath} vaultPath={noteWindowVault} />
 {:else if $vaultReady}
 	<AppLayout />
 {:else}
