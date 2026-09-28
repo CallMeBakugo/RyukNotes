@@ -541,6 +541,24 @@ pub fn set_scroll_to_change_font_size(
 }
 
 #[tauri::command]
+pub fn set_toolbar_layout(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    layout: Option<ToolbarLayout>,
+) -> Result<(), String> {
+    let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    let previous = std::mem::replace(&mut config.toolbar_layout, layout);
+    if let Err(error) = save_app_config(&config) {
+        config.toolbar_layout = previous;
+        return Err(error);
+    }
+
+    use tauri::Emitter;
+    app.emit("toolbar-layout-changed", &config.toolbar_layout)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub fn set_font_family(state: State<'_, AppState>, family: String) -> Result<(), String> {
     let mut config = state.config.lock().map_err(|e| e.to_string())?;
     config.font_family = Some(family);

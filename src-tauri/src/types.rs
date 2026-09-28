@@ -139,6 +139,12 @@ pub enum StartupView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolbarLayout {
+    pub main: Vec<String>,
+    pub more: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub vaults: Vec<VaultConfig>,
     pub active_vault: Option<String>,
@@ -157,6 +163,8 @@ pub struct AppConfig {
     pub font_size: Option<u32>,
     #[serde(default = "default_true")]
     pub scroll_to_change_font_size: bool,
+    #[serde(default)]
+    pub toolbar_layout: Option<ToolbarLayout>,
     #[serde(default)]
     pub font_family: Option<String>,
     #[serde(default)]
@@ -330,6 +338,7 @@ impl Default for AppConfig {
             accent_color: None,
             font_size: None,
             scroll_to_change_font_size: true,
+            toolbar_layout: None,
             font_family: None,
             line_height: None,
             ui_scale: None,

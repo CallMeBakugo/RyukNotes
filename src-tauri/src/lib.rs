@@ -173,6 +173,7 @@ pub fn run() {
             commands::import_custom_themes,
             commands::set_font_size,
             commands::set_scroll_to_change_font_size,
+            commands::set_toolbar_layout,
             commands::set_font_family,
             commands::set_line_height,
             commands::set_ui_scale,

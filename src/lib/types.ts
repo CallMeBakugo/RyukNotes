@@ -93,6 +93,11 @@ export interface CustomTheme {
 
 export type StartupView = "all" | "quickaccess" | "tasks" | "daily";
 
+export interface ToolbarLayout {
+  main: string[];
+  more: string[];
+}
+
 export interface AppConfig {
   vaults: VaultConfig[];
   active_vault: string | null;
@@ -103,6 +108,7 @@ export interface AppConfig {
   accent_color: string | null;
   font_size: number | null;
   scroll_to_change_font_size: boolean;
+  toolbar_layout: ToolbarLayout | null;
   font_family: string | null;
   line_height: number | null;
   ui_scale: number | null;

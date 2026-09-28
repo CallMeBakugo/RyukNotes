@@ -19,6 +19,7 @@ import type {
   TaskItem,
   ExternalVaultResult,
   StartupView,
+  ToolbarLayout,
 } from "./types";
 
 export async function openVault(path: string): Promise<void> {
@@ -79,6 +80,10 @@ export async function setFontSize(size: number): Promise<void> {
 
 export async function setScrollToChangeFontSize(enabled: boolean): Promise<void> {
   return invoke("set_scroll_to_change_font_size", { enabled });
+}
+
+export async function setToolbarLayout(layout: ToolbarLayout | null): Promise<void> {
+  return invoke("set_toolbar_layout", { layout });
 }
 
 export async function setFontFamily(family: string): Promise<void> {

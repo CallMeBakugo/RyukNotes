@@ -1267,10 +1267,10 @@
 					<div class="notelist-restore-panel">
 						<button class="notelist-restore-btn" onclick={revealNoteList} title={`Show notes list (${isMac ? '⌘' : 'Ctrl'}+Shift+\\)`} aria-label="Show notes list">
 							<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-								<line x1="8" y1="6" x2="20" y2="6" />
-								<line x1="8" y1="12" x2="20" y2="12" />
-								<line x1="8" y1="18" x2="20" y2="18" />
-								<polyline points="5 8 3 12 5 16" />
+								<line x1="4" y1="6" x2="16" y2="6" />
+								<line x1="4" y1="12" x2="16" y2="12" />
+								<line x1="4" y1="18" x2="16" y2="18" />
+								<polyline points="19 8 21 12 19 16" />
 							</svg>
 						</button>
 					</div>

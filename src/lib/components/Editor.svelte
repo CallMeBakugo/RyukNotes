@@ -39,8 +39,8 @@
 	import { openFile, openUrl, copyFileTo, copyImageToClipboard as copyImageToClipboardCmd, writeBytesTo, copyPngToClipboard, copyTextToClipboard } from '$lib/api';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { activeNote, activeNotePath, appConfig, editorDirty, sourceMode, focusMode, readOnly, quickAccessPaths, notes, navHistory, canGoBack, canGoForward, viewerNote, viewMode, notebooks, outlineWidth } from '$lib/stores/app';
-	import { saveNote, saveImage, saveAttachment, readClipboardImage, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote } from '$lib/api';
-	import type { VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord, FileEvent, SearchTarget } from '$lib/types';
+	import { saveNote, saveImage, saveAttachment, readClipboardImage, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout } from '$lib/api';
+	import type { VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord, FileEvent, SearchTarget, ToolbarLayout } from '$lib/types';
 	import { listen } from '@tauri-apps/api/event';
 	import { debounce } from '$lib/utils/debounce';
 	import { RevisionSaveQueue, type SaveRevision } from '$lib/utils/revision-save';
@@ -56,6 +56,7 @@
 	import { resolveSearchTarget, visibleSearchTarget } from '$lib/editor/search-target';
 	import { convertListNode, type MixedListName } from '$lib/editor/mixedLists';
 	import { clearFormatting } from '$lib/editor/clearFormatting';
+	import { toolbarLabels, resolveToolbarLayout, groupToolbarButtons, moveToolbarButton, toolbarLayoutPreference, type ToolbarButtonId, type ToolbarArea, type ResolvedToolbarLayout } from '$lib/editor/toolbar';
 	import { buildCodeCopyDecorations, buildTaskMetaDecorations, focusedPlaceholderDecorations } from '$lib/editor/decorations';
 	import { serializeInlineMarkdown } from '$lib/editor/markdown';
 	import { restoreTitleHeading, stripTitleHeading, type HiddenTitleHeading } from '$lib/editor/titleVisibility';
@@ -77,12 +78,18 @@
 
 	// Track virtual keyboard height on mobile via visualViewport
 	let keyboardHeight = $state(0);
-	if (isMobile && typeof window !== 'undefined' && window.visualViewport) {
+	$effect(() => {
+		if (!isMobile || !window.visualViewport) return;
 		const vv = window.visualViewport;
 		const update = () => { keyboardHeight = Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop)); };
+		update();
 		vv.addEventListener('resize', update);
 		vv.addEventListener('scroll', update);
-	}
+		return () => {
+			vv.removeEventListener('resize', update);
+			vv.removeEventListener('scroll', update);
+		};
+	});
 
 	let editorElement = $state<HTMLDivElement>(null!);
 	const LARGE_DOC_CHARS = 100_000;
@@ -137,6 +144,35 @@
 	let insertDropdown = $state(false);
 	let tablePickerOpen = $state(false);
 	let tablePickerHover = $state({ rows: 0, cols: 0 });
+	let formattingBar = $state<HTMLDivElement>();
+	let moreButton = $state<HTMLButtonElement>();
+	let morePanel = $state<HTMLDivElement>();
+	let moreOpen = $state(false);
+	let moreOpenedByHover = false;
+	let moreCloseTimer: ReturnType<typeof setTimeout> | null = null;
+	let formattingTrigger: HTMLButtonElement | null = null;
+	const morePanelId = $props.id();
+	let toolbarDraft = $state<ResolvedToolbarLayout | null>(null);
+	let toolbarSelected = $state<ToolbarButtonId | null>(null);
+	let toolbarSaving = $state(false);
+	let toolbarSaveError = $state<string | null>(null);
+	let toolbarConflict = $state(false);
+	let toolbarBase = '';
+	let toolbarEditSession = 0;
+	let toolbarPendingPreference: string | null = null;
+	let toolbarDrag: { id: ToolbarButtonId; pointerId: number; startX: number; startY: number; x: number; y: number; button: HTMLButtonElement; active: boolean } | null = null;
+	let toolbarDraggedId = $state<ToolbarButtonId | null>(null);
+	let toolbarDrop = $state<{ area: ToolbarArea; index: number; left: number; top: number; height: number } | null>(null);
+	let toolbarDragGhost: HTMLElement | null = null;
+	let toolbarDragFrame = 0;
+	let toolbarCapture: HTMLElement | null = null;
+	const toolbarLayout = $derived(toolbarDraft ?? resolveToolbarLayout($appConfig?.toolbar_layout, isMobile, !!$appConfig?.ai_provider));
+	const formattingGroups = $derived(groupToolbarButtons(toolbarLayout.main, isMobile));
+	const toolbarSelectedArea = $derived(toolbarSelected && toolbarDraft
+		? (toolbarDraft.main.includes(toolbarSelected) ? 'main' : toolbarDraft.more.includes(toolbarSelected) ? 'more' : null) : null);
+	const toolbarSelectedIndex = $derived(toolbarSelected && toolbarDraft && toolbarSelectedArea
+		? toolbarDraft[toolbarSelectedArea].indexOf(toolbarSelected) : -1);
+	const toolbarHintId = `${morePanelId}-customize-hint`;
 
 	function scrollEditorBodyToBottom(source: HTMLElement | null | undefined = editorElement) {
 		const editorBody = source?.closest('.editor-body') as HTMLElement | null;
@@ -340,12 +376,10 @@
 
 
 	function closeAllDropdowns() {
-		headingDropdown = false;
-		colorDropdown = false;
-		highlightDropdown = false;
-		alignDropdown = false;
-		insertDropdown = false;
-		tablePickerOpen = false;
+		closeFormattingDropdowns();
+		closeMore();
+		formattingTrigger = null;
+		tablePickerHover = { rows: 0, cols: 0 };
 	}
 
 	let anyDropdownOpen = $derived(headingDropdown || colorDropdown || highlightDropdown || alignDropdown || insertDropdown || tablePickerOpen);
@@ -542,17 +576,6 @@
 	let imageToolbar = $state<{ pos: number; x: number; y: number; size: string; src: string; alt: string } | null>(null);
 	let imageViewer = $state<{ src: string; alt: string } | null>(null);
 	let copyToast = $state<'copying' | 'done' | null>(null);
-
-	$effect(() => {
-		const open = headingDropdown || colorDropdown || highlightDropdown || alignDropdown || insertDropdown || tablePickerOpen;
-		if (!open) return;
-		requestAnimationFrame(() => {
-			document.querySelectorAll<HTMLElement>('.fmt-dropdown').forEach((el) => {
-				const overflow = el.getBoundingClientRect().right - (window.innerWidth - 8);
-				el.style.transform = overflow > 0 ? `translateX(${-overflow}px)` : '';
-			});
-		});
-	});
 
 	// Math insert/edit modal (opened by /math slash command or double-click on existing math node)
 	let mathModal = $state<{ kind: 'block' | 'inline'; editPos: number | null; tex: string } | null>(null);
@@ -3555,6 +3578,7 @@
 	}
 
 	export function loadNote(path: string, content: string, taskTarget?: TaskRecord) {
+		endToolbarCustomization();
 		cancelCounts();
 		closeNoteSearch(false);
 		saves.startSession();
@@ -3910,8 +3934,387 @@
 		insertDropdown = false;
 	}
 
+	function beginToolbarCustomization() {
+		if (isMobile || toolbarSaving) return;
+		closeAllDropdowns();
+		toolbarBase = JSON.stringify($appConfig?.toolbar_layout ?? null);
+		toolbarEditSession++;
+		toolbarDraft = resolveToolbarLayout($appConfig?.toolbar_layout, false, !!$appConfig?.ai_provider);
+		toolbarSelected = toolbarDraft.main[0] ?? toolbarDraft.more[0] ?? null;
+		toolbarSaveError = null;
+		toolbarConflict = false;
+		moreOpen = true;
+		// Mouse entry must not steal the note's selection; keyboard entry stays in the toolbar.
+		if (formattingBar?.contains(document.activeElement)) focusToolbarSelection();
+	}
+
+	function endToolbarCustomization(restoreFocus = false) {
+		toolbarEditSession++;
+		cancelToolbarDrag();
+		toolbarDraft = null;
+		toolbarSelected = null;
+		toolbarSaveError = null;
+		toolbarConflict = false;
+		closeAllDropdowns();
+		if (restoreFocus) moreButton?.focus({ preventScroll: true });
+	}
+
+	function resetToolbarDraft() {
+		if (!toolbarDraft || toolbarSaving) return;
+		cancelToolbarDrag();
+		toolbarDraft = resolveToolbarLayout(null, false, !!$appConfig?.ai_provider);
+		if (!toolbarSelected || !toolbarDraft.main.includes(toolbarSelected)) toolbarSelected = toolbarDraft.main[0] ?? null;
+		toolbarSaveError = null;
+	}
+
+	async function saveToolbarDraft() {
+		if (!toolbarDraft || toolbarSaving || toolbarConflict || !$appConfig) return;
+		if (JSON.stringify($appConfig.toolbar_layout ?? null) !== toolbarBase) {
+			toolbarConflict = true;
+			return;
+		}
+		cancelToolbarDrag();
+		const preference = toolbarLayoutPreference(toolbarDraft);
+		const session = toolbarEditSession;
+		const base = toolbarBase;
+		toolbarPendingPreference = JSON.stringify(preference);
+		toolbarSaving = true;
+		toolbarSaveError = null;
+		try {
+			await setToolbarLayout(preference);
+			// A concurrent window's event wins over this request's stale local response,
+			// including when note navigation already dismissed this customization session.
+			const current = JSON.stringify($appConfig?.toolbar_layout ?? null);
+			if (!toolbarConflict && (current === base || current === toolbarPendingPreference)) {
+				appConfig.update(config => config ? { ...config, toolbar_layout: preference } : config);
+			} else if (session === toolbarEditSession) {
+				toolbarConflict = true;
+			}
+			if (session === toolbarEditSession && !toolbarConflict) {
+				endToolbarCustomization(!!formattingBar?.contains(document.activeElement));
+			}
+		} catch (error) {
+			if (session === toolbarEditSession) toolbarSaveError = `Could not save toolbar: ${String(error)}`;
+		} finally {
+			toolbarSaving = false;
+			toolbarPendingPreference = null;
+		}
+	}
+
+	function focusToolbarSelection() {
+		const id = toolbarSelected;
+		void tick().then(() => {
+			if (!toolbarDraft || toolbarSelected !== id || !id) return;
+			const button = formattingBar?.querySelector<HTMLButtonElement>(`[data-toolbar-id="${id}"] button`);
+			button?.focus({ preventScroll: true });
+			button?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+		});
+	}
+
+	function moveSelectedToolbarButton(area: ToolbarArea, index: number, focus = false) {
+		if (!toolbarDraft || !toolbarSelected || toolbarSaving) return;
+		toolbarDraft = moveToolbarButton(toolbarDraft, toolbarSelected, area, index);
+		toolbarSaveError = null;
+		if (focus) focusToolbarSelection();
+	}
+
+	function selectToolbarControl(event: Event) {
+		if (!toolbarDraft) return;
+		const item = (event.target as Element).closest<HTMLElement>('[data-toolbar-id]');
+		if (item && !toolbarSaving) toolbarSelected = item.dataset.toolbarId as ToolbarButtonId;
+	}
+
+	function captureToolbarClick(event: MouseEvent) {
+		if (!toolbarDraft || !(event.target as Element).closest('[data-toolbar-id]')) return;
+		event.preventDefault();
+		event.stopPropagation();
+		selectToolbarControl(event);
+	}
+
+	function customizeToolbarKeydown(event: KeyboardEvent) {
+		if (!toolbarDraft || !(event.target as Element).closest('[data-toolbar-id]')) return;
+		if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'Enter', ' '].includes(event.key)) return;
+		event.preventDefault();
+		event.stopPropagation();
+		selectToolbarControl(event);
+		if (toolbarSaving || !toolbarSelectedArea) return;
+		const area = toolbarSelectedArea;
+		if (event.key === 'ArrowLeft') moveSelectedToolbarButton(area, toolbarSelectedIndex - 1, true);
+		else if (event.key === 'ArrowRight') moveSelectedToolbarButton(area, toolbarSelectedIndex + 2, true);
+		else if (event.key === 'Home') moveSelectedToolbarButton(area, 0, true);
+		else if (event.key === 'End') moveSelectedToolbarButton(area, toolbarDraft[area].length, true);
+		else if (event.key === 'ArrowUp' && area === 'main') moveSelectedToolbarButton('more', toolbarDraft.more.length, true);
+		else if (event.key === 'ArrowDown' && area === 'more') moveSelectedToolbarButton('main', toolbarDraft.main.length, true);
+	}
+
+	function customizeToolbarItem(node: HTMLElement, options: { id: ToolbarButtonId; selected: boolean }) {
+		const button = node.querySelector('button');
+		const update = ({ id, selected }: typeof options) => {
+			button?.setAttribute('aria-label', toolbarLabels[id]);
+			button?.setAttribute('aria-pressed', String(selected));
+			button?.setAttribute('aria-describedby', toolbarHintId);
+			button?.setAttribute('aria-keyshortcuts', 'ArrowLeft ArrowRight ArrowUp ArrowDown Home End');
+		};
+		update(options);
+		return { update };
+	}
+
+	function startToolbarDrag(event: PointerEvent) {
+		if (!toolbarDraft || event.button !== 0 || !event.isPrimary) return;
+		const item = (event.target as Element).closest<HTMLElement>('[data-toolbar-id]');
+		const button = item?.querySelector('button');
+		if (!item || !button) return;
+		event.preventDefault();
+		event.stopPropagation();
+		if (toolbarSaving || toolbarDrag) return;
+		toolbarSelected = item.dataset.toolbarId as ToolbarButtonId;
+		button.focus({ preventScroll: true });
+		toolbarDrag = {
+			id: toolbarSelected, pointerId: event.pointerId, button, active: false,
+			startX: event.clientX, startY: event.clientY, x: event.clientX, y: event.clientY,
+		};
+		// Capture on the stable bar, never an item that a drop can recreate.
+		toolbarCapture = formattingBar ?? null;
+		toolbarCapture?.setPointerCapture(event.pointerId);
+	}
+
+	function trackToolbarDrag(event: PointerEvent) {
+		const drag = toolbarDrag;
+		if (!drag || event.pointerId !== drag.pointerId) return;
+		drag.x = event.clientX;
+		drag.y = event.clientY;
+		if (!drag.active && Math.hypot(drag.x - drag.startX, drag.y - drag.startY) < 5) return;
+		event.preventDefault();
+		if (!drag.active) {
+			drag.active = true;
+			toolbarDraggedId = drag.id;
+			// A detached clone is only a visual ghost; Svelte keeps ownership of every real control.
+			const ghost = drag.button.cloneNode(true) as HTMLButtonElement;
+			ghost.removeAttribute('id');
+			ghost.setAttribute('aria-hidden', 'true');
+			ghost.inert = true;
+			ghost.style.cssText = 'position:fixed;left:0;top:0;z-index:1001;pointer-events:none;margin:0;width:34px;height:34px;background:var(--bg-primary);color:var(--text-primary);border:1px solid var(--accent);box-shadow:var(--shadow-lg);opacity:.95;';
+			document.body.appendChild(ghost);
+			toolbarDragGhost = ghost;
+			toolbarDragFrame = requestAnimationFrame(updateToolbarDrop);
+		}
+		if (toolbarDragGhost) toolbarDragGhost.style.transform = `translate(${drag.x + 12}px, ${drag.y + 12}px)`;
+	}
+
+	function updateToolbarDrop() {
+		toolbarDragFrame = 0;
+		const drag = toolbarDrag;
+		if (!drag?.active) return;
+		const zone = document.elementFromPoint(drag.x, drag.y)?.closest<HTMLElement>('[data-toolbar-area]');
+		if (!zone || !formattingBar?.contains(zone)) {
+			toolbarDrop = null;
+		} else {
+			const area = zone.dataset.toolbarArea as ToolbarArea;
+			const bounds = zone.getBoundingClientRect();
+			// Both regions may wrap and scroll. Continue scrolling while the pointer rests at an edge.
+			if (zone.scrollHeight > zone.clientHeight) {
+				zone.scrollTop += drag.y < bounds.top + 20 ? -8 : drag.y > bounds.bottom - 20 ? 8 : 0;
+			}
+			if (zone.scrollWidth > zone.clientWidth) {
+				zone.scrollLeft += drag.x < bounds.left + 20 ? -8 : drag.x > bounds.right - 20 ? 8 : 0;
+			}
+			const items = Array.from(zone.querySelectorAll<HTMLElement>('[data-toolbar-id]'), (node, index) => ({ index, rect: node.getBoundingClientRect() }))
+				.filter(({ rect }) => rect.bottom > bounds.top && rect.top < bounds.bottom && rect.right > bounds.left && rect.left < bounds.right);
+			if (items.length === 0) {
+				toolbarDrop = { area, index: 0, left: bounds.left + 8, top: bounds.top + 8, height: Math.max(24, bounds.height - 16) };
+			} else {
+				const nearest = items.reduce((best, item) => Math.abs(drag.y - (item.rect.top + item.rect.height / 2)) < Math.abs(drag.y - (best.rect.top + best.rect.height / 2)) ? item : best);
+				const row = items.filter(({ rect }) => Math.abs(rect.top - nearest.rect.top) < 3);
+				const before = row.find(({ rect }) => drag.x < rect.left + rect.width / 2);
+				const edge = before ?? row[row.length - 1];
+				toolbarDrop = {
+					area, index: edge.index + (before ? 0 : 1),
+					left: Math.max(bounds.left + 1, Math.min(before ? edge.rect.left - 2 : edge.rect.right + 1, bounds.right - 3)),
+					top: Math.max(bounds.top, edge.rect.top), height: Math.min(edge.rect.bottom, bounds.bottom) - Math.max(edge.rect.top, bounds.top),
+				};
+			}
+		}
+		toolbarDragFrame = requestAnimationFrame(updateToolbarDrop);
+	}
+
+	function finishToolbarDrag(event: PointerEvent) {
+		if (!toolbarDrag || event.pointerId !== toolbarDrag.pointerId) return;
+		if (toolbarDrag.active) {
+			toolbarDrag.x = event.clientX;
+			toolbarDrag.y = event.clientY;
+			if (toolbarDragFrame) cancelAnimationFrame(toolbarDragFrame);
+			updateToolbarDrop();
+		}
+		const drop = toolbarDrag.active ? toolbarDrop : null;
+		if (drop && toolbarDraft && !toolbarSaving) {
+			toolbarDraft = moveToolbarButton(toolbarDraft, toolbarDrag.id, drop.area, drop.index);
+			toolbarSaveError = null;
+		}
+		cancelToolbarDrag();
+		if (drop) focusToolbarSelection();
+	}
+
+	function cancelToolbarDrag(event?: PointerEvent) {
+		if (event && event.pointerId !== toolbarDrag?.pointerId) return;
+		const pointerId = toolbarDrag?.pointerId;
+		toolbarDrag = null;
+		toolbarDraggedId = null;
+		toolbarDrop = null;
+		if (toolbarDragFrame) cancelAnimationFrame(toolbarDragFrame);
+		toolbarDragFrame = 0;
+		toolbarDragGhost?.remove();
+		toolbarDragGhost = null;
+		if (pointerId !== undefined && toolbarCapture?.hasPointerCapture(pointerId)) toolbarCapture.releasePointerCapture(pointerId);
+		toolbarCapture = null;
+	}
+
+	function cancelMoreClose() {
+		if (moreCloseTimer !== null) clearTimeout(moreCloseTimer);
+		moreCloseTimer = null;
+	}
+
+	function closeMore() {
+		cancelMoreClose();
+		moreOpen = false;
+		moreOpenedByHover = false;
+	}
+
+	function openMore(focus = false) {
+		cancelMoreClose();
+		if (!moreOpen) closeFormattingDropdowns();
+		moreOpen = true;
+		if (focus) void tick().then(() => morePanel?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus({ preventScroll: true }));
+	}
+
+	function hoverMore(event: PointerEvent) {
+		if (isMobile || toolbarDraft || event.pointerType !== 'mouse') return;
+		cancelMoreClose();
+		if (!moreOpen) {
+			moreOpenedByHover = true;
+			openMore();
+		}
+	}
+
+	function leaveMore(event: PointerEvent) {
+		if (isMobile || toolbarDraft || event.pointerType !== 'mouse') return;
+		const target = event.relatedTarget as Node | null;
+		if (target && (morePanel?.contains(target) || moreButton?.contains(target))) return;
+		cancelMoreClose();
+		moreCloseTimer = setTimeout(() => {
+			moreCloseTimer = null;
+			if (!anyDropdownOpen && !morePanel?.contains(document.activeElement)) closeMore();
+		}, 160);
+	}
+
+	function toggleMore(event: MouseEvent) {
+		event.stopPropagation();
+		if (toolbarDraft) return;
+		if (moreOpen && !moreOpenedByHover) {
+			closeAllDropdowns();
+		} else {
+			openMore(event.detail === 0);
+			moreOpenedByHover = false;
+		}
+	}
+
+	function preserveFormattingFocus(event: PointerEvent | MouseEvent) {
+		// Keep the DOM selection and mobile IME in the editor. Native buttons still
+		// activate on click; keyboard focus and touch scrolling remain available.
+		if (event.button === 0 && (event.target as Element).closest('button')) event.preventDefault();
+	}
+
+	type FormattingPicker = 'insert' | 'heading' | 'text-color' | 'highlight' | 'alignment' | 'table';
+	function toggleFormattingPicker(event: MouseEvent, picker: FormattingPicker) {
+		event.stopPropagation();
+		const wasOpen = picker === 'insert' ? insertDropdown : picker === 'heading' ? headingDropdown
+			: picker === 'text-color' ? colorDropdown : picker === 'highlight' ? highlightDropdown
+			: picker === 'alignment' ? alignDropdown : tablePickerOpen;
+		closeFormattingDropdowns();
+		const clicked = event.currentTarget as HTMLButtonElement;
+		formattingTrigger = clicked.closest('.fmt-dropdown')
+			? clicked.closest('.fmt-dropdown-wrap')?.querySelector<HTMLButtonElement>(':scope > button') ?? clicked
+			: clicked;
+		if (wasOpen) return;
+		if (picker === 'insert') insertDropdown = true;
+		else if (picker === 'heading') headingDropdown = true;
+		else if (picker === 'text-color') colorDropdown = true;
+		else if (picker === 'highlight') highlightDropdown = true;
+		else if (picker === 'alignment') alignDropdown = true;
+		else tablePickerOpen = true;
+		if (event.detail === 0) void tick().then(() => formattingBar?.querySelector<HTMLButtonElement>('.fmt-dropdown button')?.focus({ preventScroll: true }));
+	}
+
 	function handleFormattingBarClick(event: MouseEvent) {
-		if (!(event.target as Element).closest('.fmt-dropdown')) closeFormattingDropdowns();
+		if (!toolbarDraft && (event.target as Element).closest('button')) closeAllDropdowns();
+	}
+
+	function handleFormattingEscape(event: KeyboardEvent) {
+		if (event.key !== 'Escape' || event.isComposing || (!moreOpen && !anyDropdownOpen)) return;
+		const target = event.target instanceof Element ? event.target : null;
+		if (target && !formattingBar?.contains(target)
+			&& target.closest('[role="dialog"], [role="menu"], .note-search-bar')) return;
+		event.preventDefault();
+		event.stopPropagation();
+		if (toolbarDraft) {
+			if (!toolbarSaving) endToolbarCustomization(!!formattingBar?.contains(document.activeElement));
+			return;
+		}
+		const focusInBar = formattingBar?.contains(document.activeElement);
+		if (anyDropdownOpen) {
+			const trigger = formattingTrigger;
+			closeFormattingDropdowns();
+			if (focusInBar) trigger?.focus({ preventScroll: true });
+		} else {
+			closeMore();
+			if (focusInBar) moreButton?.focus({ preventScroll: true });
+		}
+	}
+
+	function moreKeydown(event: KeyboardEvent) {
+		if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+			event.preventDefault();
+			openMore(true);
+			moreOpenedByHover = false;
+		}
+	}
+
+	// Fixed descendants escape the scrolling button strip/list without moving
+	// Svelte-owned DOM. Reposition on scrolling, resizing and IME viewport changes.
+	function positionFormattingPopup(node: HTMLElement, more = false) {
+		const trigger = more ? moreButton : formattingTrigger;
+		let frame = 0;
+		const position = () => {
+			frame = 0;
+			if (!trigger || !formattingBar) return;
+			const vv = window.visualViewport;
+			const leftEdge = (vv?.offsetLeft ?? 0) + 8;
+			const topEdge = (vv?.offsetTop ?? 0) + 8;
+			const rightEdge = leftEdge + (vv?.width ?? window.innerWidth) - 16;
+			const viewportBottom = topEdge + (vv?.height ?? window.innerHeight) - 16;
+			const anchor = trigger.isConnected ? trigger.getBoundingClientRect() : formattingBar.getBoundingClientRect();
+			const bottom = Math.min(formattingBar.getBoundingClientRect().top - 4, viewportBottom);
+			node.style.maxWidth = `${Math.max(0, rightEdge - leftEdge)}px`;
+			node.style.maxHeight = `${Math.max(0, bottom - topEdge)}px`;
+			node.style.left = `${Math.max(leftEdge, Math.min(more ? anchor.right - node.offsetWidth : anchor.left, rightEdge - node.offsetWidth))}px`;
+			node.style.top = `${Math.max(topEdge, bottom - node.offsetHeight)}px`;
+		};
+		const schedule = () => { if (!frame) frame = requestAnimationFrame(position); };
+		position();
+		const resize = new ResizeObserver(schedule);
+		resize.observe(node);
+		if (formattingBar) resize.observe(formattingBar);
+		window.addEventListener('resize', schedule);
+		document.addEventListener('scroll', schedule, true);
+		window.visualViewport?.addEventListener('resize', schedule);
+		window.visualViewport?.addEventListener('scroll', schedule);
+		return { destroy() {
+			if (frame) cancelAnimationFrame(frame);
+			resize.disconnect();
+			window.removeEventListener('resize', schedule);
+			document.removeEventListener('scroll', schedule, true);
+			window.visualViewport?.removeEventListener('resize', schedule);
+			window.visualViewport?.removeEventListener('scroll', schedule);
+		} };
 	}
 
 	// ── In-note search functions ──
@@ -4481,17 +4884,52 @@
 		}
 	});
 
-	// Close formatting dropdowns when clicking outside the formatting bar
 	$effect(() => {
-		if (!anyDropdownOpen) return;
-		function onClickAway(e: MouseEvent) {
-			const bar = document.querySelector('.editor-formatting-bar');
-			if (bar && !bar.contains(e.target as Node)) {
-				closeAllDropdowns();
-			}
+		if (!anyDropdownOpen && !moreOpen) return;
+		function onAway(event: Event) {
+			if (!toolbarDraft && !formattingBar?.contains(event.target as Node)) closeAllDropdowns();
 		}
-		document.addEventListener('mousedown', onClickAway);
-		return () => document.removeEventListener('mousedown', onClickAway);
+		document.addEventListener('pointerdown', onAway);
+		document.addEventListener('focusin', onAway);
+		window.addEventListener('keydown', handleFormattingEscape, true);
+		return () => {
+			document.removeEventListener('pointerdown', onAway);
+			document.removeEventListener('focusin', onAway);
+			window.removeEventListener('keydown', handleFormattingEscape, true);
+		};
+	});
+
+	$effect(() => {
+		void $activeNotePath;
+		void $sourceMode;
+		void $viewerNote;
+		void $readOnly;
+		untrack(() => endToolbarCustomization());
+	});
+
+	$effect(() => {
+		const preference = JSON.stringify($appConfig?.toolbar_layout ?? null);
+		untrack(() => {
+			if (toolbarDraft && preference !== toolbarBase && preference !== toolbarPendingPreference) toolbarConflict = true;
+		});
+	});
+
+	$effect(() => {
+		if (!toolbarDraft) return;
+		const blur = () => cancelToolbarDrag();
+		window.addEventListener('pointermove', trackToolbarDrag, { passive: false });
+		window.addEventListener('pointerup', finishToolbarDrag);
+		window.addEventListener('pointercancel', cancelToolbarDrag);
+		window.addEventListener('lostpointercapture', cancelToolbarDrag);
+		window.addEventListener('blur', blur);
+		return () => {
+			window.removeEventListener('pointermove', trackToolbarDrag);
+			window.removeEventListener('pointerup', finishToolbarDrag);
+			window.removeEventListener('pointercancel', cancelToolbarDrag);
+			window.removeEventListener('lostpointercapture', cancelToolbarDrag);
+			window.removeEventListener('blur', blur);
+			cancelToolbarDrag();
+		};
 	});
 
 	// Count immediately when Info opens or the document/mode changes, but never
@@ -6078,6 +6516,17 @@
 		else unlistenFileChange = fn;
 	}).catch(e => console.error('Failed to listen for note changes:', e));
 
+	let unlistenToolbarLayout: (() => void) | null = null;
+	listen<ToolbarLayout | null>('toolbar-layout-changed', (event) => {
+		const preference = JSON.stringify(event.payload);
+		if (toolbarDraft && preference !== toolbarBase && preference !== toolbarPendingPreference) toolbarConflict = true;
+		if (!toolbarDraft) closeAllDropdowns();
+		appConfig.update(config => config ? { ...config, toolbar_layout: event.payload } : config);
+	}).then(fn => {
+		if (editorDisposed) fn();
+		else unlistenToolbarLayout = fn;
+	}).catch(e => console.error('Failed to listen for toolbar changes:', e));
+
 	function handleOpenNote(event: Event) {
 		const path = (event as CustomEvent<string>).detail;
 		if (typeof path === 'string' && path) void navigateToWikiLink(path, '');
@@ -6087,6 +6536,7 @@
 	onDestroy(() => {
 		void flushSave();
 		closeAiMenu();
+		endToolbarCustomization();
 		editorDisposed = true;
 		if (editorNavigationToken !== null) cancelNoteNavigation(editorNavigationToken);
 		saves.startSession();
@@ -6098,9 +6548,349 @@
 		clearTargetReveal();
 		destroyEditor();
 		unlistenFileChange?.();
+		unlistenToolbarLayout?.();
 		if (infoPathCopyTimer) clearTimeout(infoPathCopyTimer);
 	});
 </script>
+
+{#snippet tableSizePicker()}
+	<div class="fmt-dropdown table-picker-dropdown" role="dialog" aria-label="Formatting options" use:positionFormattingPopup>
+		<div class="table-picker-grid">
+			{#each Array(8) as _, r}
+				{#each Array(10) as _, c}
+					<button
+						type="button"
+						class="table-picker-cell"
+						class:active={r < tablePickerHover.rows && c < tablePickerHover.cols}
+						aria-label={`Insert ${r + 1} by ${c + 1} table`}
+						onmouseenter={() => tablePickerHover = { rows: r + 1, cols: c + 1 }}
+						onclick={() => insertTable(r + 1, c + 1)}
+					></button>
+				{/each}
+			{/each}
+		</div>
+		<div class="table-picker-label">
+			{tablePickerHover.rows > 0 ? `${tablePickerHover.rows} x ${tablePickerHover.cols}` : 'Select size'}
+		</div>
+	</div>
+{/snippet}
+
+{#snippet toolbarControl(id: ToolbarButtonId)}
+	{#if id === 'insert'}
+		<div class="fmt-dropdown-wrap">
+			<button class="fmt-btn insert-btn" onclick={(e) => toggleFormattingPicker(e, 'insert')} aria-haspopup="dialog" aria-expanded={insertDropdown || (isMobile && tablePickerOpen)} title="Insert">
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>
+			</button>
+			{#if insertDropdown}
+				<div class="fmt-dropdown insert-dropdown" role="dialog" aria-label="Formatting options" use:positionFormattingPopup>
+					<button onclick={() => openAssetPicker('insert-image-input')}>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 00-2.828 0L6 21"/></svg>
+						Image
+					</button>
+					{#if isAndroid}
+						<button onclick={() => openAssetPicker('insert-camera-input')}>
+							<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 00-2 2v9a2 2 0 002 2h16a2 2 0 002-2V9a2 2 0 00-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>
+							Take Photo
+						</button>
+					{/if}
+					<button onclick={() => openAssetPicker('insert-file-input')}>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22a2 2 0 01-2-2V4a2 2 0 012-2h8a2.4 2.4 0 011.704.706l3.588 3.588A2.4 2.4 0 0120 8v12a2 2 0 01-2 2z"/><path d="M14 2v5a1 1 0 001 1h5"/></svg>
+						File
+					</button>
+					{#if isMobile}
+					<button onclick={() => { insertDropdown = false; editor?.chain().focus().toggleCodeBlock().run(); }}>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m10 9-3 3 3 3"/><path d="m14 15 3-3-3-3"/><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+						Code Block
+					</button>
+					<button onclick={() => { insertDropdown = false; editor?.chain().focus().toggleBlockquote().run(); }}>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 5H3"/><path d="M21 12H8"/><path d="M21 19H8"/><path d="M3 12v7"/></svg>
+						Quote
+					</button>
+					<button onclick={(e) => toggleFormattingPicker(e, 'table')}>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/></svg>
+						Table
+					</button>
+					<button onclick={() => { insertDropdown = false; insertDetails(); }}>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="13" height="7" x="8" y="3" rx="1"/><path d="m2 9 3 3-3 3"/><rect width="13" height="7" x="8" y="14" rx="1"/></svg>
+						Collapsible Section
+					</button>
+					<button onclick={() => { insertDropdown = false; insertCallout('note'); }}>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><line x1="7" y1="5" x2="7" y2="19"/></svg>
+						Callout
+					</button>
+					{/if}
+					<button onclick={() => { insertDropdown = false; editor?.chain().focus().setHorizontalRule().run(); }}>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>
+						Horizontal Rule
+					</button>
+					<button onclick={() => { insertDropdown = false; openSecretInsert(); }}>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
+						Secret
+					</button>
+					{#if !isMobile}
+					<button onclick={() => { insertDropdown = false; insertTimestamp('datetime'); }}>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h6"/><line x1="3" y1="10" x2="21" y2="10"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="16" y1="2" x2="16" y2="6"/><circle cx="18" cy="17" r="4"/><path d="M18 15.5v1.5l1 1"/></svg>
+						Date &amp; Time
+					</button>
+					{/if}
+				</div>
+			{/if}
+			{#if isMobile && tablePickerOpen}
+				{@render tableSizePicker()}
+			{/if}
+		</div>
+	{:else if id === 'heading'}
+		<div class="fmt-dropdown-wrap">
+			<button class="fmt-btn" class:active={isEditorActive('heading')} onclick={(e) => toggleFormattingPicker(e, 'heading')} aria-haspopup="dialog" aria-expanded={headingDropdown} title="Heading">
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 12h12"/><path d="M6 20V4"/><path d="M18 20V4"/></svg>
+			</button>
+			{#if headingDropdown}
+				<div class="fmt-dropdown" role="dialog" aria-label="Formatting options" use:positionFormattingPopup>
+					<button class:active={isEditorActive('heading', { level: 1 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 1 }).run(); headingDropdown = false; }}>Heading 1</button>
+					<button class:active={isEditorActive('heading', { level: 2 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 2 }).run(); headingDropdown = false; }}>Heading 2</button>
+					<button class:active={isEditorActive('heading', { level: 3 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 3 }).run(); headingDropdown = false; }}>Heading 3</button>
+					{#if !isMobile}<button class:active={isEditorActive('heading', { level: 4 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 4 }).run(); headingDropdown = false; }}>Heading 4</button>{/if}
+					<button class:active={isEditorActive('paragraph')} onclick={() => { editor?.chain().focus().setParagraph().run(); headingDropdown = false; }}>Paragraph</button>
+				</div>
+			{/if}
+		</div>
+	{:else if id === 'bold'}
+		<button class="fmt-btn" class:active={isEditorActive('bold')} onclick={() => editor?.chain().focus().toggleBold().run()} title={isMobile ? "Bold" : `Bold (${modKey}+B)`}>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 12h9a4 4 0 010 8H7a1 1 0 01-1-1V5a1 1 0 011-1h7a4 4 0 010 8"/></svg>
+		</button>
+	{:else if id === 'italic'}
+		<button class="fmt-btn" class:active={isEditorActive('italic')} onclick={() => editor?.chain().focus().toggleItalic().run()} title={isMobile ? "Italic" : `Italic (${modKey}+I)`}>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" x2="10" y1="4" y2="4"/><line x1="14" x2="5" y1="20" y2="20"/><line x1="15" x2="9" y1="4" y2="20"/></svg>
+		</button>
+	{:else if id === 'underline'}
+		<button class="fmt-btn" class:active={isEditorActive('underline')} onclick={() => editor?.chain().focus().toggleUnderline().run()} title={isMobile ? "Underline" : `Underline (${modKey}+U)`}>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4v6a6 6 0 0012 0V4"/><line x1="4" x2="20" y1="20" y2="20"/></svg>
+		</button>
+	{:else if id === 'strike'}
+		<button class="fmt-btn" class:active={isEditorActive('strike')} onclick={() => editor?.chain().focus().toggleStrike().run()} title={isMobile ? "Strikethrough" : `Strikethrough (${modKey}+Shift+X)`}>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4H9a3 3 0 00-2.83 4"/><path d="M14 12a4 4 0 010 8H6"/><line x1="4" x2="20" y1="12" y2="12"/></svg>
+		</button>
+	{:else if id === 'text-color'}
+		<div class="fmt-dropdown-wrap">
+			<button class="fmt-btn" onclick={(e) => toggleFormattingPicker(e, 'text-color')} aria-haspopup="dialog" aria-expanded={colorDropdown} title="Text Color">
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16"/><path d="m6 16 6-12 6 12"/><path d="M8 12h8"/></svg>
+				<span class="color-indicator" style="background: {getEditorAttributes('textStyle').color || 'var(--accent)'}"></span>
+			</button>
+			{#if colorDropdown}
+				<div class="fmt-dropdown color-grid-dropdown" role="dialog" aria-label="Formatting options" use:positionFormattingPopup>
+					{#each textColors as color}
+						<button class="color-swatch" title={color.name} onclick={() => setTextColor(color.value)} style="background: {color.value || 'var(--text-primary)'}">
+							{#if (color.value === '' && !getEditorAttributes('textStyle').color) || getEditorAttributes('textStyle').color === color.value}
+								<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
+							{/if}
+						</button>
+					{/each}
+				</div>
+			{/if}
+		</div>
+	{:else if id === 'link'}
+		<button class="fmt-btn" class:active={isEditorActive('link')} onclick={addLinkFromToolbar} title={isMobile ? "Link" : `Link (${modKey}+K)`}>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg>
+		</button>
+	{:else if id === 'bullet-list'}
+		<button class="fmt-btn" class:active={isEditorActive('bulletList')} onclick={toggleBulletList} title={isMobile ? "Bullet List" : `Bullet List (${modKey}+Shift+8)`}>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h.01"/><path d="M3 12h.01"/><path d="M3 19h.01"/><path d="M8 5h13"/><path d="M8 12h13"/><path d="M8 19h13"/></svg>
+		</button>
+	{:else if id === 'ordered-list'}
+		<button class="fmt-btn" class:active={isEditorActive('orderedList')} onclick={() => editor?.chain().focus().toggleOrderedList().run()} title={isMobile ? "Numbered List" : `Ordered List (${modKey}+Shift+7)`}>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5h10"/><path d="M11 12h10"/><path d="M11 19h10"/><path d="M4 4h1v5"/><path d="M4 9h2"/><path d="M6.5 20H3.4c0-1 2.6-1.925 2.6-3.5a1.5 1.5 0 00-2.6-1.02"/></svg>
+		</button>
+	{:else if id === 'task-list'}
+		<button class="fmt-btn" class:active={isEditorActive('taskList')} onclick={toggleTaskList} title={isMobile ? "Task List" : `Task List (${modKey}+Shift+9)`}>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 5h8"/><path d="M13 12h8"/><path d="M13 19h8"/><path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/></svg>
+		</button>
+	{:else if id === 'undo'}
+		<button class="fmt-btn" onclick={() => editor?.chain().focus().undo().run()} title={isMobile ? "Undo" : `Undo (${modKey}+Z)`}>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 015.5 5.5 5.5 5.5 0 01-5.5 5.5H11"/></svg>
+		</button>
+	{:else if id === 'redo'}
+		<button class="fmt-btn" onclick={() => editor?.chain().focus().redo().run()} title={isMobile ? "Redo" : `Redo (${modKey}+Shift+Z)`}>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 14 5-5-5-5"/><path d="M20 9H9.5A5.5 5.5 0 004 14.5 5.5 5.5 0 009.5 20H13"/></svg>
+		</button>
+	{:else if id === 'inline-code'}
+		<button class="fmt-btn" class:active={isEditorActive('code')} onclick={() => editor?.chain().focus().toggleCode().run()} title={`Inline Code (${modKey}+E)`}>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/></svg>
+		</button>
+	{:else if id === 'code-block'}
+		<button class="fmt-btn" class:active={isEditorActive('codeBlock')} onclick={() => editor?.chain().focus().toggleCodeBlock().run()} title={`Code Block (${modKey}+Alt+C)`}>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m10 9-3 3 3 3"/><path d="m14 15 3-3-3-3"/><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+		</button>
+	{:else if id === 'quote'}
+		<button class="fmt-btn" class:active={isEditorActive('blockquote')} onclick={() => editor?.chain().focus().toggleBlockquote().run()} title={`Quote (${modKey}+Shift+B)`}>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 5H3"/><path d="M21 12H8"/><path d="M21 19H8"/><path d="M3 12v7"/></svg>
+		</button>
+	{:else if id === 'details'}
+		<button class="fmt-btn" class:active={isEditorActive('details')} onclick={() => insertDetails()} title={`Collapsible Section (${modKey}+.)`}>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="13" height="7" x="8" y="3" rx="1"/><path d="m2 9 3 3-3 3"/><rect width="13" height="7" x="8" y="14" rx="1"/></svg>
+		</button>
+	{:else if id === 'callout'}
+		<button class="fmt-btn" class:active={isEditorActive('callout')} onclick={() => insertCallout('note')} title="Callout">
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><line x1="7" y1="5" x2="7" y2="19"/></svg>
+		</button>
+	{:else if id === 'table'}
+		<div class="fmt-dropdown-wrap">
+			<button class="fmt-btn" onclick={(e) => toggleFormattingPicker(e, 'table')} aria-haspopup="dialog" aria-expanded={tablePickerOpen} title="Insert Table">
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/></svg>
+			</button>
+			{#if tablePickerOpen}
+				{@render tableSizePicker()}
+			{/if}
+		</div>
+	{:else if id === 'horizontal-rule'}
+		<button class="fmt-btn" onclick={() => editor?.chain().focus().setHorizontalRule().run()} title="Horizontal Rule">
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>
+		</button>
+	{:else if id === 'highlight'}
+		{#if isMobile}
+			<button class="fmt-btn" class:active={isEditorActive('highlight')} onclick={() => editor?.chain().focus().toggleHighlight({ color: highlightColors[0].value }).run()} title="Highlight">
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 11-6 6v3h9l3-3"/><path d="m22 12-4.6 4.6a2 2 0 01-2.8 0l-5.2-5.2a2 2 0 010-2.8L14 4"/></svg>
+			</button>
+		{:else}
+			<div class="fmt-dropdown-wrap">
+				<button class="fmt-btn" class:active={isEditorActive('highlight')} onclick={(e) => toggleFormattingPicker(e, 'highlight')} aria-haspopup="dialog" aria-expanded={highlightDropdown} title={isMobile ? "Highlight" : `Highlight (${modKey}+Shift+H)`}>
+					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 11-6 6v3h9l3-3"/><path d="m22 12-4.6 4.6a2 2 0 01-2.8 0l-5.2-5.2a2 2 0 010-2.8L14 4"/></svg>
+					<span class="color-indicator" style="background: {getEditorAttributes('highlight').color || 'var(--accent)'}"></span>
+				</button>
+				{#if highlightDropdown}
+					<div class="fmt-dropdown color-grid-dropdown" role="dialog" aria-label="Formatting options" use:positionFormattingPopup>
+						{#each highlightColors as color}
+							<button class="color-swatch" title={color.name} onclick={() => setHighlightColor(color.value)} style="background: {color.swatch}">
+								{#if isEditorActive('highlight', { color: color.value })}
+									<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
+								{/if}
+							</button>
+						{/each}
+						<button class="color-swatch" title="Remove highlight" onclick={() => setHighlightColor('')} style="background: var(--bg-tertiary);">
+							{#if !isEditorActive('highlight')}
+								<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--text-primary)" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
+							{:else}
+								<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--text-tertiary)" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+							{/if}
+						</button>
+					</div>
+				{/if}
+			</div>
+		{/if}
+	{:else if id === 'subscript'}
+		<button class="fmt-btn" class:active={isEditorActive('subscript')} onclick={() => editor?.chain().focus().toggleSubscript().run()} title="Subscript">
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 5 8 8"/><path d="m12 5-8 8"/><path d="M20 19h-4c0-1.5.44-2 1.5-2.5S20 15.33 20 14c0-.47-.17-.93-.48-1.29a2.11 2.11 0 00-2.62-.44c-.42.24-.74.62-.9 1.07"/></svg>
+		</button>
+	{:else if id === 'superscript'}
+		<button class="fmt-btn" class:active={isEditorActive('superscript')} onclick={() => editor?.chain().focus().toggleSuperscript().run()} title="Superscript">
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 19 8-8"/><path d="m12 19-8-8"/><path d="M20 12h-4c0-1.5.442-2 1.5-2.5S20 8.334 20 7.002c0-.472-.17-.93-.484-1.29a2.105 2.105 0 00-2.617-.436c-.42.239-.738.614-.899 1.06"/></svg>
+		</button>
+	{:else if id === 'alignment'}
+		<div class="fmt-dropdown-wrap">
+			<button class="fmt-btn" onclick={(e) => toggleFormattingPicker(e, 'alignment')} aria-haspopup="dialog" aria-expanded={alignDropdown} title="Text Alignment">
+				{#if isEditorActive({ textAlign: 'center' })}
+					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 5H3"/><path d="M17 12H7"/><path d="M19 19H5"/></svg>
+				{:else if isEditorActive({ textAlign: 'right' })}
+					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 5H3"/><path d="M21 12H9"/><path d="M21 19H7"/></svg>
+				{:else if isEditorActive({ textAlign: 'justify' })}
+					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18"/><path d="M3 12h18"/><path d="M3 19h18"/></svg>
+				{:else}
+					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 5H3"/><path d="M15 12H3"/><path d="M17 19H3"/></svg>
+				{/if}
+			</button>
+			{#if alignDropdown}
+				<div class="fmt-dropdown align-dropdown" role="dialog" aria-label="Formatting options" use:positionFormattingPopup>
+					<button class:active={isEditorActive({ textAlign: 'left' })} onclick={() => { editor?.chain().focus().setTextAlign('left').run(); alignDropdown = false; }}>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 5H3"/><path d="M15 12H3"/><path d="M17 19H3"/></svg>
+						Left
+					</button>
+					<button class:active={isEditorActive({ textAlign: 'center' })} onclick={() => { editor?.chain().focus().setTextAlign('center').run(); alignDropdown = false; }}>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 5H3"/><path d="M17 12H7"/><path d="M19 19H5"/></svg>
+						Center
+					</button>
+					<button class:active={isEditorActive({ textAlign: 'right' })} onclick={() => { editor?.chain().focus().setTextAlign('right').run(); alignDropdown = false; }}>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 5H3"/><path d="M21 12H9"/><path d="M21 19H7"/></svg>
+						Right
+					</button>
+					<button class:active={isEditorActive({ textAlign: 'justify' })} onclick={() => { editor?.chain().focus().setTextAlign('justify').run(); alignDropdown = false; }}>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18"/><path d="M3 12h18"/><path d="M3 19h18"/></svg>
+						Justify
+					</button>
+				</div>
+			{/if}
+		</div>
+	{:else if id === 'indent'}
+		<button class="fmt-btn" onclick={() => {
+			if (!editor) return;
+			// Try list indent first - run() returns true if it succeeded
+			const sank = editor.chain().focus().sinkListItem('listItem').run();
+			if (!sank) {
+				const sankTask = editor.chain().focus().sinkListItem('taskItem').run();
+				if (!sankTask && editor.state.selection.empty) {
+					editor.chain().focus().insertContent('\t').run();
+				}
+			}
+		}} title={isMobile ? "Indent" : "Indent (Tab)"}>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="4" x2="21" y2="4"/><line x1="11" y1="9" x2="21" y2="9"/><line x1="11" y1="14" x2="21" y2="14"/><line x1="3" y1="19" x2="21" y2="19"/><polyline points="3 9 7 11.5 3 14"/></svg>
+		</button>
+	{:else if id === 'outdent'}
+		<button class="fmt-btn" onclick={() => {
+			if (!editor) return;
+			const lifted = editor.chain().focus().liftListItem('listItem').run();
+			if (!lifted) {
+				const liftedTask = editor.chain().focus().liftListItem('taskItem').run();
+				if (!liftedTask && editor.state.selection.empty) {
+					// Remove leading tab/spaces from current line
+					const { from } = editor.state.selection;
+					const pos = editor.state.doc.resolve(from);
+					const lineStart = pos.start(pos.depth);
+					const lineText = editor.state.doc.textBetween(lineStart, pos.end(pos.depth));
+					if (lineText.startsWith('\t')) {
+						editor.chain().focus().command(({ tr }) => {
+							tr.delete(lineStart, lineStart + 1);
+							return true;
+						}).run();
+					} else if (lineText.startsWith('    ')) {
+						editor.chain().focus().command(({ tr }) => {
+							tr.delete(lineStart, lineStart + 4);
+							return true;
+						}).run();
+					} else if (lineText.startsWith('  ')) {
+						editor.chain().focus().command(({ tr }) => {
+							tr.delete(lineStart, lineStart + 2);
+							return true;
+						}).run();
+					}
+				}
+			}
+		}} title={isMobile ? "Outdent" : "Outdent (Shift+Tab)"}>
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="4" x2="21" y2="4"/><line x1="11" y1="9" x2="21" y2="9"/><line x1="11" y1="14" x2="21" y2="14"/><line x1="3" y1="19" x2="21" y2="19"/><polyline points="7 9 3 11.5 7 14"/></svg>
+		</button>
+	{:else if id === 'date-time'}
+		<button class="fmt-btn" onclick={() => insertTimestamp('datetime')} title="Insert date and time">
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h6"/><line x1="3" y1="10" x2="21" y2="10"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="16" y1="2" x2="16" y2="6"/><circle cx="18" cy="17" r="4"/><path d="M18 15.5v1.5l1 1"/></svg>
+		</button>
+	{:else if id === 'ai-actions'}
+		<button class="fmt-btn" onclick={openAiMenu} title="AI Actions">
+			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+				<path d="M12 8V4l-2-2"/><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M9 13v2"/><path d="M15 13v2"/>
+			</svg>
+		</button>
+	{/if}
+{/snippet}
+
+{#snippet editableToolbarControl(id: ToolbarButtonId)}
+	<div
+		class="fmt-control"
+		class:selected={toolbarSelected === id}
+		class:dragging={toolbarDraggedId === id}
+		data-toolbar-id={id}
+		use:customizeToolbarItem={{ id, selected: toolbarSelected === id }}
+	>
+		{@render toolbarControl(id)}
+	</div>
+{/snippet}
+
+
 
 <svelte:window onkeydown={handleNoteSearchKey} />
 
@@ -6636,493 +7426,101 @@
 
 		{#if editorReady && !$sourceMode && !$viewerNote}
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
-			<div class="editor-formatting-bar" style={isMobile ? `${keyboardHeight > 0 ? `bottom: ${keyboardHeight}px;` : ''}${anyDropdownOpen ? 'overflow: visible;' : ''}` : ''} onclick={handleFormattingBarClick} onkeydown={(e) => { if (e.key === 'Escape') closeFormattingDropdowns(); }}>
-				{#if isMobile}
-				<!-- ═══ MOBILE formatting bar: compact, relevant buttons only ═══ -->
-
-				<!-- Insert (+) dropdown - at front like desktop -->
-				<div class="fmt-dropdown-wrap">
-					<button class="fmt-btn insert-btn" onclick={(e) => { e.stopPropagation(); insertDropdown = !insertDropdown; headingDropdown = false; }} title="Insert">
-						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>
-					</button>
-					{#if insertDropdown}
-						<div class="fmt-dropdown insert-dropdown">
-							<button onclick={() => openAssetPicker('insert-image-input')}>
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 00-2.828 0L6 21"/></svg>
-								Image
-							</button>
-							{#if isAndroid}
-								<button onclick={() => openAssetPicker('insert-camera-input')}>
-									<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 00-2 2v9a2 2 0 002 2h16a2 2 0 002-2V9a2 2 0 00-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>
-									Take Photo
-								</button>
-							{/if}
-							<button onclick={() => openAssetPicker('insert-file-input')}>
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22a2 2 0 01-2-2V4a2 2 0 012-2h8a2.4 2.4 0 011.704.706l3.588 3.588A2.4 2.4 0 0120 8v12a2 2 0 01-2 2z"/><path d="M14 2v5a1 1 0 001 1h5"/></svg>
-								File
-							</button>
-							<button onclick={() => { insertDropdown = false; editor?.chain().focus().toggleCodeBlock().run(); }}>
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m10 9-3 3 3 3"/><path d="m14 15 3-3-3-3"/><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
-								Code Block
-							</button>
-							<button onclick={() => { insertDropdown = false; editor?.chain().focus().toggleBlockquote().run(); }}>
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 5H3"/><path d="M21 12H8"/><path d="M21 19H8"/><path d="M3 12v7"/></svg>
-								Quote
-							</button>
-							<button onclick={() => { insertDropdown = false; tablePickerOpen = true; }}>
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/></svg>
-								Table
-							</button>
-							<button onclick={() => { insertDropdown = false; insertDetails(); }}>
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="13" height="7" x="8" y="3" rx="1"/><path d="m2 9 3 3-3 3"/><rect width="13" height="7" x="8" y="14" rx="1"/></svg>
-								Collapsible Section
-							</button>
-							<button onclick={() => { insertDropdown = false; insertCallout('note'); }}>
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><line x1="7" y1="5" x2="7" y2="19"/></svg>
-								Callout
-							</button>
-							<button onclick={() => { insertDropdown = false; editor?.chain().focus().setHorizontalRule().run(); }}>
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>
-								Horizontal Rule
-							</button>
-							<button onclick={() => { insertDropdown = false; openSecretInsert(); }}>
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
-								Secret
-							</button>
-						</div>
-					{/if}
-				</div>
-
-				<div class="fmt-sep"></div>
-
-				<!-- Heading dropdown -->
-				<div class="fmt-dropdown-wrap">
-					<button class="fmt-btn" class:active={isEditorActive('heading')} onclick={(e) => { e.stopPropagation(); headingDropdown = !headingDropdown; insertDropdown = false; }} title="Heading">
-						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 12h12"/><path d="M6 20V4"/><path d="M18 20V4"/></svg>
-					</button>
-					{#if headingDropdown}
-						<div class="fmt-dropdown">
-							<button class:active={isEditorActive('heading', { level: 1 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 1 }).run(); headingDropdown = false; }}>Heading 1</button>
-							<button class:active={isEditorActive('heading', { level: 2 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 2 }).run(); headingDropdown = false; }}>Heading 2</button>
-							<button class:active={isEditorActive('heading', { level: 3 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 3 }).run(); headingDropdown = false; }}>Heading 3</button>
-							<button class:active={isEditorActive('paragraph')} onclick={() => { editor?.chain().focus().setParagraph().run(); headingDropdown = false; }}>Paragraph</button>
-						</div>
-					{/if}
-				</div>
-
-				<div class="fmt-sep"></div>
-
-				<!-- Bold / Italic / Underline / Strike -->
-				<button class="fmt-btn" class:active={isEditorActive('bold')} onclick={() => editor?.chain().focus().toggleBold().run()} title="Bold">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 12h9a4 4 0 010 8H7a1 1 0 01-1-1V5a1 1 0 011-1h7a4 4 0 010 8"/></svg>
-				</button>
-				<button class="fmt-btn" class:active={isEditorActive('italic')} onclick={() => editor?.chain().focus().toggleItalic().run()} title="Italic">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" x2="10" y1="4" y2="4"/><line x1="14" x2="5" y1="20" y2="20"/><line x1="15" x2="9" y1="4" y2="20"/></svg>
-				</button>
-				<button class="fmt-btn" class:active={isEditorActive('underline')} onclick={() => editor?.chain().focus().toggleUnderline().run()} title="Underline">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4v6a6 6 0 0012 0V4"/><line x1="4" x2="20" y1="20" y2="20"/></svg>
-				</button>
-				<button class="fmt-btn" class:active={isEditorActive('strike')} onclick={() => editor?.chain().focus().toggleStrike().run()} title="Strikethrough">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4H9a3 3 0 00-2.83 4"/><path d="M14 12a4 4 0 010 8H6"/><line x1="4" x2="20" y1="12" y2="12"/></svg>
-				</button>
-
-				<div class="fmt-sep"></div>
-
-				<!-- Link -->
-				<button class="fmt-btn" class:active={isEditorActive('link')} onclick={addLinkFromToolbar} title="Link">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg>
-				</button>
-
-				<div class="fmt-sep"></div>
-
-				<!-- Lists -->
-				<button class="fmt-btn" class:active={isEditorActive('bulletList')} onclick={toggleBulletList} title="Bullet List">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h.01"/><path d="M3 12h.01"/><path d="M3 19h.01"/><path d="M8 5h13"/><path d="M8 12h13"/><path d="M8 19h13"/></svg>
-				</button>
-				<button class="fmt-btn" class:active={isEditorActive('orderedList')} onclick={() => editor?.chain().focus().toggleOrderedList().run()} title="Numbered List">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5h10"/><path d="M11 12h10"/><path d="M11 19h10"/><path d="M4 4h1v5"/><path d="M4 9h2"/><path d="M6.5 20H3.4c0-1 2.6-1.925 2.6-3.5a1.5 1.5 0 00-2.6-1.02"/></svg>
-				</button>
-				<button class="fmt-btn" class:active={isEditorActive('taskList')} onclick={toggleTaskList} title="Task List">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 5h8"/><path d="M13 12h8"/><path d="M13 19h8"/><path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/></svg>
-				</button>
-
-				<!-- Indent / Outdent (no Tab key on mobile soft keyboards) -->
-				<button class="fmt-btn" onclick={() => {
-					if (!editor) return;
-					// Try list indent first - run() returns true if it succeeded
-					const sank = editor.chain().focus().sinkListItem('listItem').run();
-					if (!sank) {
-						const sankTask = editor.chain().focus().sinkListItem('taskItem').run();
-						if (!sankTask && editor.state.selection.empty) {
-							editor.chain().focus().insertContent('\t').run();
-						}
-					}
-				}} title="Indent">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="4" x2="21" y2="4"/><line x1="11" y1="9" x2="21" y2="9"/><line x1="11" y1="14" x2="21" y2="14"/><line x1="3" y1="19" x2="21" y2="19"/><polyline points="3 9 7 11.5 3 14"/></svg>
-				</button>
-				<button class="fmt-btn" onclick={() => {
-					if (!editor) return;
-					const lifted = editor.chain().focus().liftListItem('listItem').run();
-					if (!lifted) {
-						const liftedTask = editor.chain().focus().liftListItem('taskItem').run();
-						if (!liftedTask && editor.state.selection.empty) {
-							// Remove leading tab/spaces from current line
-							const { from } = editor.state.selection;
-							const pos = editor.state.doc.resolve(from);
-							const lineStart = pos.start(pos.depth);
-							const lineText = editor.state.doc.textBetween(lineStart, pos.end(pos.depth));
-							if (lineText.startsWith('\t')) {
-								editor.chain().focus().command(({ tr }) => {
-									tr.delete(lineStart, lineStart + 1);
-									return true;
-								}).run();
-							} else if (lineText.startsWith('    ')) {
-								editor.chain().focus().command(({ tr }) => {
-									tr.delete(lineStart, lineStart + 4);
-									return true;
-								}).run();
-							} else if (lineText.startsWith('  ')) {
-								editor.chain().focus().command(({ tr }) => {
-									tr.delete(lineStart, lineStart + 2);
-									return true;
-								}).run();
-							}
-						}
-					}
-				}} title="Outdent">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="4" x2="21" y2="4"/><line x1="11" y1="9" x2="21" y2="9"/><line x1="11" y1="14" x2="21" y2="14"/><line x1="3" y1="19" x2="21" y2="19"/><polyline points="7 9 3 11.5 7 14"/></svg>
-				</button>
-
-				<div class="fmt-sep"></div>
-
-				<!-- Highlight -->
-				<button class="fmt-btn" class:active={isEditorActive('highlight')} onclick={() => editor?.chain().focus().toggleHighlight({ color: highlightColors[0].value }).run()} title="Highlight">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 11-6 6v3h9l3-3"/><path d="m22 12-4.6 4.6a2 2 0 01-2.8 0l-5.2-5.2a2 2 0 010-2.8L14 4"/></svg>
-				</button>
-
-				<div class="fmt-sep"></div>
-
-				<!-- Insert date/time -->
-				<button class="fmt-btn" onclick={() => insertTimestamp('datetime')} title="Insert date and time">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h6"/><line x1="3" y1="10" x2="21" y2="10"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="16" y1="2" x2="16" y2="6"/><circle cx="18" cy="17" r="4"/><path d="M18 15.5v1.5l1 1"/></svg>
-				</button>
-
-				<div class="fmt-sep"></div>
-
-				<!-- Undo / Redo -->
-				<button class="fmt-btn" onclick={() => editor?.chain().focus().undo().run()} title="Undo">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 015.5 5.5 5.5 5.5 0 01-5.5 5.5H11"/></svg>
-				</button>
-				<button class="fmt-btn" onclick={() => editor?.chain().focus().redo().run()} title="Redo">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 14 5-5-5-5"/><path d="M20 9H9.5A5.5 5.5 0 004 14.5 5.5 5.5 0 009.5 20H13"/></svg>
-				</button>
-
-				{#if $appConfig?.ai_provider}
-				<div class="fmt-sep"></div>
-				<button class="fmt-btn" onclick={openAiMenu} title="AI Actions">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-						<path d="M12 8V4l-2-2"/><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M9 13v2"/><path d="M15 13v2"/>
-					</svg>
-				</button>
-				{/if}
-
-				{:else}
-				<!-- ═══ DESKTOP formatting bar: full feature set ═══ -->
-
-				<!-- Insert (+) dropdown -->
-				<div class="fmt-dropdown-wrap">
-					<button class="fmt-btn insert-btn" onclick={(e) => { e.stopPropagation(); insertDropdown = !insertDropdown; headingDropdown = false; colorDropdown = false; highlightDropdown = false; tablePickerOpen = false; alignDropdown = false; }} title="Insert">
-						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>
-					</button>
-					{#if insertDropdown}
-						<div class="fmt-dropdown insert-dropdown">
-							<button onclick={() => openAssetPicker('insert-image-input')}>
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 00-2.828 0L6 21"/></svg>
-								Image
-							</button>
-							<button onclick={() => openAssetPicker('insert-file-input')}>
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22a2 2 0 01-2-2V4a2 2 0 012-2h8a2.4 2.4 0 011.704.706l3.588 3.588A2.4 2.4 0 0120 8v12a2 2 0 01-2 2z"/><path d="M14 2v5a1 1 0 001 1h5"/></svg>
-								File
-							</button>
-							<button onclick={() => { insertDropdown = false; editor?.chain().focus().setHorizontalRule().run(); }}>
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>
-								Horizontal Rule
-							</button>
-							<button onclick={() => { insertDropdown = false; openSecretInsert(); }}>
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
-								Secret
-							</button>
-							<button onclick={() => { insertDropdown = false; insertTimestamp('datetime'); }}>
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h6"/><line x1="3" y1="10" x2="21" y2="10"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="16" y1="2" x2="16" y2="6"/><circle cx="18" cy="17" r="4"/><path d="M18 15.5v1.5l1 1"/></svg>
-								Date &amp; Time
-							</button>
-						</div>
-					{/if}
-				</div>
-
-				<div class="fmt-sep"></div>
-
-				<!-- Heading dropdown -->
-				<div class="fmt-dropdown-wrap">
-					<button class="fmt-btn" class:active={isEditorActive('heading')} onclick={(e) => { e.stopPropagation(); headingDropdown = !headingDropdown; colorDropdown = false; highlightDropdown = false; tablePickerOpen = false; alignDropdown = false; insertDropdown = false; }} title="Heading">
-						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 12h12"/><path d="M6 20V4"/><path d="M18 20V4"/></svg>
-					</button>
-					{#if headingDropdown}
-						<div class="fmt-dropdown">
-							<button class:active={isEditorActive('heading', { level: 1 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 1 }).run(); headingDropdown = false; }}>Heading 1</button>
-							<button class:active={isEditorActive('heading', { level: 2 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 2 }).run(); headingDropdown = false; }}>Heading 2</button>
-							<button class:active={isEditorActive('heading', { level: 3 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 3 }).run(); headingDropdown = false; }}>Heading 3</button>
-							<button class:active={isEditorActive('heading', { level: 4 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 4 }).run(); headingDropdown = false; }}>Heading 4</button>
-							<button class:active={isEditorActive('paragraph')} onclick={() => { editor?.chain().focus().setParagraph().run(); headingDropdown = false; }}>Paragraph</button>
-						</div>
-					{/if}
-				</div>
-
-				<div class="fmt-sep"></div>
-
-				<!-- Text formatting -->
-				<button class="fmt-btn" class:active={isEditorActive('bold')} onclick={() => editor?.chain().focus().toggleBold().run()} title={`Bold (${modKey}+B)`}>
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 12h9a4 4 0 010 8H7a1 1 0 01-1-1V5a1 1 0 011-1h7a4 4 0 010 8"/></svg>
-				</button>
-				<button class="fmt-btn" class:active={isEditorActive('italic')} onclick={() => editor?.chain().focus().toggleItalic().run()} title={`Italic (${modKey}+I)`}>
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" x2="10" y1="4" y2="4"/><line x1="14" x2="5" y1="20" y2="20"/><line x1="15" x2="9" y1="4" y2="20"/></svg>
-				</button>
-				<button class="fmt-btn" class:active={isEditorActive('underline')} onclick={() => editor?.chain().focus().toggleUnderline().run()} title={`Underline (${modKey}+U)`}>
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4v6a6 6 0 0012 0V4"/><line x1="4" x2="20" y1="20" y2="20"/></svg>
-				</button>
-				<button class="fmt-btn" class:active={isEditorActive('strike')} onclick={() => editor?.chain().focus().toggleStrike().run()} title={`Strikethrough (${modKey}+Shift+X)`}>
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4H9a3 3 0 00-2.83 4"/><path d="M14 12a4 4 0 010 8H6"/><line x1="4" x2="20" y1="12" y2="12"/></svg>
-				</button>
-
-				<!-- Text color -->
-				<div class="fmt-dropdown-wrap">
-					<button class="fmt-btn" onclick={(e) => { e.stopPropagation(); colorDropdown = !colorDropdown; headingDropdown = false; highlightDropdown = false; tablePickerOpen = false; alignDropdown = false; insertDropdown = false; }} title="Text Color">
-						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16"/><path d="m6 16 6-12 6 12"/><path d="M8 12h8"/></svg>
-						<span class="color-indicator" style="background: {getEditorAttributes('textStyle').color || 'var(--accent)'}"></span>
-					</button>
-					{#if colorDropdown}
-						<div class="fmt-dropdown color-grid-dropdown">
-							{#each textColors as color}
-								<button class="color-swatch" title={color.name} onclick={() => setTextColor(color.value)} style="background: {color.value || 'var(--text-primary)'}">
-									{#if (color.value === '' && !getEditorAttributes('textStyle').color) || getEditorAttributes('textStyle').color === color.value}
-										<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
-									{/if}
-								</button>
-							{/each}
-						</div>
-					{/if}
-				</div>
-
-				<div class="fmt-sep"></div>
-
-				<!-- Link -->
-				<button class="fmt-btn" class:active={isEditorActive('link')} onclick={addLinkFromToolbar} title={`Link (${modKey}+K)`}>
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg>
-				</button>
-
-				<div class="fmt-sep"></div>
-
-				<!-- Lists -->
-				<button class="fmt-btn" class:active={isEditorActive('bulletList')} onclick={toggleBulletList} title={`Bullet List (${modKey}+Shift+8)`}>
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h.01"/><path d="M3 12h.01"/><path d="M3 19h.01"/><path d="M8 5h13"/><path d="M8 12h13"/><path d="M8 19h13"/></svg>
-				</button>
-				<button class="fmt-btn" class:active={isEditorActive('orderedList')} onclick={() => editor?.chain().focus().toggleOrderedList().run()} title={`Ordered List (${modKey}+Shift+7)`}>
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5h10"/><path d="M11 12h10"/><path d="M11 19h10"/><path d="M4 4h1v5"/><path d="M4 9h2"/><path d="M6.5 20H3.4c0-1 2.6-1.925 2.6-3.5a1.5 1.5 0 00-2.6-1.02"/></svg>
-				</button>
-				<button class="fmt-btn" class:active={isEditorActive('taskList')} onclick={toggleTaskList} title={`Task List (${modKey}+Shift+9)`}>
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 5h8"/><path d="M13 12h8"/><path d="M13 19h8"/><path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/></svg>
-				</button>
-
-				<div class="fmt-sep"></div>
-
-				<!-- Undo / Redo -->
-				<button class="fmt-btn" onclick={() => editor?.chain().focus().undo().run()} title={`Undo (${modKey}+Z)`}>
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 015.5 5.5 5.5 5.5 0 01-5.5 5.5H11"/></svg>
-				</button>
-				<button class="fmt-btn" onclick={() => editor?.chain().focus().redo().run()} title={`Redo (${modKey}+Shift+Z)`}>
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 14 5-5-5-5"/><path d="M20 9H9.5A5.5 5.5 0 004 14.5 5.5 5.5 0 009.5 20H13"/></svg>
-				</button>
-
-				<div class="fmt-sep"></div>
-
-				<!-- Code & Code Block -->
-				<button class="fmt-btn" class:active={isEditorActive('code')} onclick={() => editor?.chain().focus().toggleCode().run()} title={`Inline Code (${modKey}+E)`}>
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/></svg>
-				</button>
-				<button class="fmt-btn" class:active={isEditorActive('codeBlock')} onclick={() => editor?.chain().focus().toggleCodeBlock().run()} title={`Code Block (${modKey}+Alt+C)`}>
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m10 9-3 3 3 3"/><path d="m14 15 3-3-3-3"/><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
-				</button>
-
-				<!-- Blockquote -->
-				<button class="fmt-btn" class:active={isEditorActive('blockquote')} onclick={() => editor?.chain().focus().toggleBlockquote().run()} title={`Quote (${modKey}+Shift+B)`}>
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 5H3"/><path d="M21 12H8"/><path d="M21 19H8"/><path d="M3 12v7"/></svg>
-				</button>
-
-				<!-- Collapsible Section -->
-				<button class="fmt-btn" class:active={isEditorActive('details')} onclick={() => insertDetails()} title={`Collapsible Section (${modKey}+.)`}>
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="13" height="7" x="8" y="3" rx="1"/><path d="m2 9 3 3-3 3"/><rect width="13" height="7" x="8" y="14" rx="1"/></svg>
-				</button>
-
-				<!-- Callout -->
-				<button class="fmt-btn" class:active={isEditorActive('callout')} onclick={() => insertCallout('note')} title="Callout">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><line x1="7" y1="5" x2="7" y2="19"/></svg>
-				</button>
-
-				<!-- Table -->
-				<div class="fmt-dropdown-wrap">
-					<button class="fmt-btn" onclick={(e) => { e.stopPropagation(); tablePickerOpen = !tablePickerOpen; headingDropdown = false; colorDropdown = false; highlightDropdown = false; alignDropdown = false; insertDropdown = false; }} title="Insert Table">
-						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/></svg>
-					</button>
-					{#if tablePickerOpen}
-						<div class="fmt-dropdown table-picker-dropdown">
-							<div class="table-picker-grid">
-								{#each Array(8) as _, r}
-									{#each Array(10) as _, c}
-										<button
-											type="button"
-											class="table-picker-cell"
-											class:active={r < tablePickerHover.rows && c < tablePickerHover.cols}
-											aria-label={`Insert ${r + 1} by ${c + 1} table`}
-											onmouseenter={() => tablePickerHover = { rows: r + 1, cols: c + 1 }}
-											onclick={() => insertTable(r + 1, c + 1)}
-										></button>
-									{/each}
-								{/each}
-							</div>
-							<div class="table-picker-label">
-								{tablePickerHover.rows > 0 ? `${tablePickerHover.rows} x ${tablePickerHover.cols}` : 'Select size'}
-							</div>
-						</div>
-					{/if}
-				</div>
-
-				<!-- Horizontal Rule -->
-				<button class="fmt-btn" onclick={() => editor?.chain().focus().setHorizontalRule().run()} title="Horizontal Rule">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>
-				</button>
-
-				<div class="fmt-sep"></div>
-
-				<!-- Highlight -->
-				<div class="fmt-dropdown-wrap">
-					<button class="fmt-btn" class:active={isEditorActive('highlight')} onclick={(e) => { e.stopPropagation(); highlightDropdown = !highlightDropdown; headingDropdown = false; colorDropdown = false; tablePickerOpen = false; alignDropdown = false; insertDropdown = false; }} title={`Highlight (${modKey}+Shift+H)`}>
-						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 11-6 6v3h9l3-3"/><path d="m22 12-4.6 4.6a2 2 0 01-2.8 0l-5.2-5.2a2 2 0 010-2.8L14 4"/></svg>
-						<span class="color-indicator" style="background: {getEditorAttributes('highlight').color || 'var(--accent)'}"></span>
-					</button>
-					{#if highlightDropdown}
-						<div class="fmt-dropdown color-grid-dropdown">
-							{#each highlightColors as color}
-								<button class="color-swatch" title={color.name} onclick={() => setHighlightColor(color.value)} style="background: {color.swatch}">
-									{#if isEditorActive('highlight', { color: color.value })}
-										<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
-									{/if}
-								</button>
-							{/each}
-							<button class="color-swatch" title="Remove highlight" onclick={() => setHighlightColor('')} style="background: var(--bg-tertiary);">
-								{#if !isEditorActive('highlight')}
-									<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--text-primary)" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
-								{:else}
-									<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--text-tertiary)" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-								{/if}
-							</button>
-						</div>
-					{/if}
-				</div>
-
-				<!-- Subscript & Superscript -->
-				<button class="fmt-btn" class:active={isEditorActive('subscript')} onclick={() => editor?.chain().focus().toggleSubscript().run()} title="Subscript">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 5 8 8"/><path d="m12 5-8 8"/><path d="M20 19h-4c0-1.5.44-2 1.5-2.5S20 15.33 20 14c0-.47-.17-.93-.48-1.29a2.11 2.11 0 00-2.62-.44c-.42.24-.74.62-.9 1.07"/></svg>
-				</button>
-				<button class="fmt-btn" class:active={isEditorActive('superscript')} onclick={() => editor?.chain().focus().toggleSuperscript().run()} title="Superscript">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 19 8-8"/><path d="m12 19-8-8"/><path d="M20 12h-4c0-1.5.442-2 1.5-2.5S20 8.334 20 7.002c0-.472-.17-.93-.484-1.29a2.105 2.105 0 00-2.617-.436c-.42.239-.738.614-.899 1.06"/></svg>
-				</button>
-
-				<div class="fmt-sep"></div>
-
-				<!-- Text Alignment -->
-				<div class="fmt-dropdown-wrap">
-					<button class="fmt-btn" onclick={(e) => { e.stopPropagation(); alignDropdown = !alignDropdown; headingDropdown = false; colorDropdown = false; highlightDropdown = false; tablePickerOpen = false; insertDropdown = false; }} title="Text Alignment">
-						{#if isEditorActive({ textAlign: 'center' })}
-							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 5H3"/><path d="M17 12H7"/><path d="M19 19H5"/></svg>
-						{:else if isEditorActive({ textAlign: 'right' })}
-							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 5H3"/><path d="M21 12H9"/><path d="M21 19H7"/></svg>
-						{:else if isEditorActive({ textAlign: 'justify' })}
-							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18"/><path d="M3 12h18"/><path d="M3 19h18"/></svg>
+			<div
+				class="editor-formatting-bar"
+				class:customizing={toolbarDraft !== null}
+				bind:this={formattingBar}
+				style={isMobile && keyboardHeight > 0 ? `bottom: ${keyboardHeight}px;` : ''}
+				onclick={handleFormattingBarClick}
+				onclickcapture={captureToolbarClick}
+				onkeydown={handleFormattingEscape}
+				onkeydowncapture={customizeToolbarKeydown}
+				onfocusin={selectToolbarControl}
+				onpointerdowncapture={startToolbarDrag}
+				onpointerdown={preserveFormattingFocus}
+				onmousedown={preserveFormattingFocus}
+			>
+				{#if toolbarDraft}<span class="fmt-area-label">Toolbar</span>{/if}
+				<div class="fmt-main-controls" class:drop-target={toolbarDrop?.area === 'main'} data-toolbar-area="main">
+					{#if toolbarDraft}
+						{#each toolbarDraft.main as id (id)}
+							{@render editableToolbarControl(id)}
 						{:else}
-							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 5H3"/><path d="M15 12H3"/><path d="M17 19H3"/></svg>
-						{/if}
-					</button>
-					{#if alignDropdown}
-						<div class="fmt-dropdown align-dropdown">
-							<button class:active={isEditorActive({ textAlign: 'left' })} onclick={() => { editor?.chain().focus().setTextAlign('left').run(); alignDropdown = false; }}>
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 5H3"/><path d="M15 12H3"/><path d="M17 19H3"/></svg>
-								Left
-							</button>
-							<button class:active={isEditorActive({ textAlign: 'center' })} onclick={() => { editor?.chain().focus().setTextAlign('center').run(); alignDropdown = false; }}>
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 5H3"/><path d="M17 12H7"/><path d="M19 19H5"/></svg>
-								Center
-							</button>
-							<button class:active={isEditorActive({ textAlign: 'right' })} onclick={() => { editor?.chain().focus().setTextAlign('right').run(); alignDropdown = false; }}>
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 5H3"/><path d="M21 12H9"/><path d="M21 19H7"/></svg>
-								Right
-							</button>
-							<button class:active={isEditorActive({ textAlign: 'justify' })} onclick={() => { editor?.chain().focus().setTextAlign('justify').run(); alignDropdown = false; }}>
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18"/><path d="M3 12h18"/><path d="M3 19h18"/></svg>
-								Justify
-							</button>
-						</div>
+							<span class="fmt-empty-drop">Drop buttons here</span>
+						{/each}
+					{:else}
+						{#each formattingGroups as group, index}
+							{#if index > 0}<div class="fmt-sep"></div>{/if}
+							{#each group as id (id)}
+								{@render toolbarControl(id)}
+							{/each}
+						{/each}
 					{/if}
 				</div>
-
-				<div class="fmt-sep"></div>
-
-				<!-- Indent / Outdent -->
-				<button class="fmt-btn" onclick={() => {
-					if (!editor) return;
-					// Try list indent first - run() returns true if it succeeded
-					const sank = editor.chain().focus().sinkListItem('listItem').run();
-					if (!sank) {
-						const sankTask = editor.chain().focus().sinkListItem('taskItem').run();
-						if (!sankTask && editor.state.selection.empty) {
-							editor.chain().focus().insertContent('\t').run();
-						}
-					}
-				}} title="Indent (Tab)">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="4" x2="21" y2="4"/><line x1="11" y1="9" x2="21" y2="9"/><line x1="11" y1="14" x2="21" y2="14"/><line x1="3" y1="19" x2="21" y2="19"/><polyline points="3 9 7 11.5 3 14"/></svg>
-				</button>
-				<button class="fmt-btn" onclick={() => {
-					if (!editor) return;
-					const lifted = editor.chain().focus().liftListItem('listItem').run();
-					if (!lifted) {
-						const liftedTask = editor.chain().focus().liftListItem('taskItem').run();
-						if (!liftedTask && editor.state.selection.empty) {
-							// Remove leading tab/spaces from current line
-							const { from } = editor.state.selection;
-							const pos = editor.state.doc.resolve(from);
-							const lineStart = pos.start(pos.depth);
-							const lineText = editor.state.doc.textBetween(lineStart, pos.end(pos.depth));
-							if (lineText.startsWith('\t')) {
-								editor.chain().focus().command(({ tr }) => {
-									tr.delete(lineStart, lineStart + 1);
-									return true;
-								}).run();
-							} else if (lineText.startsWith('    ')) {
-								editor.chain().focus().command(({ tr }) => {
-									tr.delete(lineStart, lineStart + 4);
-									return true;
-								}).run();
-							} else if (lineText.startsWith('  ')) {
-								editor.chain().focus().command(({ tr }) => {
-									tr.delete(lineStart, lineStart + 2);
-									return true;
-								}).run();
-							}
-						}
-					}
-				}} title="Outdent (Shift+Tab)">
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="4" x2="21" y2="4"/><line x1="11" y1="9" x2="21" y2="9"/><line x1="11" y1="14" x2="21" y2="14"/><line x1="3" y1="19" x2="21" y2="19"/><polyline points="7 9 3 11.5 7 14"/></svg>
-				</button>
-
+				{#if !isMobile}
+					<button class="fmt-btn fmt-more-button" class:active={moreOpen} bind:this={moreButton} title="More formatting" aria-label="More formatting" aria-haspopup="dialog" aria-expanded={moreOpen} aria-controls={morePanelId} onclick={toggleMore} onkeydown={moreKeydown} onpointerenter={hoverMore} onpointerleave={leaveMore}>
+						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d={moreOpen ? 'm6 9 6 6 6-6' : 'm6 15 6-6 6 6'}/></svg>
+					</button>
+					{#if moreOpen}
+						<div class="fmt-more-panel" class:customizing={toolbarDraft !== null} id={morePanelId} bind:this={morePanel} role="dialog" tabindex="-1" aria-label={toolbarDraft ? 'Customize toolbar' : 'More formatting'} onpointerenter={hoverMore} onpointerleave={leaveMore} use:positionFormattingPopup={true}>
+							{#if toolbarDraft}
+								<div class="fmt-customize-heading">
+									<strong>Customize toolbar</strong>
+									<p>Drag buttons to reorder or move them into More.</p>
+								</div>
+								<div class="fmt-area-label">More</div>
+								<div class="fmt-more-controls" class:drop-target={toolbarDrop?.area === 'more'} data-toolbar-area="more">
+									{#each toolbarDraft.more as id (id)}
+										{@render editableToolbarControl(id)}
+									{:else}
+										<span class="fmt-empty-drop">Drop buttons here to keep them in More</span>
+									{/each}
+								</div>
+								<div class="fmt-customize-selection">
+									<div class="fmt-selected-label" aria-live="polite">
+										<strong>{toolbarSelected ? toolbarLabels[toolbarSelected] : 'Select a button'}</strong>
+										{#if toolbarSelectedArea}
+											<span>{toolbarSelectedArea === 'main' ? 'Toolbar' : 'More'} · {toolbarSelectedIndex + 1} of {toolbarDraft[toolbarSelectedArea].length}</span>
+										{/if}
+									</div>
+									<div class="fmt-customize-moves">
+										<button type="button" disabled={toolbarSaving || !toolbarSelectedArea || toolbarSelectedIndex === 0} onclick={() => toolbarSelectedArea && moveSelectedToolbarButton(toolbarSelectedArea, toolbarSelectedIndex - 1)} aria-label="Move selected button earlier" title="Move earlier">
+											<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m14 6-6 6 6 6"/></svg>
+										</button>
+										<button type="button" disabled={toolbarSaving || !toolbarSelectedArea || toolbarSelectedIndex === toolbarDraft[toolbarSelectedArea].length - 1} onclick={() => toolbarSelectedArea && moveSelectedToolbarButton(toolbarSelectedArea, toolbarSelectedIndex + 2)} aria-label="Move selected button later" title="Move later">
+											<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m10 6 6 6-6 6"/></svg>
+										</button>
+										<button type="button" class="fmt-move-area" disabled={toolbarSaving || !toolbarSelectedArea} onclick={() => toolbarDraft && moveSelectedToolbarButton(toolbarSelectedArea === 'main' ? 'more' : 'main', toolbarDraft[toolbarSelectedArea === 'main' ? 'more' : 'main'].length)}>
+											Move to {toolbarSelectedArea === 'main' ? 'More' : 'toolbar'}
+										</button>
+									</div>
+									<p class="fmt-customize-hint" id={toolbarHintId}>On a button: ← / → reorder, ↑ to More, ↓ to toolbar.</p>
+								</div>
+								{#if toolbarConflict}
+									<p class="fmt-customize-error" role="alert">The toolbar changed in another window. Cancel and customize again to use the latest layout.</p>
+								{:else if toolbarSaveError}
+									<p class="fmt-customize-error" role="alert">{toolbarSaveError}</p>
+								{/if}
+								<div class="fmt-customize-actions">
+									<button type="button" class="fmt-customize-reset" disabled={toolbarSaving} onclick={resetToolbarDraft} title="Restore defaults in this draft">Reset</button>
+									<button type="button" disabled={toolbarSaving} onclick={() => endToolbarCustomization(!!formattingBar?.contains(document.activeElement))}>Cancel</button>
+									<button type="button" class="fmt-customize-done" disabled={toolbarSaving || toolbarConflict || !$appConfig} onclick={saveToolbarDraft}>{toolbarSaving ? 'Saving…' : 'Done'}</button>
+								</div>
+							{:else}
+								{#if toolbarLayout.more.length > 0}
+									<div class="fmt-more-controls" style={`--toolbar-more-columns: ${Math.min(4, toolbarLayout.more.length)}`}>
+										{#each toolbarLayout.more as id (id)}
+											{@render toolbarControl(id)}
+										{/each}
+									</div>
+								{/if}
+								<button type="button" class="fmt-customize-entry" disabled={toolbarSaving} onclick={beginToolbarCustomization}>Customize toolbar…</button>
+							{/if}
+						</div>
+					{/if}
+					{#if toolbarDrop}
+						<div class="fmt-drop-indicator" aria-hidden="true" style={`left:${toolbarDrop.left}px;top:${toolbarDrop.top}px;height:${toolbarDrop.height}px;`}></div>
+					{/if}
 				{/if}
 			</div>
 		{/if}
@@ -8272,6 +8670,274 @@
 		flex-wrap: wrap;
 	}
 
+	.editor-formatting-bar.customizing {
+		flex-wrap: nowrap;
+	}
+
+	.fmt-main-controls {
+		display: contents;
+	}
+
+	.fmt-more-button {
+		flex-shrink: 0;
+	}
+
+	.fmt-more-panel {
+		position: fixed;
+		z-index: 99;
+		width: max-content;
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		box-sizing: border-box;
+		overflow: auto;
+		overscroll-behavior: contain;
+		background: var(--bg-primary);
+		border: 1px solid var(--border-color);
+		border-radius: 8px;
+		box-shadow: var(--shadow-lg);
+		padding: 6px;
+	}
+
+	.fmt-more-controls {
+		display: grid;
+		grid-template-columns: repeat(var(--toolbar-more-columns, 7), 32px);
+		gap: 2px;
+		align-content: start;
+		justify-content: start;
+	}
+
+	.fmt-customize-entry {
+		min-height: 30px;
+		padding: 6px 8px;
+		border: 0;
+		border-radius: 4px;
+		background: none;
+		color: var(--text-secondary);
+		text-align: left;
+		font-size: 12px;
+		white-space: nowrap;
+		cursor: pointer;
+	}
+
+	.fmt-more-controls + .fmt-customize-entry {
+		border-top: 1px solid var(--border-light);
+		border-radius: 0 0 4px 4px;
+		padding-top: 9px;
+	}
+
+	.fmt-customize-entry:hover {
+		background: var(--bg-hover);
+		color: var(--text-primary);
+	}
+
+	.editor-formatting-bar.customizing {
+		background: var(--bg-secondary);
+		gap: 8px;
+	}
+
+	.customizing .fmt-main-controls,
+	.fmt-more-panel.customizing .fmt-more-controls {
+		border: 1px dashed var(--border-color);
+		border-radius: 6px;
+		padding: 5px;
+		min-height: 42px;
+		box-sizing: border-box;
+		overflow: auto;
+		overscroll-behavior: contain;
+	}
+
+	.customizing .fmt-main-controls {
+		display: flex;
+		flex: 1;
+		min-width: 0;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 2px;
+		max-height: 116px;
+	}
+
+	.fmt-more-panel.customizing {
+		width: 280px;
+		padding: 12px;
+		gap: 8px;
+	}
+
+	.fmt-more-panel.customizing .fmt-more-controls {
+		max-height: 152px;
+		min-height: 58px;
+	}
+
+	.fmt-area-label {
+		font-size: 11px;
+		font-weight: 600;
+		color: var(--text-tertiary);
+		flex-shrink: 0;
+	}
+
+	.fmt-empty-drop {
+		font-size: 11px;
+		color: var(--text-tertiary);
+		padding: 7px 4px;
+		grid-column: 1 / -1;
+		line-height: 1.5;
+		pointer-events: none;
+	}
+
+	.fmt-control {
+		flex-shrink: 0;
+		border-radius: 4px;
+		touch-action: none;
+	}
+
+	.fmt-control .fmt-btn {
+		cursor: grab;
+		background: none;
+		color: var(--text-secondary);
+	}
+
+	.fmt-control.selected {
+		outline: 2px solid var(--accent);
+		outline-offset: -1px;
+		background: var(--accent-light);
+	}
+
+	.fmt-control.dragging {
+		opacity: 0.3;
+	}
+
+	.customizing .drop-target {
+		border-color: var(--accent);
+		background: var(--accent-light);
+	}
+
+	.fmt-drop-indicator {
+		position: fixed;
+		width: 3px;
+		border-radius: 2px;
+		background: var(--accent);
+		z-index: 1000;
+		pointer-events: none;
+	}
+
+	.fmt-customize-heading strong {
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--text-primary);
+	}
+
+	.fmt-customize-heading p,
+	.fmt-customize-hint {
+		margin: 5px 0 0;
+		font-size: 11px;
+		line-height: 1.5;
+		color: var(--text-tertiary);
+	}
+
+	.fmt-customize-selection {
+		border-top: 1px solid var(--border-light);
+		padding-top: 9px;
+	}
+
+	.fmt-selected-label {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: 8px;
+		margin-bottom: 7px;
+		font-size: 11px;
+	}
+
+	.fmt-selected-label strong {
+		color: var(--text-primary);
+		font-weight: 500;
+	}
+
+	.fmt-selected-label span {
+		color: var(--text-tertiary);
+		white-space: nowrap;
+	}
+
+	.fmt-customize-moves,
+	.fmt-customize-actions {
+		display: flex;
+		gap: 5px;
+	}
+
+	.fmt-customize-moves button,
+	.fmt-customize-actions button {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		min-width: 28px;
+		min-height: 28px;
+		padding: 4px 8px;
+		border: 1px solid var(--border-color);
+		border-radius: 5px;
+		background: var(--bg-primary);
+		color: var(--text-secondary);
+		font-size: 11px;
+		cursor: pointer;
+	}
+
+	.fmt-customize-moves button:hover:not(:disabled),
+	.fmt-customize-actions button:hover:not(:disabled) {
+		background: var(--bg-hover);
+	}
+
+	.fmt-customize-moves .fmt-move-area {
+		flex: 1;
+	}
+
+	.fmt-customize-actions {
+		border-top: 1px solid var(--border-light);
+		padding-top: 9px;
+	}
+
+	.fmt-customize-actions .fmt-customize-reset {
+		margin-right: auto;
+		border-color: transparent;
+		background: none;
+	}
+
+	.fmt-customize-actions .fmt-customize-done {
+		background: var(--accent);
+		color: var(--bg-primary);
+		border-color: var(--accent);
+	}
+
+	.fmt-customize-actions .fmt-customize-done:hover:not(:disabled) {
+		background: var(--accent);
+		filter: brightness(1.1);
+	}
+
+	.fmt-more-panel button:disabled {
+		opacity: 0.45;
+		cursor: default;
+	}
+
+	.fmt-customize-entry:focus-visible,
+	.fmt-customize-moves button:focus-visible,
+	.fmt-customize-actions button:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: 1px;
+	}
+
+	.fmt-customize-error {
+		margin: 0;
+		font-size: 11px;
+		line-height: 1.5;
+		color: var(--danger, #e53e3e);
+		overflow-wrap: anywhere;
+	}
+
+
+	.fmt-btn:focus-visible,
+	.fmt-dropdown button:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: -2px;
+	}
+
 	.fmt-btn {
 		background: none;
 		border: none;
@@ -8316,9 +8982,11 @@
 	}
 
 	.fmt-dropdown {
-		position: absolute;
-		bottom: calc(100% + 4px);
-		left: 0;
+		position: fixed;
+		bottom: auto;
+		box-sizing: border-box;
+		overflow: auto;
+		overscroll-behavior: contain;
 		background: var(--bg-primary);
 		border: 1px solid var(--border-color);
 		border-radius: 8px;
@@ -11322,17 +11990,39 @@
 		z-index: 50;
 		padding: 4px 8px;
 		padding-bottom: calc(4px + env(safe-area-inset-bottom));
-		overflow-x: auto;
+		overflow: visible;
 		flex-wrap: nowrap;
-		-webkit-overflow-scrolling: touch;
-		scrollbar-width: none;
 		gap: 1px;
 		background: var(--bg-secondary);
 		border-top: 1px solid var(--border-color);
 	}
 
-	.editor-container.mobile .editor-formatting-bar::-webkit-scrollbar {
+	.editor-container.mobile .fmt-main-controls::-webkit-scrollbar {
 		display: none;
+	}
+
+	.editor-container.mobile .fmt-main-controls {
+		display: flex;
+		flex: 1;
+		min-width: 0;
+		align-items: center;
+		flex-wrap: nowrap;
+		gap: 1px;
+		overflow-x: auto;
+		scrollbar-width: none;
+		-webkit-overflow-scrolling: touch;
+	}
+
+
+	.editor-container.mobile .table-picker-grid {
+		grid-template-columns: repeat(10, 44px);
+		grid-template-rows: repeat(8, 44px);
+	}
+
+	.editor-container.mobile .table-picker-dropdown .table-picker-cell {
+		width: 44px;
+		height: 44px;
+		padding: 0;
 	}
 
 	.editor-container.mobile .fmt-btn {
@@ -11348,14 +12038,7 @@
 	}
 
 	.editor-container.mobile .fmt-dropdown {
-		position: absolute;
-		bottom: calc(100% + 4px);
-		left: 0;
-		right: auto;
 		min-width: 180px;
-		max-width: calc(100vw - 16px);
-		max-height: 60vh;
-		overflow-y: auto;
 	}
 
 	.editor-container.mobile .fmt-dropdown button {
@@ -11365,12 +12048,8 @@
 	}
 
 	.editor-container.mobile .insert-dropdown {
-		position: absolute;
-		bottom: calc(100% + 4px);
-		left: 0;
-		right: auto;
+		width: max-content;
 		min-width: 200px;
-		max-width: calc(100vw - 16px);
 	}
 
 	.editor-container.mobile .shortcuts-hint {
