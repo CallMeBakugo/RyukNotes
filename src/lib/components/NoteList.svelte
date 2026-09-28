@@ -44,7 +44,7 @@
 	import { encodeNoteDragPaths } from '$lib/utils/note-drag';
 	import { tagIterationKey } from '$lib/utils/tag-styles';
 	import { updateNoteList } from '$lib/utils/note-list-updates';
-	import { buildNoteListRows, noteListOffsets, noteListWindow } from '$lib/utils/note-list-window';
+	import { buildNoteListRows, noteListOffsets, noteListWindow, noteListRevealScrollTop } from '$lib/utils/note-list-window';
 	import { beginNoteNavigation, isCurrentNoteNavigation, cancelNoteNavigation } from '$lib/utils/note-navigation';
 	import type { NoteEntry, NoteMeta, TrashNotebookEntry, SortMode, TaskItem } from '$lib/types';
 	import TasksView from './TasksView.svelte';
@@ -284,6 +284,35 @@
 			}
 			scrollTop = listContainer.scrollTop;
 		});
+	}
+
+	export async function revealNote(path: string, token: number): Promise<boolean> {
+		const view = cacheKey();
+		const current = () => ownerIsCurrent() && isCurrentNoteNavigation(token)
+			&& $activeNotePath === path && cacheKey() === view;
+		if (!current()) return false;
+		clearSelection();
+		stickToBottom = false;
+		// First render the estimated window, then refine using its actual row heights.
+		for (let pass = 0; pass < 2; pass++) {
+			await tick();
+			if (!current() || !listContainer || !virtualList) return false;
+			const index = listRows.findIndex(row => row.kind === 'note' && row.note.path === path);
+			if (index < 0) return false;
+			listOrigin = virtualList.offsetTop;
+			listContainer.scrollTop = noteListRevealScrollTop(
+				offsets, index, listContainer.scrollTop, listContainer.clientHeight, listOrigin,
+			);
+			scrollTop = listContainer.scrollTop;
+			await tick();
+			if (!current() || !virtualList) return false;
+			for (const row of virtualList.querySelectorAll<HTMLDivElement>('.virtual-note-row')) {
+				if (row.offsetHeight > 0) pendingHeights.set(row.dataset.rowKey!, row.offsetHeight);
+			}
+			if (measurementFrame !== null) cancelAnimationFrame(measurementFrame);
+			applyMeasuredRows();
+		}
+		return current();
 	}
 
 	function measureRow(node: HTMLDivElement) {

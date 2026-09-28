@@ -40,7 +40,7 @@
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { activeNote, activeNotePath, appConfig, editorDirty, sourceMode, focusMode, readOnly, quickAccessPaths, notes, navHistory, canGoBack, canGoForward, viewerNote, viewMode, notebooks, outlineWidth } from '$lib/stores/app';
 	import { saveNote, saveImage, saveAttachment, readClipboardImage, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote } from '$lib/api';
-	import type { VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord, FileEvent } from '$lib/types';
+	import type { VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord, FileEvent, SearchTarget } from '$lib/types';
 	import { listen } from '@tauri-apps/api/event';
 	import { debounce } from '$lib/utils/debounce';
 	import { RevisionSaveQueue, type SaveRevision } from '$lib/utils/revision-save';
@@ -53,6 +53,7 @@
 	import SourceEditor from './SourceEditor.svelte';
 	import { SourceController } from '$lib/editor/source/controller';
 	import { findDocumentMatches, findSourceMatches, closestSearchMatch, type NoteSearchMatch } from '$lib/editor/search';
+	import { resolveSearchTarget, visibleSearchTarget } from '$lib/editor/search-target';
 	import { convertListNode, type MixedListName } from '$lib/editor/mixedLists';
 	import { clearFormatting } from '$lib/editor/clearFormatting';
 	import { buildCodeCopyDecorations, buildTaskMetaDecorations, focusedPlaceholderDecorations } from '$lib/editor/decorations';
@@ -118,9 +119,13 @@
 	let lastSourceMode = $sourceMode;
 	let linkContextMenu = $state<{ x: number; y: number; href: string; anchor: HTMLAnchorElement } | null>(null);
 	let hiddenTitleHeading: HiddenTitleHeading | null = null;
-	let taskRevealTimer: ReturnType<typeof setTimeout> | null = null;
-	let taskRevealRequest = 0;
-	const taskRevealPluginKey = new PluginKey('taskReveal');
+	let targetRevealTimer: ReturnType<typeof setTimeout> | null = null;
+	let targetRevealRequest = 0;
+	const targetRevealPluginKey = new PluginKey('targetReveal');
+	let searchPassageActive = false;
+	let searchTitleReveal = $state(false);
+	let searchTagsReveal = $state(false);
+	let searchRevealNotice = $state('');
 	type TaskRevealTarget = { sourceOrdinal: number; richOrdinal: number | null };
 	const TASK_LINE_RE = /^\s*[-*]\s\[[ xX]\]\s+.+?\s*$/;
 	const RICH_TASK_LINE_RE = /^\s*-\s\[(?:x| )\]\s+.+?\s*$/;
@@ -143,12 +148,107 @@
 	}
 
 
-	function clearTaskReveal() {
-		if (taskRevealTimer) clearTimeout(taskRevealTimer);
-		taskRevealTimer = null;
+	function clearTargetReveal() {
+		if (targetRevealTimer) clearTimeout(targetRevealTimer);
+		targetRevealTimer = null;
+		searchPassageActive = false;
+		searchTitleReveal = false;
+		searchTagsReveal = false;
+		searchRevealNotice = '';
 		source.highlight(null);
 		if (editor && !editor.isDestroyed) {
-			editor.view.dispatch(editor.state.tr.setMeta(taskRevealPluginKey, DecorationSet.empty));
+			editor.view.dispatch(editor.state.tr.setMeta(targetRevealPluginKey, DecorationSet.empty));
+		}
+	}
+
+	export async function revealSearchTarget(target: SearchTarget | null, canReveal: () => boolean) {
+		if (!target || !canReveal()) return;
+		closeNoteSearch(false);
+		clearTargetReveal();
+		const request = ++targetRevealRequest;
+		const snapshot = saves.capture();
+		const path = loadedPath;
+		const vault = $appConfig?.active_vault;
+		let mode = $sourceMode;
+		const current = () => request === targetRevealRequest && canReveal() && !editorDisposed
+			&& path === loadedPath && path === $activeNotePath && vault === $appConfig?.active_vault
+			&& mode === $sourceMode && saves.isCurrent(snapshot);
+		searchPassageActive = true;
+		try {
+			await tick();
+			if (!current() || !$activeNote) return;
+			const changed = () => { searchRevealNotice = 'The indexed passage has changed. Search again after saving.'; };
+			const revealTitle = () => {
+				searchTitleReveal = true;
+				const surface = $sourceMode ? source.view?.scrollDOM : editorElement?.closest('.editor-body');
+				if (surface) surface.scrollTop = 0;
+			};
+			if (target.field !== 'body') {
+				const value = target.field === 'title' ? $activeNote.meta.title : $activeNote.meta.tags.join(' ');
+				if (!resolveSearchTarget(value, target)) { changed(); return; }
+				if (target.field === 'title') revealTitle();
+				else {
+					searchTagsReveal = true;
+					searchRevealNotice = `Matched tag: ${target.text}`;
+				}
+				return;
+			}
+			let body = $editorDirty ? getCurrentBody() : $activeNote.content;
+			let match = resolveSearchTarget(body, target);
+			if (!match) { changed(); return; }
+			let visible = visibleSearchTarget(body, $activeNote.meta.title, $appConfig?.hide_title_in_body ?? false, match);
+			if (visible.hiddenTitle) { revealTitle(); return; }
+			if (!visible.match) { changed(); return; }
+			if (!$sourceMode && editor) {
+				// Search rendered text directly: never re-render the note just to locate a hit.
+				const richMatch = findDocumentMatches(editor.state.doc, target.text, { matchCase: true, wholeWord: false })[0];
+				if (richMatch) {
+					const decorations = DecorationSet.create(editor.state.doc, [
+						Decoration.inline(richMatch.from, richMatch.to, {
+							class: 'note-search-match note-search-active',
+							'data-search-passage': '',
+						}),
+					]);
+					editor.view.dispatch(editor.state.tr.setMeta(targetRevealPluginKey, decorations));
+					const element = editor.view.dom.querySelector<HTMLElement>('[data-search-passage]');
+					if (element) {
+						for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+							if (parent.matches('[data-type="details"]') && !parent.classList.contains('is-open')) {
+								searchRevealedDetails.add(parent);
+								openDetailsEl(parent);
+							}
+						}
+						if (element.getClientRects().length) {
+							element.scrollIntoView({ block: 'center', behavior: 'instant' });
+							return;
+						}
+					}
+				}
+				// Destinations, attributes and other non-rendered Markdown need the source view.
+				closeNoteSearch(false);
+				mode = true;
+				$sourceMode = true;
+				await tick();
+				await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+				if (!current()) return;
+				source.load(stripTitleH1(body));
+				searchRevealNotice = 'Match is in Markdown source.';
+			}
+			if (!current() || !source.view) return;
+			if (visible.markdown !== source.state.doc.toString()) {
+				// A previous mode conversion may have normalized Markdown without changing the note.
+				body = getCurrentBody();
+				match = resolveSearchTarget(body, target);
+				if (!match) { changed(); return; }
+				visible = visibleSearchTarget(body, $activeNote.meta.title, $appConfig?.hide_title_in_body ?? false, match);
+			}
+			if (visible.match) source.highlight(visible.match, true);
+			else changed();
+		} finally {
+			if (request === targetRevealRequest) {
+				if (current()) targetRevealTimer = setTimeout(clearTargetReveal, 4000);
+				else clearTargetReveal();
+			}
 		}
 	}
 
@@ -184,16 +284,16 @@
 	}
 
 	function revealTaskTarget(target: TaskRevealTarget): boolean {
-		clearTaskReveal();
+		clearTargetReveal();
 		if ($sourceMode) {
 			if (!source.view) return false;
 			const range = sourceTaskRange(target.sourceOrdinal);
 			if (!range) return true;
 			source.highlight({ from: range.start, to: range.end }, true);
 			const origin = captureOrigin();
-			taskRevealTimer = setTimeout(() => {
+			targetRevealTimer = setTimeout(() => {
 				if (isOriginCurrent(origin) && !noteSearchOpen) source.highlight(null);
-				taskRevealTimer = null;
+				targetRevealTimer = null;
 			}, 1600);
 			return true;
 		}
@@ -213,17 +313,17 @@
 		const decorations = DecorationSet.create(editor.state.doc, [
 			Decoration.node(targetPos, targetPos + node.nodeSize, { class: 'task-target-reveal' }),
 		]);
-		editor.view.dispatch(editor.state.tr.setMeta(taskRevealPluginKey, decorations));
+		editor.view.dispatch(editor.state.tr.setMeta(targetRevealPluginKey, decorations));
 		const element = editor.view.nodeDOM(targetPos);
 		if (!(element instanceof HTMLElement)) return true;
 		const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 		element.scrollIntoView({ block: 'center', behavior: reduceMotion ? 'auto' : 'smooth' });
 		const decoratedEditor = editor;
-		taskRevealTimer = setTimeout(() => {
+		targetRevealTimer = setTimeout(() => {
 			if (!decoratedEditor.isDestroyed) {
-				decoratedEditor.view.dispatch(decoratedEditor.state.tr.setMeta(taskRevealPluginKey, DecorationSet.empty));
+				decoratedEditor.view.dispatch(decoratedEditor.state.tr.setMeta(targetRevealPluginKey, DecorationSet.empty));
 			}
-			taskRevealTimer = null;
+			targetRevealTimer = null;
 		}, 2200);
 		return true;
 	}
@@ -231,7 +331,7 @@
 	function scheduleTaskReveal(path: string, target: TaskRevealTarget | null, request: number, attempts = 0) {
 		if (!target) return;
 		tick().then(() => requestAnimationFrame(() => {
-			if (request !== taskRevealRequest || path !== loadedPath) return;
+			if (request !== targetRevealRequest || path !== loadedPath) return;
 			if (!revealTaskTarget(target) && attempts < 3) {
 				scheduleTaskReveal(path, target, request, attempts + 1);
 			}
@@ -1741,16 +1841,16 @@
 		},
 	});
 
-	const TaskRevealExtension = Extension.create({
-		name: 'taskReveal',
+	const TargetRevealExtension = Extension.create({
+		name: 'targetReveal',
 		addProseMirrorPlugins() {
 			return [
 				new Plugin({
-					key: taskRevealPluginKey,
+					key: targetRevealPluginKey,
 					state: {
 						init() { return DecorationSet.empty; },
 						apply(tr, old) {
-							const meta = tr.getMeta(taskRevealPluginKey);
+							const meta = tr.getMeta(targetRevealPluginKey);
 							if (meta !== undefined) return meta;
 							return old.map(tr.mapping, tr.doc);
 						},
@@ -3044,6 +3144,9 @@
 
 	const saves = new RevisionSaveQueue();
 	let savedBlobImages = new Map<string, string>();
+	let saveError = $state<{ message: string; path: string; vault: string } | null>(null);
+	let saveAttempt = 0;
+	let retryingSave = $state(false);
 
 	type EditorOrigin = {
 		snapshot: SaveRevision;
@@ -3076,6 +3179,31 @@
 		saves.schedule(() => { void forceSave(); });
 	}
 
+	function isCurrentSaveAttempt(origin: EditorOrigin, attempt: number): boolean {
+		return !editorDisposed && attempt === saveAttempt && saves.isCurrentSession(origin.snapshot)
+			&& origin.path === $activeNotePath && origin.vault === $appConfig?.active_vault;
+	}
+
+	function reportSaveError(error: unknown, origin: EditorOrigin, attempt: number): false {
+		console.error('Save failed:', error);
+		if (origin.path && origin.vault && isCurrentSaveAttempt(origin, attempt)) {
+			const message = error instanceof Error ? error.message : String(error);
+			saveError = { message: message.trim() || 'The note could not be saved.', path: origin.path, vault: origin.vault };
+		}
+		return false;
+	}
+
+	async function retrySave() {
+		if (retryingSave || !saveError || saveError.path !== $activeNotePath || saveError.vault !== $appConfig?.active_vault) return;
+		const snapshot = saves.capture();
+		retryingSave = true;
+		try {
+			await forceSave();
+		} finally {
+			if (saves.isCurrentSession(snapshot)) retryingSave = false;
+		}
+	}
+
 	export function forceSave(allowWhileTrashing = false): Promise<boolean> {
 		saves.cancelScheduled();
 		if (get(viewerNote) || !$activeNote || !$activeNotePath) return Promise.resolve(true);
@@ -3085,9 +3213,10 @@
 		if ($activeNotePath !== loadedPath || (!$sourceMode && (!editor || pendingContent !== null))) {
 			return Promise.resolve(false);
 		}
+		const origin = captureOrigin();
+		const attempt = ++saveAttempt;
 		try {
 			// Capture everything before yielding: queued work must never read another note's state.
-			const origin = captureOrigin();
 			const { snapshot } = origin;
 			const path = $activeNotePath;
 			const vault = origin.vault;
@@ -3121,17 +3250,14 @@
 				}
 				await saveNote(vault, path, meta, body);
 			}).then((current) => {
+				if (isCurrentSaveAttempt(origin, attempt)) saveError = null;
 				if (!current || !isOriginCurrent(origin, true)) return false;
 				if ($activeNote) $activeNote = { ...$activeNote, content: body };
 				$editorDirty = false;
 				return true;
-			}).catch((e) => {
-				console.error('Save failed:', e);
-				return false;
-			});
+			}).catch((error) => reportSaveError(error, origin, attempt));
 		} catch (e) {
-			console.error('Save failed:', e);
-			return Promise.resolve(false);
+			return Promise.resolve(reportSaveError(e, origin, attempt));
 		}
 	}
 
@@ -3422,7 +3548,7 @@
 	function restoreNoteScroll(surface: HTMLElement, scrollTop: number, path: string) {
 		const snapshot = saves.capture();
 		const apply = () => {
-			if (saves.isCurrentSession(snapshot) && loadedPath === path && surface.isConnected) surface.scrollTop = scrollTop;
+			if (!searchPassageActive && saves.isCurrentSession(snapshot) && loadedPath === path && surface.isConnected) surface.scrollTop = scrollTop;
 		};
 		apply();
 		requestAnimationFrame(apply);
@@ -3432,6 +3558,8 @@
 		cancelCounts();
 		closeNoteSearch(false);
 		saves.startSession();
+		saveError = null;
+		retryingSave = false;
 		closeAiMenu();
 		showHistory = false;
 		historyPreview = null;
@@ -3454,8 +3582,8 @@
 		$editorDirty = false;
 		rememberLoadedNoteScroll();
 		const scrollPosition = taskTarget ? undefined : noteScrollPositions.get(path);
-		clearTaskReveal();
-		const revealRequest = ++taskRevealRequest;
+		clearTargetReveal();
+		const revealRequest = ++targetRevealRequest;
 		const revealTarget = taskTarget ? resolveTaskTarget(taskTarget, content) : null;
 		loadedPath = path;
 		const loadSnapshot = saves.capture();
@@ -3962,6 +4090,8 @@
 	function noteSearchPrev() { navigateNoteSearch(-1); }
 
 	export function openNoteSearch() {
+		++targetRevealRequest;
+		clearTargetReveal();
 		noteSearchOpen = true;
 		tick().then(() => {
 			if (noteSearchOpen && !editorDisposed) noteSearchInput?.focus({ preventScroll: true });
@@ -4582,7 +4712,7 @@
 				MoveLineShortcuts,
 					TabIndent,
 					NoteSearchExtension,
-					TaskRevealExtension,
+					TargetRevealExtension,
 					ColorSwatch,
 				TaskMetaDim,
 				...($appConfig?.enable_wiki_links ? [WikiLink, WikiLinkAutocomplete] : []),
@@ -5965,7 +6095,7 @@
 		searchRevealedDetails.clear();
 		if (wikiTitleRefreshTimer !== null) clearTimeout(wikiTitleRefreshTimer);
 		window.removeEventListener('helixnotes-open-note', handleOpenNote);
-		clearTaskReveal();
+		clearTargetReveal();
 		destroyEditor();
 		unlistenFileChange?.();
 		if (infoPathCopyTimer) clearTimeout(infoPathCopyTimer);
@@ -6009,7 +6139,7 @@
 		{/if}
 		{#if !$viewerNote}
 		<div class="editor-toolbar" class:mobile={isMobile}>
-			<div class="editor-title">
+			<div class="editor-title" class:search-target-meta={searchTitleReveal}>
 				<input
 					bind:this={titleInput}
 					type="text"
@@ -6242,6 +6372,17 @@
 			{/if}
 		</div>
 		{/if}
+		{#if saveError && $editorDirty && !$viewerNote && saveError.path === $activeNotePath && saveError.vault === $appConfig?.active_vault}
+			<div class="save-error" role="alert">
+				<span><strong>Save failed.</strong> {saveError.message}</span>
+				<button type="button" onclick={retrySave} disabled={retryingSave} aria-label="Retry saving note">
+					{retryingSave ? 'Saving…' : 'Retry'}
+				</button>
+			</div>
+		{/if}
+		{#if searchRevealNotice}
+			<div class="search-target-notice" role="status">{searchRevealNotice}</div>
+		{/if}
 
 		{#if !$focusMode}
 		<div class="note-meta-bar">
@@ -6256,7 +6397,7 @@
 				{/if}
 			</span>
 			<span class="meta-divider">·</span>
-			<button class="note-tags-trigger" onclick={toggleTagMenu} title="Edit tags">
+			<button class="note-tags-trigger" class:search-target-meta={searchTagsReveal} onclick={toggleTagMenu} title="Edit tags">
 				{#if $activeNote.meta.tags?.length > 0}
 					{#each $activeNote.meta.tags as tag, i (tagIterationKey(tag, i))}<TagLabel name={tag} size={11} tone="muted" />{/each}
 				{:else}
@@ -8014,6 +8155,70 @@
 		background: var(--bg-tertiary);
 		padding: 2px 8px;
 		border-radius: 4px;
+	}
+
+	.save-error {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		flex-shrink: 0;
+		padding: 8px 16px;
+		border-bottom: 1px solid color-mix(in srgb, var(--danger, #e53e3e) 30%, var(--border-color));
+		background: color-mix(in srgb, var(--danger, #e53e3e) 8%, var(--bg-primary));
+		color: var(--danger, #e53e3e);
+		font-size: 12px;
+		line-height: 1.5;
+	}
+
+	.save-error > span {
+		flex: 1;
+		min-width: 0;
+		overflow-wrap: anywhere;
+	}
+
+	.save-error button {
+		flex-shrink: 0;
+		min-height: 32px;
+		padding: 4px 10px;
+		border: 1px solid currentColor;
+		border-radius: 4px;
+		background: transparent;
+		color: inherit;
+		font: inherit;
+		cursor: pointer;
+	}
+
+	.save-error button:hover:not(:disabled) {
+		background: color-mix(in srgb, var(--danger, #e53e3e) 12%, transparent);
+	}
+
+	.save-error button:focus-visible {
+		outline: 2px solid currentColor;
+		outline-offset: 2px;
+	}
+
+	.save-error button:disabled {
+		opacity: 0.6;
+		cursor: wait;
+	}
+
+	.editor-container.mobile .save-error button {
+		min-height: 44px;
+	}
+
+	.editor-title.search-target-meta,
+	.note-tags-trigger.search-target-meta {
+		background: var(--accent-light);
+		outline: 1px solid var(--accent);
+		border-radius: 4px;
+	}
+
+	.search-target-notice {
+		padding: 6px 12px;
+		font-size: 12px;
+		color: var(--text-secondary);
+		background: var(--accent-light);
+		overflow-wrap: anywhere;
 	}
 
 	.readonly-indicator {

@@ -457,6 +457,27 @@ pub struct SearchMatch {
     pub end: usize,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchTargetField {
+    Body,
+    Title,
+    Tags,
+}
+
+/// Half-open UTF-16 offsets into the indexed field, with exact source context.
+/// Body excludes frontmatter; tags use the indexed space-joined values.
+/// Text is capped at 240 Unicode scalars and each context at 32 scalars.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchTarget {
+    pub field: SearchTargetField,
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+    pub before: String,
+    pub after: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub path: String,
@@ -465,6 +486,7 @@ pub struct SearchResult {
     pub score: f32,
     pub title_matches: Vec<SearchMatch>,
     pub snippet_matches: Vec<SearchMatch>,
+    pub match_target: Option<SearchTarget>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

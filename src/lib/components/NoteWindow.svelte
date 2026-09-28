@@ -15,6 +15,7 @@
 	} from '$lib/stores/app';
 	import { completeWindowClose, getTagStyles, readNote } from '$lib/api';
 	import { keybindings, matchAction } from '$lib/keybindings';
+	import { isMobile } from '$lib/platform';
 	import type { FileEvent } from '$lib/types';
 	import { isCurrentVaultEvent } from '$lib/utils/note-list-updates';
 	import { beginNoteNavigation, isCurrentNoteNavigation, cancelNoteNavigation } from '$lib/utils/note-navigation';
@@ -97,22 +98,24 @@
 		const isCurrentOwner = () => !disposed && (vault === null || vault === $appConfig?.active_vault);
 
 		async function initialize() {
-			const closeListener = await appWindow.onCloseRequested(async (event) => {
-				event.preventDefault();
-				if (!isCurrentOwner()) return;
-				try {
-					if (editor && !(await editor.flushSave())) return;
+			if (!isMobile) {
+				const closeListener = await appWindow.onCloseRequested(async (event) => {
+					event.preventDefault();
 					if (!isCurrentOwner()) return;
-					await completeWindowClose();
-				} catch (error) {
-					console.error('Failed to close window:', error);
+					try {
+						if (editor && !(await editor.flushSave())) return;
+						if (!isCurrentOwner()) return;
+						await completeWindowClose();
+					} catch (error) {
+						console.error('Failed to close window:', error);
+					}
+				});
+				if (!isCurrentOwner()) {
+					closeListener();
+					return;
 				}
-			});
-			if (!isCurrentOwner()) {
-				closeListener();
-				return;
+				unlistenClose = closeListener;
 			}
-			unlistenClose = closeListener;
 			if (!ownerVault) {
 				loadError = 'This note window has no valid originating vault.';
 				return;

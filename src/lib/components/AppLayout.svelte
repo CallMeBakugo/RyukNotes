@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount, onDestroy, tick } from 'svelte';
+	import { onMount, onDestroy, tick, untrack } from 'svelte';
 	import { listen } from '@tauri-apps/api/event';
 	import Sidebar from './Sidebar.svelte';
 	import NoteList from './NoteList.svelte';
@@ -73,7 +73,7 @@
 	import { beginNoteNavigation, isCurrentNoteNavigation, cancelNoteNavigation } from '$lib/utils/note-navigation';
 	import { isPathInDirectory, isTrashedNote } from '$lib/utils/paths';
 	import { get } from 'svelte/store';
-	import type { VaultState, FileEvent, NotebookEntry, NoteEntry, TaskItem } from '$lib/types';
+	import type { VaultState, FileEvent, NotebookEntry, NoteEntry, TaskItem, SearchResult } from '$lib/types';
 	import { completeWindowClose } from '$lib/api';
 	import type { StartupTarget } from '$lib/utils/startup-view';
 
@@ -89,6 +89,7 @@
 	let sidebar = $state<Sidebar>();
 	let noteList = $state<NoteList>();
 	let editor = $state<Editor>();
+	let pendingSearchReveal = $state<{ path: string; token: number } | null>(null);
 	let unlistenFileChange: (() => void) | null = null;
 	let unlistenClose: (() => void) | null = null;
 	let fileRefreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -431,18 +432,18 @@
 		if (isMobile) $mobileView = 'editor';
 	}
 
-	async function selectNoteFromSwitcher(path: string): Promise<boolean> {
-		const token = beginNavigation();
-		if (!navigationIsCurrent(token)) return false;
+	async function selectNoteFromSwitcher(path: string, token = beginNavigation(), canSelect?: () => boolean): Promise<boolean> {
+		const current = () => navigationIsCurrent(token) && (canSelect?.() ?? true);
+		if (!current()) return false;
 		const currentPath = $activeNotePath;
 		if (currentPath && currentPath.replace(/\\/g, '/') === path.replace(/\\/g, '/')) return true;
 		if (editor && !(await editor.flushSave())) return false;
-		if (!navigationIsCurrent(token)) return false;
+		if (!current()) return false;
 		try {
 			const content = await readNote(ownerVault!, path);
-			if (!navigationIsCurrent(token)) return false;
+			if (!current()) return false;
 			if (editor && !(await editor.flushSave())) return false;
-			if (!navigationIsCurrent(token)) return false;
+			if (!current()) return false;
 			$viewerNote = null;
 			$activeNote = content;
 			$activeNotePath = path;
@@ -454,6 +455,54 @@
 			return false;
 		}
 	}
+
+	async function selectNoteFromSearch(result: SearchResult, notebook: NotebookEntry | null, canSelect: () => boolean): Promise<boolean> {
+		const { path } = result;
+		const token = beginNavigation();
+		if (!(await selectNoteFromSwitcher(path, token, canSelect)) || !navigationIsCurrent(token) || !canSelect()) return false;
+		const mode = notebook ? 'notebook' : 'all';
+		if ($viewMode !== mode || $activeNotebook?.path !== notebook?.path || $activeTag !== null) {
+			$activeNotebook = notebook;
+			$activeTag = null;
+			$viewMode = mode;
+			$notes = [];
+		}
+		$notelistCollapsed = false;
+		pendingSearchReveal = { path, token };
+		if (isMobile) $mobileView = 'editor';
+		await tick();
+		if (!navigationIsCurrent(token) || !canSelect()) return false;
+		await editor?.revealSearchTarget(result.match_target, () => navigationIsCurrent(token) && canSelect());
+		return navigationIsCurrent(token) && canSelect();
+	}
+
+	$effect(() => {
+		const request = pendingSearchReveal;
+		const list = noteList;
+		if (!request || !list) return;
+		// A hidden focus-mode list can mount later; only the originating navigation
+		// may refresh and reveal it. Do not subscribe this effect to list internals.
+		void untrack(async () => {
+			const current = () => pendingSearchReveal === request && noteList === list
+				&& navigationIsCurrent(request.token) && $activeNotePath === request.path;
+			try {
+				if (!current()) return;
+				await list.refresh();
+				if (!current()) return;
+				const revealed = await list.revealNote(request.path, request.token);
+				if (!revealed && current()) {
+					// Search can find a newly indexed note before a cached list sees it.
+					await list.refresh(true);
+					if (current()) await list.revealNote(request.path, request.token);
+				}
+			} catch (error) {
+				console.error('Failed to reveal search result:', error);
+			} finally {
+				if (pendingSearchReveal === request && (noteList === list
+					|| !navigationIsCurrent(request.token) || $activeNotePath !== request.path)) pendingSearchReveal = null;
+			}
+		});
+	});
 
 	function handleViewChanged() {
 		if (!ownerIsCurrent()) return;
@@ -807,21 +856,23 @@
 	onMount(async () => {
 		if (!ownerIsCurrent() || !ownerVault) return;
 		const startupToken = beginNavigation();
-		unlistenClose = await appWindow.onCloseRequested(async (event) => {
-			// Always prevent Tauri's implicit JS destroy(), which bypasses the tray policy.
-			event.preventDefault();
-			if (!ownerIsCurrent()) return;
-			try {
-				if (editor && !(await editor.flushSave())) return;
+		if (!isMobile) {
+			unlistenClose = await appWindow.onCloseRequested(async (event) => {
+				// Always prevent Tauri's implicit JS destroy(), which bypasses the tray policy.
+				event.preventDefault();
 				if (!ownerIsCurrent()) return;
-				await persistVaultState();
-				if (!ownerIsCurrent()) return;
-				await completeWindowClose();
-			} catch (error) {
-				console.error('Failed to close window:', error);
-			}
-		});
-		if (!ownerIsCurrent()) { unlistenClose(); return; }
+				try {
+					if (editor && !(await editor.flushSave())) return;
+					if (!ownerIsCurrent()) return;
+					await persistVaultState();
+					if (!ownerIsCurrent()) return;
+					await completeWindowClose();
+				} catch (error) {
+					console.error('Failed to close window:', error);
+				}
+			});
+			if (!ownerIsCurrent()) { unlistenClose(); return; }
+		}
 		unlistenFileChange = await listen<FileEvent>('file-changed', ({ payload }) => {
 			if (!ownerIsCurrent() || !isCurrentVaultEvent(payload, ownerVault)) return;
 			if (!payload.note) {
@@ -1241,7 +1292,7 @@
 	</div>
 {/if}
 
-<SearchPanel onSelectNote={selectNoteFromSwitcher} />
+<SearchPanel onSelectNote={selectNoteFromSearch} />
 <CommandPalette onNavigate={handleViewChanged} />
 <SettingsPanel onBeforeVaultSwitch={prepareVaultSwitch} />
 <InfoPanel />

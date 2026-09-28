@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildNoteListRows, noteListOffsets, noteListWindow } from './note-list-window.ts';
+import { buildNoteListRows, noteListOffsets, noteListWindow, noteListRevealScrollTop } from './note-list-window.ts';
 
 const today = new Date(2026, 8, 26, 12);
 function note(index, daysAgo = 0, pinned = false) {
@@ -58,4 +58,32 @@ test('empty lists and a viewport above the note rows have safe padding', () => {
   assert.equal(window.top, 0);
   assert.equal(window.bottom, 0);
   assert.deepEqual(rows.map(row => row.noteIndex), [0, 1]);
+});
+
+test('revealing a distant grouped note puts its row inside the virtual window', () => {
+  const notes = Array.from({ length: 3000 }, (_, index) => note(index, index, index < 3));
+  const rows = buildNoteListRows(notes, 'created', today);
+  const offsets = noteListOffsets(rows, new Map(), 62, 32);
+  const index = rows.findIndex(row => row.kind === 'note' && row.note.path === notes[2550].path);
+  const top = noteListRevealScrollTop(offsets, index, 0, 600);
+  const window = noteListWindow(offsets, top, 600);
+  assert.ok(index >= window.start && index < window.end);
+  assert.ok(offsets[index] >= top);
+  assert.ok(offsets[index + 1] <= top + 600);
+});
+
+test('revealing keeps visible notes stationary and accounts for content above the list', () => {
+  const offsets = [0, 30, 90, 150, 210];
+  assert.equal(noteListRevealScrollTop(offsets, 1, 25, 100), 25);
+  assert.equal(noteListRevealScrollTop(offsets, 3, 0, 100), 130);
+  assert.equal(noteListRevealScrollTop(offsets, 2, 0, 100, 180), 250);
+  assert.equal(noteListRevealScrollTop(offsets, 0, 200, 100), 0);
+});
+
+test('revealing oversized notes shows their beginning and ignores unavailable rows', () => {
+  assert.equal(noteListRevealScrollTop([0, 200, 260], 0, 100, 80, 20), 20);
+  assert.equal(noteListRevealScrollTop([0], 0, 42, 600), 42);
+  assert.equal(noteListRevealScrollTop([0, 62], -1, 42, 600), 42);
+  assert.equal(noteListRevealScrollTop([0, 62], 1, 42, 600), 42);
+  assert.equal(noteListRevealScrollTop([0, 62], 0, 42, 0), 42);
 });

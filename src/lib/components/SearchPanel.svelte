@@ -1,12 +1,14 @@
 <script lang="ts">
 	import { tick } from 'svelte';
-	import { showSearch, appConfig, mobileView, notebooks, activeNotebook, activeTag, viewMode } from '$lib/stores/app';
+	import { showSearch, appConfig, notebooks } from '$lib/stores/app';
 	import { searchNotes } from '$lib/api';
 	import { relativePath } from '$lib/utils/paths';
 	import type { SearchResult, SearchMatch, NotebookEntry } from '$lib/types';
 	import { isMobile } from '$lib/platform';
 
-	let { onSelectNote }: { onSelectNote: (path: string) => Promise<boolean> } = $props();
+	let { onSelectNote }: {
+		onSelectNote: (result: SearchResult, notebook: NotebookEntry | null, isCurrent: () => boolean) => Promise<boolean>;
+	} = $props();
 
 	const PAGE_SIZE = 20;
 	const currentVault = $derived($appConfig?.active_vault ?? null);
@@ -168,21 +170,16 @@
 		opening = true;
 		error = '';
 		try {
-			const opened = await onSelectNote(result.path);
+			const normalized = result.path.replace(/\\/g, '/');
+			const parentDir = normalized.slice(0, normalized.lastIndexOf('/'));
+			const notebook = parentDir ? findNotebookByPath($notebooks, parentDir) : null;
+			const opened = await onSelectNote(result, notebook, () => isCurrent(generation, vault));
 			if (!isCurrent(generation, vault)) return;
 			if (!opened) {
 				error = 'Could not open this note.';
 				return;
 			}
 			close();
-			// Reveal the note without applying a late result to another search/vault.
-			const sep = result.path.includes('\\') ? '\\' : '/';
-			const parentDir = result.path.slice(0, result.path.lastIndexOf(sep));
-			const nb = parentDir ? findNotebookByPath($notebooks, parentDir) : null;
-			$activeNotebook = nb;
-			$activeTag = null;
-			$viewMode = nb ? 'notebook' : 'all';
-			if (isMobile) $mobileView = 'editor';
 		} catch (cause) {
 			if (isCurrent(generation, vault)) error = cause instanceof Error ? cause.message : String(cause);
 		} finally {

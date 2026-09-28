@@ -1,4 +1,4 @@
-use crate::types::{SearchMatch, SearchPage, SearchResult};
+use crate::types::{SearchMatch, SearchPage, SearchResult, SearchTarget, SearchTargetField};
 use crate::vault::frontmatter;
 use crate::vault::operations::helixnotes_dir;
 use parking_lot::{Condvar, Mutex};
@@ -29,6 +29,7 @@ const INDEX_BATCH_DELAY: Duration = Duration::from_millis(300);
 const MAX_PAGE_SIZE: usize = 100;
 const SNIPPET_CHARS: usize = 240;
 const SNIPPET_LEADING_CHARS: usize = 80;
+const TARGET_CONTEXT_CHARS: usize = 32;
 
 /// Per-vault search index dir in local app-data, kept out of the (possibly synced) vault.
 #[cfg(desktop)]
@@ -198,7 +199,7 @@ fn utf16_matches(text: &str, mut matches: Vec<SearchMatch>, prefix: usize) -> Ve
     matches
 }
 
-fn title_matches(
+fn title_byte_matches(
     title: &str,
     terms: &[SearchTerm],
     analyzer: &mut TextAnalyzer,
@@ -211,14 +212,69 @@ fn title_matches(
             push_match(&mut matches, token.offset_from, token.offset_to);
         }
     }
-    utf16_matches(title, matches, 0)
+    matches
+}
+
+fn first_tag_match(
+    tags: &str,
+    terms: &[SearchTerm],
+    analyzer: &mut TextAnalyzer,
+) -> Option<SearchMatch> {
+    let mut first: Option<SearchMatch> = None;
+    let mut stream = analyzer.token_stream(tags);
+    while stream.advance() {
+        let token = stream.token();
+        if first
+            .as_ref()
+            .is_some_and(|range| token.offset_from > range.end)
+        {
+            break;
+        }
+        if terms.iter().any(|term| term.matches(&token.text)) {
+            if let Some(range) = &mut first {
+                range.end = range.end.max(token.offset_to);
+            } else {
+                first = Some(SearchMatch {
+                    start: token.offset_from,
+                    end: token.offset_to,
+                });
+            }
+        }
+    }
+    first
+}
+
+fn match_target(text: &str, field: SearchTargetField, start: usize, end: usize) -> SearchTarget {
+    let end = text[start..end]
+        .char_indices()
+        .nth(SNIPPET_CHARS)
+        .map_or(end, |(offset, _)| start + offset);
+    let before = text[..start]
+        .char_indices()
+        .rev()
+        .nth(TARGET_CONTEXT_CHARS - 1)
+        .map_or(0, |(offset, _)| offset);
+    let after = text[end..]
+        .char_indices()
+        .nth(TARGET_CONTEXT_CHARS)
+        .map_or(text.len(), |(offset, _)| end + offset);
+    let matched = &text[start..end];
+    let utf16_start = text[..start].encode_utf16().count();
+    SearchTarget {
+        field,
+        start: utf16_start,
+        end: utf16_start + matched.encode_utf16().count(),
+        text: matched.to_owned(),
+        before: text[before..start].to_owned(),
+        after: text[end..after].to_owned(),
+    }
 }
 
 fn body_snippet(
     body: &str,
     terms: &[SearchTerm],
     analyzer: &mut TextAnalyzer,
-) -> (String, Vec<SearchMatch>) {
+) -> (String, Vec<SearchMatch>, Option<SearchTarget>) {
     let mut stream = analyzer.token_stream(body);
     let mut start = 0;
     let mut end = body
@@ -253,6 +309,14 @@ fn body_snippet(
             token.offset_to.min(end) - start,
         );
     }
+    let target = matches.first().map(|range| {
+        match_target(
+            body,
+            SearchTargetField::Body,
+            start + range.start,
+            start + range.end,
+        )
+    });
     let context = &body[start..end];
     let prefix = usize::from(start > 0);
     let matches = utf16_matches(context, matches, prefix);
@@ -264,7 +328,7 @@ fn body_snippet(
     if end < body.len() {
         snippet.push('…');
     }
-    (snippet, matches)
+    (snippet, matches, target)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -886,8 +950,21 @@ impl SearchIndex {
                 .get_first(self.body_field)
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let title_matches = title_matches(title, &terms, &mut analyzer);
-            let (snippet, snippet_matches) = body_snippet(body, &terms, &mut analyzer);
+            let title_ranges = title_byte_matches(title, &terms, &mut analyzer);
+            let (snippet, snippet_matches, body_target) = body_snippet(body, &terms, &mut analyzer);
+            let match_target = body_target
+                .or_else(|| {
+                    title_ranges.first().map(|range| {
+                        match_target(title, SearchTargetField::Title, range.start, range.end)
+                    })
+                })
+                .or_else(|| {
+                    let tags = doc.get_first(self.tags_field).and_then(|v| v.as_str())?;
+                    first_tag_match(tags, &terms, &mut analyzer).map(|range| {
+                        match_target(tags, SearchTargetField::Tags, range.start, range.end)
+                    })
+                });
+            let title_matches = utf16_matches(title, title_ranges, 0);
             results.push(SearchResult {
                 path: path.to_owned(),
                 title: title.to_owned(),
@@ -895,6 +972,7 @@ impl SearchIndex {
                 score,
                 title_matches,
                 snippet_matches,
+                match_target,
             });
         }
         Ok(SearchPage { results, total })
@@ -965,6 +1043,36 @@ mod tests {
                 String::from_utf16(&utf16[range.start..range.end]).unwrap()
             })
             .collect()
+    }
+
+    fn assert_target<'a>(
+        result: &'a SearchResult,
+        source: &str,
+        field: SearchTargetField,
+        matched: &str,
+    ) -> &'a SearchTarget {
+        let target = result.match_target.as_ref().unwrap();
+        assert_eq!(target.field, field);
+        assert_eq!(target.text, matched);
+        assert!(target.text.chars().count() <= SNIPPET_CHARS);
+        let utf16: Vec<_> = source.encode_utf16().collect();
+        assert_eq!(
+            String::from_utf16(&utf16[target.start..target.end]).unwrap(),
+            matched
+        );
+        let before = String::from_utf16(&utf16[..target.start]).unwrap();
+        let after = String::from_utf16(&utf16[target.end..]).unwrap();
+        assert!(before.ends_with(&target.before));
+        assert!(after.starts_with(&target.after));
+        assert_eq!(
+            target.before.chars().count(),
+            before.chars().count().min(TARGET_CONTEXT_CHARS)
+        );
+        assert_eq!(
+            target.after.chars().count(),
+            after.chars().count().min(TARGET_CONTEXT_CHARS)
+        );
+        target
     }
 
     #[test]
@@ -1126,6 +1234,11 @@ mod tests {
             vec!["Café", "東京"]
         );
         assert_eq!(result.title_matches[0], SearchMatch { start: 3, end: 7 });
+        let target = assert_target(&result, &body, SearchTargetField::Body, "Café");
+        assert_eq!(
+            target.start,
+            body[..body.find("Café").unwrap()].encode_utf16().count()
+        );
         // Prefixes highlight the actual matched indexed token, not an invented
         // exact substring; overlapping CJK uni/bigrams become one range.
         let prefix = index.search("straw", 20, 0).unwrap().results.remove(0);
@@ -1133,11 +1246,15 @@ mod tests {
             highlighted(&prefix.snippet, &prefix.snippet_matches),
             vec!["strawberry"]
         );
+        assert_target(&prefix, &body, SearchTargetField::Body, "strawberry");
+        let fuzzy = index.search("strawberyr", 20, 0).unwrap().results.remove(0);
+        assert_target(&fuzzy, &body, SearchTargetField::Body, "strawberry");
         let cjk = index.search("東京大学", 20, 0).unwrap().results.remove(0);
         assert_eq!(
             highlighted(&cjk.snippet, &cjk.snippet_matches),
             vec!["東京大学"]
         );
+        assert_target(&cjk, &body, SearchTargetField::Body, "東京大学");
     }
 
     #[test]
@@ -1163,18 +1280,97 @@ mod tests {
             unicode.title_matches,
             vec![SearchMatch { start: 3, end: 11 }]
         );
+        let target = assert_target(&unicode, "🦊 İSTANBUL", SearchTargetField::Body, "İSTANBUL");
+        assert_eq!((target.start, target.end), (3, 11));
         let long = index.search("prefix", 20, 0).unwrap().results.remove(0);
         assert_eq!(long.snippet.chars().count(), SNIPPET_CHARS + 1);
         assert_eq!(
             highlighted(&long.snippet, &long.snippet_matches),
             vec![long_word[..SNIPPET_CHARS].to_owned()]
         );
+        assert_target(
+            &long,
+            &long_word,
+            SearchTargetField::Body,
+            &long_word[..SNIPPET_CHARS],
+        );
         for query in ["heading", "watermelon"] {
             let result = index.search(query, 20, 0).unwrap().results.remove(0);
             assert_eq!(result.path, tagged.to_str().unwrap());
             assert_eq!(result.snippet, "Plain body without the requested token.");
             assert!(result.snippet_matches.is_empty());
+            let (field, text) = if query == "heading" {
+                (SearchTargetField::Title, "Heading")
+            } else {
+                (SearchTargetField::Tags, "watermelon")
+            };
+            assert_target(&result, text, field, text);
         }
+    }
+
+    #[test]
+    fn targets_prefer_first_body_then_title_then_stored_tags() {
+        let vault = TestVault::new();
+        let title = "🦊 Watermelon Strawberry";
+        let body = "quiet 🦊 STRAWBERRY strawberry";
+        let tags = "watermelon pineapple strawberry 東京大学";
+        fs::write(
+            vault.0.join("priority.md"),
+            format!(
+                "---\ntitle: '{title}'\ntags: [watermelon, pineapple, strawberry, 東京大学]\n---\n{body}"
+            ),
+        )
+        .unwrap();
+        let index = vault.index();
+        index.rebuild(vault.0.to_str().unwrap()).unwrap();
+        let body_hit = index.search("straw", 20, 0).unwrap().results.remove(0);
+        let target = assert_target(&body_hit, body, SearchTargetField::Body, "STRAWBERRY");
+        assert_eq!((target.start, target.end), (9, 19));
+        let title_hit = index.search("watermelno", 20, 0).unwrap().results.remove(0);
+        let target = assert_target(&title_hit, title, SearchTargetField::Title, "Watermelon");
+        assert_eq!((target.start, target.end), (3, 13));
+        let tags_hit = index.search("pineap", 20, 0).unwrap().results.remove(0);
+        let target = assert_target(&tags_hit, tags, SearchTargetField::Tags, "pineapple");
+        assert_eq!((target.start, target.end), (11, 20));
+        let cjk_tags = index.search("東京大学", 20, 0).unwrap().results.remove(0);
+        assert_target(&cjk_tags, tags, SearchTargetField::Tags, "東京大学");
+    }
+
+    #[test]
+    fn title_and_tag_targets_bound_unicode_text_and_context() {
+        let vault = TestVault::new();
+        let long_title = format!("heading{}", "é".repeat(300));
+        let long_tag = format!("category{}", "é".repeat(300));
+        let title = format!("{} {long_title} {}", "🦊".repeat(40), "🌊".repeat(40));
+        let tags = format!(
+            "{} {long_tag} {} pineapple {}",
+            "🦊".repeat(40),
+            "🌊".repeat(40),
+            "🚀".repeat(40)
+        );
+        fs::write(
+            vault.0.join("bounded.md"),
+            format!("---\ntitle: '{title}'\ntags: ['{tags}']\n---\nPlain content."),
+        )
+        .unwrap();
+        let index = vault.index();
+        index.rebuild(vault.0.to_str().unwrap()).unwrap();
+        for (query, source, field, word) in [
+            ("head", &title, SearchTargetField::Title, &long_title),
+            ("categ", &tags, SearchTargetField::Tags, &long_tag),
+        ] {
+            let result = index.search(query, 20, 0).unwrap().results.remove(0);
+            let matched: String = word.chars().take(SNIPPET_CHARS).collect();
+            let target = assert_target(&result, source, field, &matched);
+            assert_eq!(target.start, 81);
+            assert_eq!(target.end, 81 + SNIPPET_CHARS);
+            assert_eq!(target.before, format!("{} ", "🦊".repeat(31)));
+            assert_eq!(target.after, "é".repeat(TARGET_CONTEXT_CHARS));
+        }
+        let result = index.search("pineap", 20, 0).unwrap().results.remove(0);
+        let target = assert_target(&result, &tags, SearchTargetField::Tags, "pineapple");
+        assert_eq!(target.before, format!("{} ", "🌊".repeat(31)));
+        assert_eq!(target.after, format!(" {}", "🚀".repeat(31)));
     }
 
     #[test]
@@ -1197,6 +1393,12 @@ mod tests {
             highlighted(&cached.snippet, &cached.snippet_matches),
             vec!["pineapple"]
         );
+        assert_target(
+            &cached,
+            "🦊 pineapple context",
+            SearchTargetField::Body,
+            "pineapple",
+        );
         write_search_note(
             &vault,
             "cached.md",
@@ -1210,6 +1412,12 @@ mod tests {
         assert_eq!(
             highlighted(&refreshed.snippet, &refreshed.snippet_matches),
             vec!["watermelon"]
+        );
+        assert_target(
+            &refreshed,
+            "🦊 watermelon changed context",
+            SearchTargetField::Body,
+            "watermelon",
         );
         index.refresh_vault(vault.0.to_str().unwrap()).unwrap();
         assert_eq!(index.search("watermelno", 20, 0).unwrap().total, 1);

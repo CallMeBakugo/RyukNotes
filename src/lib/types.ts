@@ -187,6 +187,15 @@ export interface SearchMatch {
   end: number;
 }
 
+export interface SearchTarget {
+  field: 'body' | 'title' | 'tags';
+  start: number;
+  end: number;
+  text: string;
+  before: string;
+  after: string;
+}
+
 export interface SearchResult {
   path: string;
   title: string;
@@ -194,6 +203,7 @@ export interface SearchResult {
   score: number;
   title_matches: SearchMatch[];
   snippet_matches: SearchMatch[];
+  match_target: SearchTarget | null;
 }
 
 export interface SearchPage {

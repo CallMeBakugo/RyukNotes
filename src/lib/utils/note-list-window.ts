@@ -63,3 +63,19 @@ export function noteListWindow(offsets: number[], scrollTop: number, height: num
   const end = Math.min(count, rowAt(offsets, Math.max(0, scrollTop + height)) + 1 + overscan);
   return { start, end, anchor, top: offsets[start], bottom: offsets[count] - offsets[end] };
 }
+
+/** Keep visible rows stationary; request a centered offset for off-screen rows. */
+export function noteListRevealScrollTop(
+  offsets: number[],
+  rowIndex: number,
+  scrollTop: number,
+  height: number,
+  listOrigin = 0,
+): number {
+  if (rowIndex < 0 || rowIndex + 1 >= offsets.length || height <= 0) return scrollTop;
+  const top = listOrigin + offsets[rowIndex];
+  const bottom = listOrigin + offsets[rowIndex + 1];
+  if (top >= scrollTop && bottom <= scrollTop + height) return scrollTop;
+  // The scrolling element clamps the upper bound, including its bottom padding.
+  return Math.max(0, top - Math.max(0, height - (bottom - top)) / 2);
+}

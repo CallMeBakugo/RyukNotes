@@ -162,6 +162,7 @@ pub fn run() {
             commands::restore_external_vault,
             commands::remove_vault,
             commands::get_app_config,
+            #[cfg(desktop)]
             commands::complete_window_close,
             commands::set_theme,
             commands::set_system_themes,

@@ -366,21 +366,19 @@ pub fn get_pending_open_file(state: State<'_, AppState>) -> Result<Option<String
     Ok(pending.take())
 }
 
-/// Finish a close request only after the frontend has flushed its editor.
+/// Finish a desktop close request only after the frontend has flushed its editor.
+#[cfg(desktop)]
 #[tauri::command]
 pub fn complete_window_close<R: Runtime>(
     window: tauri::Window<R>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    #[cfg(desktop)]
     if state.should_hide_to_tray(
         window.label(),
         window.app_handle().tray_by_id("helixnotes").is_some(),
     )? {
         return window.hide().map_err(|error| error.to_string());
     }
-    #[cfg(mobile)]
-    let _ = state;
     window.destroy().map_err(|error| error.to_string())
 }
 
@@ -996,14 +994,19 @@ pub async fn get_note_switcher_titles(
 // ── Graph ──
 
 #[tauri::command]
-pub fn get_graph_data(
+pub async fn get_graph_data(
     state: State<'_, AppState>,
     vault_path: String,
 ) -> Result<crate::types::GraphData, String> {
+    state.validate_vault(&vault_path)?;
+    tauri::async_runtime::spawn_blocking(move || scan_graph_data(&vault_path))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn scan_graph_data(vault_path: &str) -> Result<crate::types::GraphData, String> {
     use std::collections::{HashMap, HashSet};
 
-    state.validate_vault(&vault_path)?;
-    let vault_path = vault_path.as_str();
     let vault = std::path::Path::new(vault_path);
 
     // Pass 1: collect ALL notes as nodes (no title deduplication - every note must appear)
@@ -2114,22 +2117,50 @@ pub async fn reorder_quick_access(
 }
 
 #[tauri::command]
-pub fn get_vault_stats(state: State<'_, AppState>) -> Result<VaultStats, String> {
-    use rayon::prelude::*;
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let vault_path = config.active_vault.as_ref().ok_or("No active vault")?;
+pub async fn get_vault_stats(state: State<'_, AppState>) -> Result<VaultStats, String> {
+    let vault_path = state
+        .config
+        .lock()
+        .map_err(|error| error.to_string())?
+        .active_vault
+        .clone()
+        .ok_or("No active vault")?;
+    tauri::async_runtime::spawn_blocking(move || scan_vault_stats(&vault_path))
+        .await
+        .map_err(|error| error.to_string())?
+}
 
-    let paths: Vec<std::path::PathBuf> = walkdir::WalkDir::new(vault_path)
+fn scan_vault_stats(vault_path: &str) -> Result<VaultStats, String> {
+    use rayon::prelude::*;
+    let vault = Path::new(vault_path);
+
+    let paths: Vec<PathBuf> = walkdir::WalkDir::new(vault)
         .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            let Ok(relative) = entry.path().strip_prefix(vault) else {
+                return false;
+            };
+            let is_directory = entry.file_type().is_dir();
+            if is_directory && entry.file_name() == ".trash" {
+                return false;
+            }
+            // Prune metadata children except the attachments directory. Inspect
+            // only vault-relative components, never names in the vault's parent.
+            if relative
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == ".helixnotes")
+            {
+                return is_directory && entry.file_name() == "attachments";
+            }
+            true
+        })
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .map(|e| e.into_path())
-        .filter(|p| {
-            // attachments under .helixnotes count; nothing else in .helixnotes or .trash does
-            let s = p.to_string_lossy();
-            (!s.contains("/.helixnotes/") || s.contains("/.helixnotes/attachments/"))
-                && !s.contains("/.trash/")
-        })
         .collect();
 
     // Stat files in parallel; each metadata() is a FUSE round-trip on Android.
@@ -2155,6 +2186,150 @@ pub fn get_vault_stats(state: State<'_, AppState>) -> Result<VaultStats, String>
         attachments_size,
         total_size: notes_size + attachments_size,
     })
+}
+
+#[cfg(test)]
+mod vault_stats_tests {
+    use super::scan_vault_stats;
+    use std::path::Path;
+
+    fn write_fixture(vault: &Path, files: &[(&[&str], &[u8])]) {
+        for (components, contents) in files {
+            let mut path = vault.to_path_buf();
+            for component in *components {
+                path.push(component);
+            }
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+    }
+
+    fn assert_stats(vault: &Path, expected: (u64, u64, u64, u64, u64)) {
+        let stats = scan_vault_stats(vault.to_str().unwrap()).unwrap();
+        assert_eq!(
+            (
+                stats.total_notes,
+                stats.total_attachments,
+                stats.notes_size,
+                stats.attachments_size,
+                stats.total_size,
+            ),
+            expected,
+            "vault: {}",
+            vault.display()
+        );
+    }
+
+    #[test]
+    fn vault_stats_preserve_file_classification_and_byte_totals() {
+        let vault = tempfile::tempdir().unwrap();
+        write_fixture(
+            vault.path(),
+            &[
+                (&["Note.md"], b"note"),
+                (&["Notebook", "Note.md"], "café".as_bytes()),
+                (&["Empty.md"], b""),
+                (&["Upper.MD"], b"upper"),
+                (&["Notebook", "data.bin"], b"\0\x01\xff"),
+                (&["README"], b"plain"),
+            ],
+        );
+
+        assert_stats(vault.path(), (3, 3, 9, 13, 22));
+    }
+
+    #[test]
+    fn vault_stats_include_only_attachment_subtrees_inside_metadata() {
+        let vault = tempfile::tempdir().unwrap();
+        write_fixture(
+            vault.path(),
+            &[
+                (&[".helixnotes", "attachments", "image.png"], b"123"),
+                (&[".helixnotes", "attachments", "Manual.md"], b"1234"),
+                (
+                    &[".helixnotes", "attachments", "Nested", "icon.svg"],
+                    b"12345",
+                ),
+                (
+                    &[".helixnotes", "attachments", ".trash-backup", "backup.bin"],
+                    b"123456",
+                ),
+                (&[".helixnotes", "settings.json"], b"excluded"),
+                (&[".helixnotes", "history", "Snapshot.md"], b"excluded"),
+                (&[".helixnotes", "trash", "Deleted.md"], b"excluded"),
+                (&[".helixnotes", "attachments-old", "old.png"], b"excluded"),
+                (
+                    &[".helixnotes", "attachments", ".trash", "deleted.png"],
+                    b"excluded",
+                ),
+            ],
+        );
+
+        assert_stats(vault.path(), (1, 3, 4, 14, 18));
+    }
+
+    #[test]
+    fn vault_stats_match_exact_directory_boundaries() {
+        let vault = tempfile::tempdir().unwrap();
+        write_fixture(
+            vault.path(),
+            &[
+                (&[".trash-backup", "Note.md"], b"1"),
+                (&[".helixnotes-backup", "Note.md"], b"12"),
+                (&["attachments-old", "Note.md"], b"123"),
+                (&["Work.notebook", "attachments-old", "Note.md"], b"1234"),
+                (&["Work.notebook", ".trash-backup", "picture.png"], b"12345"),
+                (&["Files", ".trash"], b"123456"),
+                (&["Files", ".helixnotes"], b"1234567"),
+                (
+                    &["Work.notebook", ".helixnotes", "attachments", "photo.png"],
+                    b"12345678",
+                ),
+                (&[".trash", "Deleted.md"], b"excluded"),
+                (&["Work.notebook", ".trash", "deleted.png"], b"excluded"),
+                (
+                    &["Work.notebook", ".helixnotes", "history", "Snapshot.md"],
+                    b"excluded",
+                ),
+                (
+                    &["Work.notebook", ".helixnotes", "attachments-old", "old.png"],
+                    b"excluded",
+                ),
+            ],
+        );
+
+        assert_stats(vault.path(), (4, 4, 10, 26, 36));
+    }
+
+    #[test]
+    fn vault_stats_ignore_excluded_names_outside_the_vault() {
+        let locations: &[&[&str]] = &[
+            &[".trash", "vault"],
+            &[".helixnotes", "history", "vault"],
+            &[".helixnotes", "attachments-old", "vault"],
+            &[".trash"],
+            &[".helixnotes"],
+        ];
+        for components in locations {
+            let root = tempfile::tempdir().unwrap();
+            let mut vault = root.path().to_path_buf();
+            for component in *components {
+                vault.push(component);
+            }
+            write_fixture(
+                &vault,
+                &[
+                    (&["Note.md"], b"hello"),
+                    (&["Notebook", "photo.png"], b"123"),
+                    (&[".helixnotes", "attachments", "photo.png"], b"12"),
+                    (&[".helixnotes", "history", "Snapshot.md"], b"excluded"),
+                    (&[".trash", "Deleted.md"], b"excluded"),
+                ],
+            );
+
+            assert_stats(&vault, (1, 2, 5, 5, 10));
+        }
+    }
 }
 
 #[tauri::command]
@@ -3840,7 +4015,7 @@ mod mutation_order_tests {
                 .collect::<Vec<_>>(),
             ["Alpha"]
         );
-        let graph = get_graph_data(app.state(), a.clone()).unwrap();
+        let graph = get_graph_data(app.state(), a.clone()).await.unwrap();
         assert_eq!(
             graph
                 .nodes

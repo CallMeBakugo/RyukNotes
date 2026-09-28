@@ -57,3 +57,18 @@ test('leaves the title visible when title hiding is disabled', () => {
     hiddenTitle: null
   });
 });
+
+test('reports the exact contiguous range removed without changing leading blank behavior', () => {
+  for (const [markdown, expected, removedRange] of [
+    ['# Note title\n\nBody', 'Body', { from: 0, to: 14 }],
+    ['\n# Note title\nBody', '\nBody', { from: 1, to: 14 }],
+    ['\n\n# Note title', '\n', { from: 1, to: 14 }],
+    ['\n\n# Note title\n', '\n', { from: 1, to: 15 }],
+    ['# Note title\r\n\r\nBody', 'Body', { from: 0, to: 16 }],
+  ]) {
+    const stripped = stripTitleHeading(markdown, 'Note title', true);
+    assert.equal(stripped.markdown, expected);
+    assert.deepEqual(stripped.removedRange, removedRange);
+    assert.equal(markdown.slice(0, removedRange.from) + markdown.slice(removedRange.to), expected);
+  }
+});

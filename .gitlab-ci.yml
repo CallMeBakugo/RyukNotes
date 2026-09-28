@@ -1,0 +1,41 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+verify:
+  stage: test
+  image: node:24-bookworm
+  rules:
+    - when: on_success
+  variables:
+    DEBIAN_FRONTEND: noninteractive
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+    RUST_VERSION: "1.97.1"
+  cache:
+    key:
+      prefix: linux-verification
+      files:
+        - pnpm-lock.yaml
+        - src-tauri/Cargo.lock
+    paths:
+      - .pnpm-store/
+      - .cargo/registry/
+      - .cargo/git/
+  before_script:
+    - apt-get update
+    - >-
+      apt-get install --yes --no-install-recommends
+      build-essential ca-certificates curl pkg-config
+      libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev
+      libxdo-dev libssl-dev librsvg2-dev
+    - curl --proto '=https' --tlsv1.2 --fail --silent --show-error https://sh.rustup.rs --output /tmp/rustup-init.sh
+    - sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "$RUST_VERSION" --component rustfmt --component clippy
+    - export PATH="$CARGO_HOME/bin:$PATH"
+    - npm install --global "$(node -p "require('./package.json').packageManager")"
+    - pnpm install --frozen-lockfile --store-dir .pnpm-store
+    - cargo fetch --locked --manifest-path src-tauri/Cargo.toml
+  script:
+    - pnpm verify
