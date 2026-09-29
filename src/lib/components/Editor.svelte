@@ -39,8 +39,8 @@
 	import { openFile, openUrl, copyFileTo, copyImageToClipboard as copyImageToClipboardCmd, writeBytesTo, copyPngToClipboard, copyTextToClipboard } from '$lib/api';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { activeNote, activeNotePath, appConfig, editorDirty, sourceMode, focusMode, readOnly, quickAccessPaths, notes, navHistory, canGoBack, canGoForward, viewerNote, viewMode, notebooks, outlineWidth } from '$lib/stores/app';
-	import { saveNote, saveImage, saveAttachment, readClipboardImage, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout } from '$lib/api';
-	import type { VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord, FileEvent, SearchTarget, ToolbarLayout } from '$lib/types';
+	import { saveNote, createNote, saveImage, saveAttachment, readClipboardImage, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout } from '$lib/api';
+	import type { NoteContent, VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord, FileEvent, SearchTarget, ToolbarLayout } from '$lib/types';
 	import { listen } from '@tauri-apps/api/event';
 	import { debounce } from '$lib/utils/debounce';
 	import { RevisionSaveQueue, type SaveRevision } from '$lib/utils/revision-save';
@@ -123,6 +123,8 @@
 	let isLoadingNote = false;
 	let trashingNote = $state(false);
 	let renamingNote: SaveRevision | null = null;
+	let externalOperationBusy = $state(false);
+	let pathMigrationPending = false;
 	let lastSourceMode = $sourceMode;
 	let linkContextMenu = $state<{ x: number; y: number; href: string; anchor: HTMLAnchorElement } | null>(null);
 	let hiddenTitleHeading: HiddenTitleHeading | null = null;
@@ -148,8 +150,6 @@
 	let moreButton = $state<HTMLButtonElement>();
 	let morePanel = $state<HTMLDivElement>();
 	let moreOpen = $state(false);
-	let moreOpenedByHover = false;
-	let moreCloseTimer: ReturnType<typeof setTimeout> | null = null;
 	let formattingTrigger: HTMLButtonElement | null = null;
 	const morePanelId = $props.id();
 	let toolbarDraft = $state<ResolvedToolbarLayout | null>(null);
@@ -881,6 +881,10 @@
 		addAttributes() {
 			return {
 				...this.parent?.(),
+				src: {
+					default: null,
+					parseHTML: (element: HTMLElement) => resolveImageSrc(element.getAttribute('src') ?? ''),
+				},
 				size: {
 					default: 'full',
 					parseHTML: (element: HTMLElement) => element.getAttribute('data-size') || 'full',
@@ -3135,7 +3139,12 @@
 			return convertFileSrc(src, 'imgproxy');
 		}
 		// Decode URL encoding and undo the extra leading slash added to Windows drive paths.
-		let decoded = normalizeLocalAssetPath(decodeURIComponent(src));
+		let decoded: string;
+		try {
+			decoded = normalizeLocalAssetPath(decodeURIComponent(src));
+		} catch {
+			decoded = normalizeLocalAssetPath(src);
+		}
 		// Keep repairing legacy POSIX paths that were saved with duplicate leading slashes.
 		if (/^\/{2,}/.test(decoded)) decoded = decoded.replace(/^\/{2,}/, '/');
 		if (decoded.startsWith('/') || /^[A-Za-z]:\//.test(decoded)) {
@@ -3165,9 +3174,32 @@
 		return src;
 	}
 
+	function normalizeImageHtml(html: string): string {
+		if (!/<img\b/i.test(html)) return html;
+		// Template contents are inert: parsing raw image HTML must not fetch its
+		// original URL before Tiptap gets a chance to normalize the image node.
+		const template = document.createElement('template');
+		template.innerHTML = html;
+		for (const image of template.content.querySelectorAll('img')) {
+			for (const attribute of Array.from(image.attributes)) {
+				if (!['src', 'alt', 'title', 'data-size', 'width', 'height'].includes(attribute.name)) {
+					image.removeAttribute(attribute.name);
+				}
+			}
+			const source = image.getAttribute('src');
+			if (source) image.setAttribute('src', resolveImageSrc(source));
+			const size = (image.getAttribute('alt') ?? '').match(/^(.*?)\|size=(small|medium|full)$/);
+			if (size) {
+				image.setAttribute('alt', size[1]);
+				image.setAttribute('data-size', size[2]);
+			}
+		}
+		return template.innerHTML;
+	}
+
 	const saves = new RevisionSaveQueue();
 	let savedBlobImages = new Map<string, string>();
-	let saveError = $state<{ message: string; path: string; vault: string } | null>(null);
+	let saveError = $state<{ message: string; path: string; vault: string; conflict: boolean } | null>(null);
 	let saveAttempt = 0;
 	let retryingSave = $state(false);
 
@@ -3193,7 +3225,7 @@
 	}
 
 	function canInsert(origin: EditorOrigin): boolean {
-		return isOriginCurrent(origin) && !!origin.vault && !trashPreview && !$readOnly && !$viewerNote;
+		return !externalOperationBusy && !pathMigrationPending && isOriginCurrent(origin) && !!origin.vault && !trashPreview && !$readOnly && !$viewerNote;
 	}
 
 	export function markEdited(): void {
@@ -3211,7 +3243,7 @@
 		console.error('Save failed:', error);
 		if (origin.path && origin.vault && isCurrentSaveAttempt(origin, attempt)) {
 			const message = error instanceof Error ? error.message : String(error);
-			saveError = { message: message.trim() || 'The note could not be saved.', path: origin.path, vault: origin.vault };
+			saveError = { message: message.trim() || 'The note could not be saved.', path: origin.path, vault: origin.vault, conflict: /conflict|modified outside/i.test(message) };
 		}
 		return false;
 	}
@@ -3227,8 +3259,63 @@
 		}
 	}
 
+	async function saveConflictCopy() {
+		if (!saveError?.conflict || !$activeNote || !$activeNotePath || !$appConfig?.active_vault || retryingSave) return;
+		const origin = captureOrigin();
+		const vault = origin.vault!;
+		const originalPath = origin.path!;
+		let body = getCurrentBody();
+		const meta = { ...$activeNote.meta, tags: [...$activeNote.meta.tags] };
+		retryingSave = true;
+		try {
+			await saves.idle();
+			if (!isOriginCurrent(origin, true)) return;
+			const parent = originalPath.slice(vault.length + 1).replace(/[/\\][^/\\]+$/, '');
+			const notebook = parent === originalPath.slice(vault.length + 1) ? null : parent.replace(/\\/g, '/');
+			const entry = await createNote(vault, notebook, `${meta.title} (conflict copy)`);
+			for (const match of body.matchAll(/blob:[^)\s"']+/g)) {
+				const url = match[0];
+				let relativePath = savedBlobImages.get(url);
+				if (!relativePath) {
+					relativePath = await saveBlobImage(vault, url);
+					savedBlobImages.set(url, relativePath);
+				}
+				body = body.replaceAll(url, relativePath);
+			}
+			const copy = await readNote(vault, entry.path);
+			await saveNote(vault, entry.path, { ...copy.meta, pinned: meta.pinned, tags: meta.tags }, body, copy.raw);
+			if (!isOriginCurrent(origin, true)) return;
+			const current = await readNote(vault, entry.path);
+			if (!isOriginCurrent(origin, true)) return;
+			$activeNotePath = entry.path;
+			$activeNote = current;
+			loadNote(entry.path, current.content);
+		} catch (error) {
+			console.error('Failed to save conflict copy:', error);
+		} finally {
+			retryingSave = false;
+		}
+	}
+
+	async function reloadConflictedNote() {
+		if (!saveError?.conflict || !$activeNotePath || !$appConfig?.active_vault) return;
+		if (!window.confirm('Discard your unsaved draft and reload this note from disk? Choose Save a copy to keep the draft.')) return;
+		const origin = captureOrigin();
+		try {
+			await saves.idle();
+			if (!isOriginCurrent(origin, true)) return;
+			const content = await readNote(origin.vault!, origin.path!);
+			if (!isOriginCurrent(origin, true)) return;
+			$activeNote = content;
+			loadNote(origin.path!, content.content);
+		} catch (error) {
+			console.error('Failed to reload conflicted note:', error);
+		}
+	}
+
 	export function forceSave(allowWhileTrashing = false): Promise<boolean> {
 		saves.cancelScheduled();
+		if (externalOperationBusy || pathMigrationPending) return Promise.resolve(false);
 		if (get(viewerNote) || !$activeNote || !$activeNotePath) return Promise.resolve(true);
 		if ((renamingNote && saves.isCurrentSession(renamingNote)) || (trashingNote && !allowWhileTrashing)) return Promise.resolve(false);
 		if (!$editorDirty) return Promise.resolve(true);
@@ -3261,7 +3348,8 @@
 				}
 			}
 			const blobImages = savedBlobImages;
-			return saves.save(snapshot, async () => {
+			let savedContent: NoteContent | null = null;
+			return saves.save(snapshot, async (expectedRaw) => {
 				for (const url of blobUrls) {
 					let relativePath = blobImages.get(url);
 					if (!relativePath) {
@@ -3271,11 +3359,12 @@
 					body = body.replaceAll(url, relativePath);
 					replaceSavedBlob(origin, url, relativePath);
 				}
-				await saveNote(vault, path, meta, body);
+				savedContent = await saveNote(vault, path, meta, body, expectedRaw);
+				return savedContent.raw;
 			}).then((current) => {
 				if (isCurrentSaveAttempt(origin, attempt)) saveError = null;
 				if (!current || !isOriginCurrent(origin, true)) return false;
-				if ($activeNote) $activeNote = { ...$activeNote, content: body };
+				if (savedContent) $activeNote = savedContent;
 				$editorDirty = false;
 				return true;
 			}).catch((error) => reportSaveError(error, origin, attempt));
@@ -3306,6 +3395,21 @@
 	// The markdown body the editor would currently save; used to ignore the file-watcher echo of our own save.
 	export function getCurrentBody(): string {
 		return $sourceMode ? restoreTitleH1(source.state.doc.toString()) : editorToMarkdown();
+	}
+
+	export function getAcceptedRaw(): string {
+		return saves.raw;
+	}
+
+	export function flagExternalConflict() {
+		if (!$editorDirty || !$activeNotePath || !$appConfig?.active_vault) return;
+		saveError = { path: $activeNotePath, vault: $appConfig.active_vault,
+			message: 'The file changed on disk. Save a copy of your draft or explicitly reload the disk version.',
+			conflict: true };
+	}
+
+	export function isMutationPending(): boolean {
+		return externalOperationBusy || pathMigrationPending;
 	}
 
 	// ── Tag editing (active note) ──
@@ -3339,7 +3443,7 @@
 		untrack(() => {
 			if (editor) {
 				if (ro && $editorDirty) forceSave();
-				editor.setEditable(!ro);
+				editor.setEditable(!ro && !externalOperationBusy);
 			}
 		});
 	});
@@ -3551,6 +3655,47 @@
 		return forceSave();
 	}
 
+	/** Keep both editing surfaces stable while a native task mutation edits this note. */
+	export async function applyNativeTaskChange(path: string, operation: () => Promise<void>): Promise<void> {
+		if (externalOperationBusy || path !== $activeNotePath || !(await flushSave())) return;
+		if (externalOperationBusy || $editorDirty || path !== $activeNotePath || !$appConfig?.active_vault) return;
+		const vault = $appConfig.active_vault;
+		const snapshot = saves.capture();
+		externalOperationBusy = true;
+		source.configure(true, !isMobile && ($appConfig?.show_line_numbers ?? false));
+		editor?.setEditable(false);
+		try {
+			await operation();
+			const content = await readNote(vault, path);
+			if (path === $activeNotePath && vault === $appConfig?.active_vault) {
+				if (saves.isCurrent(snapshot) && !$editorDirty) {
+					$activeNote = content;
+					loadNote(path, content.content);
+				} else {
+					flagExternalConflict();
+				}
+			}
+		} finally {
+			externalOperationBusy = false;
+			source.configure($readOnly || !!$viewerNote, !isMobile && ($appConfig?.show_line_numbers ?? false));
+			editor?.setEditable(!$readOnly && !$viewerNote);
+		}
+	}
+
+	export async function beginPathMutation(): Promise<(() => void) | null> {
+		if (externalOperationBusy) return null;
+		const path = $activeNotePath;
+		if (!(await flushSave()) || externalOperationBusy || path !== $activeNotePath) return null;
+		externalOperationBusy = true;
+		source.configure(true, !isMobile && ($appConfig?.show_line_numbers ?? false));
+		editor?.setEditable(false);
+		return () => {
+			externalOperationBusy = false;
+			source.configure($readOnly || !!$viewerNote, !isMobile && ($appConfig?.show_line_numbers ?? false));
+			editor?.setEditable(!$readOnly && !$viewerNote);
+		};
+	}
+
 	function rememberLoadedNoteScroll() {
 		if (!loadedPath) return;
 		const previous = noteScrollPositions.get(loadedPath) ?? { rich: 0, source: 0 };
@@ -3581,7 +3726,7 @@
 		endToolbarCustomization();
 		cancelCounts();
 		closeNoteSearch(false);
-		saves.startSession();
+		saves.startSession($activeNote?.raw ?? content);
 		saveError = null;
 		retryingSave = false;
 		closeAiMenu();
@@ -3625,7 +3770,7 @@
 		const shouldBeReadOnly = isViewer || isTrashedNote(path, $appConfig?.active_vault)
 			? true : (isNewNote ? false : ($appConfig?.default_view_mode ?? false));
 		$readOnly = shouldBeReadOnly;
-		if (editor) editor.setEditable(!shouldBeReadOnly);
+		if (editor) editor.setEditable(!shouldBeReadOnly && !externalOperationBusy);
 		const editorBody = editorElement?.closest('.editor-body') as HTMLElement | null;
 		if ($sourceMode) {
 			source.load(stripTitleH1(content));
@@ -4168,52 +4313,23 @@
 		toolbarCapture = null;
 	}
 
-	function cancelMoreClose() {
-		if (moreCloseTimer !== null) clearTimeout(moreCloseTimer);
-		moreCloseTimer = null;
-	}
-
 	function closeMore() {
-		cancelMoreClose();
 		moreOpen = false;
-		moreOpenedByHover = false;
 	}
 
 	function openMore(focus = false) {
-		cancelMoreClose();
 		if (!moreOpen) closeFormattingDropdowns();
 		moreOpen = true;
 		if (focus) void tick().then(() => morePanel?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus({ preventScroll: true }));
 	}
 
-	function hoverMore(event: PointerEvent) {
-		if (isMobile || toolbarDraft || event.pointerType !== 'mouse') return;
-		cancelMoreClose();
-		if (!moreOpen) {
-			moreOpenedByHover = true;
-			openMore();
-		}
-	}
-
-	function leaveMore(event: PointerEvent) {
-		if (isMobile || toolbarDraft || event.pointerType !== 'mouse') return;
-		const target = event.relatedTarget as Node | null;
-		if (target && (morePanel?.contains(target) || moreButton?.contains(target))) return;
-		cancelMoreClose();
-		moreCloseTimer = setTimeout(() => {
-			moreCloseTimer = null;
-			if (!anyDropdownOpen && !morePanel?.contains(document.activeElement)) closeMore();
-		}, 160);
-	}
-
 	function toggleMore(event: MouseEvent) {
 		event.stopPropagation();
 		if (toolbarDraft) return;
-		if (moreOpen && !moreOpenedByHover) {
+		if (moreOpen) {
 			closeAllDropdowns();
 		} else {
 			openMore(event.detail === 0);
-			moreOpenedByHover = false;
 		}
 	}
 
@@ -4274,14 +4390,13 @@
 		if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
 			event.preventDefault();
 			openMore(true);
-			moreOpenedByHover = false;
 		}
 	}
 
 	// Fixed descendants escape the scrolling button strip/list without moving
 	// Svelte-owned DOM. Reposition on scrolling, resizing and IME viewport changes.
-	function positionFormattingPopup(node: HTMLElement, more = false) {
-		const trigger = more ? moreButton : formattingTrigger;
+	function positionFormattingPopup(node: HTMLElement) {
+		const trigger = formattingTrigger;
 		let frame = 0;
 		const position = () => {
 			frame = 0;
@@ -4295,7 +4410,7 @@
 			const bottom = Math.min(formattingBar.getBoundingClientRect().top - 4, viewportBottom);
 			node.style.maxWidth = `${Math.max(0, rightEdge - leftEdge)}px`;
 			node.style.maxHeight = `${Math.max(0, bottom - topEdge)}px`;
-			node.style.left = `${Math.max(leftEdge, Math.min(more ? anchor.right - node.offsetWidth : anchor.left, rightEdge - node.offsetWidth))}px`;
+			node.style.left = `${Math.max(leftEdge, Math.min(anchor.left, rightEdge - node.offsetWidth))}px`;
 			node.style.top = `${Math.max(topEdge, bottom - node.offsetHeight)}px`;
 		};
 		const schedule = () => { if (!frame) frame = requestAnimationFrame(position); };
@@ -4843,17 +4958,7 @@
 		});
 		html = html.replace(/<ul>(\s*<li data-type="taskItem")/gi, '<ul data-type="taskList">$1');
 
-		// Post-process: resolve image src paths and parse size attribute
-		html = html.replace(/<img\s+src="([^"]*)"(?:\s+alt="([^"]*)")?[^>]*\/?>/gi, (_, imgSrc, altRaw) => {
-			let alt = altRaw || '';
-			let size = 'full';
-			const sizeMatch = alt.match(/^(.*?)\|size=(small|medium|full)$/);
-			if (sizeMatch) {
-				alt = sizeMatch[1];
-				size = sizeMatch[2];
-			}
-			return `<img src="${resolveImageSrc(imgSrc)}" alt="${alt}" data-size="${size}">`;
-		});
+		html = normalizeImageHtml(html);
 
 		// Post-process: turn Obsidian callout blockquotes (> [!type] ...) into callout blocks.
 		if (html.includes('[!')) {
@@ -5239,6 +5344,7 @@
 				// Keeps semantic marks (bold, italic, links, headings, alignment) - drops only the
 				// inline visual styles that fight the app's theme (color, bg-color, font-family, font-size).
 				transformPastedHTML: (html: string) => {
+					html = normalizeImageHtml(html);
 					if (!/style=|<font/i.test(html)) return html;
 					try {
 						const doc = new DOMParser().parseFromString(html, 'text/html');
@@ -6516,6 +6622,61 @@
 		else unlistenFileChange = fn;
 	}).catch(e => console.error('Failed to listen for note changes:', e));
 
+	type PathMovedEvent = {
+		vault_path: string; old_path: string; new_path: string;
+		old_raw?: string | null; new_raw?: string | null; old_title?: string | null; new_title?: string | null;
+	};
+	let unlistenPathMoved: (() => void) | null = null;
+	listen<PathMovedEvent>('vault-path-moved', ({ payload }) => {
+		if (editorDisposed || externalOperationBusy || payload.vault_path !== $appConfig?.active_vault) return;
+		const path = $activeNotePath;
+		if (!path || (path !== payload.old_path
+			&& !path.startsWith(payload.old_path + '/') && !path.startsWith(payload.old_path + '\\'))) return;
+		const migrated = payload.new_path + path.slice(payload.old_path.length);
+		const previous = $activeNote;
+		if (!previous) return;
+		const session = saves.capture();
+		const oldRaw = saves.raw;
+		pathMigrationPending = true;
+		loadedPath = migrated;
+		$activeNotePath = migrated;
+		$activeNote = { ...previous, path: migrated };
+		navHistory.remap(payload.old_path, payload.new_path);
+		void (async () => {
+			try {
+				await saves.idle();
+				const content = await readNote(payload.vault_path, migrated);
+				if (editorDisposed || !saves.isCurrentSession(session) || $activeNotePath !== migrated) return;
+				const renamedRaw = typeof payload.old_raw === 'string';
+				const baselineMatches = renamedRaw ? oldRaw === payload.old_raw && saves.raw === oldRaw
+					&& (typeof payload.new_raw !== 'string' || payload.new_raw === content.raw)
+					: saves.raw === content.raw;
+				if ($editorDirty) {
+					if (!baselineMatches) { flagExternalConflict(); return; }
+					if (renamedRaw) saves.adoptMovedRaw(oldRaw, content.raw);
+					if (typeof payload.old_title === 'string' && typeof payload.new_title === 'string'
+						&& $activeNote?.meta.title === payload.old_title) {
+						$activeNote = { ...$activeNote, meta: { ...$activeNote.meta, title: payload.new_title } };
+					}
+				} else {
+					$activeNote = content;
+					loadNote(migrated, content.content);
+				}
+			} catch (error) {
+				console.error('Failed to refresh relocated note:', error);
+				flagExternalConflict();
+			} finally {
+				pathMigrationPending = false;
+				if ($editorDirty && !saveError?.conflict && $activeNotePath === migrated) {
+					saves.schedule(() => { void forceSave(); });
+				}
+			}
+		})();
+	}).then(fn => {
+		if (editorDisposed) fn();
+		else unlistenPathMoved = fn;
+	}).catch(error => console.error('Failed to listen for relocated notes:', error));
+
 	let unlistenToolbarLayout: (() => void) | null = null;
 	listen<ToolbarLayout | null>('toolbar-layout-changed', (event) => {
 		const preference = JSON.stringify(event.payload);
@@ -6548,6 +6709,7 @@
 		clearTargetReveal();
 		destroyEditor();
 		unlistenFileChange?.();
+		unlistenPathMoved?.();
 		unlistenToolbarLayout?.();
 		if (infoPathCopyTimer) clearTimeout(infoPathCopyTimer);
 	});
@@ -6895,7 +7057,7 @@
 <svelte:window onkeydown={handleNoteSearchKey} />
 
 
-<div class="editor-container" class:mobile={isMobile}>
+<div class="editor-container" class:mobile={isMobile} inert={externalOperationBusy}>
 	{#if !$activeNote}
 		<div class="empty-editor">
 			<div class="empty-icon">
@@ -6933,7 +7095,7 @@
 				<input
 					bind:this={titleInput}
 					type="text"
-					readonly={$readOnly}
+					readonly={$readOnly || externalOperationBusy}
 					value={$activeNote.meta.title}
 					oninput={(e) => {
 						if (!$activeNote) return;
@@ -7162,12 +7324,20 @@
 			{/if}
 		</div>
 		{/if}
+		{#if externalOperationBusy}
+			<div class="save-error" role="status">Updating note location or task… Editing will resume shortly.</div>
+		{/if}
 		{#if saveError && $editorDirty && !$viewerNote && saveError.path === $activeNotePath && saveError.vault === $appConfig?.active_vault}
 			<div class="save-error" role="alert">
 				<span><strong>Save failed.</strong> {saveError.message}</span>
-				<button type="button" onclick={retrySave} disabled={retryingSave} aria-label="Retry saving note">
-					{retryingSave ? 'Saving…' : 'Retry'}
-				</button>
+				{#if saveError.conflict}
+					<button type="button" onclick={saveConflictCopy} disabled={retryingSave} aria-label="Save draft as a copy">Save a copy</button>
+					<button type="button" onclick={reloadConflictedNote} disabled={retryingSave} aria-label="Discard draft and reload note">Reload from disk</button>
+				{:else}
+					<button type="button" onclick={retrySave} disabled={retryingSave} aria-label="Retry saving note">
+						{retryingSave ? 'Saving…' : 'Retry'}
+					</button>
+				{/if}
 			</div>
 		{/if}
 		{#if searchRevealNotice}
@@ -7239,12 +7409,12 @@
 			<div class="editor-body-row">
 			<div class="editor-body" class:source-body={$sourceMode}>
 				{#if isMobile}
-					<SourceEditor controller={source} readonly={$readOnly || !!$viewerNote} visible={$sourceMode} mobile />
+					<SourceEditor controller={source} readonly={$readOnly || !!$viewerNote || externalOperationBusy} visible={$sourceMode} mobile />
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div class="tiptap-wrapper" class:large-doc={isLargeDoc} style={$sourceMode ? 'display:none' : ''} spellcheck="false" bind:this={editorElement} onclick={(e) => { closeLinkContextMenu(); handleEditorClick(e); }} onkeydown={(e) => { if (e.key === 'Escape') closeLinkContextMenu(); }}></div>
 				{:else}
 					{#if $sourceMode}
-						<SourceEditor controller={source} readonly={$readOnly || !!$viewerNote} numbers={$appConfig?.show_line_numbers ?? false} />
+						<SourceEditor controller={source} readonly={$readOnly || !!$viewerNote || externalOperationBusy} numbers={$appConfig?.show_line_numbers ?? false} />
 					{:else}
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
 						<div class="tiptap-wrapper" class:large-doc={isLargeDoc} spellcheck="false" bind:this={editorElement} onclick={(e) => { closeLinkContextMenu(); handleEditorClick(e); }} onkeydown={(e) => { if (e.key === 'Escape') closeLinkContextMenu(); }} oncontextmenu={handleEditorContextMenu}></div>
@@ -7428,6 +7598,7 @@
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<div
 				class="editor-formatting-bar"
+				class:expanded={moreOpen}
 				class:customizing={toolbarDraft !== null}
 				bind:this={formattingBar}
 				style={isMobile && keyboardHeight > 0 ? `bottom: ${keyboardHeight}px;` : ''}
@@ -7458,11 +7629,11 @@
 					{/if}
 				</div>
 				{#if !isMobile}
-					<button class="fmt-btn fmt-more-button" class:active={moreOpen} bind:this={moreButton} title="More formatting" aria-label="More formatting" aria-haspopup="dialog" aria-expanded={moreOpen} aria-controls={morePanelId} onclick={toggleMore} onkeydown={moreKeydown} onpointerenter={hoverMore} onpointerleave={leaveMore}>
-						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d={moreOpen ? 'm6 9 6 6 6-6' : 'm6 15 6-6 6 6'}/></svg>
+					<button class="fmt-btn fmt-more-button" class:active={moreOpen} bind:this={moreButton} title="More formatting" aria-label="More formatting" aria-expanded={moreOpen} aria-controls={morePanelId} onclick={toggleMore} onkeydown={moreKeydown}>
+						<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
 					</button>
 					{#if moreOpen}
-						<div class="fmt-more-panel" class:customizing={toolbarDraft !== null} id={morePanelId} bind:this={morePanel} role="dialog" tabindex="-1" aria-label={toolbarDraft ? 'Customize toolbar' : 'More formatting'} onpointerenter={hoverMore} onpointerleave={leaveMore} use:positionFormattingPopup={true}>
+						<div class="fmt-more-panel" class:customizing={toolbarDraft !== null} id={morePanelId} bind:this={morePanel} role="region" aria-label={toolbarDraft ? 'Customize toolbar' : 'More formatting'}>
 							{#if toolbarDraft}
 								<div class="fmt-customize-heading">
 									<strong>Customize toolbar</strong>
@@ -7508,7 +7679,7 @@
 								</div>
 							{:else}
 								{#if toolbarLayout.more.length > 0}
-									<div class="fmt-more-controls" style={`--toolbar-more-columns: ${Math.min(4, toolbarLayout.more.length)}`}>
+									<div class="fmt-more-controls">
 										{#each toolbarLayout.more as id (id)}
 											{@render toolbarControl(id)}
 										{/each}
@@ -8670,8 +8841,13 @@
 		flex-wrap: wrap;
 	}
 
-	.editor-formatting-bar.customizing {
-		flex-wrap: nowrap;
+	.editor-formatting-bar.expanded {
+		flex-shrink: 1;
+		min-height: 44px;
+		max-height: 70%;
+		overflow-y: auto;
+		overscroll-behavior: contain;
+		align-content: flex-start;
 	}
 
 	.fmt-main-controls {
@@ -8682,26 +8858,28 @@
 		flex-shrink: 0;
 	}
 
+	/* More expands above the main row, inside the bar. Only formatting pickers
+	   float over the editor; short windows scroll the expanded toolbar in place. */
 	.fmt-more-panel {
-		position: fixed;
-		z-index: 99;
-		width: max-content;
+		order: -1;
+		flex: 0 0 100%;
+		min-width: 0;
 		display: flex;
-		flex-direction: column;
-		gap: 6px;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 8px;
 		box-sizing: border-box;
+		max-height: min(360px, 45vh);
 		overflow: auto;
 		overscroll-behavior: contain;
-		background: var(--bg-primary);
-		border: 1px solid var(--border-color);
-		border-radius: 8px;
-		box-shadow: var(--shadow-lg);
-		padding: 6px;
+		border-bottom: 1px solid var(--border-light);
+		padding: 2px 0 8px;
+		animation: fmt-expand 140ms ease-out;
 	}
 
 	.fmt-more-controls {
-		display: grid;
-		grid-template-columns: repeat(var(--toolbar-more-columns, 7), 32px);
+		display: flex;
+		flex-wrap: wrap;
 		gap: 2px;
 		align-content: start;
 		justify-content: start;
@@ -8709,6 +8887,7 @@
 
 	.fmt-customize-entry {
 		min-height: 30px;
+		margin-left: auto;
 		padding: 6px 8px;
 		border: 0;
 		border-radius: 4px;
@@ -8720,11 +8899,6 @@
 		cursor: pointer;
 	}
 
-	.fmt-more-controls + .fmt-customize-entry {
-		border-top: 1px solid var(--border-light);
-		border-radius: 0 0 4px 4px;
-		padding-top: 9px;
-	}
 
 	.fmt-customize-entry:hover {
 		background: var(--bg-hover);
@@ -8758,14 +8932,15 @@
 	}
 
 	.fmt-more-panel.customizing {
-		width: 280px;
-		padding: 12px;
-		gap: 8px;
+		align-items: stretch;
+		flex-direction: column;
+		flex-wrap: nowrap;
+		padding: 4px 0 10px;
 	}
 
 	.fmt-more-panel.customizing .fmt-more-controls {
-		max-height: 152px;
-		min-height: 58px;
+		flex-shrink: 0;
+		max-height: 116px;
 	}
 
 	.fmt-area-label {
@@ -8820,6 +8995,13 @@
 		pointer-events: none;
 	}
 
+	.fmt-customize-heading {
+		display: flex;
+		align-items: baseline;
+		flex-wrap: wrap;
+		gap: 4px 12px;
+	}
+
 	.fmt-customize-heading strong {
 		font-size: 13px;
 		font-weight: 600;
@@ -8835,6 +9017,10 @@
 	}
 
 	.fmt-customize-selection {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 8px 16px;
 		border-top: 1px solid var(--border-light);
 		padding-top: 9px;
 	}
@@ -8844,8 +9030,22 @@
 		align-items: baseline;
 		justify-content: space-between;
 		gap: 8px;
-		margin-bottom: 7px;
+		margin-right: auto;
 		font-size: 11px;
+	}
+
+	.fmt-customize-selection .fmt-customize-hint {
+		flex-basis: 100%;
+		margin: 0;
+	}
+
+	@keyframes fmt-expand {
+		from { opacity: 0; }
+		to { opacity: 1; }
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.fmt-more-panel { animation: none; }
 	}
 
 	.fmt-selected-label strong {

@@ -22,9 +22,10 @@
 		collapsedNotebooks,
 		rootNoteCount,
 		notebookSortMode,
-		notebookOrder
+		notebookOrder,
+		noteOrder
 	} from '$lib/stores/app';
-	import { getNotebooks, getAllTags, createNotebook, deleteNotebook, renameNotebook, moveNotebook, getNotebookIcons, setNotebookIcon, getTagStyles, importNotebookIcon, getQuickAccess, addQuickAccess, removeQuickAccess, emptyTrash, moveNote, readNote, countRootNotes } from '$lib/api';
+	import { getNotebooks, getAllTags, createNotebook, deleteNotebook, renameNotebook, moveNotebook, getNotebookIcons, setNotebookIcon, getTagStyles, importNotebookIcon, getQuickAccess, addQuickAccess, removeQuickAccess, emptyTrash, moveNote, countRootNotes } from '$lib/api';
 	import { open as openDialog } from '@tauri-apps/plugin-dialog';
 	import { readFile } from '@tauri-apps/plugin-fs';
 	import { convertFileSrc } from '@tauri-apps/api/core';
@@ -43,9 +44,11 @@
 		type NotebookIconId
 	} from '$lib/utils/notebook-icons';
 
-	let { onViewChanged = () => {}, onBeforeNoteChange = async () => true }: {
+	let { onViewChanged = () => {}, onBeforeNoteChange = async () => true, onBeforePathMutation = async () => null, onPathsMoved = async (_old: string, _next: string) => {} }: {
 		onViewChanged?: () => void;
 		onBeforeNoteChange?: () => Promise<boolean>;
+		onBeforePathMutation?: () => Promise<(() => void) | null>;
+		onPathsMoved?: (oldPath: string, nextPath: string) => Promise<void>;
 	} = $props();
 
 	const modKey = navigator.platform.startsWith('Mac') ? '⌘' : 'Ctrl';
@@ -93,6 +96,26 @@
 	const baseOf = (p: string) => p.slice(lastSep(p) + 1);
 	const joinPath = (parent: string, name: string) => parent + (parent.includes('\\') ? '\\' : '/') + name;
 	const isDescendant = (child: string, anc: string) => child.startsWith(anc + '/') || child.startsWith(anc + '\\');
+
+	function migratePaths(oldPath: string, newPath: string) {
+		const replace = (path: string) => path === oldPath ? newPath
+			: isDescendant(path, oldPath) ? newPath + path.slice(oldPath.length) : path;
+		$collapsedNotebooks = $collapsedNotebooks.map(replace);
+		$notebookOrder = Object.fromEntries(Object.entries($notebookOrder).map(([path, index]) => [replace(path), index]));
+		$noteOrder = Object.fromEntries(Object.entries($noteOrder).map(([path, index]) => [replace(path), index]));
+		if ($activeNotebook && replace($activeNotebook.path) !== $activeNotebook.path) {
+			const path = replace($activeNotebook.path);
+			$activeNotebook = {
+				...$activeNotebook, path,
+				relative_path: path.slice(ownerVault!.length + 1).replace(/\\/g, '/'),
+				name: baseOf(path)
+			};
+		}
+		$notes = $notes.map(note => {
+			const path = replace(note.path);
+			return path === note.path ? note : { ...note, path, relative_path: path.slice(ownerVault!.length + 1).replace(/\\/g, '/') };
+		});
+	}
 
 	// Apply manual ordering recursively when in 'manual' sort mode.
 	// In 'alphabetical' mode the Rust scanner already sorts, so we pass through unchanged.
@@ -355,15 +378,21 @@
 			editingNotebook = null;
 			return;
 		}
+		const release = await onBeforePathMutation();
+		if (!release) return;
 		try {
-			if (!(await onBeforeNoteChange())) return;
 			if (!ownerIsCurrent()) return;
-			await renameNotebook(ownerVault!, nb.path, editValue.trim());
+			const newPath = await renameNotebook(ownerVault!, nb.path, editValue.trim());
+			if (!ownerIsCurrent()) return;
+			migratePaths(nb.path, newPath);
+			await onPathsMoved(nb.path, newPath);
 			if (!ownerIsCurrent()) return;
 			editingNotebook = null;
 			await refresh();
 		} catch (e) {
 			console.error('Failed to rename:', e);
+		} finally {
+			release();
 		}
 	}
 
@@ -408,35 +437,24 @@
 		const notePaths = [...new Set(decodeNoteDragPaths(payload))]
 			.filter((path) => norm(parentOf(path)) !== norm(nb.path));
 		if (notePaths.length === 0) return;
-		if (!(await onBeforeNoteChange())) return;
-		if (!ownerIsCurrent()) return;
-
-		const movedPaths = new Map<string, string>();
-		for (const notePath of notePaths) {
-			try {
-				movedPaths.set(notePath, await moveNote(ownerVault!, notePath, nb.path));
-			} catch (e) {
-				console.error('Failed to move note:', notePath, e);
-			}
+		const release = await onBeforePathMutation();
+		if (!release) return;
+		try {
 			if (!ownerIsCurrent()) return;
-		}
-		if (movedPaths.size === 0) return;
-
-		$notes = $notes.filter((note) => !movedPaths.has(note.path));
-		const activeNewPath = $activeNotePath ? movedPaths.get($activeNotePath) : undefined;
-		if (activeNewPath) {
-			$activeNotePath = activeNewPath;
-			try {
-				const previous = $activeNote;
-				const content = await readNote(ownerVault!, activeNewPath);
-				if (ownerIsCurrent() && $activeNotePath === activeNewPath && $activeNote === previous && !$editorDirty) {
-					$activeNote = content;
+			for (const notePath of notePaths) {
+				try {
+					const newPath = await moveNote(ownerVault!, notePath, nb.path);
+					if (!ownerIsCurrent()) return;
+					migratePaths(notePath, newPath);
+					await onPathsMoved(notePath, newPath);
+				} catch (error) {
+					console.error('Failed to move note:', notePath, error);
 				}
-			} catch (e) {
-				console.error('Failed to reload moved note:', e);
 			}
+			if (ownerIsCurrent()) await refresh();
+		} finally {
+			release();
 		}
-		await refresh();
 	}
 
 	async function handleNotebookDrop(e: DragEvent, destPath: string) {
@@ -454,37 +472,22 @@
 		// Don't move if already in that parent
 		const parentDir = parentOf(srcPath);
 		if (parentDir === destPath) return;
+		const release = await onBeforePathMutation();
+		if (!release) return;
 		try {
-			if (!(await onBeforeNoteChange())) return;
 			if (!ownerIsCurrent()) return;
-			const oldName = baseOf(srcPath);
-			const newBasePath = joinPath(destPath, oldName);
-			await moveNotebook(ownerVault!, srcPath, destPath);
+			const newPath = await moveNotebook(ownerVault!, srcPath, destPath);
 			if (!ownerIsCurrent()) return;
-			// Update collapsedNotebooks paths
-			$collapsedNotebooks = $collapsedNotebooks.map(p => {
-				if (p === srcPath) return newBasePath;
-				if (isDescendant(p, srcPath)) return newBasePath + p.slice(srcPath.length);
-				return p;
-			});
-			// Update active notebook/note if inside the moved notebook
-			if ($activeNotebook?.path === srcPath || isDescendant($activeNotebook?.path ?? '', srcPath)) {
-				selectAllNotes();
-			}
-			if ($activeNotePath && isDescendant($activeNotePath, srcPath)) {
-				const newNotePath = newBasePath + $activeNotePath.slice(srcPath.length);
-				$activeNotePath = newNotePath;
-				const previous = $activeNote;
-				const content = await readNote(ownerVault!, newNotePath);
-				if (ownerIsCurrent() && $activeNotePath === newNotePath && $activeNote === previous && !$editorDirty) {
-					$activeNote = content;
-				}
-			}
-			await refresh();
-		} catch (e) {
-			console.error('Failed to move notebook:', e);
+			migratePaths(srcPath, newPath);
+			await onPathsMoved(srcPath, newPath);
+			if (ownerIsCurrent()) await refresh();
+		} catch (error) {
+			console.error('Failed to move notebook:', error);
+		} finally {
+			release();
 		}
 	}
+
 
 	function nbStopDragListeners() {
 		window.removeEventListener('pointermove', nbPointerMove);
@@ -574,43 +577,16 @@
 		const srcParent = parentOf(srcPath);
 		const targetParent = parentOf(targetPath);
 		let actualSrcPath = srcPath;
-
+		const release = srcParent !== targetParent ? await onBeforePathMutation() : () => {};
+		if (!release) return;
 		try {
 			// Step 1: if different parents, move src into target's parent first
 			if (srcParent !== targetParent) {
-				if (!(await onBeforeNoteChange())) return;
 				if (!ownerIsCurrent()) return;
-				const oldName = baseOf(srcPath);
-				const newPath = joinPath(targetParent, oldName);
-				await moveNotebook(ownerVault!, srcPath, targetParent);
+				const newPath = await moveNotebook(ownerVault!, srcPath, targetParent);
 				if (!ownerIsCurrent()) return;
-				// Migrate paths in collapsedNotebooks
-				$collapsedNotebooks = $collapsedNotebooks.map(p => {
-					if (p === srcPath) return newPath;
-					if (isDescendant(p, srcPath)) return newPath + p.slice(srcPath.length);
-					return p;
-				});
-				// Migrate paths in notebookOrder
-				const migrated: Record<string, number> = {};
-				for (const [p, v] of Object.entries($notebookOrder)) {
-					if (p === srcPath) migrated[newPath] = v;
-					else if (isDescendant(p, srcPath)) migrated[newPath + p.slice(srcPath.length)] = v;
-					else migrated[p] = v;
-				}
-				$notebookOrder = migrated;
-				// Update active notebook/note
-				if ($activeNotebook?.path === srcPath || isDescendant($activeNotebook?.path ?? '', srcPath)) {
-					selectAllNotes();
-				}
-				if ($activeNotePath && isDescendant($activeNotePath, srcPath)) {
-					const newNotePath = newPath + $activeNotePath.slice(srcPath.length);
-					$activeNotePath = newNotePath;
-					const previous = $activeNote;
-					const content = await readNote(ownerVault!, newNotePath);
-					if (ownerIsCurrent() && $activeNotePath === newNotePath && $activeNote === previous && !$editorDirty) {
-						$activeNote = content;
-					}
-				}
+				migratePaths(srcPath, newPath);
+				await onPathsMoved(srcPath, newPath);
 				await refresh();
 				if (!ownerIsCurrent()) return;
 				actualSrcPath = newPath;
@@ -640,6 +616,8 @@
 			if ($notebookSortMode !== 'manual') $notebookSortMode = 'manual';
 		} catch (e) {
 			console.error('Failed to reorder notebook:', e);
+		} finally {
+			release();
 		}
 	}
 

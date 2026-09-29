@@ -64,6 +64,12 @@ export interface VaultConfig {
   sync_on_change?: boolean;
   sync_interval_minutes?: number;
   last_sync_time?: string | null;
+  last_backup_time?: string | null;
+}
+
+export interface PendingOpenFile {
+  id: number;
+  path: string;
 }
 
 export interface ExternalVaultResult {
@@ -136,7 +142,6 @@ export interface AppConfig {
   backup_frequency: string;
   backup_max_count: number;
   backup_location: string | null;
-  last_backup_time: string | null;
   backup_include_attachments: boolean;
   max_versions_per_note: number;
   ai_provider: string | null;

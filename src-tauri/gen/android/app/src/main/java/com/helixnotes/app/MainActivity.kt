@@ -35,6 +35,16 @@ class MainActivity : TauriActivity() {
     webView.settings.layoutAlgorithm = android.webkit.WebSettings.LayoutAlgorithm.NORMAL
   }
 
+  override fun onPause() {
+    // Give the editor a chance to persist its current document before Android
+    // suspends the WebView. The save remains best-effort when the process is killed.
+    webView?.evaluateJavascript(
+      "window.dispatchEvent(new Event('app-lifecycle-flush'))",
+      null
+    )
+    super.onPause()
+  }
+
   override fun onResume() {
     super.onResume()
     if (hasStoragePermission()) {

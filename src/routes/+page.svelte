@@ -165,7 +165,9 @@
 					config.active_vault = noteWindowVault;
 					config.active_bookmark_id = origin?.bookmark_id ?? null;
 				} else {
+					noteWindowPath = null;
 					noteWindowVault = null;
+					startupVaultError = 'This note window’s vault is no longer available. Choose a vault to continue.';
 				}
 			}
 			$appConfig = config;
@@ -284,14 +286,15 @@
 					}
 					$vaultReady = true;
 				} catch (e) {
-					if (isIOS && activeVault?.bookmark_id) {
-						startupVaultError = String(e);
-						$appConfig = {
-							...config,
-							active_vault: null,
-							active_bookmark_id: null
-						};
-					}
+					$vaultReady = false;
+					startupVaultError = `Could not open the last vault: ${String(e)}`;
+					// A saved path is not proof that the vault was initialized.
+					// Do not let the picker navigate back into a failed startup.
+					$appConfig = {
+						...config,
+						active_vault: null,
+						active_bookmark_id: null
+					};
 				}
 			}
 		} catch {

@@ -20,6 +20,7 @@ import type {
   ExternalVaultResult,
   StartupView,
   ToolbarLayout,
+  PendingOpenFile,
 } from "./types";
 
 export async function openVault(path: string): Promise<void> {
@@ -44,6 +45,10 @@ export async function getAppConfig(): Promise<AppConfig> {
 
 export async function completeWindowClose(): Promise<void> {
   return invoke("complete_window_close");
+}
+
+export async function cancelWindowClose(): Promise<void> {
+  return invoke("cancel_window_close");
 }
 
 export async function setTheme(theme: string): Promise<void> {
@@ -153,8 +158,9 @@ export async function saveNote(
   path: string,
   meta: NoteMeta,
   body: string,
-): Promise<void> {
-  return invoke("save_note", { vaultPath, path, meta, body });
+  expectedRaw: string,
+): Promise<NoteContent> {
+  return invoke("save_note", { vaultPath, path, meta, body, expectedRaw });
 }
 
 export async function createNote(
@@ -448,20 +454,20 @@ export async function copyPngToClipboard(data: Uint8Array): Promise<void> {
 
 // ── Backup ──
 
-export async function createBackup(): Promise<void> {
-  return invoke("create_backup");
+export async function createBackup(vaultPath: string): Promise<void> {
+  return invoke("create_backup", { vaultPath });
 }
 
-export async function listBackups(): Promise<BackupEntry[]> {
-  return invoke("list_backups");
+export async function listBackups(vaultPath: string): Promise<BackupEntry[]> {
+  return invoke("list_backups", { vaultPath });
 }
 
-export async function restoreBackup(backupPath: string): Promise<void> {
-  return invoke("restore_backup", { backupPath });
+export async function restoreBackup(vaultPath: string, backupPath: string): Promise<void> {
+  return invoke("restore_backup", { vaultPath, backupPath });
 }
 
-export async function deleteBackup(backupPath: string): Promise<void> {
-  return invoke("delete_backup", { backupPath });
+export async function deleteBackup(vaultPath: string, backupPath: string): Promise<void> {
+  return invoke("delete_backup", { vaultPath, backupPath });
 }
 
 export async function setBackupSettings(
@@ -599,6 +605,10 @@ export async function isMobilePlatform(): Promise<boolean> {
   return invoke("is_mobile_platform");
 }
 
-export async function getPendingOpenFile(): Promise<string | null> {
+export async function getPendingOpenFile(): Promise<PendingOpenFile | null> {
   return invoke("get_pending_open_file");
+}
+
+export async function ackPendingOpenFile(id: number): Promise<void> {
+  return invoke("ack_pending_open_file", { id });
 }

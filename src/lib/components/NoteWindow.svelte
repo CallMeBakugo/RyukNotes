@@ -13,7 +13,7 @@
 		sourceMode,
 		tagStyles
 	} from '$lib/stores/app';
-	import { completeWindowClose, getTagStyles, readNote } from '$lib/api';
+	import { completeWindowClose, cancelWindowClose, getTagStyles, readNote } from '$lib/api';
 	import { keybindings, matchAction } from '$lib/keybindings';
 	import { isMobile } from '$lib/platform';
 	import type { FileEvent } from '$lib/types';
@@ -30,6 +30,8 @@
 	let unlistenFileChange: (() => void) | null = null;
 	let unlistenUiScale: (() => void) | null = null;
 	let unlistenClose: (() => void) | null = null;
+	let unlistenVaultRestored: (() => void) | null = null;
+	let removeMobileFlushListeners: (() => void) | null = null;
 	let maximized = $state(false);
 	let loadError = $state<string | null>(null);
 	let disposed = false;
@@ -47,6 +49,11 @@
 		const unlisten = appWindow.onResized(() => checkMaximized());
 		return () => { unlisten.then(fn => fn()); };
 	});
+	$effect(() => {
+		const title = $activeNote?.meta.title;
+		if (title && !disposed) void appWindow.setTitle(`${title} - HelixNotes`);
+	});
+
 
 	let lastMouseDown = 0;
 	const RESIZE_EDGE = 6;
@@ -96,18 +103,35 @@
 		const token = beginNoteNavigation();
 		initialNavigationToken = token;
 		const isCurrentOwner = () => !disposed && (vault === null || vault === $appConfig?.active_vault);
+		if (isMobile) {
+			const flush = () => {
+				if (isCurrentOwner()) void editor?.flushSave();
+			};
+			const onVisibilityChange = () => {
+				if (document.visibilityState === 'hidden') flush();
+			};
+			document.addEventListener('visibilitychange', onVisibilityChange);
+			window.addEventListener('pagehide', flush);
+			window.addEventListener('app-lifecycle-flush', flush);
+			removeMobileFlushListeners = () => {
+				document.removeEventListener('visibilitychange', onVisibilityChange);
+				window.removeEventListener('pagehide', flush);
+				window.removeEventListener('app-lifecycle-flush', flush);
+			};
+		}
 
 		async function initialize() {
 			if (!isMobile) {
 				const closeListener = await appWindow.onCloseRequested(async (event) => {
 					event.preventDefault();
-					if (!isCurrentOwner()) return;
+					if (!isCurrentOwner()) { await cancelWindowClose(); return; }
 					try {
-						if (editor && !(await editor.flushSave())) return;
-						if (!isCurrentOwner()) return;
+						if (editor && !(await editor.flushSave())) { await cancelWindowClose(); return; }
+						if (!isCurrentOwner()) { await cancelWindowClose(); return; }
 						await completeWindowClose();
 					} catch (error) {
 						console.error('Failed to close window:', error);
+						try { await cancelWindowClose(); } catch (cancelError) { console.error('Failed to cancel window close:', cancelError); }
 					}
 				});
 				if (!isCurrentOwner()) {
@@ -154,7 +178,6 @@
 							if (!isCurrentOwner() || !isCurrentNoteNavigation(token)
 								|| $activeNotePath !== path || $activeNote !== content || $editorDirty) return;
 							editor?.loadNote(path, content.content);
-							void appWindow.setTitle(`${content.meta.title} - HelixNotes`);
 						}, 50);
 					}
 				} catch (e) {
@@ -163,30 +186,45 @@
 			}
 			if (!isCurrentOwner()) return;
 
-			const fileListener = await listen<FileEvent>('file-changed', async (event) => {
-				if (!isCurrentOwner() || !isCurrentVaultEvent(event.payload, vault ?? null)) return;
+			async function refreshOpenNote(restored = false) {
 				const path = $activeNotePath;
 				const openingNote = $activeNote;
-				if (!path || event.payload.path !== path || !event.payload.note || $editorDirty) return;
+				if (!path || !openingNote) return;
 				const request = ++fileRefreshRequest;
 				try {
 					const content = await readNote(ownerVault!, path);
-					if (!isCurrentOwner() || request !== fileRefreshRequest
-						|| $activeNotePath !== path || $activeNote !== openingNote || $editorDirty) return;
-					// Compare only this note; never reload an editor that changed during the read.
-					if (content.content.trim() !== (editor?.getCurrentBody() ?? '').trim()) {
-						$activeNote = content;
-						editor?.loadNote(path, content.content);
+					if (!isCurrentOwner() || request !== fileRefreshRequest || $activeNotePath !== path) return;
+					if ($editorDirty) {
+						if (restored && content.raw !== editor?.getAcceptedRaw()) editor?.flagExternalConflict();
+						return;
 					}
-				} catch (e) {
-					console.error('Failed to refresh note window:', e);
+					if ($activeNote !== openingNote || openingNote.raw === content.raw) return;
+					$activeNote = content;
+					editor?.loadNote(path, content.content);
+				} catch (error) {
+					if (restored && isCurrentOwner() && request === fileRefreshRequest && $activeNotePath === path) {
+						if ($editorDirty) editor?.flagExternalConflict();
+						else {
+							$activeNote = null;
+							$activeNotePath = null;
+							loadError = 'This note was removed by the vault restore.';
+						}
+					} else if (!restored) console.error('Failed to refresh note window:', error);
 				}
+			}
+			const fileListener = await listen<FileEvent>('file-changed', (event) => {
+				if (!isCurrentOwner() || !isCurrentVaultEvent(event.payload, vault ?? null)) return;
+				if (event.payload.note?.path === $activeNotePath) void refreshOpenNote();
 			});
 			if (!isCurrentOwner()) {
 				fileListener();
 				return;
 			}
 			unlistenFileChange = fileListener;
+			unlistenVaultRestored = await listen<{ vault_path: string }>('vault-restored', ({ payload }) => {
+				if (isCurrentOwner() && payload.vault_path === vault) void refreshOpenNote(true);
+			});
+			if (!isCurrentOwner()) { unlistenVaultRestored(); return; }
 		}
 
 		void initialize().catch(error => {
@@ -199,6 +237,8 @@
 		if (initialNavigationToken !== null) cancelNoteNavigation(initialNavigationToken);
 		if (initialLoadTimer !== null) clearTimeout(initialLoadTimer);
 		unlistenFileChange?.();
+		unlistenVaultRestored?.();
+		removeMobileFlushListeners?.();
 		unlistenUiScale?.();
 		unlistenClose?.();
 	});

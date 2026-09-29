@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { showSettings, theme, resolvedTheme, appConfig, platformIsMobile, activeVaultConfig, updateAvailable as globalUpdateAvailable, updateObj as globalUpdateObj, installType, settingsTab, vaultReady, androidApkUrl, checkForUpdateMobile, notebookSortMode, isManagedInstall, customThemes } from '$lib/stores/app';
-	import { setTheme, setSystemThemes, setAccentColor, setFontSize, setScrollToChangeFontSize, setFontFamily, setLineHeight, setUiScale, setContentWidth, setGeneralSettings, importObsidian, createBackup, listBackups, restoreBackup, deleteBackup, setBackupSettings, setAiSettings, testAiConnection, setSyncSettings, testSyncConnection, syncNow, getAppConfig, saveCustomTheme, deleteCustomTheme, exportCustomTheme, importCustomThemes, getVaultStats, findOrphanedAttachments, trashOrphanedAttachments } from '$lib/api';
+	import { setTheme, setSystemThemes, setAccentColor, setFontSize, setScrollToChangeFontSize, setFontFamily, setLineHeight, setUiScale, setContentWidth, setGeneralSettings, importObsidian, createBackup, listBackups, restoreBackup, deleteBackup, setBackupSettings, setAiSettings, testAiConnection, setSyncSettings, testSyncConnection, syncNow, saveCustomTheme, deleteCustomTheme, exportCustomTheme, importCustomThemes, getVaultStats, findOrphanedAttachments, trashOrphanedAttachments } from '$lib/api';
 	import { darkThemes, isMobile, isAndroid } from '$lib/platform';
 	import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { listen } from '@tauri-apps/api/event';
@@ -218,68 +218,127 @@
 	let backupLoading = $state(false);
 	let backupMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
 	let restoreConfirm = $state<BackupEntry | null>(null);
+	let backupRequest = 0;
+	let backupReadRequest = 0;
+	let backupUnlisten: (() => void) | null = null;
+	const lastBackupTime = $derived(activeVaultConfig($appConfig)?.last_backup_time ?? null);
+
+	$effect(() => {
+		void maintenanceVault;
+		void $showSettings;
+		backupRequest++;
+		backupReadRequest++;
+		backupUnlisten?.();
+		backupUnlisten = null;
+		backupLoading = false;
+		return () => {
+			backupRequest++;
+			backupReadRequest++;
+			backupUnlisten?.();
+			backupUnlisten = null;
+		};
+	});
 
 	async function loadBackups() {
+		const vault = maintenanceVault;
+		if (!vault) return;
+		const request = ++backupReadRequest;
 		try {
-			backups = await listBackups();
+			const loaded = await listBackups(vault);
+			if (request === backupReadRequest && maintenanceVault === vault && $showSettings) backups = loaded;
 		} catch (e) {
 			console.error('Failed to load backups:', e);
 		}
 	}
 
 	async function handleBackupNow() {
+		const vault = maintenanceVault;
+		if (!vault || backupLoading) return;
+		const request = ++backupRequest;
+		const current = () => request === backupRequest && maintenanceVault === vault && $showSettings;
 		backupLoading = true;
 		backupMessage = null;
-		const unlisten = await listen<{ success: boolean; entry?: BackupEntry; error?: string }>('backup-done', async (event) => {
-			const data = event.payload;
-			if (data.success) {
-				backupMessage = { type: 'success', text: 'Backup created successfully' };
-				await loadBackups();
-				if ($appConfig) {
-					$appConfig = { ...$appConfig, last_backup_time: new Date().toISOString() };
-				}
-			} else {
-				backupMessage = { type: 'error', text: `Backup failed: ${data.error}` };
-			}
-			backupLoading = false;
-			unlisten();
-		});
+		let stop: (() => void) | undefined;
+		let finished = false;
 		try {
-			await createBackup();
+			if (!(await onBeforeVaultSwitch())) throw new Error('Save the current note before creating a backup.');
+			if (!current()) return;
+			stop = await listen<{ vault_path: string; success: boolean; entry?: BackupEntry; error?: string }>('backup-done', (event) => {
+				const data = event.payload;
+				if (data.vault_path !== vault || !current()) return;
+				finished = true;
+				stop?.();
+				backupUnlisten = null;
+				backupLoading = false;
+				if (data.success) {
+					backupMessage = { type: 'success', text: 'Backup created successfully' };
+					const timestamp = data.entry?.created;
+					const currentVault = activeVaultConfig($appConfig);
+					if (timestamp && currentVault && $appConfig) {
+						$appConfig = { ...$appConfig, vaults: $appConfig.vaults.map(item =>
+							item === currentVault ? { ...item, last_backup_time: timestamp } : item) };
+					}
+					void loadBackups();
+				} else {
+					backupMessage = { type: 'error', text: `Backup failed: ${data.error}` };
+				}
+			});
+			if (!current() || finished) { stop(); return; }
+			backupUnlisten = stop;
+			await createBackup(vault);
 		} catch (e) {
-			backupMessage = { type: 'error', text: `Backup failed: ${e}` };
-			backupLoading = false;
-			unlisten();
+			stop?.();
+			if (current()) {
+				backupUnlisten = null;
+				backupMessage = { type: 'error', text: `Backup failed: ${e}` };
+				backupLoading = false;
+			}
 		}
 	}
 
 	async function handleRestore(entry: BackupEntry) {
+		const vault = maintenanceVault;
+		if (!vault || backupLoading) return;
+		const request = ++backupRequest;
+		const current = () => request === backupRequest && maintenanceVault === vault && $showSettings;
 		restoreConfirm = null;
 		backupLoading = true;
 		backupMessage = null;
-		const unlisten = await listen<{ success: boolean; error?: string }>('restore-done', (event) => {
-			const data = event.payload;
-			if (data.success) {
-				backupMessage = { type: 'success', text: 'Backup restored. Restart the app to see changes.' };
-			} else {
-				backupMessage = { type: 'error', text: `Restore failed: ${data.error}` };
-			}
-			backupLoading = false;
-			unlisten();
-		});
+		let stop: (() => void) | undefined;
+		let finished = false;
 		try {
-			await restoreBackup(entry.path);
+			if (!(await onBeforeVaultSwitch())) throw new Error('Save the current note before restoring a backup.');
+			if (!current()) return;
+			stop = await listen<{ vault_path: string; success: boolean; error?: string }>('restore-done', (event) => {
+				const data = event.payload;
+				if (data.vault_path !== vault || !current()) return;
+				finished = true;
+				stop?.();
+				backupUnlisten = null;
+				backupMessage = data.success
+					? { type: 'success', text: 'Backup restored successfully.' }
+					: { type: 'error', text: `Restore failed: ${data.error}` };
+				backupLoading = false;
+			});
+			if (!current() || finished) { stop(); return; }
+			backupUnlisten = stop;
+			await restoreBackup(vault, entry.path);
 		} catch (e) {
-			backupMessage = { type: 'error', text: `Restore failed: ${e}` };
-			backupLoading = false;
-			unlisten();
+			stop?.();
+			if (current()) {
+				backupUnlisten = null;
+				backupMessage = { type: 'error', text: `Restore failed: ${e}` };
+				backupLoading = false;
+			}
 		}
 	}
 
 	async function handleDeleteBackup(entry: BackupEntry) {
+		const vault = maintenanceVault;
+		if (!vault) return;
 		try {
-			await deleteBackup(entry.path);
-			backups = backups.filter(b => b.path !== entry.path);
+			await deleteBackup(vault, entry.path);
+			if (maintenanceVault === vault) backups = backups.filter(b => b.path !== entry.path);
 		} catch (e) {
 			console.error('Failed to delete backup:', e);
 		}
@@ -479,11 +538,15 @@
 	}
 
 	async function handleSyncNow() {
+		const vault = maintenanceVault;
+		if (!vault || syncRunning) return;
 		syncRunning = true;
 		syncMessage = null;
 		const unlisteners: Array<() => void> = [];
 		const cleanup = () => { unlisteners.forEach((u) => u()); };
-		unlisteners.push(await listen<{ success: boolean; summary?: { uploaded?: number; downloaded?: number; deleted_local?: number; deleted_remote?: number; conflicts?: number }; last_sync_time?: string }>('sync-done', async (event) => {
+		unlisteners.push(await listen<{ vault_path: string; success: boolean; summary?: { uploaded?: number; downloaded?: number; deleted_local?: number; deleted_remote?: number; conflicts?: number }; last_sync_time?: string }>('sync-done', (event) => {
+			if (event.payload.vault_path !== vault) return;
+			if (!$showSettings || maintenanceVault !== vault) { cleanup(); return; }
 			const s = event.payload.summary ?? {};
 			const parts: string[] = [];
 			if (s.uploaded) parts.push(`${s.uploaded} uploaded`);
@@ -493,14 +556,17 @@
 			if (s.conflicts) parts.push(`${s.conflicts} conflict copies`);
 			syncMessage = { type: 'success', text: parts.length ? `Synced: ${parts.join(', ')}.` : 'Already up to date.' };
 			syncRunning = false;
-			if (event.payload.last_sync_time) {
-				try {
-					$appConfig = await getAppConfig();
-				} catch {}
+			const timestamp = event.payload.last_sync_time;
+			const currentVault = activeVaultConfig($appConfig);
+			if (timestamp && currentVault && $appConfig) {
+				$appConfig = { ...$appConfig, vaults: $appConfig.vaults.map(item =>
+					item === currentVault ? { ...item, last_sync_time: timestamp } : item) };
 			}
 			cleanup();
 		}));
-		unlisteners.push(await listen<{ error?: string }>('sync-error', (event) => {
+		unlisteners.push(await listen<{ vault_path: string; error?: string }>('sync-error', (event) => {
+			if (event.payload.vault_path !== vault) return;
+			if (!$showSettings || maintenanceVault !== vault) { cleanup(); return; }
 			syncMessage = { type: 'error', text: event.payload.error ?? 'Sync failed' };
 			syncRunning = false;
 			cleanup();
@@ -2125,8 +2191,8 @@
 								</div>
 
 								<p class="backup-last-time">
-									{#if $appConfig?.last_backup_time}
-										Last backup: {formatBackupDate($appConfig.last_backup_time)}
+									{#if lastBackupTime}
+										Last backup: {formatBackupDate(lastBackupTime)}
 									{:else}
 										No backups yet
 									{/if}

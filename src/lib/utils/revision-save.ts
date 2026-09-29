@@ -1,6 +1,7 @@
 interface SaveSession {
   revision: number;
   savedRevision: number;
+  raw: string;
 }
 
 export interface SaveRevision {
@@ -10,14 +11,14 @@ export interface SaveRevision {
 
 /** Serializes immutable save snapshots without letting an old completion mark newer edits clean. */
 export class RevisionSaveQueue {
-  private session: SaveSession = { revision: 0, savedRevision: 0 };
+  private session: SaveSession = { revision: 0, savedRevision: 0, raw: '' };
   private tail: Promise<void> = Promise.resolve();
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private maxWaitTimer: ReturnType<typeof setTimeout> | null = null;
 
-  startSession(): void {
+  startSession(raw = ''): void {
     this.cancelScheduled();
-    this.session = { revision: 0, savedRevision: 0 };
+    this.session = { revision: 0, savedRevision: 0, raw };
   }
 
   markChanged(): void {
@@ -54,15 +55,27 @@ export class RevisionSaveQueue {
     return this.isCurrentSession(snapshot) && snapshot.revision === this.session.revision;
   }
 
+  get raw(): string {
+    return this.session.raw;
+  }
+
+  /** Adopt a native rename's serialized baseline only when it moved our accepted revision. */
+  adoptMovedRaw(oldRaw: string, newRaw: string): boolean {
+    if (this.session.raw !== oldRaw) return false;
+    this.session.raw = newRaw;
+    return true;
+  }
+
   get dirty(): boolean {
     return this.session.revision !== this.session.savedRevision;
   }
 
-  save(snapshot: SaveRevision, persist: () => Promise<void>): Promise<boolean> {
+  save(snapshot: SaveRevision, persist: (expectedRaw: string) => Promise<string | void>): Promise<boolean> {
     const queued = this.tail.then(async () => {
       // An explicit flush may capture the same revision as an already queued autosave.
       if (snapshot.revision > snapshot.session.savedRevision) {
-        await persist();
+        const nextRaw = await persist(snapshot.session.raw);
+        if (typeof nextRaw === 'string') snapshot.session.raw = nextRaw;
         snapshot.session.savedRevision = snapshot.revision;
       }
       return this.isCurrent(snapshot);

@@ -24,6 +24,63 @@ fn history_dir(vault_path: &str, note_id: &str) -> Result<PathBuf, String> {
         .join(safe_path_component(note_id, "note ID")?))
 }
 
+fn snapshot_path(dir: &Path, raw_content: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".helixnotes-history-")
+        .tempfile_in(dir)
+        .map_err(|error| error.to_string())?;
+    temporary
+        .write_all(raw_content.as_bytes())
+        .map_err(|error| error.to_string())?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    let mut instant = Utc::now();
+    loop {
+        // Fractional seconds keep timestamps valid RFC3339 for the UI while
+        // allowing multiple versions within one second.
+        let timestamp = instant.format("%Y-%m-%dT%H-%M-%S%.3f");
+        let path = dir.join(format!("{timestamp}.md"));
+        match temporary.persist_noclobber(&path) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                temporary = error.file;
+                instant += chrono::Duration::milliseconds(1);
+            }
+            Err(error) => return Err(error.error.to_string()),
+        }
+    }
+}
+
+fn version_timestamp(filename: &str) -> String {
+    match (filename.get(..13), filename.get(14..16), filename.get(17..)) {
+        (Some(hour), Some(minute), Some(rest))
+            if filename.as_bytes().get(10) == Some(&b'T')
+                && filename.as_bytes().get(13) == Some(&b'-')
+                && filename.as_bytes().get(16) == Some(&b'-') =>
+        {
+            format!("{hour}:{minute}:{rest}Z")
+        }
+        _ => filename.to_string(),
+    }
+}
+
+fn snapshot_filename(timestamp: &str) -> String {
+    let time = timestamp.strip_suffix('Z').unwrap_or(timestamp);
+    match (time.get(..13), time.get(14..16), time.get(17..)) {
+        (Some(hour), Some(minute), Some(rest))
+            if time.as_bytes().get(10) == Some(&b'T')
+                && time.as_bytes().get(13) == Some(&b':')
+                && time.as_bytes().get(16) == Some(&b':') =>
+        {
+            format!("{hour}-{minute}-{rest}.md")
+        }
+        _ => format!("{timestamp}.md"),
+    }
+}
+
 /// Save a version snapshot if enough time has passed since the last one.
 /// Minimum interval: 5 minutes between snapshots.
 pub fn maybe_snapshot(vault_path: &str, note_id: &str, raw_content: &str, max_versions: u32) {
@@ -32,31 +89,34 @@ pub fn maybe_snapshot(vault_path: &str, note_id: &str, raw_content: &str, max_ve
         return;
     };
 
-    // Check if we should create a snapshot (5 min cooldown)
+    // Old second-resolution and new fractional-second names share the first
+    // 19 ASCII bytes. Ignore arbitrary files (including malformed Unicode).
     if let Ok(entries) = fs::read_dir(&dir) {
-        let mut files: Vec<String> = entries
-            .filter_map(|e| e.ok())
-            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
-            .filter(|n| n.ends_with(".md"))
-            .collect();
-        files.sort();
-
-        if let Some(last) = files.last() {
-            if let Some(ts) = last.strip_suffix(".md") {
-                // Parse timestamp: 2026-02-08T18-30-00.md
-                if let Some(t_pos) = ts.find('T') {
-                    let date_part = &ts[..t_pos];
-                    let time_part = &ts[t_pos + 1..];
-                    let time_colons = time_part.replace('-', ":");
-                    let iso = format!("{}T{}Z", date_part, time_colons);
-                    if let Ok(last_time) = iso.parse::<DateTime<Utc>>() {
-                        let elapsed = Utc::now() - last_time;
-                        if elapsed.num_minutes() < 5 {
-                            return; // Too soon, skip
-                        }
-                    }
+        let latest = entries
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name();
+                let name = name.to_str()?;
+                if !name.ends_with(".md") {
+                    return None;
                 }
-            }
+                let (Some(hour), Some(minute), Some(second)) =
+                    (name.get(..13), name.get(14..16), name.get(17..19))
+                else {
+                    return None;
+                };
+                if name.as_bytes().get(10) != Some(&b'T')
+                    || name.as_bytes().get(13) != Some(&b'-')
+                    || name.as_bytes().get(16) != Some(&b'-')
+                {
+                    return None;
+                }
+                format!("{hour}:{minute}:{second}Z")
+                    .parse::<DateTime<Utc>>()
+                    .ok()
+            })
+            .max();
+        if latest.is_some_and(|last| (Utc::now() - last).num_minutes() < 5) {
+            return;
         }
     }
 
@@ -66,12 +126,8 @@ pub fn maybe_snapshot(vault_path: &str, note_id: &str, raw_content: &str, max_ve
         return;
     }
 
-    let timestamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-    let filename = format!("{}.md", timestamp);
-    let path = dir.join(&filename);
-
-    if let Err(e) = fs::write(&path, raw_content) {
-        eprintln!("Failed to write version snapshot: {}", e);
+    if let Err(error) = snapshot_path(&dir, raw_content) {
+        eprintln!("Failed to write version snapshot: {error}");
         return;
     }
 
@@ -91,11 +147,7 @@ pub fn force_snapshot(
     let dir = history_dir(vault_path, note_id)?;
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
 
-    let timestamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-    let filename = format!("{}.md", timestamp);
-    let path = dir.join(&filename);
-
-    fs::write(&path, raw_content).map_err(|error| error.to_string())?;
+    snapshot_path(&dir, raw_content)?;
 
     if max_versions > 0 {
         prune_versions(&dir, max_versions)?;
@@ -123,16 +175,7 @@ pub fn list_versions(vault_path: &str, note_id: &str) -> Result<Vec<VersionEntry
                 .to_string();
             let meta = fs::metadata(&path).map_err(|e| e.to_string())?;
 
-            // Parse timestamp from filename
-            let timestamp = if let Some(t_pos) = filename.find('T') {
-                let date_part = &filename[..t_pos];
-                let time_part = &filename[t_pos + 1..];
-                let time_colons = time_part.replace('-', ":");
-                format!("{}T{}Z", date_part, time_colons)
-            } else {
-                filename.clone()
-            };
-
+            let timestamp = version_timestamp(&filename);
             entries.push(VersionEntry {
                 timestamp,
                 size: meta.len(),
@@ -148,15 +191,8 @@ pub fn list_versions(vault_path: &str, note_id: &str) -> Result<Vec<VersionEntry
 /// Get the raw content of a specific version.
 pub fn get_version(vault_path: &str, note_id: &str, timestamp: &str) -> Result<String, String> {
     safe_path_component(timestamp, "version timestamp")?;
-    // Convert ISO timestamp back to filename: 2026-02-08T18:30:00Z → 2026-02-08T18-30-00.md
-    let filename = if let Some(t_pos) = timestamp.find('T') {
-        let date_part = &timestamp[..t_pos];
-        let time_part = timestamp[t_pos + 1..].trim_end_matches('Z');
-        let time_dashes = time_part.replace(':', "-");
-        format!("{date_part}T{time_dashes}.md")
-    } else {
-        format!("{}.md", timestamp)
-    };
+    // Accept both legacy second-resolution names and unique suffixes.
+    let filename = snapshot_filename(timestamp);
 
     let path = history_dir(vault_path, note_id)?.join(&filename);
     fs::read_to_string(&path).map_err(|e| format!("Version not found: {}", e))
@@ -205,5 +241,52 @@ mod tests {
         assert!(get_version(&vault.to_string_lossy(), "safe", "../../secret").is_err());
 
         fs::remove_dir_all(vault).unwrap();
+    }
+    #[test]
+    fn rapid_forced_versions_are_individually_retrievable_and_prunable() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().to_str().unwrap();
+        for index in 0..200 {
+            super::force_snapshot(root, "note", &format!("snapshot {index}"), 0).unwrap();
+        }
+        let versions = list_versions(root, "note").unwrap();
+        assert_eq!(versions.len(), 200);
+        let contents: std::collections::HashSet<_> = versions
+            .iter()
+            .map(|version| get_version(root, "note", &version.timestamp).unwrap())
+            .collect();
+        assert_eq!(contents.len(), 200);
+        assert!(contents.contains("snapshot 0"));
+        assert!(contents.contains("snapshot 199"));
+
+        super::force_snapshot(root, "note", "latest", 10).unwrap();
+        let retained = list_versions(root, "note").unwrap();
+        assert_eq!(retained.len(), 10);
+        assert_eq!(
+            get_version(root, "note", &retained[0].timestamp).unwrap(),
+            "latest"
+        );
+    }
+
+    #[test]
+    fn legacy_versions_remain_readable_and_recent_unique_versions_observe_cooldown() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().to_str().unwrap();
+        let history = vault.path().join(".helixnotes/history/note");
+        fs::create_dir_all(&history).unwrap();
+        fs::write(history.join("2026-01-01T00-00-00.md"), "legacy").unwrap();
+        fs::write(history.join("2026-01-01T1é-00-00.md"), "unusual filename").unwrap();
+        super::force_snapshot(root, "note", "new", 0).unwrap();
+        super::maybe_snapshot(root, "note", "too soon", 0);
+        let versions = list_versions(root, "note").unwrap();
+        assert_eq!(versions.len(), 3);
+        assert_eq!(
+            get_version(root, "note", "2026-01-01T00:00:00Z").unwrap(),
+            "legacy"
+        );
+        assert_eq!(
+            get_version(root, "note", &versions[0].timestamp).unwrap(),
+            "new"
+        );
     }
 }

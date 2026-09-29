@@ -133,6 +133,7 @@ pub fn start_watcher(app: AppHandle, vault_path: String) -> Result<VaultWatcher,
     std::thread::spawn(move || {
         let vault_root = Path::new(&vault_path);
         let mut changes = HashMap::new();
+        let mut search = None;
         loop {
             let first = if changes.is_empty() {
                 match rx.recv() {
@@ -162,27 +163,30 @@ pub fn start_watcher(app: AppHandle, vault_path: String) -> Result<VaultWatcher,
                 next = rx.recv_timeout(remaining).ok();
             }
             let state = app.state::<AppState>();
+            // Native note mutations hold note_save through their path event.
+            // Read and emit only after they finish, so the watcher cannot
+            // publish an intermediate rename or stale note contents.
+            let _save_guard = state.note_save.blocking_lock();
             // Keep the batch while muted, rather than losing concurrent external
             // edits. Nothing is indexed or emitted until local imports finish.
             if state.importing.load(std::sync::atomic::Ordering::Relaxed) {
                 continue;
             }
-            let search = {
-                // Match the runtime commit's lock order so an old watcher cannot
-                // send its final batch into the newly selected vault's index.
-                let Ok(search) = state.search_index.lock() else {
-                    continue;
-                };
-                let active = state
-                    .config
-                    .lock()
-                    .ok()
-                    .is_some_and(|config| config.active_vault.as_deref() == Some(&vault_path));
-                if !active {
-                    continue;
+            // Each watcher belongs to its own vault. A detached note window may
+            // still need changes from a vault that is no longer active; never
+            // index those changes into the main window's active search index.
+            if state.validate_vault(&vault_path).is_err() {
+                continue;
+            }
+            if search.is_none() {
+                match state.vault_snapshot(&vault_path) {
+                    Ok(index) => search = index,
+                    Err(error) => {
+                        log::error!("Could not open search index for watched vault: {error}");
+                        continue;
+                    }
                 }
-                search.clone()
-            };
+            }
             let mut refresh_vault = false;
             for (path, event_type) in changes.drain() {
                 if path.extension().and_then(|extension| extension.to_str()) == Some("md")

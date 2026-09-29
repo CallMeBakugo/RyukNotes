@@ -146,9 +146,9 @@ pub fn run() {
                                 asset_scope::allow_external_note_assets(app.handle(), &resolved);
                         }
                         let app_state = app.state::<AppState>();
-                        let _ = app_state.pending_open_file.lock().map(|mut p| {
-                            *p = Some(resolved_str.to_string());
-                        });
+                        if let Err(error) = app_state.enqueue_open_file(resolved_str.to_string()) {
+                            log::error!("Could not queue startup file: {error}");
+                        }
                     }
                 }
             }
@@ -253,6 +253,9 @@ pub fn run() {
             commands::get_install_type,
             commands::is_mobile_platform,
             commands::get_pending_open_file,
+            commands::ack_pending_open_file,
+            #[cfg(desktop)]
+            commands::cancel_window_close,
         ])
         .register_asynchronous_uri_scheme_protocol("imgproxy", |_ctx, request, responder| {
             let path = request.uri().path().to_string();
@@ -307,7 +310,14 @@ pub fn run() {
                         }
                         let _ = asset_scope::allow_external_note_assets(app, &resolved);
                     }
-                    let _ = app.emit("open-file", resolved_str.to_string());
+                    if let Err(error) = app
+                        .state::<AppState>()
+                        .enqueue_open_file(resolved_str.to_string())
+                    {
+                        log::error!("Could not queue open file: {error}");
+                    } else {
+                        let _ = app.emit("open-file-pending", ());
+                    }
                 }
             }
         }));

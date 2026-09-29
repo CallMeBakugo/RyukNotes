@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import { open } from '@tauri-apps/plugin-dialog';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { documentDir } from '@tauri-apps/api/path';
@@ -30,14 +30,11 @@
 
 	let recentVaults: VaultConfig[] = $derived($appConfig?.vaults ?? []);
 	let loading = $state(false);
-	let error = $state('');
+	let error = $state(untrack(() => initialError));
 	let vaultName = $state('HelixNotes');
 	let hasPermission = $state(!isAndroid);
 	let selectedLocation = $state('Documents');
 
-	$effect(() => {
-		if (initialError && !error) error = initialError;
-	});
 	let customPath = $state('');
 	let iosBasePath = $state('');
 
@@ -286,7 +283,7 @@
 			</button>
 		{/if}
 
-		{#if $appConfig?.active_vault}
+		{#if $appConfig?.active_vault && !initialError}
 			<button class="btn-back" onclick={() => ($vaultReady = true)}>
 				Back
 			</button>

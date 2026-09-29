@@ -52,11 +52,13 @@
 	import TagLabel from './TagLabel.svelte';
 	import { isMobile, isAndroid } from '$lib/platform';
 
-	let { onNoteSelected = (_path: string, _content: string, _task?: TaskItem) => {}, onNoteMoved = () => {}, onBeforeNoteSwitch = async () => true, onBeforeNoteDuplicate = async () => true, onUpdateActiveNote, onTagsChanged, onRefreshTags, onNoteCreated = () => {}, onToggleTask = async (_t: TaskItem) => {}, onSetTaskPriority = async (_t: TaskItem, _p: string | null) => {}, onSetTaskDue = async (_t: TaskItem, _d: string | null) => {} }: {
+	let { onNoteSelected = (_path: string, _content: string, _task?: TaskItem) => {}, onNoteMoved = () => {}, onBeforeNoteSwitch = async () => true, onBeforeNoteDuplicate = async () => true, onBeforePathMutation = async () => null, onPathsMoved = async (_old: string, _next: string) => {}, onUpdateActiveNote, onTagsChanged, onRefreshTags, onNoteCreated = () => {}, onToggleTask = async (_t: TaskItem) => {}, onSetTaskPriority = async (_t: TaskItem, _p: string | null) => {}, onSetTaskDue = async (_t: TaskItem, _d: string | null) => {} }: {
 		onNoteSelected?: (path: string, content: string, task?: TaskItem) => void;
 		onNoteMoved?: () => void;
 		onBeforeNoteSwitch?: () => Promise<boolean>;
 		onBeforeNoteDuplicate?: () => Promise<boolean>;
+		onBeforePathMutation?: () => Promise<(() => void) | null>;
+		onPathsMoved?: (oldPath: string, newPath: string) => Promise<void>;
 		onUpdateActiveNote: (patch: Pick<NoteMeta, 'pinned' | 'tags'>) => Promise<boolean>;
 		onTagsChanged: (path: string, nextTags: string[]) => void;
 		onRefreshTags: () => void;
@@ -680,8 +682,9 @@
 			editingNote = null;
 			return;
 		}
+		const release = $activeNotePath === note.path ? await onBeforePathMutation() : () => {};
+		if (!release) return;
 		try {
-			if ($activeNotePath === note.path && !(await onBeforeNoteSwitch())) return;
 			if (!ownerIsCurrent()) return;
 			const newTitle = editValue.trim();
 			const newPath = await renameNote(ownerVault!, note.path, newTitle);
@@ -689,22 +692,16 @@
 			renameManualNoteOrderPath(note.path, newPath);
 			noteCache.clear();
 			editingNote = null;
-			// Update local store immediately (avoid full vault re-scan)
 			$notes = $notes.map(n =>
 				n.path === note.path
 					? { ...n, path: newPath, relative_path: n.relative_path.replace(/[^/]+$/, newTitle + '.md'), meta: { ...n.meta, title: newTitle } }
 					: n
 			);
-			if ($activeNotePath === note.path) {
-				$activeNotePath = newPath;
-				const previous = $activeNote;
-				const content = await readNote(ownerVault!, newPath);
-				if (ownerIsCurrent() && $activeNotePath === newPath && $activeNote === previous && !$editorDirty) {
-					$activeNote = content;
-				}
-			}
+			await onPathsMoved(note.path, newPath);
 		} catch (e) {
 			console.error('Failed to rename:', e);
+		} finally {
+			release();
 		}
 	}
 
@@ -798,7 +795,7 @@
 				throw new Error('Note still has unsaved changes');
 			}
 		} else {
-			await saveNote(ownerVault!, path, meta, current.content);
+			await saveNote(ownerVault!, path, meta, current.content, current.raw);
 		}
 		if (!ownerIsCurrent()) return;
 		if (current.meta.tags.length !== meta.tags.length || current.meta.tags.some((tag) => !meta.tags.includes(tag))) {
@@ -987,26 +984,21 @@
 	async function handleMoveNote(note: NoteEntry, destPath: string) {
 		contextMenu = null;
 		movePickerNote = null;
+		const release = $activeNotePath === note.path ? await onBeforePathMutation() : () => {};
+		if (!release) return;
 		try {
-			if ($activeNotePath === note.path && !(await onBeforeNoteSwitch())) return;
 			if (!ownerIsCurrent()) return;
 			const newPath = await moveNote(ownerVault!, note.path, destPath);
 			if (!ownerIsCurrent()) return;
 			renameManualNoteOrderPath(note.path, newPath);
 			noteCache.clear();
 			$notes = $notes.filter(n => n.path !== note.path);
-			if ($activeNotePath === note.path) {
-				$activeNotePath = newPath;
-				const previous = $activeNote;
-				const content = await readNote(ownerVault!, newPath);
-				if (ownerIsCurrent() && $activeNotePath === newPath && $activeNote === previous && !$editorDirty) {
-					$activeNote = content;
-				}
-			}
-			if (!ownerIsCurrent()) return;
-			onNoteMoved();
+			await onPathsMoved(note.path, newPath);
+			if (ownerIsCurrent()) onNoteMoved();
 		} catch (e) {
 			console.error('Failed to move note:', e);
+		} finally {
+			release();
 		}
 	}
 
@@ -1129,18 +1121,27 @@
 
 	async function handleBatchMove(destPath: string) {
 		const toMove = new Set(selectedPaths);
-		if ($activeNotePath && toMove.has($activeNotePath) && !(await onBeforeNoteSwitch())) return;
-		if (!ownerIsCurrent()) return;
-		noteCache.clear();
-		$notes = $notes.filter(n => !toMove.has(n.path));
-		if ($activeNotePath && toMove.has($activeNotePath)) {
-			$activeNote = null;
-			$activeNotePath = null;
+		const release = $activeNotePath && toMove.has($activeNotePath) ? await onBeforePathMutation() : () => {};
+		if (!release) return;
+		try {
+			if (!ownerIsCurrent()) return;
+			for (const path of toMove) {
+				try {
+					const newPath = await moveNote(ownerVault!, path, destPath);
+					if (!ownerIsCurrent()) return;
+					renameManualNoteOrderPath(path, newPath);
+					await onPathsMoved(path, newPath);
+					$notes = $notes.filter(note => note.path !== path);
+				} catch (error) {
+					console.error('Failed to move:', path, error);
+				}
+			}
+			noteCache.clear();
+			clearSelection();
+			if (ownerIsCurrent()) onNoteMoved();
+		} finally {
+			release();
 		}
-		clearSelection();
-		await Promise.all([...toMove].map(p => moveNote(ownerVault!, p, destPath).catch(e => console.error('Failed to move:', p, e))));
-		if (!ownerIsCurrent()) return;
-		onNoteMoved();
 	}
 
 	async function handleBatchRestore() {

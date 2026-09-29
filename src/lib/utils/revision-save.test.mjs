@@ -97,6 +97,73 @@ test('returning to the same note starts a new session that an older completion c
   assert.equal(saves.dirty, false);
 });
 
+test('queued saves advance the exact accepted raw baseline even when newer typing remains dirty', async () => {
+  const saves = new RevisionSaveQueue();
+  const firstWrite = deferred();
+  const started = deferred();
+  let disk = '---\nmodified: old\n---\noriginal';
+  saves.startSession(disk);
+  saves.markChanged();
+  const first = saves.save(saves.capture(), async (expectedRaw) => {
+    assert.equal(expectedRaw, disk);
+    started.resolve();
+    await firstWrite.promise;
+    disk = '---\nmodified: first\n---\nfirst edit';
+    return disk;
+  });
+  await started.promise;
+  saves.markChanged();
+  firstWrite.resolve();
+  assert.equal(await first, false);
+  assert.equal(saves.dirty, true);
+  assert.equal(saves.raw, disk, 'a successful older save advances the active session baseline');
+  const second = saves.save(saves.capture(), async (expectedRaw) => {
+    assert.equal(expectedRaw, disk, 'later queued saves compare against the preceding accepted raw');
+    disk = '---\nmodified: second\n---\nsecond edit';
+    return disk;
+  });
+  assert.equal(await second, true);
+  assert.equal(saves.raw, disk);
+  assert.equal(saves.dirty, false);
+});
+
+test('external disk changes reject an edit without losing its baseline or silently replacing disk', async () => {
+  const saves = new RevisionSaveQueue();
+  saves.startSession('original');
+  saves.markChanged();
+  let disk = 'external';
+  const snapshot = saves.capture();
+  const write = async (expectedRaw) => {
+    if (expectedRaw !== disk) throw new Error('Save conflict: changed outside the app');
+    disk = 'draft';
+    return disk;
+  };
+  await assert.rejects(saves.save(snapshot, write), /Save conflict/);
+  assert.equal(disk, 'external');
+  assert.equal(saves.raw, 'original');
+  assert.equal(saves.dirty, true);
+  await assert.rejects(saves.save(snapshot, write), /Save conflict/);
+  assert.equal(disk, 'external');
+});
+
+test('native rename advances a dirty draft baseline only for its accepted raw', async () => {
+  const saves = new RevisionSaveQueue();
+  saves.startSession('before rename');
+  saves.markChanged();
+  assert.equal(saves.adoptMovedRaw('stale unrelated revision', 'renamed'), false);
+  assert.equal(saves.raw, 'before rename');
+  assert.equal(saves.adoptMovedRaw('before rename', 'renamed'), true);
+  assert.equal(saves.dirty, true, 'native path migration does not claim the draft was saved');
+  let disk = 'renamed';
+  assert.equal(await saves.save(saves.capture(), async (expectedRaw) => {
+    assert.equal(expectedRaw, disk);
+    disk = 'renamed with draft';
+    return disk;
+  }), true);
+  assert.equal(saves.raw, disk);
+  assert.equal(saves.dirty, false);
+});
+
 test('overlapping manual saves and a clean save do not rewrite the same revision', async () => {
   const saves = new RevisionSaveQueue();
   let writes = 0;

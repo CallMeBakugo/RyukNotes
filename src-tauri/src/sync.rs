@@ -43,29 +43,49 @@ pub struct SyncSummary {
 
 #[derive(Default, Serialize, Deserialize)]
 struct SyncManifest {
+    #[serde(default)]
+    identity: String,
     files: HashMap<String, ManifestEntry>, // relpath (forward-slash) -> entry
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 struct ManifestEntry {
     local_hash: String,  // sha256 of local content at last sync
-    remote_etag: String, // remote etag at last sync
+    remote_etag: String, // strong remote etag at last sync, or empty
+    #[serde(default)]
+    remote_hash: String, // sha256 of remote content when no strong etag is available
 }
 
 fn manifest_path(vault: &str) -> PathBuf {
     helixnotes_dir(vault).join("sync_state.json")
 }
 
-fn load_manifest(vault: &str) -> SyncManifest {
-    fs::read_to_string(manifest_path(vault))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+fn load_manifest(vault: &str) -> Result<SyncManifest, String> {
+    match fs::read(manifest_path(vault)) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| format!("Invalid sync manifest; sync stopped to protect your notes: {e}")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(SyncManifest::default()),
+        Err(error) => Err(format!("Cannot read sync manifest: {error}")),
+    }
 }
 
-fn save_manifest(vault: &str, m: &SyncManifest) {
-    if let Ok(s) = serde_json::to_string(m) {
-        let _ = fs::write(manifest_path(vault), s);
+fn save_manifest(vault: &str, m: &SyncManifest) -> Result<(), String> {
+    let bytes = serde_json::to_vec(m).map_err(|e| e.to_string())?;
+    let target = manifest_path(vault);
+    fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
+    crate::vault::operations::replace_file_atomically(&target, &bytes)
+}
+
+fn baseline_for_endpoint(manifest: SyncManifest, identity: &str) -> SyncManifest {
+    if manifest.identity == identity {
+        manifest
+    } else {
+        // Legacy manifests without an identity are also untrusted: they may
+        // belong to another server. Reconcile as two independent snapshots.
+        SyncManifest {
+            identity: identity.to_string(),
+            files: HashMap::new(),
+        }
     }
 }
 
@@ -92,11 +112,13 @@ fn sha256_reader(
     }
 }
 
-fn normalize_etag(s: &str) -> String {
-    s.trim()
-        .trim_start_matches("W/")
-        .trim_matches('"')
-        .to_string()
+fn strong_etag(s: &str) -> String {
+    let s = s.trim();
+    if s.starts_with("W/") || s.len() < 2 || !s.starts_with('"') || !s.ends_with('"') {
+        String::new()
+    } else {
+        s.to_string()
+    }
 }
 
 /// Percent-encode each path segment, keeping the `/` separators.
@@ -202,23 +224,38 @@ fn scan_local(vault: &str) -> Result<HashMap<String, LocalFile>, String> {
     let vault_path = Path::new(vault);
     let mut map = HashMap::new();
     let mut buffer = [0; HASH_BUFFER_SIZE];
-    for entry in WalkDir::new(vault_path).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(vault_path) {
+        let entry = entry.map_err(|e| format!("Cannot scan local vault: {e}"))?;
         let p = entry.path();
-        if !p.is_file() {
+        // WalkDir deliberately does not follow links. A note replaced by a
+        // link (or a linked directory of notes) must not look like a deletion
+        // and authorize a remote DELETE. Do not traverse outside the vault.
+        if entry.file_type().is_symlink() {
+            return Err(format!(
+                "Cannot sync vault containing symbolic link {}",
+                p.display()
+            ));
+        }
+        if entry.file_type().is_dir() {
             continue;
         }
-        let rel = match p.strip_prefix(vault_path) {
-            Ok(r) => r.to_string_lossy().replace('\\', "/"),
-            Err(_) => continue,
-        };
+        if !entry.file_type().is_file() {
+            return Err(format!(
+                "Cannot sync unsupported filesystem entry {}",
+                p.display()
+            ));
+        }
+        let rel = p
+            .strip_prefix(vault_path)
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .replace('\\', "/");
         if !is_synced_relpath(&rel) {
             continue;
         }
-        let hash =
-            match fs::File::open(p).and_then(|mut file| sha256_reader(&mut file, &mut buffer)) {
-                Ok(hash) => hash,
-                Err(_) => continue,
-            };
+        let hash = fs::File::open(p)
+            .and_then(|mut file| sha256_reader(&mut file, &mut buffer))
+            .map_err(|e| format!("Cannot read local file {}: {e}", p.display()))?;
         map.insert(
             rel,
             LocalFile {
@@ -248,23 +285,36 @@ struct WebdavClient {
 
 impl WebdavClient {
     fn new(cfg: WebdavConfig) -> Result<Self, String> {
-        let base = cfg.url.trim().trim_end_matches('/').to_string();
-        if !base.starts_with("http://") && !base.starts_with("https://") {
+        let mut url =
+            reqwest::Url::parse(cfg.url.trim()).map_err(|e| format!("Invalid WebDAV URL: {e}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
             return Err("WebDAV URL must start with http:// or https://".to_string());
         }
-        let base_url = reqwest::Url::parse(&base).map_err(|e| format!("Invalid URL: {e}"))?;
-        let base_path = base_url.path().trim_end_matches('/').to_string();
+        if url.query().is_some()
+            || url.fragment().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err("WebDAV URL must not contain credentials, query, or fragment".to_string());
+        }
+        let path = url.path().trim_end_matches('/').to_string();
+        url.set_path(if path.is_empty() { "/" } else { &path });
+        let base = url.to_string().trim_end_matches('/').to_string();
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .map_err(|e| e.to_string())?;
         Ok(Self {
             base,
-            base_path,
+            base_path: url.path().trim_end_matches('/').to_string(),
             client,
             user: cfg.username,
             pass: cfg.password,
         })
+    }
+
+    fn identity(&self) -> String {
+        sha256_hex(format!("{}\n{}", self.base, self.user).as_bytes())
     }
 
     fn url_for(&self, relpath: &str) -> String {
@@ -327,57 +377,102 @@ impl WebdavClient {
         Ok(files)
     }
 
-    fn get(&self, relpath: &str) -> Result<Vec<u8>, String> {
-        let resp = self
+    fn get(&self, relpath: &str, expected_etag: &str) -> Result<Vec<u8>, String> {
+        let mut request = self
             .client
             .get(self.url_for(relpath))
-            .basic_auth(&self.user, Some(&self.pass))
-            .send()
-            .map_err(|e| e.to_string())?;
+            .basic_auth(&self.user, Some(&self.pass));
+        if !expected_etag.is_empty() {
+            request = request.header("If-Match", expected_etag);
+        }
+        let resp = request.send().map_err(|e| e.to_string())?;
+        if resp.status().as_u16() == 412 {
+            return Err(format!(
+                "Remote file {relpath} changed during sync; retry sync"
+            ));
+        }
         if !resp.status().is_success() {
             return Err(format!(
-                "GET {} failed: HTTP {}",
-                relpath,
+                "GET {relpath} failed: HTTP {}",
                 resp.status().as_u16()
             ));
         }
-        Ok(resp.bytes().map_err(|e| e.to_string())?.to_vec())
-    }
-
-    fn put(&self, relpath: &str, bytes: &[u8]) -> Result<Option<String>, String> {
-        let resp = self
-            .client
-            .put(self.url_for(relpath))
-            .basic_auth(&self.user, Some(&self.pass))
-            .body(bytes.to_vec())
-            .send()
-            .map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            return Err(format!(
-                "PUT {} failed: HTTP {}",
-                relpath,
-                resp.status().as_u16()
-            ));
-        }
-        Ok(resp
+        let response_etag = resp
             .headers()
             .get("etag")
             .and_then(|h| h.to_str().ok())
-            .map(normalize_etag))
+            .map(strong_etag)
+            .unwrap_or_default();
+        if !expected_etag.is_empty() && !response_etag.is_empty() && response_etag != expected_etag
+        {
+            return Err(format!(
+                "Remote file {relpath} changed during sync; retry sync"
+            ));
+        }
+        let bytes = resp.bytes().map_err(|e| e.to_string())?.to_vec();
+        if !expected_etag.is_empty() && self.etag_for(relpath)? != expected_etag {
+            return Err(format!(
+                "Remote file {relpath} changed during sync; retry sync"
+            ));
+        }
+        Ok(bytes)
     }
 
-    fn delete(&self, relpath: &str) -> Result<(), String> {
+    fn put(&self, relpath: &str, bytes: &[u8], prior_etag: Option<&str>) -> Result<(), String> {
+        let mut request = self
+            .client
+            .put(self.url_for(relpath))
+            .basic_auth(&self.user, Some(&self.pass))
+            .body(bytes.to_vec());
+        request = match prior_etag {
+            Some(etag) if !etag.is_empty() => request.header("If-Match", etag),
+            Some(_) => {
+                return Err(format!(
+                    "Cannot safely overwrite {relpath}: server provides no strong ETag"
+                ))
+            }
+            None => request.header("If-None-Match", "*"),
+        };
+        let resp = request.send().map_err(|e| e.to_string())?;
+        if resp.status().as_u16() == 412 {
+            return Err(format!(
+                "Remote file {relpath} changed during sync; retry sync"
+            ));
+        }
+        if !resp.status().is_success() {
+            return Err(format!(
+                "PUT {relpath} failed: HTTP {}",
+                resp.status().as_u16()
+            ));
+        }
+        Ok(())
+    }
+
+    fn delete(&self, relpath: &str, etag: &str) -> Result<(), String> {
+        if etag.is_empty() {
+            return Err(format!(
+                "Cannot safely delete {relpath}: server provides no strong ETag"
+            ));
+        }
         let resp = self
             .client
             .delete(self.url_for(relpath))
             .basic_auth(&self.user, Some(&self.pass))
+            .header("If-Match", etag)
             .send()
             .map_err(|e| e.to_string())?;
-        let s = resp.status();
-        if s.is_success() || s.as_u16() == 404 {
+        if resp.status().as_u16() == 412 || resp.status().as_u16() == 404 {
+            return Err(format!(
+                "Remote file {relpath} changed during sync; retry sync"
+            ));
+        }
+        if resp.status().is_success() {
             Ok(())
         } else {
-            Err(format!("DELETE {} failed: HTTP {}", relpath, s.as_u16()))
+            Err(format!(
+                "DELETE {relpath} failed: HTTP {}",
+                resp.status().as_u16()
+            ))
         }
     }
 
@@ -390,16 +485,13 @@ impl WebdavClient {
             .send()
             .map_err(|e| e.to_string())?;
         let s = resp.status().as_u16();
-        // 201 created; 405 already exists; 301 redirect-to-existing;
-        // 403 some servers (openmediavault et al.) return 403 instead of 405.
         if resp.status().is_success() || s == 405 || s == 301 || s == 403 {
             Ok(())
         } else {
-            Err(format!("MKCOL {} failed: HTTP {}", relpath, s))
+            Err(format!("MKCOL {relpath} failed: HTTP {s}"))
         }
     }
 
-    /// Ensure every ancestor collection of `relpath` exists on the remote.
     fn ensure_dirs(&self, relpath: &str, created: &mut HashSet<String>) -> Result<(), String> {
         let parts: Vec<&str> = relpath.split('/').collect();
         if parts.len() <= 1 {
@@ -418,29 +510,30 @@ impl WebdavClient {
         Ok(())
     }
 
-    /// Read a file's authoritative remote etag via a Depth-0 PROPFIND. The PUT-response
-    /// etag is unreliable across WebDAV servers (some omit it, some differ in format from
-    /// the getetag PROPFIND returns), so we always source the manifest etag from PROPFIND
-    /// to keep it consistent with future listings. (issue #147)
-    fn etag_for(&self, relpath: &str) -> String {
-        self.propfind(relpath, "0")
-            .ok()
-            .and_then(|es| es.into_iter().find(|e| !e.is_dir).map(|e| e.etag))
-            .unwrap_or_default()
+    fn etag_for(&self, relpath: &str) -> Result<String, String> {
+        self.propfind(relpath, "0")?
+            .into_iter()
+            .find(|e| e.relpath == relpath && !e.is_dir)
+            .map(|e| e.etag)
+            .ok_or_else(|| format!("Remote file {relpath} disappeared during sync; retry sync"))
     }
 
-    /// PUT a file (creating parent collections first), then read back its authoritative
-    /// etag via PROPFIND. Returns the PROPFIND etag (empty if the server exposes no
-    /// getetag), NOT the PUT-response etag, which is unreliable across servers. (issue #147)
     fn upload(
         &self,
         relpath: &str,
         bytes: &[u8],
+        prior_etag: Option<&str>,
         created: &mut HashSet<String>,
     ) -> Result<String, String> {
         self.ensure_dirs(relpath, created)?;
-        self.put(relpath, bytes)?; // PUT-response etag intentionally discarded
-        Ok(self.etag_for(relpath))
+        self.put(relpath, bytes, prior_etag)?;
+        let etag = self.etag_for(relpath)?;
+        if self.get(relpath, &etag)?.as_slice() != bytes {
+            return Err(format!(
+                "Remote file {relpath} changed after upload; retry sync"
+            ));
+        }
+        Ok(etag)
     }
 }
 
@@ -552,7 +645,7 @@ fn parse_multistatus(xml: &str, base_path: &str) -> Result<Vec<RemoteEntry>, Str
                         if let Some(rel) = href_to_relpath(&h, base_path)? {
                             entries.push(RemoteEntry {
                                 relpath: rel,
-                                etag: etag.take().map(|s| normalize_etag(&s)).unwrap_or_default(),
+                                etag: etag.take().map(|s| strong_etag(&s)).unwrap_or_default(),
                                 is_dir,
                             });
                         }
@@ -570,6 +663,26 @@ fn parse_multistatus(xml: &str, base_path: &str) -> Result<Vec<RemoteEntry>, Str
 
 // ───────────────────────── sync engine ─────────────────────────
 
+fn read_scanned_local(file: &LocalFile) -> Result<Vec<u8>, String> {
+    let bytes =
+        fs::read(&file.path).map_err(|e| format!("Cannot read {}: {e}", file.path.display()))?;
+    if sha256_hex(&bytes) != file.hash {
+        return Err(format!(
+            "Sync stopped because {} changed locally during sync",
+            file.path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
+fn manifest_entry(hash: String, etag: &str) -> ManifestEntry {
+    ManifestEntry {
+        remote_hash: hash.clone(),
+        local_hash: hash,
+        remote_etag: etag.to_string(),
+    }
+}
+
 fn apply_changes(
     client: &WebdavClient,
     vault: &str,
@@ -580,11 +693,13 @@ fn apply_changes(
     write_guard: &tokio::sync::Mutex<()>,
 ) -> Result<(SyncManifest, SyncSummary), String> {
     let vault_path = Path::new(vault);
-    let mut new_m = SyncManifest::default();
+    let mut new_m = SyncManifest {
+        identity: client.identity(),
+        files: HashMap::new(),
+    };
     let mut sum = SyncSummary::default();
     let mut created: HashSet<String> = HashSet::new();
     let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S").to_string();
-
     let mut keys: HashSet<&String> = HashSet::new();
     keys.extend(local.keys());
     keys.extend(remote.keys());
@@ -594,179 +709,135 @@ fn apply_changes(
         let l = local.get(key);
         let r = remote.get(key);
         let m = manifest.files.get(key);
-
         match (l, r) {
-            (Some(lf), Some(re)) => {
-                let local_changed = match m {
-                    Some(entry) => entry.local_hash != lf.hash,
-                    None => true,
-                };
-                let remote_changed = match m {
-                    Some(entry) => &entry.remote_etag != re,
-                    None => true,
-                };
+            (Some(lf), Some(etag)) => {
+                // On ETag-less servers, a listing cannot tell us if content changed.
+                // Read every time and compare to the last accepted remote content hash.
+                let remote_bytes =
+                    if etag.is_empty() || m.is_none_or(|old| old.remote_etag != *etag) {
+                        Some(client.get(key, etag)?)
+                    } else {
+                        None
+                    };
+                let remote_hash = remote_bytes.as_ref().map(|bytes| sha256_hex(bytes));
+                let remote_changed = m.is_none_or(|old| {
+                    old.remote_etag != *etag
+                        || (etag.is_empty()
+                            && (old.remote_hash.is_empty()
+                                || remote_hash.as_deref() != Some(old.remote_hash.as_str())))
+                });
+                let local_changed = m.is_none_or(|old| old.local_hash != lf.hash);
                 if !local_changed && !remote_changed {
                     new_m.files.insert(
                         key.clone(),
                         ManifestEntry {
                             local_hash: lf.hash.clone(),
-                            remote_etag: re.clone(),
+                            remote_etag: etag.clone(),
+                            remote_hash: m.unwrap().remote_hash.clone(),
                         },
                     );
                 } else if local_changed && !remote_changed {
-                    let bytes = fs::read(&lf.path).map_err(|e| e.to_string())?;
-                    let etag = client.upload(key, &bytes, &mut created)?;
-                    new_m.files.insert(
-                        key.clone(),
-                        ManifestEntry {
-                            local_hash: lf.hash.clone(),
-                            remote_etag: etag,
-                        },
-                    );
+                    let bytes = read_scanned_local(lf)?;
+                    let new_etag = client.upload(key, &bytes, Some(etag), &mut created)?;
+                    new_m
+                        .files
+                        .insert(key.clone(), manifest_entry(lf.hash.clone(), &new_etag));
                     sum.uploaded += 1;
-                } else if !local_changed && remote_changed {
-                    let bytes = client.get(key)?;
-                    write_local_if_unchanged(
-                        write_guard,
-                        vault_path,
-                        key,
-                        &bytes,
-                        Some(&lf.hash),
-                        changes,
-                    )?;
-                    new_m.files.insert(
-                        key.clone(),
-                        ManifestEntry {
-                            local_hash: sha256_hex(&bytes),
-                            remote_etag: re.clone(),
-                        },
-                    );
-                    sum.downloaded += 1;
                 } else {
-                    // both changed: compare contents; identical => no real conflict.
-                    let rbytes = client.get(key)?;
-                    let rhash = sha256_hex(&rbytes);
-                    if rhash == lf.hash {
-                        new_m.files.insert(
-                            key.clone(),
-                            ManifestEntry {
-                                local_hash: lf.hash.clone(),
-                                remote_etag: re.clone(),
-                            },
-                        );
+                    let bytes = match remote_bytes {
+                        Some(bytes) => bytes,
+                        None => client.get(key, etag)?,
+                    };
+                    let hash = remote_hash.unwrap_or_else(|| sha256_hex(&bytes));
+                    if hash == lf.hash {
+                        new_m.files.insert(key.clone(), manifest_entry(hash, etag));
+                    } else if !local_changed {
+                        write_local_if_unchanged(
+                            write_guard,
+                            vault_path,
+                            key,
+                            &bytes,
+                            Some(&lf.hash),
+                            changes,
+                        )?;
+                        new_m.files.insert(key.clone(), manifest_entry(hash, etag));
+                        sum.downloaded += 1;
                     } else {
-                        // keep-both: remote becomes canonical; local saved as a conflict copy.
+                        // Keep both, but only replace the canonical note after the
+                        // previous local bytes have been safely copied aside.
                         let ckey = conflict_relpath(key, &stamp);
                         let lbytes = {
                             let _guard = write_guard.blocking_lock();
-                            require_unchanged_local(&lf.path, Some(&lf.hash))?;
                             require_unchanged_local(&vault_path.join(&ckey), None)?;
-                            let lbytes = fs::read(&lf.path).map_err(|e| e.to_string())?;
-                            // Preserve the local bytes before replacing their canonical path.
+                            let lbytes = read_scanned_local(lf)?;
                             write_local(vault_path, &ckey, &lbytes, changes)?;
-                            write_local(vault_path, key, &rbytes, changes)?;
+                            write_local(vault_path, key, &bytes, changes)?;
                             lbytes
                         };
-                        new_m.files.insert(
-                            key.clone(),
-                            ManifestEntry {
-                                local_hash: rhash,
-                                remote_etag: re.clone(),
-                            },
-                        );
-                        let cetag = client.upload(&ckey, &lbytes, &mut created)?;
-                        new_m.files.insert(
-                            ckey,
-                            ManifestEntry {
-                                local_hash: sha256_hex(&lbytes),
-                                remote_etag: cetag,
-                            },
-                        );
+                        new_m.files.insert(key.clone(), manifest_entry(hash, etag));
+                        let cetag = client.upload(&ckey, &lbytes, None, &mut created)?;
+                        new_m
+                            .files
+                            .insert(ckey, manifest_entry(sha256_hex(&lbytes), &cetag));
                         sum.conflicts += 1;
                     }
                 }
             }
             (Some(lf), None) => match m {
                 None => {
-                    // new local -> upload
-                    let bytes = fs::read(&lf.path).map_err(|e| e.to_string())?;
-                    let etag = client.upload(key, &bytes, &mut created)?;
-                    new_m.files.insert(
-                        key.clone(),
-                        ManifestEntry {
-                            local_hash: lf.hash.clone(),
-                            remote_etag: etag,
-                        },
-                    );
+                    let bytes = read_scanned_local(lf)?;
+                    let etag = client.upload(key, &bytes, None, &mut created)?;
+                    new_m
+                        .files
+                        .insert(key.clone(), manifest_entry(lf.hash.clone(), &etag));
                     sum.uploaded += 1;
                 }
-                Some(me) => {
-                    if me.local_hash != lf.hash {
-                        // remote deleted but local edited -> resurrect (upload)
-                        let bytes = fs::read(&lf.path).map_err(|e| e.to_string())?;
-                        let etag = client.upload(key, &bytes, &mut created)?;
-                        new_m.files.insert(
-                            key.clone(),
-                            ManifestEntry {
-                                local_hash: lf.hash.clone(),
-                                remote_etag: etag,
-                            },
-                        );
-                        sum.uploaded += 1;
-                    } else {
-                        // remote deleted, local unchanged -> delete local
-                        let _guard = write_guard.blocking_lock();
-                        require_unchanged_local(&lf.path, Some(&lf.hash))?;
-                        fs::remove_file(&lf.path).map_err(|e| e.to_string())?;
-                        changes.insert(lf.path.clone(), "remove");
-                        sum.deleted_local += 1;
-                    }
+                Some(me) if me.local_hash != lf.hash => {
+                    let bytes = read_scanned_local(lf)?;
+                    let etag = client.upload(key, &bytes, None, &mut created)?;
+                    new_m
+                        .files
+                        .insert(key.clone(), manifest_entry(lf.hash.clone(), &etag));
+                    sum.uploaded += 1;
+                }
+                Some(_) => {
+                    let _guard = write_guard.blocking_lock();
+                    require_unchanged_local(&lf.path, Some(&lf.hash))?;
+                    fs::remove_file(&lf.path).map_err(|e| e.to_string())?;
+                    changes.insert(lf.path.clone(), "remove");
+                    sum.deleted_local += 1;
                 }
             },
-            (None, Some(re)) => match m {
-                None => {
-                    // new remote -> download
-                    let bytes = client.get(key)?;
+            (None, Some(etag)) => {
+                let bytes = if etag.is_empty() || m.is_none_or(|old| old.remote_etag != *etag) {
+                    Some(client.get(key, etag)?)
+                } else {
+                    None
+                };
+                let remote_hash = bytes.as_ref().map(|bytes| sha256_hex(bytes));
+                let remote_changed = m.is_none_or(|old| {
+                    old.remote_etag != *etag
+                        || (etag.is_empty()
+                            && (old.remote_hash.is_empty()
+                                || remote_hash.as_deref() != Some(old.remote_hash.as_str())))
+                });
+                if remote_changed {
+                    let bytes = match bytes {
+                        Some(bytes) => bytes,
+                        None => client.get(key, etag)?,
+                    };
                     write_local_if_unchanged(write_guard, vault_path, key, &bytes, None, changes)?;
                     new_m.files.insert(
                         key.clone(),
-                        ManifestEntry {
-                            local_hash: sha256_hex(&bytes),
-                            remote_etag: re.clone(),
-                        },
+                        manifest_entry(remote_hash.unwrap_or_else(|| sha256_hex(&bytes)), etag),
                     );
                     sum.downloaded += 1;
+                } else {
+                    client.delete(key, etag)?;
+                    sum.deleted_remote += 1;
                 }
-                Some(me) => {
-                    if &me.remote_etag != re {
-                        // local deleted but remote changed -> resurrect (download)
-                        let bytes = client.get(key)?;
-                        write_local_if_unchanged(
-                            write_guard,
-                            vault_path,
-                            key,
-                            &bytes,
-                            None,
-                            changes,
-                        )?;
-                        new_m.files.insert(
-                            key.clone(),
-                            ManifestEntry {
-                                local_hash: sha256_hex(&bytes),
-                                remote_etag: re.clone(),
-                            },
-                        );
-                        sum.downloaded += 1;
-                    } else {
-                        // local deleted, remote unchanged -> delete remote
-                        client.delete(key)?;
-                        sum.deleted_remote += 1;
-                    }
-                }
-            },
-            (None, None) => {
-                // gone on both sides -> drop from manifest
             }
+            (None, None) => {}
         }
     }
     Ok((new_m, sum))
@@ -789,12 +860,16 @@ pub fn run_sync(
     use std::sync::atomic::Ordering;
 
     let state = app.state::<AppState>();
+    let _maintenance = state.vault_maintenance.blocking_lock();
     // Keep the original vault's index even if the user switches vaults while
     // WebDAV is working. No config lock is held during network or file I/O.
     let search = state.vault_snapshot(&vault)?;
     let client = WebdavClient::new(cfg)?;
 
-    let _ = app.emit("sync-progress", serde_json::json!({ "status": "listing" }));
+    let _ = app.emit(
+        "sync-progress",
+        serde_json::json!({ "vault_path": vault, "status": "listing" }),
+    );
     let remote: HashMap<String, String> = client
         .list()?
         .into_iter()
@@ -802,7 +877,10 @@ pub fn run_sync(
         .collect();
     let (local, manifest) = {
         let _guard = state.note_save.blocking_lock();
-        (scan_local(&vault)?, load_manifest(&vault))
+        (
+            scan_local(&vault)?,
+            baseline_for_endpoint(load_manifest(&vault)?, &client.identity()),
+        )
     };
 
     // Safety guard (issue #102): never treat an empty remote listing as "everything was
@@ -819,7 +897,10 @@ pub fn run_sync(
         );
     }
 
-    let _ = app.emit("sync-progress", serde_json::json!({ "status": "syncing" }));
+    let _ = app.emit(
+        "sync-progress",
+        serde_json::json!({ "vault_path": vault, "status": "syncing" }),
+    );
     let mut changes = HashMap::new();
     // Mute the watcher across local writes; its deferred batch also preserves
     // external edits that arrive while the network operation is in progress.
@@ -873,7 +954,7 @@ pub fn run_sync(
     }
 
     let (new_manifest, summary) = applied?;
-    save_manifest(&vault, &new_manifest);
+    save_manifest(&vault, &new_manifest)?;
     Ok(summary)
 }
 
@@ -1056,6 +1137,44 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn previously_synced_note_replaced_by_link_is_not_scanned_as_deleted() {
+        use std::os::unix::fs::symlink;
+        let vault = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = vault.path().to_str().unwrap();
+        let note = vault.path().join("note.md");
+        fs::write(&note, b"accepted").unwrap();
+        let baseline = scan_local(root).unwrap();
+        assert_eq!(baseline["note.md"].hash, sha256_hex(b"accepted"));
+
+        let external = outside.path().join("outside.md");
+        fs::write(&external, b"external").unwrap();
+        fs::remove_file(&note).unwrap();
+        symlink(&external, &note).unwrap();
+        assert!(scan_local(root).err().unwrap().contains("symbolic link"));
+        assert_eq!(fs::read(&external).unwrap(), b"external");
+
+        fs::remove_file(&note).unwrap();
+        symlink(outside.path().join("missing.md"), &note).unwrap();
+        assert!(scan_local(root).err().unwrap().contains("symbolic link"));
+
+        fs::remove_file(&note).unwrap();
+        fs::create_dir_all(outside.path().join("Notebook")).unwrap();
+        fs::write(outside.path().join("Notebook/note.md"), b"external").unwrap();
+        symlink(
+            outside.path().join("Notebook"),
+            vault.path().join("Notebook"),
+        )
+        .unwrap();
+        assert!(scan_local(root).err().unwrap().contains("symbolic link"));
+        assert_eq!(
+            fs::read(outside.path().join("Notebook/note.md")).unwrap(),
+            b"external"
+        );
+    }
+
     #[test]
     fn syncs_notebook_icon_mapping_and_assets_only() {
         for path in [
@@ -1086,13 +1205,15 @@ mod tests {
         let modified = fs::metadata(&path).unwrap().modified().unwrap();
         let vault_path = vault.path().to_str().unwrap();
         let local = scan_local(vault_path).unwrap();
-        let remote = HashMap::from([("note.md".to_string(), "etag".to_string())]);
+        let remote = HashMap::from([("note.md".to_string(), "\"etag\"".to_string())]);
         let manifest = SyncManifest {
+            identity: String::new(),
             files: HashMap::from([(
                 "note.md".to_string(),
                 ManifestEntry {
                     local_hash: local["note.md"].hash.clone(),
-                    remote_etag: "etag".to_string(),
+                    remote_etag: "\"etag\"".to_string(),
+                    remote_hash: String::new(),
                 },
             )]),
         };
@@ -1132,11 +1253,13 @@ mod tests {
         let vault_path = vault.path().to_str().unwrap();
         let local = scan_local(vault_path).unwrap();
         let manifest = SyncManifest {
+            identity: String::new(),
             files: HashMap::from([(
                 "note.md".to_string(),
                 ManifestEntry {
                     local_hash: local["note.md"].hash.clone(),
-                    remote_etag: "etag".to_string(),
+                    remote_etag: "\"etag\"".to_string(),
+                    remote_hash: String::new(),
                 },
             )]),
         };
@@ -1206,5 +1329,236 @@ mod tests {
         assert_eq!(changes, HashMap::from([(path.clone(), "modify")]));
         let event = changed_entry(path, "modify", vault.path());
         assert_eq!(event.note.unwrap().preview, "remote content");
+    }
+    fn webdav_test_client(
+        responses: Vec<(&'static str, &'static str)>,
+    ) -> (WebdavClient, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::Write;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/vault", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                let header_end = loop {
+                    let len = stream.read(&mut chunk).unwrap();
+                    assert!(len > 0);
+                    request.extend_from_slice(&chunk[..len]);
+                    if let Some(offset) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break offset + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+                let content_length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse().ok())
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let len = stream.read(&mut chunk).unwrap();
+                    assert!(len > 0);
+                    request.extend_from_slice(&chunk[..len]);
+                }
+                requests.push(headers);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            requests
+        });
+        (
+            WebdavClient::new(WebdavConfig {
+                url,
+                username: "alice".into(),
+                password: "secret".into(),
+            })
+            .unwrap(),
+            worker,
+        )
+    }
+
+    #[test]
+    fn corrupt_manifest_and_unreadable_vault_stop_without_treating_files_as_deleted() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().to_str().unwrap();
+        fs::create_dir_all(helixnotes_dir(root)).unwrap();
+        fs::write(manifest_path(root), b"{invalid").unwrap();
+        assert!(load_manifest(root)
+            .err()
+            .unwrap()
+            .contains("Invalid sync manifest"));
+        fs::write(manifest_path(root), b"{\"files\":{}}").unwrap();
+        assert!(scan_local(&vault.path().join("missing").to_string_lossy()).is_err());
+        fs::write(vault.path().join("note.md"), b"local").unwrap();
+        let old = load_manifest(root).unwrap();
+        let rebased = baseline_for_endpoint(old, "new account");
+        assert!(rebased.files.is_empty());
+        fs::remove_dir_all(helixnotes_dir(root)).unwrap();
+        fs::write(helixnotes_dir(root), b"not a directory").unwrap();
+        assert!(save_manifest(root, &rebased).is_err());
+        assert_eq!(fs::read(vault.path().join("note.md")).unwrap(), b"local");
+    }
+
+    #[test]
+    fn endpoint_identity_rebases_without_credentials_or_deletion_history() {
+        let first = WebdavClient::new(WebdavConfig {
+            url: "HTTPS://Example.org:443/team/".into(),
+            username: "alice".into(),
+            password: "one".into(),
+        })
+        .unwrap();
+        let same = WebdavClient::new(WebdavConfig {
+            url: "https://example.org/team".into(),
+            username: "alice".into(),
+            password: "other".into(),
+        })
+        .unwrap();
+        let other = WebdavClient::new(WebdavConfig {
+            url: "https://example.org/team".into(),
+            username: "bob".into(),
+            password: "one".into(),
+        })
+        .unwrap();
+        let different_folder = WebdavClient::new(WebdavConfig {
+            url: "https://example.org/another".into(),
+            username: "alice".into(),
+            password: "one".into(),
+        })
+        .unwrap();
+        assert_eq!(first.identity(), same.identity());
+        assert_ne!(same.identity(), other.identity());
+        assert_ne!(same.identity(), different_folder.identity());
+        let manifest = SyncManifest {
+            identity: first.identity(),
+            files: HashMap::from([(
+                "note.md".into(),
+                manifest_entry(sha256_hex(b"old"), "\"old\""),
+            )]),
+        };
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().to_str().unwrap();
+        save_manifest(root, &manifest).unwrap();
+        let persisted = fs::read_to_string(manifest_path(root)).unwrap();
+        assert!(!persisted.contains("one") && !persisted.contains("alice"));
+        assert_eq!(load_manifest(root).unwrap().identity, same.identity());
+        assert_eq!(
+            baseline_for_endpoint(manifest, &other.identity())
+                .files
+                .len(),
+            0
+        );
+        assert!(
+            baseline_for_endpoint(load_manifest(root).unwrap(), &different_folder.identity())
+                .files
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn etagless_remote_content_change_refreshes_local_and_refuses_remote_deletion() {
+        let vault = tempfile::tempdir().unwrap();
+        fs::write(vault.path().join("note.md"), b"old").unwrap();
+        let root = vault.path().to_str().unwrap();
+        let local = scan_local(root).unwrap();
+        let manifest = SyncManifest {
+            identity: String::new(),
+            files: HashMap::from([("note.md".into(), manifest_entry(sha256_hex(b"old"), ""))]),
+        };
+        let (client, requests) = webdav_test_client(vec![("200 OK", "new")]);
+        let mut changes = HashMap::new();
+        let (next, summary) = apply_changes(
+            &client,
+            root,
+            &local,
+            &HashMap::from([("note.md".into(), String::new())]),
+            &manifest,
+            &mut changes,
+            &tokio::sync::Mutex::new(()),
+        )
+        .unwrap();
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(fs::read(vault.path().join("note.md")).unwrap(), b"new");
+        assert_eq!(next.files["note.md"].remote_hash, sha256_hex(b"new"));
+        assert!(requests.join().unwrap()[0].starts_with("GET /vault/note.md "));
+        let (client, requests) = webdav_test_client(vec![("200 OK", "new")]);
+        let error = apply_changes(
+            &client,
+            root,
+            &HashMap::new(),
+            &HashMap::from([("note.md".into(), String::new())]),
+            &next,
+            &mut HashMap::new(),
+            &tokio::sync::Mutex::new(()),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("Cannot safely delete"));
+        assert_eq!(requests.join().unwrap().len(), 1); // GET only, never DELETE
+    }
+
+    #[test]
+    fn changed_get_etag_never_installs_stale_snapshot() {
+        let (client, requests) = webdav_test_client(vec![("200 OK\r\nETag: \"new\"", "newer")]);
+        assert!(client
+            .get("note.md", "\"old\"")
+            .unwrap_err()
+            .contains("retry"));
+        let requests = requests.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0]
+            .to_ascii_lowercase()
+            .contains("if-match: \"old\""));
+    }
+
+    #[test]
+    fn conditional_writes_preserve_concurrent_remote_content() {
+        let (client, requests) = webdav_test_client(vec![("412 Precondition Failed", "")]);
+        assert!(client
+            .put("note.md", b"edited", Some("\"old\""))
+            .unwrap_err()
+            .contains("retry"));
+        let requests = requests.join().unwrap();
+        assert!(requests[0]
+            .to_ascii_lowercase()
+            .contains("if-match: \"old\""));
+
+        let (client, requests) = webdav_test_client(vec![("412 Precondition Failed", "")]);
+        assert!(client
+            .delete("note.md", "\"old\"")
+            .unwrap_err()
+            .contains("retry"));
+        assert!(requests.join().unwrap()[0]
+            .to_ascii_lowercase()
+            .contains("if-match: \"old\""));
+
+        let (client, requests) = webdav_test_client(vec![("412 Precondition Failed", "")]);
+        assert!(client
+            .put("new.md", b"new", None)
+            .unwrap_err()
+            .contains("retry"));
+        assert!(requests.join().unwrap()[0]
+            .to_ascii_lowercase()
+            .contains("if-none-match: *"));
+        let (client, requests) = webdav_test_client(vec![]);
+        assert!(client
+            .put("note.md", b"edited", Some(""))
+            .unwrap_err()
+            .contains("no strong ETag"));
+        assert!(client
+            .delete("note.md", "")
+            .unwrap_err()
+            .contains("no strong ETag"));
+        assert!(requests.join().unwrap().is_empty());
     }
 }

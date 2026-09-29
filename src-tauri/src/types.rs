@@ -104,6 +104,8 @@ pub struct VaultConfig {
     pub sync_interval_minutes: u32,
     #[serde(default)]
     pub last_sync_time: Option<String>,
+    #[serde(default)]
+    pub last_backup_time: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,8 +221,6 @@ pub struct AppConfig {
     pub backup_max_count: u32,
     #[serde(default)]
     pub backup_location: Option<String>,
-    #[serde(default)]
-    pub last_backup_time: Option<String>,
     #[serde(default)]
     pub backup_include_attachments: bool,
     #[serde(default = "default_max_versions")]
@@ -366,7 +366,6 @@ impl Default for AppConfig {
             backup_frequency: "24h".to_string(),
             backup_max_count: 10,
             backup_location: None,
-            last_backup_time: None,
             backup_include_attachments: false,
             max_versions_per_note: 20,
             ai_provider: None,

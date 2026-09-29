@@ -118,6 +118,168 @@ fn safe_child_name(name: &str) -> Result<&str, String> {
     Ok(name)
 }
 
+// A normal rename can replace an existing file (or an empty directory).
+// Use the OS's exclusive rename primitive instead; checking exists first is racy.
+#[cfg(target_os = "linux")]
+fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn renameat2(
+            olddirfd: i32,
+            oldpath: *const std::ffi::c_char,
+            newdirfd: i32,
+            newpath: *const std::ffi::c_char,
+            flags: u32,
+        ) -> i32;
+    }
+    let old = CString::new(src.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let new = CString::new(dest.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    // AT_FDCWD and RENAME_NOREPLACE
+    if unsafe { renameat2(-100, old.as_ptr(), -100, new.as_ptr(), 1) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "android")]
+fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let old = CString::new(src.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let new = CString::new(dest.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    // Bionic exports renameat2 only on newer Android releases (minSdk is 24).
+    // The kernel syscall is available independently; ENOSYS safely rejects
+    // the move on old kernels rather than falling back to a clobbering rename.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            old.as_ptr(),
+            libc::AT_FDCWD,
+            new.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn renameatx_np(
+            olddirfd: i32,
+            oldpath: *const std::ffi::c_char,
+            newdirfd: i32,
+            newpath: *const std::ffi::c_char,
+            flags: u32,
+        ) -> i32;
+    }
+    let old = CString::new(src.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let new = CString::new(dest.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    // AT_FDCWD and RENAME_EXCL
+    if unsafe { renameatx_np(-2, old.as_ptr(), -2, new.as_ptr(), 4) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn MoveFileW(old: *const u16, new: *const u16) -> i32;
+    }
+    let old: Vec<u16> = src.as_os_str().encode_wide().chain(Some(0)).collect();
+    let new: Vec<u16> = dest.as_os_str().encode_wide().chain(Some(0)).collect();
+    if unsafe { MoveFileW(old.as_ptr(), new.as_ptr()) } != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn move_without_replacing(src: &Path, dest: &Path) -> Result<(), String> {
+    if src == dest {
+        return Ok(());
+    }
+    // Case-insensitive volumes resolve two differently-spelled paths to the
+    // same object. Move via a unique sibling to permit a case-only rename.
+    let same_object = fs::canonicalize(dest)
+        .and_then(|target| fs::canonicalize(src).map(|source| source == target))
+        .unwrap_or(false);
+    if same_object {
+        let parent = src.parent().ok_or("Item has no parent directory")?;
+        let staging = loop {
+            let candidate = parent.join(format!(".helixnotes-rename-{}", Uuid::new_v4()));
+            match rename_exclusive(src, &candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        };
+        if let Err(error) = rename_exclusive(&staging, dest) {
+            return Err(match rename_exclusive(&staging, src) {
+                Ok(()) => error.to_string(),
+                Err(rollback) => {
+                    format!("{error}; item remains at {}: {rollback}", staging.display())
+                }
+            });
+        }
+        return Ok(());
+    }
+    rename_exclusive(src, dest).map_err(|error| error.to_string())
+}
+
+fn trash_name(original: &str) -> String {
+    format!(
+        "{}_{}_{}",
+        Utc::now().format("%Y%m%d%H%M%S%3f"),
+        Uuid::new_v4(),
+        original
+    )
+}
+
+fn original_trash_name(name: &str) -> &str {
+    let (prefix, rest) = if name.len() > 18
+        && name.as_bytes()[..17].iter().all(u8::is_ascii_digit)
+        && name.as_bytes()[17] == b'_'
+    {
+        (18, &name[18..])
+    } else if name.len() > 15
+        && name.as_bytes()[..14].iter().all(u8::is_ascii_digit)
+        && name.as_bytes()[14] == b'_'
+    {
+        (15, &name[15..])
+    } else {
+        return name;
+    };
+    if prefix == 18
+        && rest.len() > 37
+        && rest.as_bytes()[36] == b'_'
+        && Uuid::parse_str(&rest[..36]).is_ok()
+    {
+        &rest[37..]
+    } else {
+        rest
+    }
+}
+
 pub fn ensure_vault_structure(vault_path: &str) -> Result<(), String> {
     let hn_dir = helixnotes_dir(vault_path);
     fs::create_dir_all(hn_dir.join("trash")).map_err(|e| e.to_string())?;
@@ -601,11 +763,17 @@ pub fn save_note(
     path: &str,
     meta: &NoteMeta,
     body: &str,
+    expected_raw: &str,
 ) -> Result<Option<SavedNote>, String> {
     let validated = ensure_note_path(vault_path, Path::new(path))?;
     // Replace the actual file, not a symlink pointing to it.
     let target = canonicalize_path(&validated, "note path")?;
     let existing = read_note_content(&target, path)?;
+    if existing.raw != expected_raw {
+        return Err(
+            "Save conflict: note changed on disk. Your edits have not been written.".to_string(),
+        );
+    }
     let mut updated_meta = meta.clone();
 
     // A stale editor may still have an empty ID after the first save.
@@ -867,13 +1035,23 @@ pub fn create_daily_note(
     };
 
     let dir = Path::new(vault_path).join("Daily");
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-
+    if fs::symlink_metadata(&dir).is_err() {
+        fs::create_dir(&dir).map_err(|e| e.to_string())?;
+    }
+    let dir = ensure_vault_content_dir(vault_path, &dir)?;
     let file_path = dir.join(format!("{}.md", date_str));
     let vault_root = Path::new(vault_path);
 
-    // If today's note already exists, return it
-    if file_path.exists() {
+    // Return a genuine existing daily note, but never follow an outside link.
+    if fs::symlink_metadata(&file_path).is_ok() {
+        if fs::symlink_metadata(&file_path)
+            .map_err(|e| e.to_string())?
+            .file_type()
+            .is_symlink()
+        {
+            return Err("Daily note destination is a symlink".to_string());
+        }
+        ensure_note_path(vault_path, &file_path)?;
         return read_note_entry(&file_path, vault_root);
     }
 
@@ -888,7 +1066,25 @@ pub fn create_daily_note(
     };
 
     let raw = frontmatter::update_note_raw(&meta, "\n");
-    fs::write(&file_path, raw).map_err(|e| e.to_string())?;
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&file_path)
+    {
+        Ok(mut file) => file.write_all(raw.as_bytes()).map_err(|e| e.to_string())?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if fs::symlink_metadata(&file_path)
+                .map_err(|e| e.to_string())?
+                .file_type()
+                .is_symlink()
+            {
+                return Err("Daily note destination is a symlink".to_string());
+            }
+            ensure_note_path(vault_path, &file_path)?;
+            return read_note_entry(&file_path, vault_root);
+        }
+        Err(error) => return Err(error.to_string()),
+    }
 
     let relative = file_path
         .strip_prefix(vault_root)
@@ -950,11 +1146,14 @@ pub fn delete_note(vault_path: &str, note_path: &str) -> Result<(), String> {
         .to_string_lossy()
         .to_string();
 
-    let timestamp = Utc::now().format("%Y%m%d%H%M%S%3f");
-    let trash_name = format!("{}_{}", timestamp, filename);
-    let dest = trash_dir.join(&trash_name);
-
-    fs::rename(src, dest).map_err(|e| e.to_string())?;
+    loop {
+        let candidate = trash_dir.join(trash_name(&filename));
+        match rename_exclusive(src, &candidate) {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
     Ok(())
 }
 
@@ -971,24 +1170,52 @@ pub fn delete_notebook(vault_path: &str, notebook_path: &str) -> Result<(), Stri
         .to_string_lossy()
         .to_string();
 
-    let timestamp = Utc::now().format("%Y%m%d%H%M%S%3f");
-    let trash_name = format!("{}_{}", timestamp, dirname);
-    let dest = trash_dir.join(&trash_name);
-
-    // Save original relative path in a sidecar .meta file for restore
     let relative = src
         .strip_prefix(vault_path)
         .unwrap_or(src)
         .to_string_lossy()
         .to_string();
-    let meta_path = trash_dir.join(format!("{}.meta", trash_name));
-    let _ = fs::write(&meta_path, &relative);
-
-    fs::rename(src, dest).map_err(|e| e.to_string())?;
-    Ok(())
+    loop {
+        let trash_name = trash_name(&dirname);
+        let dest = trash_dir.join(&trash_name);
+        let meta_path = trash_dir.join(format!("{trash_name}.meta"));
+        let mut sidecar = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&meta_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if let Err(error) = sidecar.write_all(relative.as_bytes()) {
+            drop(sidecar);
+            let _ = fs::remove_file(&meta_path);
+            return Err(error.to_string());
+        }
+        drop(sidecar);
+        match rename_exclusive(src, &dest) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let _ = fs::remove_file(&meta_path);
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(error.to_string());
+            }
+        }
+    }
 }
 
-pub fn rename_note(path: &str, new_title: &str, vault_path: &str) -> Result<String, String> {
+pub struct RenamedNote {
+    pub path: String,
+    pub old_raw: String,
+    pub new_raw: String,
+    pub old_title: String,
+    pub new_title: String,
+}
+
+pub fn rename_note(path: &str, new_title: &str, vault_path: &str) -> Result<RenamedNote, String> {
     let validated = ensure_note_path(vault_path, Path::new(path))?;
     let src = validated.as_path();
 
@@ -1014,10 +1241,29 @@ pub fn rename_note(path: &str, new_title: &str, vault_path: &str) -> Result<Stri
     // Rename file
     let new_filename = sanitize_filename(new_title);
     let new_path = src.parent().unwrap().join(format!("{}.md", new_filename));
-    fs::write(src, &updated).map_err(|e| e.to_string())?;
-
-    if new_path != src {
-        fs::rename(src, &new_path).map_err(|e| e.to_string())?;
+    let previous_quick_access = move_note_with_quick_access(vault_path, src, &new_path)?;
+    if let Err(error) = replace_file_atomically(&new_path, updated.as_bytes()) {
+        if new_path != src {
+            return Err(match move_without_replacing(&new_path, src) {
+                Ok(()) => {
+                    if let Some(previous) = previous_quick_access {
+                        match save_quick_access(vault_path, &previous) {
+                            Ok(()) => error,
+                            Err(rollback) => {
+                                format!("{error}; Quick Access rollback failed: {rollback}")
+                            }
+                        }
+                    } else {
+                        error
+                    }
+                }
+                Err(rollback) => format!(
+                    "{error}; note remains at {}: {rollback}",
+                    new_path.display()
+                ),
+            });
+        }
+        return Err(error);
     }
 
     let new_path_str = new_path.to_string_lossy().to_string();
@@ -1031,7 +1277,13 @@ pub fn rename_note(path: &str, new_title: &str, vault_path: &str) -> Result<Stri
         new_title,
     );
 
-    Ok(new_path_str)
+    Ok(RenamedNote {
+        path: new_path_str,
+        old_raw: raw,
+        new_raw: updated,
+        old_title,
+        new_title: meta.title,
+    })
 }
 
 /// Walk all .md files in the vault and update wikilink references after a note rename.
@@ -1158,8 +1410,8 @@ pub fn rename_notebook(vault_path: &str, path: &str, new_name: &str) -> Result<S
     let src = validated.as_path();
 
     let new_path = src.parent().unwrap().join(safe_child_name(new_name)?);
-    if new_path.exists() {
-        return Err("A notebook with that name already exists".to_string());
+    if src == new_path {
+        return Ok(path.to_string());
     }
 
     move_notebook_with_icons(vault_path, src, &new_path)?;
@@ -1179,7 +1431,7 @@ pub fn move_note(vault_path: &str, note_path: &str, dest_notebook: &str) -> Resu
     let filename = src.file_name().unwrap_or_default();
     let dest = dest_dir.join(filename);
 
-    fs::rename(src, &dest).map_err(|e| e.to_string())?;
+    move_note_with_quick_access(vault_path, src, &dest)?;
     Ok(dest.to_string_lossy().to_string())
 }
 
@@ -1210,9 +1462,7 @@ pub fn move_notebook(
         return Err("Cannot move a notebook into itself or its descendants".to_string());
     }
 
-    if dest.exists() {
-        return Err("A notebook with that name already exists in the destination".to_string());
-    }
+    // Destination reservation is performed atomically by move_notebook_with_icons.
 
     move_notebook_with_icons(vault_path, src, &dest)?;
     Ok(dest.to_string_lossy().to_string())
@@ -1263,14 +1513,7 @@ pub fn get_trash_contents(vault_path: &str) -> Result<TrashContents, String> {
                 })
                 .count();
             let dirname = path.file_name().unwrap_or_default().to_string_lossy();
-            // Strip timestamp prefix to get original notebook name
-            let name = if dirname.len() > 18 && dirname.chars().nth(17) == Some('_') {
-                dirname[18..].to_string()
-            } else if dirname.len() > 15 && dirname.chars().nth(14) == Some('_') {
-                dirname[15..].to_string()
-            } else {
-                dirname.to_string()
-            };
+            let name = original_trash_name(&dirname).to_string();
             let modified = fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .map(DateTime::<Utc>::from)
@@ -1306,19 +1549,13 @@ pub fn restore_note(
     };
     let dest_dir = ensure_vault_content_dir(vault_path, &requested_dest)?;
 
-    // Strip timestamp prefix from trash filename (17-char with millis or 14-char legacy)
+    // Support both legacy timestamps and timestamp/UUID destinations.
     let filename = src.file_name().unwrap_or_default().to_string_lossy();
-    let original_name = if filename.len() > 18 && filename.chars().nth(17) == Some('_') {
-        &filename[18..]
-    } else if filename.len() > 15 && filename.chars().nth(14) == Some('_') {
-        &filename[15..]
-    } else {
-        &filename
-    };
+    let original_name = original_trash_name(&filename);
 
     let parent = src.parent().map(|p| p.to_path_buf());
     let dest = dest_dir.join(original_name);
-    fs::rename(src, &dest).map_err(|e| e.to_string())?;
+    move_without_replacing(src, &dest)?;
 
     // Clean up empty parent directory (deleted notebook folder) in trash
     cleanup_empty_trash_dir(vault_path, parent.as_deref());
@@ -1335,33 +1572,43 @@ pub fn restore_notebook(vault_path: &str, trash_path: &str) -> Result<String, St
 
     let dirname = src.file_name().unwrap_or_default().to_string_lossy();
 
-    // Try to read original path from sidecar .meta file
-    let meta_path = src
-        .with_extension("")
-        .with_file_name(format!("{}.meta", dirname));
-    let relative = if let Ok(original) = fs::read_to_string(&meta_path) {
-        original
-    } else {
-        // Fallback for notebooks trashed before .meta files existed:
-        // strip timestamp prefix to get notebook name, restore to root
-        let name = if dirname.len() > 18 && dirname.chars().nth(17) == Some('_') {
-            &dirname[18..]
-        } else if dirname.len() > 15 && dirname.chars().nth(14) == Some('_') {
-            &dirname[15..]
-        } else {
-            &dirname
-        };
-        name.to_string()
+    // The sidecar is paired with the exact trash entry name, including its UUID.
+    let meta_path = src.with_file_name(format!("{}.meta", dirname));
+    let relative = match fs::read_to_string(&meta_path) {
+        Ok(original) => original,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Legacy notebooks without sidecars were restored to the vault root.
+            original_trash_name(&dirname).to_string()
+        }
+        Err(error) => return Err(error.to_string()),
     };
 
-    let dest = Path::new(vault_path).join(safe_relative_path(&relative)?);
-
-    // Recreate parent directories if needed
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let relative = safe_relative_path(&relative)?;
+    let dest = Path::new(vault_path).join(relative);
+    // Validate every existing ancestor before creating children: a symlink
+    // inside the vault may otherwise redirect this restore outside the vault.
+    let vault = canonicalize_path(Path::new(vault_path), "vault path")?;
+    let mut ancestor = PathBuf::from(vault_path);
+    for component in relative
+        .components()
+        .take(relative.components().count() - 1)
+    {
+        ancestor.push(component);
+        if fs::symlink_metadata(&ancestor).is_ok() {
+            let canonical = canonicalize_path(&ancestor, "notebook destination")?;
+            if !canonical.starts_with(&vault) || canonical.starts_with(vault.join(".helixnotes")) {
+                return Err("Path must stay inside the active vault".to_string());
+            }
+            if !canonical.is_dir() {
+                return Err("Notebook destination parent is not a directory".to_string());
+            }
+        } else {
+            fs::create_dir(&ancestor).map_err(|e| e.to_string())?;
+        }
     }
-
-    fs::rename(src, &dest).map_err(|e| e.to_string())?;
+    let parent = dest.parent().ok_or("Notebook has no parent directory")?;
+    ensure_vault_content_dir(vault_path, parent)?;
+    move_without_replacing(src, &dest)?;
     // Clean up .meta file
     let _ = fs::remove_file(&meta_path);
     Ok(dest.to_string_lossy().to_string())
@@ -1373,6 +1620,10 @@ pub fn permanent_delete(vault_path: &str, path: &str) -> Result<(), String> {
     let parent = p.parent().map(|pp| pp.to_path_buf());
     if p.is_dir() {
         fs::remove_dir_all(p).map_err(|e| e.to_string())?;
+        if let Some(name) = p.file_name() {
+            let sidecar = p.with_file_name(format!("{}.meta", name.to_string_lossy()));
+            let _ = fs::remove_file(sidecar);
+        }
     } else {
         fs::remove_file(p).map_err(|e| e.to_string())?;
     }
@@ -1405,8 +1656,7 @@ pub fn load_vault_state(vault_path: &str) -> Result<VaultState, String> {
 pub fn save_vault_state(vault_path: &str, state: &VaultState) -> Result<(), String> {
     let state_path = helixnotes_dir(vault_path).join("state.json");
     let data = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
-    fs::write(&state_path, data).map_err(|e| e.to_string())?;
-    Ok(())
+    replace_file_atomically(&state_path, data.as_bytes())
 }
 
 pub fn get_all_tags(vault_path: &str) -> Result<Vec<(String, usize)>, String> {
@@ -1548,29 +1798,45 @@ fn move_notebook_with_icons(vault_path: &str, src: &Path, dest: &Path) -> Result
             .map_err(|error| error.to_string())?
             .to_string_lossy(),
     );
+    let quick_access = quick_access_migration(vault_path, src, dest, true)?;
     let prefix = format!("{old_key}/");
-    let mut changed = false;
-    let migrated = icons
-        .into_iter()
-        .map(|(key, value)| {
-            let key = if key == old_key {
-                changed = true;
-                new_key.clone()
-            } else if let Some(suffix) = key.strip_prefix(&prefix) {
-                changed = true;
-                format!("{new_key}/{suffix}")
-            } else {
-                key
-            };
-            (key, value)
-        })
-        .collect();
-    fs::rename(src, dest).map_err(|error| error.to_string())?;
-    if changed {
-        if let Err(error) = save_notebook_icons(vault_path, &migrated) {
-            return Err(match fs::rename(dest, src) {
+    let mut migrated = None;
+    for (key, value) in &icons {
+        let new_icon_key = if key == &old_key {
+            new_key.clone()
+        } else if let Some(suffix) = key.strip_prefix(&prefix) {
+            format!("{new_key}/{suffix}")
+        } else {
+            continue;
+        };
+        let mapping = migrated.get_or_insert_with(|| icons.clone());
+        mapping.remove(key);
+        mapping.insert(new_icon_key, value.clone());
+    }
+    move_without_replacing(src, dest)?;
+    if let Some(migrated) = &migrated {
+        if let Err(error) = save_notebook_icons(vault_path, migrated) {
+            return Err(match move_without_replacing(dest, src) {
                 Ok(()) => error,
-                Err(rollback) => format!("{error}; notebook move rollback failed: {rollback}"),
+                Err(rollback) => format!(
+                    "{error}; notebook remains at {}: {rollback}",
+                    dest.display()
+                ),
+            });
+        }
+    }
+    if let Some((_, updated)) = quick_access {
+        if let Err(error) = save_quick_access(vault_path, &updated) {
+            return Err(match move_without_replacing(dest, src) {
+                Ok(()) if migrated.is_some() => match save_notebook_icons(vault_path, &icons) {
+                    Ok(()) => error,
+                    Err(rollback) => format!("{error}; notebook icon rollback failed: {rollback}"),
+                },
+                Ok(()) => error,
+                Err(rollback) => format!(
+                    "{error}; notebook remains at {}: {rollback}",
+                    dest.display()
+                ),
             });
         }
     }
@@ -1739,6 +2005,76 @@ pub(crate) fn attachment_metadata_references(
     }
 }
 
+type QuickAccessChange = (Vec<String>, Vec<String>);
+
+fn quick_access_migration(
+    vault_path: &str,
+    src: &Path,
+    dest: &Path,
+    notebook: bool,
+) -> Result<Option<QuickAccessChange>, String> {
+    if src == dest {
+        return Ok(None);
+    }
+    let previous = load_quick_access(vault_path)?;
+    if previous.is_empty() {
+        return Ok(None);
+    }
+    let old = normalize_notebook_icon_key(
+        &src.strip_prefix(vault_path)
+            .map_err(|error| error.to_string())?
+            .to_string_lossy(),
+    );
+    let new = normalize_notebook_icon_key(
+        &dest
+            .strip_prefix(vault_path)
+            .map_err(|error| error.to_string())?
+            .to_string_lossy(),
+    );
+    let mut updated: Option<Vec<String>> = None;
+    for (index, entry) in previous.iter().enumerate() {
+        let normalized: std::borrow::Cow<'_, str> = if entry.contains('\\') {
+            std::borrow::Cow::Owned(entry.replace('\\', "/"))
+        } else {
+            std::borrow::Cow::Borrowed(entry.as_str())
+        };
+        let mapped = if notebook {
+            normalized
+                .strip_prefix(&old)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                .map(|suffix| format!("{new}/{suffix}"))
+        } else if normalized.as_ref() == old {
+            Some(new.clone())
+        } else {
+            None
+        };
+        if let Some(mapped) = mapped {
+            updated.get_or_insert_with(|| previous.clone())[index] = mapped;
+        }
+    }
+    Ok(updated.map(|updated| (previous, updated)))
+}
+
+fn move_note_with_quick_access(
+    vault_path: &str,
+    src: &Path,
+    dest: &Path,
+) -> Result<Option<Vec<String>>, String> {
+    let migration = quick_access_migration(vault_path, src, dest, false)?;
+    move_without_replacing(src, dest)?;
+    if let Some((previous, updated)) = migration {
+        if let Err(error) = save_quick_access(vault_path, &updated) {
+            return Err(match move_without_replacing(dest, src) {
+                Ok(()) => error,
+                Err(rollback) => format!("{error}; note remains at {}: {rollback}", dest.display()),
+            });
+        }
+        Ok(Some(previous))
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn load_quick_access(vault_path: &str) -> Result<Vec<String>, String> {
     let qa_path = helixnotes_dir(vault_path).join("quick_access.json");
     if qa_path.exists() {
@@ -1752,8 +2088,7 @@ pub fn load_quick_access(vault_path: &str) -> Result<Vec<String>, String> {
 pub fn save_quick_access(vault_path: &str, paths: &[String]) -> Result<(), String> {
     let qa_path = helixnotes_dir(vault_path).join("quick_access.json");
     let data = serde_json::to_string_pretty(paths).map_err(|e| e.to_string())?;
-    fs::write(&qa_path, data).map_err(|e| e.to_string())?;
-    Ok(())
+    replace_file_atomically(&qa_path, data.as_bytes())
 }
 
 pub fn add_quick_access(vault_path: &str, note_relative: &str) -> Result<(), String> {
@@ -2387,6 +2722,7 @@ mod tests {
             path.to_str().unwrap(),
             &note.meta,
             "New body.",
+            &note.raw,
         )
         .unwrap();
         let mobile = super::read_note_entry_metadata_only(&path, vault.path()).unwrap();
@@ -2410,9 +2746,11 @@ mod tests {
         meta.modified = chrono::Utc::now();
         let serialized_body = format!("{}\n", note.content);
 
-        assert!(save_note(&vault_path, &note_path, &meta, &serialized_body)
-            .unwrap()
-            .is_none());
+        assert!(
+            save_note(&vault_path, &note_path, &meta, &serialized_body, original)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
     }
@@ -2428,9 +2766,11 @@ mod tests {
         let note = read_note(&vault_path, &note_path).unwrap();
         let body = format!("{}  \n", note.content);
 
-        assert!(save_note(&vault_path, &note_path, &note.meta, &body)
-            .unwrap()
-            .is_some());
+        assert!(
+            save_note(&vault_path, &note_path, &note.meta, &body, &note.raw)
+                .unwrap()
+                .is_some()
+        );
         assert!(fs::read_to_string(&path)
             .unwrap()
             .ends_with("Final line.  \n"));
@@ -2447,15 +2787,27 @@ mod tests {
         let meta = read_note(&vault_path, &note_path).unwrap().meta;
         assert!(meta.id.is_empty());
 
-        let first = save_note(&vault_path, &note_path, &meta, "# Note\n\nFirst change.\n")
-            .unwrap()
-            .unwrap();
+        let first = save_note(
+            &vault_path,
+            &note_path,
+            &meta,
+            "# Note\n\nFirst change.\n",
+            original,
+        )
+        .unwrap()
+        .unwrap();
         Uuid::parse_str(&first.id).unwrap();
         assert_eq!(first.previous_raw, original);
         let first_raw = fs::read_to_string(&path).unwrap();
-        let second = save_note(&vault_path, &note_path, &meta, "# Note\n\nSecond change.\n")
-            .unwrap()
-            .unwrap();
+        let second = save_note(
+            &vault_path,
+            &note_path,
+            &meta,
+            "# Note\n\nSecond change.\n",
+            &first_raw,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(second.id, first.id);
         assert_eq!(second.previous_raw, first_raw);
 
@@ -2521,5 +2873,398 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o440)).unwrap();
         assert!(replace_file_atomically(&path, b"must not save").is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "saved");
+    }
+    #[test]
+    fn stale_save_does_not_overwrite_external_edits_even_when_requested_body_is_unchanged() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().join("Note.md");
+        fs::write(&path, "---\nid: original\ntitle: Note\n---\nOriginal\n").unwrap();
+        let vault_path = vault.path().to_str().unwrap();
+        let note = read_note(vault_path, path.to_str().unwrap()).unwrap();
+        let external = "---\nid: original\ntitle: Note\naliases: [External]\n---\nOriginal\n";
+        fs::write(&path, external).unwrap();
+        let error = save_note(
+            vault_path,
+            path.to_str().unwrap(),
+            &note.meta,
+            &note.content,
+            &note.raw,
+        )
+        .err()
+        .unwrap();
+        assert!(error.starts_with("Save conflict:"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), external);
+    }
+
+    #[test]
+    fn rename_reports_exact_old_and_saved_baselines_to_open_editors() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        let old_path = root.join("Before.md");
+        let old_raw = "---\nid: stable\ntitle: Before\naliases: [Legacy]\n---\nBody.\n";
+        fs::write(&old_path, old_raw).unwrap();
+        let result =
+            super::rename_note(old_path.to_str().unwrap(), "After", root.to_str().unwrap())
+                .unwrap();
+        assert_eq!(result.path, root.join("After.md").to_string_lossy());
+        assert_eq!(result.old_raw, old_raw);
+        assert_eq!(result.old_title, "Before");
+        assert_eq!(result.new_title, "After");
+        assert_eq!(result.new_raw, fs::read_to_string(&result.path).unwrap());
+        assert!(result.new_raw.contains("aliases:"));
+        assert!(!old_path.exists());
+    }
+
+    #[test]
+    fn favorites_follow_note_and_notebook_renames_and_moves_with_mixed_separators() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        let vault_path = root.to_str().unwrap();
+        super::ensure_vault_structure(vault_path).unwrap();
+        fs::create_dir(root.join("Drafts")).unwrap();
+        fs::create_dir(root.join("DraftsExtra")).unwrap();
+        fs::create_dir(root.join("Archive")).unwrap();
+        fs::create_dir(root.join("Group")).unwrap();
+        fs::write(root.join("Drafts/First.md"), "---\ntitle: First\n---\nbody").unwrap();
+        fs::write(root.join("DraftsExtra/Keep.md"), "other").unwrap();
+        super::save_quick_access(
+            vault_path,
+            &["Drafts\\First.md".into(), "DraftsExtra/Keep.md".into()],
+        )
+        .unwrap();
+        let renamed = super::rename_note(
+            root.join("Drafts/First.md").to_str().unwrap(),
+            "Second",
+            vault_path,
+        )
+        .unwrap();
+        assert_eq!(
+            super::load_quick_access(vault_path).unwrap(),
+            ["Drafts/Second.md", "DraftsExtra/Keep.md",]
+        );
+        let moved = super::move_note(
+            vault_path,
+            &renamed.path,
+            root.join("Archive").to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            super::load_quick_access(vault_path).unwrap()[0],
+            "Archive/Second.md"
+        );
+        let note_after_move = fs::read_to_string(&moved).unwrap();
+
+        super::save_quick_access(
+            vault_path,
+            &[
+                "Archive\\Second.md".into(),
+                "Archive/Sub\\Other.md".into(),
+                "DraftsExtra/Keep.md".into(),
+            ],
+        )
+        .unwrap();
+        set_notebook_icon(vault_path, "Archive", Some("builtin:folder")).unwrap();
+        let renamed_book = super::rename_notebook(
+            vault_path,
+            root.join("Archive").to_str().unwrap(),
+            "Journal",
+        )
+        .unwrap();
+        assert_eq!(
+            super::load_quick_access(vault_path).unwrap(),
+            [
+                "Journal/Second.md",
+                "Journal/Sub/Other.md",
+                "DraftsExtra/Keep.md",
+            ]
+        );
+        super::move_notebook(
+            vault_path,
+            &renamed_book,
+            root.join("Group").to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            super::load_quick_access(vault_path).unwrap(),
+            [
+                "Group/Journal/Second.md",
+                "Group/Journal/Sub/Other.md",
+                "DraftsExtra/Keep.md",
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("Group/Journal/Second.md")).unwrap(),
+            note_after_move
+        );
+        assert_eq!(
+            load_notebook_icons(vault_path).unwrap()["Group/Journal"],
+            "builtin:folder"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_favorites_save_rolls_back_note_and_notebook_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        let vault_path = root.to_str().unwrap();
+        super::ensure_vault_structure(vault_path).unwrap();
+        fs::create_dir(root.join("Book")).unwrap();
+        fs::create_dir(root.join("Target")).unwrap();
+        let note = root.join("Book/Note.md");
+        let original = "---\ntitle: Note\n---\noriginal";
+        fs::write(&note, original).unwrap();
+        super::save_quick_access(vault_path, &["Book/Note.md".into()]).unwrap();
+        let favorites = helixnotes_dir(vault_path).join("quick_access.json");
+        let before = fs::read(&favorites).unwrap();
+        fs::set_permissions(&favorites, fs::Permissions::from_mode(0o440)).unwrap();
+
+        assert!(super::rename_note(note.to_str().unwrap(), "Changed", vault_path).is_err());
+        assert!(super::move_note(
+            vault_path,
+            note.to_str().unwrap(),
+            root.join("Target").to_str().unwrap()
+        )
+        .is_err());
+        assert!(
+            super::rename_notebook(vault_path, root.join("Book").to_str().unwrap(), "Renamed")
+                .is_err()
+        );
+        assert!(super::move_notebook(
+            vault_path,
+            root.join("Book").to_str().unwrap(),
+            root.join("Target").to_str().unwrap()
+        )
+        .is_err());
+        assert_eq!(fs::read_to_string(&note).unwrap(), original);
+        assert!(!root.join("Book/Changed.md").exists());
+        assert!(!root.join("Target/Note.md").exists());
+        assert!(!root.join("Renamed").exists());
+        assert!(!root.join("Target/Book").exists());
+        assert_eq!(fs::read(&favorites).unwrap(), before);
+    }
+
+    #[test]
+    fn rename_move_and_restore_reject_collisions_without_changing_either_note() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        let vault_path = root.to_str().unwrap();
+        super::ensure_vault_structure(vault_path).unwrap();
+        let src = root.join("Source.md");
+        let existing = root.join("Taken.md");
+        fs::write(&src, "---\ntitle: Source\n---\nSOURCE").unwrap();
+        fs::write(&existing, "DESTINATION").unwrap();
+        assert!(super::rename_note(src.to_str().unwrap(), "Taken", vault_path).is_err());
+        assert_eq!(
+            fs::read_to_string(&src).unwrap(),
+            "---\ntitle: Source\n---\nSOURCE"
+        );
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "DESTINATION");
+
+        let target_dir = root.join("Target");
+        fs::create_dir(&target_dir).unwrap();
+        fs::write(target_dir.join("Source.md"), "TARGET").unwrap();
+        assert!(super::move_note(
+            vault_path,
+            src.to_str().unwrap(),
+            target_dir.to_str().unwrap()
+        )
+        .is_err());
+        assert_eq!(
+            fs::read_to_string(&src).unwrap(),
+            "---\ntitle: Source\n---\nSOURCE"
+        );
+        assert_eq!(
+            fs::read_to_string(target_dir.join("Source.md")).unwrap(),
+            "TARGET"
+        );
+
+        super::delete_note(vault_path, src.to_str().unwrap()).unwrap();
+        let trash = super::get_trash_contents(vault_path).unwrap().notes;
+        assert_eq!(trash.len(), 1);
+        fs::write(&src, "REPLACEMENT").unwrap();
+        assert!(super::restore_note(vault_path, &trash[0].path, None).is_err());
+        assert_eq!(fs::read_to_string(&src).unwrap(), "REPLACEMENT");
+        assert_eq!(
+            fs::read_to_string(&trash[0].path).unwrap(),
+            "---\ntitle: Source\n---\nSOURCE"
+        );
+    }
+
+    #[test]
+    fn rapid_repeated_trash_preserves_all_same_named_notes_and_restores_original_name() {
+        let vault = tempfile::tempdir().unwrap();
+        let vault_path = vault.path().to_str().unwrap();
+        super::ensure_vault_structure(vault_path).unwrap();
+        let note = vault.path().join("Repeat.md");
+        for index in 0..200 {
+            fs::write(&note, format!("---\ntitle: Repeat\n---\nCopy {index}")).unwrap();
+            super::delete_note(vault_path, note.to_str().unwrap()).unwrap();
+        }
+        let trash = super::get_trash_contents(vault_path).unwrap();
+        assert_eq!(trash.notes.len(), 200);
+        let contents: std::collections::HashSet<_> = trash
+            .notes
+            .iter()
+            .map(|entry| fs::read_to_string(&entry.path).unwrap())
+            .collect();
+        assert_eq!(contents.len(), 200);
+        let restored = super::restore_note(vault_path, &trash.notes[0].path, None).unwrap();
+        assert_eq!(restored, note.to_string_lossy());
+        assert!(fs::read_to_string(&restored).unwrap().contains("Copy "));
+    }
+
+    #[test]
+    fn notebook_trash_sidecars_survive_repeated_deletion_and_restore_collisions() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        let vault_path = root.to_str().unwrap();
+        super::ensure_vault_structure(vault_path).unwrap();
+        fs::create_dir(root.join("Parent")).unwrap();
+        for index in 0..30 {
+            fs::create_dir(root.join("Parent/Book")).unwrap();
+            fs::write(root.join("Parent/Book/Note.md"), format!("Book {index}")).unwrap();
+            super::delete_notebook(vault_path, root.join("Parent/Book").to_str().unwrap()).unwrap();
+        }
+        let trash = super::get_trash_contents(vault_path).unwrap();
+        assert_eq!(trash.notebooks.len(), 30);
+        assert!(trash
+            .notebooks
+            .iter()
+            .all(|entry| entry.name == "Book" && entry.note_count == 1));
+        fs::create_dir(root.join("Parent/Book")).unwrap();
+        fs::write(root.join("Parent/Book/Note.md"), "current").unwrap();
+        let old = &trash.notebooks[0].path;
+        assert!(super::restore_notebook(vault_path, old).is_err());
+        assert_eq!(
+            fs::read_to_string(root.join("Parent/Book/Note.md")).unwrap(),
+            "current"
+        );
+        assert!(std::path::Path::new(old).exists());
+        fs::remove_dir_all(root.join("Parent/Book")).unwrap();
+        let restored = super::restore_notebook(vault_path, old).unwrap();
+        assert_eq!(restored, root.join("Parent/Book").to_string_lossy());
+        assert!(fs::read_to_string(root.join("Parent/Book/Note.md"))
+            .unwrap()
+            .starts_with("Book "));
+    }
+
+    #[test]
+    fn notebook_rename_and_move_reject_existing_directories_without_losing_icons() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        let vault_path = root.to_str().unwrap();
+        super::ensure_vault_structure(vault_path).unwrap();
+        let book = create_notebook(vault_path, None, "Book").unwrap();
+        fs::write(root.join("Book/Only.md"), "original").unwrap();
+        set_notebook_icon(vault_path, "Book", Some("builtin:star")).unwrap();
+        fs::create_dir(root.join("Taken")).unwrap();
+        assert!(super::rename_notebook(vault_path, &book.path, "Taken").is_err());
+        fs::create_dir(root.join("Target")).unwrap();
+        fs::create_dir(root.join("Target/Book")).unwrap();
+        assert!(super::move_notebook(
+            vault_path,
+            &book.path,
+            root.join("Target").to_str().unwrap()
+        )
+        .is_err());
+        assert_eq!(
+            fs::read_to_string(root.join("Book/Only.md")).unwrap(),
+            "original"
+        );
+        assert_eq!(
+            load_notebook_icons(vault_path).unwrap()["Book"],
+            "builtin:star"
+        );
+    }
+
+    #[test]
+    fn legacy_trash_names_restore_without_a_sidecar() {
+        let vault = tempfile::tempdir().unwrap();
+        let vault_path = vault.path().to_str().unwrap();
+        super::ensure_vault_structure(vault_path).unwrap();
+        let trash = helixnotes_dir(vault_path).join("trash");
+        let old_note = trash.join("20260101000000_Old.md");
+        fs::write(&old_note, "---\ntitle: Old\n---\nlegacy note").unwrap();
+        let restored_note =
+            super::restore_note(vault_path, old_note.to_str().unwrap(), None).unwrap();
+        assert_eq!(restored_note, vault.path().join("Old.md").to_string_lossy());
+        assert!(fs::read_to_string(&restored_note)
+            .unwrap()
+            .contains("legacy note"));
+
+        let old_notebook = trash.join("20260101000000000_Old Book");
+        fs::create_dir(&old_notebook).unwrap();
+        fs::write(old_notebook.join("Keep.md"), "legacy book").unwrap();
+        let restored_book = restore_notebook(vault_path, old_notebook.to_str().unwrap()).unwrap();
+        assert_eq!(
+            restored_book,
+            vault.path().join("Old Book").to_string_lossy()
+        );
+        assert_eq!(
+            fs::read_to_string(vault.path().join("Old Book/Keep.md")).unwrap(),
+            "legacy book"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daily_and_restored_notebook_cannot_follow_symlinks_out_of_vault() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let vault = root.path().join("vault");
+        let outside = root.path().join("outside");
+        fs::create_dir(&vault).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let vault_path = vault.to_str().unwrap();
+        super::ensure_vault_structure(vault_path).unwrap();
+        symlink(&outside, vault.join("Daily")).unwrap();
+        assert!(super::create_daily_note(vault_path, Some("2026-01-01"), "iso").is_err());
+        assert!(!outside.join("2026-01-01.md").exists());
+        fs::remove_file(vault.join("Daily")).unwrap();
+        let existing = vault.join("Daily/2026-01-01.md");
+        fs::create_dir(vault.join("Daily")).unwrap();
+        fs::write(outside.join("2026-01-01.md"), "outside").unwrap();
+        symlink(outside.join("2026-01-01.md"), &existing).unwrap();
+        assert!(super::create_daily_note(vault_path, Some("2026-01-01"), "iso").is_err());
+        assert_eq!(
+            fs::read_to_string(outside.join("2026-01-01.md")).unwrap(),
+            "outside"
+        );
+
+        let trash = helixnotes_dir(vault_path).join("trash");
+        let notebook = trash.join("20260101000000000_Stashed");
+        fs::create_dir(&notebook).unwrap();
+        fs::write(notebook.join("Keep.md"), "safe").unwrap();
+        fs::write(
+            trash.join("20260101000000000_Stashed.meta"),
+            "Escape/Stashed",
+        )
+        .unwrap();
+        symlink(&outside, vault.join("Escape")).unwrap();
+        assert!(restore_notebook(vault_path, notebook.to_str().unwrap()).is_err());
+        assert!(notebook.join("Keep.md").exists());
+        assert!(!outside.join("Stashed").exists());
+    }
+
+    #[test]
+    fn vault_state_save_replaces_file_without_truncating_open_reader() {
+        let vault = tempfile::tempdir().unwrap();
+        let vault_path = vault.path().to_str().unwrap();
+        super::ensure_vault_structure(vault_path).unwrap();
+        let state = helixnotes_dir(vault_path).join("state.json");
+        fs::write(&state, b"old vault state").unwrap();
+        let mut reader = fs::File::open(&state).unwrap();
+        let new_state = crate::types::VaultState {
+            last_open_note: Some("Daily/2026-01-01.md".into()),
+            ..Default::default()
+        };
+        super::save_vault_state(vault_path, &new_state).unwrap();
+        let mut old = String::new();
+        reader.read_to_string(&mut old).unwrap();
+        assert_eq!(old, "old vault state");
+        let saved = super::load_vault_state(vault_path).unwrap();
+        assert_eq!(saved.last_open_note, new_state.last_open_note);
     }
 }

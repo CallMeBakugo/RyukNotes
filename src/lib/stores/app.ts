@@ -203,6 +203,22 @@ function createNavHistory() {
         return { stack: [...trimmed, path], index: trimmed.length, skipping: false };
       });
     },
+    remap(oldPrefix: string, newPrefix: string) {
+      const oldRoot = oldPrefix.replace(/\\/g, '/').replace(/\/+$/, '');
+      const newRoot = newPrefix.replace(/[\\/]+$/, '');
+      const insensitive = /^[A-Za-z]:\//.test(oldRoot) || oldRoot.startsWith('//');
+      const matchRoot = insensitive ? oldRoot.toLowerCase() : oldRoot;
+      store.update(s => ({
+        ...s,
+        stack: s.stack.map(path => {
+          const normalized = path.replace(/\\/g, '/');
+          const candidate = insensitive ? normalized.toLowerCase() : normalized;
+          return candidate === matchRoot || candidate.startsWith(`${matchRoot}/`)
+            ? newRoot + path.slice(oldRoot.length)
+            : path;
+        }),
+      }));
+    },
     go(direction: -1 | 1): string | null {
       let target: string | null = null;
       store.update(s => {

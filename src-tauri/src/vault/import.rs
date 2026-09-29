@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::fs::OpenOptions;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use gray_matter::engine::YAML;
@@ -9,23 +11,16 @@ use uuid::Uuid;
 
 use crate::types::{ImportResult, NoteMeta};
 use crate::vault::frontmatter;
+use crate::vault::operations::replace_file_atomically;
 
 pub fn import(vault_path: &str) -> Result<ImportResult, String> {
     let vault = Path::new(vault_path);
 
-    let file_index = build_file_index(vault);
+    let file_index = build_file_index(vault)?;
 
-    let md_files: Vec<_> = walkdir::WalkDir::new(vault)
+    let md_files: Vec<_> = scanned_files(vault)?
         .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let p = e.path();
-            p.is_file()
-                && p.extension().and_then(|x| x.to_str()) == Some("md")
-                && !p.to_string_lossy().contains("/.helixnotes/")
-                && !p.to_string_lossy().contains("/.trash/")
-        })
-        .map(|e| e.path().to_path_buf())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md"))
         .collect();
 
     let wiki_embed_re =
@@ -46,10 +41,8 @@ pub fn import(vault_path: &str) -> Result<ImportResult, String> {
     };
 
     for path in &md_files {
-        let raw = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("Reading {}: {e}", path.display()))?;
         let note_dir = path.parent().unwrap_or(Path::new(""));
 
         let mut content = raw.clone();
@@ -193,7 +186,8 @@ pub fn import(vault_path: &str) -> Result<ImportResult, String> {
         }
 
         if changed {
-            let _ = std::fs::write(path, &content);
+            replace_file_atomically(path, content.as_bytes())
+                .map_err(|e| format!("Writing {}: {e}", path.display()))?;
             result.files_converted += 1;
         }
     }
@@ -203,30 +197,65 @@ pub fn import(vault_path: &str) -> Result<ImportResult, String> {
 
     if !moved.is_empty() {
         rewrite_attachment_refs(vault, &moved)?;
+        for old_rel in moved.keys() {
+            let src_path = vault.join(old_rel);
+            std::fs::remove_file(&src_path)
+                .map_err(|e| format!("Removing {} after copying: {e}", src_path.display()))?;
+        }
     }
 
-    cleanup_empty_dirs(vault);
+    cleanup_empty_dirs(vault)?;
 
     Ok(result)
 }
 
-fn build_file_index(vault: &Path) -> HashMap<String, String> {
-    let mut index = HashMap::new();
-    for entry in walkdir::WalkDir::new(vault)
+fn is_excluded_dir(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(".helixnotes" | ".obsidian" | ".trash" | ".stfolder" | ".claude")
+    )
+}
+
+fn vault_entries(
+    vault: &Path,
+) -> impl Iterator<Item = Result<walkdir::DirEntry, walkdir::Error>> + '_ {
+    walkdir::WalkDir::new(vault)
         .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if !path.is_file() {
+        .filter_entry(|entry| {
+            entry.depth() == 0 || !entry.file_type().is_dir() || !is_excluded_dir(entry.path())
+        })
+}
+
+fn scanned_files(vault: &Path) -> Result<Vec<PathBuf>, String> {
+    vault_entries(vault)
+        .filter_map(|entry| match entry {
+            Ok(entry) if entry.file_type().is_file() => Some(Ok(entry.into_path())),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Scanning {}: {e}", vault.display()))
+}
+
+fn vault_relative(path: &Path, vault: &Path) -> Result<String, String> {
+    path.strip_prefix(vault)
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .map_err(|e| format!("Relativizing {}: {e}", path.display()))
+}
+
+fn build_file_index(vault: &Path) -> Result<HashMap<String, String>, String> {
+    let mut index = HashMap::new();
+    for entry in vault_entries(vault) {
+        let entry = entry.map_err(|e| format!("Scanning {}: {e}", vault.display()))?;
+        if !entry.file_type().is_file() {
             continue;
         }
+        let path = entry.path();
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if let Ok(rel) = path.strip_prefix(vault) {
-                index.insert(name.to_string(), rel.to_string_lossy().to_string());
-            }
+            index.insert(name.to_string(), vault_relative(path, vault)?);
         }
     }
-    index
+    Ok(index)
 }
 
 fn rename_deprecated_properties(raw: &str) -> String {
@@ -565,52 +594,102 @@ fn fix_md_link_refs(
     .to_string()
 }
 
+fn ensure_attachment_parent(
+    vault: &Path,
+    canonical_vault: &Path,
+    parent: &Path,
+) -> Result<(), String> {
+    let relative = parent
+        .strip_prefix(vault)
+        .map_err(|e| format!("Invalid attachment destination {}: {e}", parent.display()))?;
+    let mut current = vault.to_path_buf();
+    let mut relative_path = PathBuf::new();
+    for component in relative.components() {
+        current.push(component);
+        relative_path.push(component);
+        match std::fs::create_dir(&current) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("Creating {}: {e}", current.display())),
+        }
+        let canonical = std::fs::canonicalize(&current)
+            .map_err(|e| format!("Resolving {}: {e}", current.display()))?;
+        if !current.is_dir() || canonical != canonical_vault.join(&relative_path) {
+            return Err(format!(
+                "Attachment destination escapes vault: {}",
+                current.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn move_attachments(vault: &Path) -> Result<HashMap<String, String>, String> {
     let attachments_dir = vault.join(".helixnotes").join("attachments");
-    let _ = std::fs::create_dir_all(&attachments_dir);
-
-    let attachment_files: Vec<_> = walkdir::WalkDir::new(vault)
+    let attachment_files: Vec<_> = scanned_files(vault)?
         .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let p = e.path();
-            if !p.is_file() {
-                return false;
-            }
-            if p.extension().and_then(|x| x.to_str()) == Some("md") {
-                return false;
-            }
-            let path_str = p.to_string_lossy();
-            !path_str.contains("/.helixnotes/")
-                && !path_str.contains("/.obsidian/")
-                && !path_str.contains("/.trash/")
-                && !path_str.contains("/.stfolder")
-                && !path_str.contains("/.claude/")
-        })
-        .map(|e| e.path().to_path_buf())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) != Some("md"))
         .collect();
+    let canonical_vault =
+        std::fs::canonicalize(vault).map_err(|e| format!("Resolving {}: {e}", vault.display()))?;
 
-    let mut moved: HashMap<String, String> = HashMap::new();
+    let mut moved = HashMap::new();
+    for src_path in attachment_files {
+        let old_rel = vault_relative(&src_path, vault)?;
+        let preferred = attachments_dir.join(&old_rel);
+        let parent = preferred.parent().expect("attachment has a parent");
+        ensure_attachment_parent(vault, &canonical_vault, parent)?;
 
-    for src_path in &attachment_files {
-        let old_rel = match src_path.strip_prefix(vault) {
-            Ok(r) => r.to_string_lossy().to_string(),
-            Err(_) => continue,
+        // Reserve the destination atomically: neither rename nor std::fs::copy protects
+        // a pre-existing attachment (or one created concurrently) from replacement.
+        let mut suffix = 0u64;
+        let (dest_path, mut dest) = loop {
+            let candidate = if suffix == 0 {
+                preferred.clone()
+            } else {
+                let stem = preferred.file_stem().unwrap_or_default().to_string_lossy();
+                let ext = preferred
+                    .extension()
+                    .map(|ext| format!(".{}", ext.to_string_lossy()))
+                    .unwrap_or_default();
+                preferred.with_file_name(format!("{stem}-{suffix}{ext}"))
+            };
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    suffix = suffix
+                        .checked_add(1)
+                        .ok_or("Too many attachment collisions")?;
+                }
+                Err(e) => return Err(format!("Creating {}: {e}", candidate.display())),
+            }
         };
-        let new_rel = format!(".helixnotes/attachments/{}", old_rel);
-        let dest_path = vault.join(&new_rel);
-
-        if let Some(parent) = dest_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        let copied = (|| -> io::Result<()> {
+            let mut src = std::fs::File::open(&src_path)?;
+            io::copy(&mut src, &mut dest)?;
+            dest.sync_all()?;
+            Ok(())
+        })();
+        drop(dest);
+        if let Err(e) = copied {
+            std::fs::remove_file(&dest_path).map_err(|cleanup| {
+                format!(
+                    "Copying {} to {}: {e}; removing incomplete copy: {cleanup}",
+                    src_path.display(),
+                    dest_path.display()
+                )
+            })?;
+            return Err(format!(
+                "Copying {} to {}: {e}",
+                src_path.display(),
+                dest_path.display()
+            ));
         }
-
-        if std::fs::rename(src_path, &dest_path).is_ok()
-            || std::fs::copy(src_path, &dest_path)
-                .and_then(|_| std::fs::remove_file(src_path))
-                .is_ok()
-        {
-            moved.insert(old_rel, new_rel);
-        }
+        moved.insert(old_rel, vault_relative(&dest_path, vault)?);
     }
     Ok(moved)
 }
@@ -618,24 +697,14 @@ fn move_attachments(vault: &Path) -> Result<HashMap<String, String>, String> {
 fn rewrite_attachment_refs(vault: &Path, moved: &HashMap<String, String>) -> Result<(), String> {
     let md_ref = Regex::new(r"(!?\[[^\]]*\])\(([^)]+)\)").map_err(|e| e.to_string())?;
 
-    let md_files: Vec<_> = walkdir::WalkDir::new(vault)
+    let md_files: Vec<_> = scanned_files(vault)?
         .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let p = e.path();
-            p.is_file()
-                && p.extension().and_then(|x| x.to_str()) == Some("md")
-                && !p.to_string_lossy().contains("/.helixnotes/")
-                && !p.to_string_lossy().contains("/.trash/")
-        })
-        .map(|e| e.path().to_path_buf())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md"))
         .collect();
 
     for path in &md_files {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("Reading {}: {e}", path.display()))?;
         let note_dir = path.parent().unwrap_or(Path::new(""));
 
         let new_content = md_ref
@@ -643,28 +712,29 @@ fn rewrite_attachment_refs(vault: &Path, moved: &HashMap<String, String>) -> Res
                 let prefix = &caps[1];
                 let href = &caps[2];
                 let decoded_href = percent_decode(href);
+                let (reference, suffix) = decoded_href
+                    .find(['#', '?'])
+                    .map(|index| decoded_href.split_at(index))
+                    .unwrap_or((&decoded_href, ""));
 
-                if decoded_href.starts_with("http") || decoded_href.starts_with("data:") {
+                if reference.starts_with("http")
+                    || reference.starts_with("data:")
+                    || reference.starts_with('/')
+                {
                     return format!("{}({})", prefix, href);
                 }
 
-                let abs_from_note = note_dir.join(&decoded_href);
-                let rel_from_note = abs_from_note
+                let rel_from_note = note_dir
                     .strip_prefix(vault)
                     .ok()
-                    .map(|r| r.to_string_lossy().to_string());
-                let rel_from_vault = decoded_href.clone();
-
+                    .and_then(|base| resolve_relative_ref(base, reference));
                 let old_vault_rel = rel_from_note
                     .as_ref()
                     .filter(|r| moved.contains_key(r.as_str()))
                     .cloned()
                     .or_else(|| {
-                        if moved.contains_key(&rel_from_vault) {
-                            Some(rel_from_vault)
-                        } else {
-                            None
-                        }
+                        resolve_relative_ref(Path::new(""), reference)
+                            .filter(|r| moved.contains_key(r.as_str()))
                     });
 
                 if let Some(old_rel) = old_vault_rel {
@@ -675,7 +745,12 @@ fn rewrite_attachment_refs(vault: &Path, moved: &HashMap<String, String>) -> Res
                             note_dir.to_str().unwrap_or(""),
                         )
                         .unwrap_or(new_rel.clone());
-                        return format!("{}({})", prefix, new_note_rel.replace(' ', "%20"));
+                        return format!(
+                            "{}({}{})",
+                            prefix,
+                            new_note_rel.replace('\\', "/").replace(' ', "%20"),
+                            suffix
+                        );
                     }
                 }
                 format!("{}({})", prefix, href)
@@ -683,33 +758,59 @@ fn rewrite_attachment_refs(vault: &Path, moved: &HashMap<String, String>) -> Res
             .to_string();
 
         if new_content != content {
-            let _ = std::fs::write(path, new_content);
+            replace_file_atomically(path, new_content.as_bytes())
+                .map_err(|e| format!("Writing {}: {e}", path.display()))?;
         }
     }
     Ok(())
 }
 
-fn cleanup_empty_dirs(root: &Path) {
-    let mut dirs: Vec<_> = walkdir::WalkDir::new(root)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .map(|e| e.path().to_path_buf())
-        .collect();
+fn resolve_relative_ref(base: &Path, reference: &str) -> Option<String> {
+    let mut rel = base.to_path_buf();
+    for component in Path::new(&reference.replace('\\', "/")).components() {
+        match component {
+            std::path::Component::Normal(name) => rel.push(name),
+            std::path::Component::ParentDir => {
+                if !rel.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    Some(rel.to_string_lossy().replace('\\', "/"))
+}
+
+fn cleanup_empty_dirs(root: &Path) -> Result<(), String> {
+    let mut dirs: Vec<_> = vault_entries(root)
+        .filter_map(|entry| match entry {
+            Ok(entry) if entry.file_type().is_dir() => Some(Ok(entry.into_path())),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Scanning {}: {e}", root.display()))?;
 
     dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
 
     for dir in dirs {
-        let dir_str = dir.to_string_lossy();
-        if dir_str.contains("/.helixnotes") || dir_str.contains("/.obsidian") || dir == root {
+        if dir == root {
             continue;
         }
-        if let Ok(mut entries) = std::fs::read_dir(&dir) {
-            if entries.next().is_none() {
-                let _ = std::fs::remove_dir(&dir);
-            }
+        let mut entries =
+            std::fs::read_dir(&dir).map_err(|e| format!("Reading {}: {e}", dir.display()))?;
+        if entries
+            .next()
+            .transpose()
+            .map_err(|e| format!("Reading {}: {e}", dir.display()))?
+            .is_none()
+        {
+            std::fs::remove_dir(&dir)
+                .map_err(|e| format!("Removing empty directory {}: {e}", dir.display()))?;
         }
     }
+    Ok(())
 }
 
 fn split_anchor(reference: &str) -> (&str, Option<&str>) {
@@ -778,7 +879,7 @@ fn pathdiff(target: &str, base: &str) -> Result<String, ()> {
     for component in &target_components[common..] {
         result.push(component);
     }
-    Ok(result.to_string_lossy().to_string())
+    Ok(result.to_string_lossy().replace('\\', "/"))
 }
 
 fn percent_decode(s: &str) -> String {
@@ -1011,6 +1112,131 @@ mod tests {
         let raw = "---\naliases: [A]\ncssclasses: [c]\n---\n# Note";
         let result = rename_deprecated_properties(raw);
         assert_eq!(result, raw);
+    }
+
+    #[test]
+    fn import_keeps_colliding_attachments_and_rewrites_note_relative_links() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        let note_dir = root.join("Notes");
+        let stored = root.join(".helixnotes/attachments/Notes");
+        std::fs::create_dir_all(&note_dir).unwrap();
+        std::fs::create_dir_all(&stored).unwrap();
+        std::fs::write(note_dir.join("pic.png"), b"NEW").unwrap();
+        std::fs::write(stored.join("pic.png"), b"OLD").unwrap();
+        std::fs::write(stored.join("pic-1.png"), b"OLDER").unwrap();
+        std::fs::write(
+            note_dir.join("Entry.md"),
+            "# Entry\n\n![picture](pic.png) [picture](./pic.png#preview)",
+        )
+        .unwrap();
+
+        let result = import(root.to_str().unwrap()).unwrap();
+
+        assert_eq!(result.attachments_moved, 1);
+        assert_eq!(std::fs::read(stored.join("pic.png")).unwrap(), b"OLD");
+        assert_eq!(std::fs::read(stored.join("pic-1.png")).unwrap(), b"OLDER");
+        assert_eq!(std::fs::read(stored.join("pic-2.png")).unwrap(), b"NEW");
+        assert!(!note_dir.join("pic.png").exists());
+        let note = std::fs::read_to_string(note_dir.join("Entry.md")).unwrap();
+        assert!(note.contains("![picture](../.helixnotes/attachments/Notes/pic-2.png)"));
+        assert!(note.contains("[picture](../.helixnotes/attachments/Notes/pic-2.png#preview)"));
+    }
+
+    #[test]
+    fn import_prunes_metadata_directories_at_every_depth() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        for hidden in [".helixnotes", ".obsidian", ".trash", ".stfolder", ".claude"] {
+            for base in [root.to_path_buf(), root.join("Notebook")] {
+                let hidden_dir = base.join(hidden).join("history");
+                std::fs::create_dir_all(&hidden_dir).unwrap();
+                std::fs::write(hidden_dir.join("Secret.md"), "==untouched==").unwrap();
+                std::fs::write(hidden_dir.join("asset.bin"), b"untouched").unwrap();
+            }
+        }
+        let visible_dir = root.join("Notebook/stfolder-visible");
+        std::fs::create_dir_all(&visible_dir).unwrap();
+        std::fs::write(visible_dir.join("asset.bin"), b"visible").unwrap();
+        std::fs::write(
+            root.join("Note.md"),
+            "# Note\n\n![file](Notebook/stfolder-visible/asset.bin)",
+        )
+        .unwrap();
+
+        let result = import(root.to_str().unwrap()).unwrap();
+
+        assert_eq!(result.attachments_moved, 1);
+        assert_eq!(
+            std::fs::read(root.join(".helixnotes/attachments/Notebook/stfolder-visible/asset.bin"))
+                .unwrap(),
+            b"visible"
+        );
+        for hidden in [".helixnotes", ".obsidian", ".trash", ".stfolder", ".claude"] {
+            for base in [root.to_path_buf(), root.join("Notebook")] {
+                let hidden_dir = base.join(hidden).join("history");
+                assert_eq!(
+                    std::fs::read_to_string(hidden_dir.join("Secret.md")).unwrap(),
+                    "==untouched=="
+                );
+                assert_eq!(
+                    std::fs::read(hidden_dir.join("asset.bin")).unwrap(),
+                    b"untouched"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn destination_io_failure_leaves_original_attachment_in_place() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        std::fs::create_dir(root.join(".helixnotes")).unwrap();
+        std::fs::write(root.join(".helixnotes/attachments"), b"existing metadata").unwrap();
+        std::fs::write(root.join("asset.bin"), b"original").unwrap();
+
+        assert!(import(root.to_str().unwrap()).is_err());
+        assert_eq!(std::fs::read(root.join("asset.bin")).unwrap(), b"original");
+        assert_eq!(
+            std::fs::read(root.join(".helixnotes/attachments")).unwrap(),
+            b"existing metadata"
+        );
+    }
+
+    #[test]
+    fn readonly_note_does_not_lose_original_or_attachment() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        let note = root.join("Note.md");
+        let original = "# Note\n\n![asset](asset.bin)";
+        std::fs::write(&note, original).unwrap();
+        std::fs::write(root.join("asset.bin"), b"original").unwrap();
+        let original_permissions = std::fs::metadata(&note).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&note, permissions).unwrap();
+
+        let result = import(root.to_str().unwrap());
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), original);
+        assert_eq!(std::fs::read(root.join("asset.bin")).unwrap(), b"original");
+        std::fs::set_permissions(&note, original_permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_directory_symlink_cannot_escape_vault() {
+        let vault = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        std::fs::create_dir(root.join(".helixnotes")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join(".helixnotes/attachments")).unwrap();
+        std::fs::write(root.join("asset.bin"), b"original").unwrap();
+
+        assert!(import(root.to_str().unwrap()).is_err());
+        assert_eq!(std::fs::read(root.join("asset.bin")).unwrap(), b"original");
+        assert!(!outside.path().join("asset.bin").exists());
     }
 
     #[test]

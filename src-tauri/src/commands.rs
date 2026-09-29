@@ -2,10 +2,10 @@ use crate::asset_scope;
 use crate::search::SearchIndex;
 use crate::state::AppState;
 use crate::types::*;
-use crate::vault::{operations, watcher};
+use crate::vault::operations;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tauri::{AppHandle, Manager, Runtime, State};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tauri_plugin_fs::FsExt;
 
 fn index_note_bg(search: Option<Arc<SearchIndex>>, path: &str) {
@@ -24,6 +24,45 @@ fn remove_note_bg(search: Option<Arc<SearchIndex>>, path: &str) {
                 log::error!("Failed to remove note from search index: {error}");
             }
         });
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
+struct PathMovedEvent<'a> {
+    vault_path: &'a str,
+    old_path: &'a str,
+    new_path: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_raw: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_raw: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_title: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_title: Option<&'a str>,
+}
+
+fn emit_path_move<R: Runtime>(
+    app: &AppHandle<R>,
+    vault: &str,
+    old: &str,
+    new: &str,
+    renamed: Option<&operations::RenamedNote>,
+) {
+    // Called before releasing note_save; watcher reconciliation takes that lock too.
+    if let Err(error) = app.emit(
+        "vault-path-moved",
+        PathMovedEvent {
+            vault_path: vault,
+            old_path: old,
+            new_path: new,
+            old_raw: renamed.map(|note| note.old_raw.as_str()),
+            new_raw: renamed.map(|note| note.new_raw.as_str()),
+            old_title: renamed.map(|note| note.old_title.as_str()),
+            new_title: renamed.map(|note| note.new_title.as_str()),
+        },
+    ) {
+        log::error!("Could not notify note windows about a moved path: {error}");
     }
 }
 
@@ -62,13 +101,12 @@ fn open_vault_path(
     // Stage the search index and watcher before replacing the active runtime.
     let search = state.search_index_for_vault(&path)?;
 
-    let new_watcher = watcher::start_watcher(app.clone(), path.clone())?;
     asset_scope::allow_vault_assets(&app, Path::new(&path))?;
+    state.ensure_vault_watcher(&app, &path)?;
 
     // Update config. External vaults use the bookmark as their stable identity;
     // the resolved path is refreshed whenever the vault opens.
     let mut search_slot = state.search_index.lock().map_err(|e| e.to_string())?;
-    let mut watcher_slot = state.watcher.lock().map_err(|e| e.to_string())?;
     let mut config = state.config.lock().map_err(|e| e.to_string())?;
     let mut next = config.clone();
     let active_bookmark_id = external
@@ -108,16 +146,18 @@ fn open_vault_path(
     }
     next.active_vault = Some(path);
     next.active_bookmark_id = active_bookmark_id;
-    save_app_config(&next)?;
+    if let Err(error) = save_app_config(&next) {
+        drop(config);
+        drop(search_slot);
+        let _ = state.retain_vault_watchers();
+        return Err(error);
+    }
     let old_search = search_slot.replace(search.clone());
-    let old_watcher = watcher_slot.replace(new_watcher);
     *config = next;
     drop(config);
-    drop(watcher_slot);
     drop(search_slot);
-    // Watcher shutdown and index disposal may block; never do either while a
-    // global state slot is locked.
-    drop(old_watcher);
+    // Index disposal and watcher shutdown must not hold global state slots.
+    state.retain_vault_watchers()?;
     drop(old_search);
 
     Ok(search)
@@ -286,7 +326,6 @@ fn remove_vault_path<R: Runtime>(
         .search_index
         .lock()
         .map_err(|error| error.to_string())?;
-    let mut watcher_slot = state.watcher.lock().map_err(|error| error.to_string())?;
     let mut config = state.config.lock().map_err(|error| error.to_string())?;
     let target = if let Some(bookmark_id) = bookmark_id.as_deref() {
         config
@@ -312,6 +351,8 @@ fn remove_vault_path<R: Runtime>(
     let Some((target_path, target_bookmark, is_active)) = target else {
         return Ok(());
     };
+    #[cfg(desktop)]
+    AppState::ensure_no_detached_windows(app, &target_path)?;
 
     let old = config.clone();
     let mut next = old.clone();
@@ -343,12 +384,10 @@ fn remove_vault_path<R: Runtime>(
     let _ = (app, &target_bookmark);
 
     let old_search = if is_active { search_slot.take() } else { None };
-    let old_watcher = if is_active { watcher_slot.take() } else { None };
     *config = next;
     drop(config);
-    drop(watcher_slot);
     drop(search_slot);
-    drop(old_watcher);
+    state.retain_vault_watchers()?;
     drop(old_search);
 
     Ok(())
@@ -361,9 +400,26 @@ pub fn get_app_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
 }
 
 #[tauri::command]
-pub fn get_pending_open_file(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    let mut pending = state.pending_open_file.lock().map_err(|e| e.to_string())?;
-    Ok(pending.take())
+pub fn get_pending_open_file(
+    state: State<'_, AppState>,
+) -> Result<Option<crate::state::PendingOpenFile>, String> {
+    state.peek_pending_open_file()
+}
+
+#[tauri::command]
+pub fn ack_pending_open_file(state: State<'_, AppState>, id: u64) -> Result<(), String> {
+    if !state.ack_pending_open_file(id)? {
+        return Err("File-open request is no longer pending".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+pub fn cancel_window_close(state: State<'_, AppState>) {
+    state
+        .quitting
+        .store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Finish a desktop close request only after the frontend has flushed its editor.
@@ -637,7 +693,8 @@ pub async fn create_notebook(
 }
 
 #[tauri::command]
-pub async fn rename_notebook(
+pub async fn rename_notebook<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppState>,
     vault_path: String,
     path: String,
@@ -646,6 +703,7 @@ pub async fn rename_notebook(
     let search = state.vault_snapshot(&vault_path)?;
     let _write_guard = state.note_save.lock().await;
     let renamed = operations::rename_notebook(&vault_path, &path, &new_name)?;
+    emit_path_move(&app, &vault_path, &path, &renamed, None);
     if let Some(search) = search {
         if let Err(error) = search.queue_vault_refresh(&vault_path) {
             log::error!("Failed to queue renamed notebook search refresh: {error}");
@@ -655,7 +713,8 @@ pub async fn rename_notebook(
 }
 
 #[tauri::command]
-pub async fn move_notebook(
+pub async fn move_notebook<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppState>,
     vault_path: String,
     notebook_path: String,
@@ -665,32 +724,8 @@ pub async fn move_notebook(
     let _write_guard = state.note_save.lock().await;
     let vault_path = vault_path.as_str();
 
-    let old_relative = Path::new(&notebook_path)
-        .strip_prefix(vault_path)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-
     let new_full_path = operations::move_notebook(vault_path, &notebook_path, &dest_parent)?;
-
-    let new_relative = Path::new(&new_full_path)
-        .strip_prefix(vault_path)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    // Update Quick Access paths for all notes inside the moved notebook
-    if let Ok(mut qa) = operations::load_quick_access(vault_path) {
-        let old_prefix = format!("{}/", old_relative);
-        let mut changed = false;
-        for path in qa.iter_mut() {
-            if path.starts_with(&old_prefix) {
-                *path = format!("{}/{}", new_relative, &path[old_prefix.len()..]);
-                changed = true;
-            }
-        }
-        if changed {
-            let _ = operations::save_quick_access(vault_path, &qa);
-        }
-    }
+    emit_path_move(&app, vault_path, &notebook_path, &new_full_path, None);
 
     // Reconcile renamed paths without blocking the move on a full rebuild.
     if let Some(search) = search {
@@ -759,7 +794,8 @@ pub async fn save_note(
     path: String,
     meta: NoteMeta,
     body: String,
-) -> Result<(), String> {
+    expected_raw: String,
+) -> Result<NoteContent, String> {
     let search = state.vault_snapshot(&vault_path)?;
     let max_versions = state
         .config
@@ -773,7 +809,8 @@ pub async fn save_note(
     tauri::async_runtime::spawn_blocking(move || {
         // Keep ordering even if the calling window closes while its save runs.
         let _save_guard = save_guard;
-        if let Some(saved) = operations::save_note(&vault_path, &path, &meta, &body)? {
+        if let Some(saved) = operations::save_note(&vault_path, &path, &meta, &body, &expected_raw)?
+        {
             crate::history::maybe_snapshot(
                 &vault_path,
                 &saved.id,
@@ -782,7 +819,7 @@ pub async fn save_note(
             );
             index_note_bg(search, &path);
         }
-        Ok(())
+        operations::read_vault_note(&vault_path, &path)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -840,7 +877,8 @@ pub async fn create_daily_note(
 }
 
 #[tauri::command]
-pub async fn rename_note(
+pub async fn rename_note<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppState>,
     vault_path: String,
     path: String,
@@ -849,12 +887,13 @@ pub async fn rename_note(
     let search = state.vault_snapshot(&vault_path)?;
     let _write_guard = state.note_save.lock().await;
     let renamed = operations::rename_note(&path, &new_title, &vault_path)?;
+    emit_path_move(&app, &vault_path, &path, &renamed.path, Some(&renamed));
     if let Some(search) = search {
         if let Err(error) = search.queue_vault_refresh(&vault_path) {
             log::error!("Failed to queue renamed note search refresh: {error}");
         }
     }
-    Ok(renamed)
+    Ok(renamed.path)
 }
 
 #[tauri::command]
@@ -874,7 +913,8 @@ pub async fn delete_note(
 }
 
 #[tauri::command]
-pub async fn move_note(
+pub async fn move_note<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppState>,
     vault_path: String,
     note_path: String,
@@ -884,29 +924,9 @@ pub async fn move_note(
     let _write_guard = state.note_save.lock().await;
     let vault_path = vault_path.as_str();
 
-    // Compute old relative path before move
-    let old_relative = Path::new(&note_path)
-        .strip_prefix(vault_path)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-
     let new_full_path = operations::move_note(vault_path, &note_path, &dest_notebook)?;
+    emit_path_move(&app, vault_path, &note_path, &new_full_path, None);
 
-    // Update quick access if the moved note was in it
-    if !old_relative.is_empty() {
-        if let Ok(mut qa) = operations::load_quick_access(vault_path) {
-            if let Some(pos) = qa.iter().position(|p| *p == old_relative) {
-                let new_relative = Path::new(&new_full_path)
-                    .strip_prefix(vault_path)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if !new_relative.is_empty() {
-                    qa[pos] = new_relative;
-                    let _ = operations::save_quick_access(vault_path, &qa);
-                }
-            }
-        }
-    }
     index_note_bg(search.clone(), &note_path);
     index_note_bg(search, &new_full_path);
 
@@ -1394,6 +1414,7 @@ pub async fn set_task_done(
     let NoteContent {
         meta,
         content: body,
+        raw,
         ..
     } = operations::read_vault_note(&vault_path, &note_path)?;
     let mut lines: Vec<String> = body.lines().map(|l| l.to_string()).collect();
@@ -1416,7 +1437,7 @@ pub async fn set_task_done(
     if body.ends_with('\n') && !new_body.ends_with('\n') {
         new_body.push('\n');
     }
-    if operations::save_note(&vault_path, &note_path, &meta, &new_body)?.is_some() {
+    if operations::save_note(&vault_path, &note_path, &meta, &new_body, &raw)?.is_some() {
         index_note_bg(search, &note_path);
     }
     Ok(())
@@ -1455,6 +1476,7 @@ pub async fn set_task_priority(
     let NoteContent {
         meta,
         content: body,
+        raw,
         ..
     } = operations::read_vault_note(&vault_path, &note_path)?;
     let mut lines: Vec<String> = body.lines().map(|l| l.to_string()).collect();
@@ -1476,7 +1498,7 @@ pub async fn set_task_priority(
     if body.ends_with('\n') && !new_body.ends_with('\n') {
         new_body.push('\n');
     }
-    if operations::save_note(&vault_path, &note_path, &meta, &new_body)?.is_some() {
+    if operations::save_note(&vault_path, &note_path, &meta, &new_body, &raw)?.is_some() {
         index_note_bg(search, &note_path);
     }
     Ok(())
@@ -1514,6 +1536,7 @@ pub async fn set_task_due(
     let NoteContent {
         meta,
         content: body,
+        raw,
         ..
     } = operations::read_vault_note(&vault_path, &note_path)?;
     let mut lines: Vec<String> = body.lines().map(|l| l.to_string()).collect();
@@ -1535,7 +1558,7 @@ pub async fn set_task_due(
     if body.ends_with('\n') && !new_body.ends_with('\n') {
         new_body.push('\n');
     }
-    if operations::save_note(&vault_path, &note_path, &meta, &new_body)?.is_some() {
+    if operations::save_note(&vault_path, &note_path, &meta, &new_body, &raw)?.is_some() {
         index_note_bg(search, &note_path);
     }
     Ok(())
@@ -2393,6 +2416,7 @@ pub fn import_obsidian(app: AppHandle) -> Result<(), String> {
 
 fn do_import_obsidian(app: AppHandle, vault_path: &str) -> Result<ImportResult, String> {
     let state = app.state::<AppState>();
+    let _maintenance_guard = state.vault_maintenance.blocking_lock();
     let _write_guard = state.note_save.blocking_lock();
     ensure_cleanup_idle(&state)?;
     state
@@ -3057,89 +3081,67 @@ pub fn write_bytes_to(app: AppHandle, destination: String, data: Vec<u8>) -> Res
 // ── Backup ──
 
 #[tauri::command]
-pub fn create_backup(app: AppHandle) -> Result<(), String> {
-    let (vault_path, backup_dir, include_attachments, max_count) = {
+pub fn create_backup(app: AppHandle, vault_path: String) -> Result<(), String> {
+    let (backup_dir, include_attachments, max_count, bookmark_id) = {
         let state = app.state::<AppState>();
+        state.validate_vault(&vault_path)?;
         let config = state.config.lock().map_err(|e| e.to_string())?;
-        let vault_path = config.active_vault.clone().ok_or("No active vault")?;
-        let backup_dir = crate::backup::get_backup_dir(&config.backup_location)?;
+        let bookmark_id = config
+            .vaults
+            .iter()
+            .find(|vault| vault.path == vault_path)
+            .and_then(|vault| vault.bookmark_id.clone());
         (
-            vault_path,
-            backup_dir,
+            crate::backup::get_backup_dir(&config.backup_location)?,
             config.backup_include_attachments,
             config.backup_max_count,
+            bookmark_id,
         )
     };
 
     std::thread::spawn(move || {
         use tauri::Emitter;
-        match crate::backup::create_backup(&vault_path, &backup_dir, include_attachments) {
-            Ok(entry) => {
-                // Update last backup time
-                let state = app.state::<AppState>();
-                if let Ok(mut config) = state.config.lock() {
-                    config.last_backup_time = Some(entry.created.clone());
-                    let _ = save_app_config(&config);
-                }
-                // Cleanup old backups
-                let _ = crate::backup::cleanup_old_backups(&backup_dir, max_count);
-                let _ = app.emit(
-                    "backup-done",
-                    serde_json::json!({
-                        "success": true,
-                        "entry": entry,
-                    }),
-                );
-            }
-            Err(e) => {
-                let _ = app.emit(
-                    "backup-done",
-                    serde_json::json!({
-                        "success": false,
-                        "error": e,
-                    }),
-                );
-            }
-        }
-    });
-    Ok(())
-}
-
-#[tauri::command]
-pub fn list_backups(state: State<'_, AppState>) -> Result<Vec<BackupEntry>, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let backup_dir = crate::backup::get_backup_dir(&config.backup_location)?;
-    crate::backup::list_backups(&backup_dir)
-}
-
-#[tauri::command]
-pub fn restore_backup(app: AppHandle, backup_path: String) -> Result<(), String> {
-    let (vault_path, backup_dir) = {
         let state = app.state::<AppState>();
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        (
-            config.active_vault.clone().ok_or("No active vault")?,
-            crate::backup::get_backup_dir(&config.backup_location)?,
-        )
-    };
-
-    std::thread::spawn(move || {
-        use tauri::Emitter;
-        match crate::backup::restore_backup(&vault_path, &backup_dir, &backup_path) {
-            Ok(()) => {
+        let _maintenance = state.vault_maintenance.blocking_lock();
+        let result = {
+            let _writes = state.note_save.blocking_lock();
+            crate::backup::create_backup(&vault_path, &backup_dir, include_attachments)
+        };
+        match result {
+            Ok(entry) => {
+                if let Ok(mut config) = state.config.lock() {
+                    let mut next = config.clone();
+                    if let Some(vault) = next.vaults.iter_mut().find(|candidate| {
+                        vault_matches_identity(candidate, &vault_path, bookmark_id.as_deref())
+                    }) {
+                        vault.last_backup_time = Some(entry.created.clone());
+                        match save_app_config(&next) {
+                            Ok(()) => *config = next,
+                            Err(error) => {
+                                log::error!("Could not persist backup timestamp: {error}")
+                            }
+                        }
+                    }
+                }
+                if let Err(error) =
+                    crate::backup::cleanup_old_backups(&backup_dir, &vault_path, max_count)
+                {
+                    log::error!("Could not prune completed backups: {error}");
+                }
                 let _ = app.emit(
-                    "restore-done",
+                    "backup-done",
                     serde_json::json!({
-                        "success": true,
+                        "vault_path": vault_path, "bookmark_id": bookmark_id,
+                        "success": true, "entry": entry,
                     }),
                 );
             }
-            Err(e) => {
+            Err(error) => {
                 let _ = app.emit(
-                    "restore-done",
+                    "backup-done",
                     serde_json::json!({
-                        "success": false,
-                        "error": e,
+                        "vault_path": vault_path, "bookmark_id": bookmark_id,
+                        "success": false, "error": error,
                     }),
                 );
             }
@@ -3149,9 +3151,98 @@ pub fn restore_backup(app: AppHandle, backup_path: String) -> Result<(), String>
 }
 
 #[tauri::command]
-pub fn delete_backup(state: State<'_, AppState>, backup_path: String) -> Result<(), String> {
-    let config = state.config.lock().map_err(|error| error.to_string())?;
-    let backup_dir = crate::backup::get_backup_dir(&config.backup_location)?;
+pub async fn list_backups(
+    state: State<'_, AppState>,
+    vault_path: String,
+) -> Result<Vec<BackupEntry>, String> {
+    state.validate_vault(&vault_path)?;
+    let backup_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        crate::backup::get_backup_dir(&config.backup_location)?
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::backup::list_backups(&backup_dir, &vault_path)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub fn restore_backup(
+    app: AppHandle,
+    vault_path: String,
+    backup_path: String,
+) -> Result<(), String> {
+    let backup_dir = {
+        let state = app.state::<AppState>();
+        state.validate_vault(&vault_path)?;
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        crate::backup::get_backup_dir(&config.backup_location)?
+    };
+
+    std::thread::spawn(move || {
+        use std::sync::atomic::Ordering;
+        use tauri::Emitter;
+        let state = app.state::<AppState>();
+        let _maintenance = state.vault_maintenance.blocking_lock();
+        let result = {
+            let _writes = state.note_save.blocking_lock();
+            state.importing.store(true, Ordering::Release);
+            let result = crate::backup::restore_backup(&vault_path, &backup_dir, &backup_path);
+            state.importing.store(false, Ordering::Release);
+            result
+        };
+        match result {
+            Ok(()) => {
+                if let Ok(Some(search)) = state.vault_snapshot(&vault_path) {
+                    if let Err(error) = search.queue_vault_refresh(&vault_path) {
+                        log::error!("Could not refresh restored vault search: {error}");
+                    }
+                }
+                let _ = app.emit(
+                    "file-changed",
+                    FileEvent {
+                        vault_path: vault_path.clone(),
+                        event_type: "modify".into(),
+                        path: vault_path.clone(),
+                        note: None,
+                    },
+                );
+                let _ = app.emit(
+                    "vault-restored",
+                    serde_json::json!({ "vault_path": vault_path }),
+                );
+                let _ = app.emit(
+                    "restore-done",
+                    serde_json::json!({
+                        "vault_path": vault_path, "success": true,
+                    }),
+                );
+            }
+            Err(error) => {
+                let _ = app.emit(
+                    "restore-done",
+                    serde_json::json!({
+                        "vault_path": vault_path, "success": false, "error": error,
+                    }),
+                );
+            }
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_backup(
+    state: State<'_, AppState>,
+    vault_path: String,
+    backup_path: String,
+) -> Result<(), String> {
+    state.validate_vault(&vault_path)?;
+    let backup_dir = {
+        let config = state.config.lock().map_err(|error| error.to_string())?;
+        crate::backup::get_backup_dir(&config.backup_location)?
+    };
     crate::backup::delete_backup(&backup_dir, &backup_path)
 }
 
@@ -3499,13 +3590,13 @@ pub fn sync_now(app: AppHandle) -> Result<(), String> {
                 }
                 let _ = app.emit(
                     "sync-done",
-                    serde_json::json!({ "success": true, "summary": summary, "last_sync_time": ts }),
+                    serde_json::json!({ "vault_path": vault, "bookmark_id": bookmark_id, "success": true, "summary": summary, "last_sync_time": ts }),
                 );
             }
             Err(e) => {
                 let _ = app.emit(
                     "sync-error",
-                    serde_json::json!({ "success": false, "error": e }),
+                    serde_json::json!({ "vault_path": vault, "success": false, "error": e }),
                 );
             }
         }
@@ -3934,6 +4025,62 @@ mod mutation_order_tests {
     use futures::FutureExt;
 
     #[tokio::test]
+    async fn concurrent_editors_reject_stale_baselines_and_accept_the_saved_revision() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().to_string_lossy().into_owned();
+        operations::ensure_vault_structure(&root).unwrap();
+        let entry = operations::create_note(&root, None, "Shared").unwrap();
+        let initial = operations::read_note(&root, &entry.path).unwrap();
+        let app = tauri::test::mock_builder()
+            .manage(AppState::new(AppConfig {
+                active_vault: Some(root.clone()),
+                ..AppConfig::default()
+            }))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = app.state::<AppState>();
+        let held = state.note_save.lock().await;
+        let mut first = Box::pin(save_note(
+            app.state(),
+            root.clone(),
+            entry.path.clone(),
+            initial.meta.clone(),
+            "# Shared\n\nFirst editor's content".into(),
+            initial.raw.clone(),
+        ));
+        let mut stale = Box::pin(save_note(
+            app.state(),
+            root.clone(),
+            entry.path.clone(),
+            initial.meta.clone(),
+            "# Shared\n\nStale editor's content".into(),
+            initial.raw,
+        ));
+        assert!(first.as_mut().now_or_never().is_none());
+        assert!(stale.as_mut().now_or_never().is_none());
+        drop(held);
+        let accepted = first.await.unwrap();
+        assert!(stale.await.is_err());
+        assert_eq!(std::fs::read_to_string(&entry.path).unwrap(), accepted.raw);
+        assert_eq!(accepted.content, "# Shared\n\nFirst editor's content");
+        let subsequent = save_note(
+            app.state(),
+            root.clone(),
+            entry.path.clone(),
+            accepted.meta,
+            "# Shared\n\nNext accepted edit".into(),
+            accepted.raw,
+        )
+        .await
+        .unwrap();
+        assert_eq!(subsequent.content, "# Shared\n\nNext accepted edit");
+        assert_eq!(
+            std::fs::read_to_string(&entry.path).unwrap(),
+            subsequent.raw
+        );
+    }
+
+    #[tokio::test]
     async fn detached_history_quick_access_titles_and_graph_keep_their_origin() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
@@ -4094,6 +4241,7 @@ mod mutation_order_tests {
             alpha.path.clone(),
             alpha.meta.clone(),
             "# Shared\n\nQueued save".into(),
+            std::fs::read_to_string(&alpha.path).unwrap(),
         ));
         assert!(creating.as_mut().now_or_never().is_none());
         assert!(saving.as_mut().now_or_never().is_none());
@@ -4126,6 +4274,7 @@ mod mutation_order_tests {
             alpha.path.clone(),
             alpha.meta,
             "# Shared\n\nDetached save".into(),
+            std::fs::read_to_string(&alpha.path).unwrap(),
         )
         .await
         .unwrap();
@@ -4222,6 +4371,7 @@ mod mutation_order_tests {
             Some("builtin:briefcase".into()),
         ));
         let mut renaming = Box::pin(rename_notebook(
+            app.handle().clone(),
             app.state(),
             path.clone(),
             vault.path().join("Projects").to_string_lossy().into_owned(),
@@ -4233,6 +4383,7 @@ mod mutation_order_tests {
         changing.await.unwrap();
         let renamed = renaming.await.unwrap();
         move_notebook(
+            app.handle().clone(),
             app.state(),
             path.clone(),
             renamed,
@@ -4298,6 +4449,7 @@ mod mutation_order_tests {
             note.path.clone(),
             note.meta,
             "# Draft\n\nSaved before search is ready.".into(),
+            std::fs::read_to_string(&note.path).unwrap(),
         )
         .await
         .unwrap();
@@ -4324,13 +4476,21 @@ mod mutation_order_tests {
 
         let saving = state.note_save.lock().await;
         let mut moving = Box::pin(move_note(
+            app.handle().clone(),
             app.state(),
             vault_path.clone(),
             entry.path.clone(),
             archive.to_string_lossy().into_owned(),
         ));
         assert!(moving.as_mut().now_or_never().is_none());
-        operations::save_note(&vault_path, &entry.path, &entry.meta, "Latest saved text").unwrap();
+        operations::save_note(
+            &vault_path,
+            &entry.path,
+            &entry.meta,
+            "Latest saved text",
+            &std::fs::read_to_string(&entry.path).unwrap(),
+        )
+        .unwrap();
         drop(saving);
         let moved_path = moving.await.unwrap();
         assert!(!Path::new(&entry.path).exists());
@@ -4349,6 +4509,7 @@ mod mutation_order_tests {
             &moved_path,
             &moved.meta,
             "Latest text before trash",
+            &moved.raw,
         )
         .unwrap();
         drop(saving);
