@@ -253,7 +253,7 @@
 						<section class="switcher-section" aria-labelledby={`note-switcher-${section.label.replace(' ', '-').toLowerCase()}`}>
 							<h2 id={`note-switcher-${section.label.replace(' ', '-').toLowerCase()}`}>{section.label}</h2>
 							{#each section.rows as row (row.path)}
-								<div class="note-row" class:current-row={row.current}>
+								<div class="note-row" class:current-row={row.current} title={row.path}>
 									{#if row.current}<span class="current-marker" aria-hidden="true"></span>{/if}
 									<button
 										class="note-primary"

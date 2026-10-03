@@ -43,6 +43,10 @@
 	import type { NoteContent, VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord, FileEvent, SearchTarget, ToolbarLayout } from '$lib/types';
 	import { listen } from '@tauri-apps/api/event';
 	import { debounce } from '$lib/utils/debounce';
+	import { formatClockTime } from '$lib/utils/time';
+	import DOMPurify from 'dompurify';
+	import { splitSnapshot } from '$lib/utils/history-comparison';
+	import HistoryReview from './HistoryReview.svelte';
 	import { RevisionSaveQueue, type SaveRevision } from '$lib/utils/revision-save';
 	import { isCurrentVaultEvent } from '$lib/utils/note-list-updates';
 	import { beginNoteNavigation, isCurrentNoteNavigation, cancelNoteNavigation } from '$lib/utils/note-navigation';
@@ -469,6 +473,10 @@
 	let historyPreview = $state<string | null>(null);
 	let historySelected = $state<VersionEntry | null>(null);
 	let historyLoading = $state(false);
+	let historyError = $state<string | null>(null);
+	let historyPreviewLoading = $state(false);
+	let historyPreviewError = $state<string | null>(null);
+	let historyWorking = $state('');
 
 	// Info panel
 	let showInfo = $state(false);
@@ -476,6 +484,9 @@
 	let charCount = $state(0);
 	let infoPathCopyState = $state<'idle' | 'copied' | 'error'>('idle');
 	let infoPathCopyTimer: ReturnType<typeof setTimeout> | null = null;
+	const infoFrontmatter = $derived(showInfo && !showHistory && $activeNote
+		? splitSnapshot($activeNote.raw).metadata
+		: '');
 
 	$effect(() => {
 		$activeNotePath;
@@ -517,7 +528,7 @@
 		const now = new Date();
 		const pad = (n: number) => String(n).padStart(2, '0');
 		const date = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
-		const time = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+		const time = formatClockTime(now, $appConfig?.time_format);
 		const text = kind === 'date' ? date : kind === 'time' ? time : `${date} ${time}`;
 		editor.chain().focus().insertContent(text).run();
 	}
@@ -3440,10 +3451,11 @@
 	$effect(() => {
 		if (trashPreview && !$readOnly) $readOnly = true;
 		const ro = $readOnly;
+		const inspecting = showHistory;
 		untrack(() => {
 			if (editor) {
 				if (ro && $editorDirty) forceSave();
-				editor.setEditable(!ro && !externalOperationBusy);
+				editor.setEditable(!ro && !inspecting && !externalOperationBusy);
 			}
 		});
 	});
@@ -3513,24 +3525,63 @@
 
 	let historyRequest = 0;
 
+	function closeHistory() {
+		historyRequest++;
+		showHistory = false;
+		historyVersions = [];
+		historySelected = null;
+		historyPreview = null;
+		historyLoading = false;
+		historyError = null;
+		historyPreviewLoading = false;
+		historyPreviewError = null;
+	}
+
 	async function toggleHistory() {
+		if (showHistory) {
+			closeHistory();
+			return;
+		}
+		closeNoteSearch(false);
+		endToolbarCustomization();
+		historyWorking = $editorDirty
+			? ($sourceMode ? restoreTitleH1(source.state.doc.toString()) : editorToMarkdown())
+			: ($activeNote?.content ?? '');
+		showHistory = true;
+		await loadHistory();
+	}
+
+	async function loadHistory() {
 		const origin = captureOrigin();
 		const request = ++historyRequest;
-		showHistory = !showHistory;
-		historyPreview = null;
+		const current = () => !editorDisposed && request === historyRequest && showHistory;
+		historyVersions = [];
 		historySelected = null;
+		historyPreview = null;
+		historyPreviewLoading = false;
+		historyPreviewError = null;
+		historyError = null;
 		historyLoading = false;
-		if (!showHistory || !origin.noteId || !origin.vault) return;
+		if (!origin.noteId || !origin.vault) {
+			historyError = 'Version history is unavailable for this note.';
+			return;
+		}
 		historyLoading = true;
 		try {
 			const versions = await getNoteVersions(origin.vault, origin.noteId);
-			if (!isOriginCurrent(origin) || request !== historyRequest || !showHistory) return;
+			if (!current()) return;
+			if (!isOriginCurrent(origin)) {
+				historyError = 'The editor changed while versions were loading. Retry to reload them.';
+				return;
+			}
 			historyVersions = versions;
+			historyLoading = false;
+			if (versions[0]) void previewVersion(versions[0]);
 		} catch (e) {
 			console.error('Failed to load versions:', e);
-			if (isOriginCurrent(origin) && request === historyRequest) historyVersions = [];
+			if (current()) historyError = `Could not load versions: ${String(e)}`;
 		} finally {
-			if (isOriginCurrent(origin) && request === historyRequest) historyLoading = false;
+			if (current()) historyLoading = false;
 		}
 	}
 
@@ -3538,36 +3589,39 @@
 		const origin = captureOrigin();
 		if (!origin.noteId || !origin.vault) return;
 		const request = ++historyRequest;
+		const current = () => !editorDisposed && request === historyRequest && showHistory;
 		historySelected = v;
 		historyPreview = null;
+		historyPreviewError = null;
+		historyPreviewLoading = true;
 		try {
 			const content = await getNoteVersionContent(origin.vault, origin.noteId, v.timestamp);
-			if (isOriginCurrent(origin) && request === historyRequest && showHistory) historyPreview = content;
+			if (!current()) return;
+			if (!isOriginCurrent(origin)) {
+				historyPreviewError = 'The editor changed while this version was loading. Select it again to retry.';
+				return;
+			}
+			historyPreview = content;
 		} catch (e) {
 			console.error('Failed to load version:', e);
+			if (current()) historyPreviewError = `Could not load this version: ${String(e)}`;
+		} finally {
+			if (current()) historyPreviewLoading = false;
 		}
 	}
 
-	async function restoreVersion() {
-		if (!$activeNote || !$activeNotePath || !historySelected) return;
-		const origin = captureOrigin();
-		const selected = historySelected;
-		const request = historyRequest;
-		if (!canInsert(origin)) return;
+	function restoreVersion() {
+		if (!$activeNote || !$activeNotePath || !historySelected || historyPreview === null || historyPreviewLoading) return;
+		if (!canInsert(captureOrigin())) return;
+		if ($editorDirty && !window.confirm('Restore this version and replace your unsaved draft?')) return;
 		try {
-			const raw = historyPreview ?? await getNoteVersionContent(origin.vault!, origin.noteId!, selected.timestamp);
-			if (!isOriginCurrent(origin, true) || !canInsert(origin) || request !== historyRequest || !showHistory) return;
-			// The raw content includes frontmatter - parse out the body
-			const fmEnd = raw.indexOf('---', 4);
-			const body = fmEnd > 0 ? raw.substring(raw.indexOf('\n', fmEnd) + 1) : raw;
+			const body = splitSnapshot(historyPreview).body;
 			if ($sourceMode) {
 				source.replace(stripTitleH1(body));
 			} else if (editor) {
 				editor.commands.setContent(markdownToHtml(body));
 			}
-			historyPreview = null;
-			historySelected = null;
-			showHistory = false;
+			closeHistory();
 		} catch (e) {
 			console.error('Failed to restore version:', e);
 		}
@@ -3588,22 +3642,14 @@
 		}
 	}
 
+	const historyDateFormatter = new Intl.DateTimeFormat(undefined, {
+		year: 'numeric', month: 'short', day: 'numeric',
+		hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3,
+	});
+
 	function formatVersionDate(iso: string): string {
-		try {
-			const d = new Date(iso);
-			const now = new Date();
-			const diffMs = now.getTime() - d.getTime();
-			const diffMins = Math.floor(diffMs / 60000);
-			if (diffMins < 1) return 'Just now';
-			if (diffMins < 60) return `${diffMins}m ago`;
-			const diffHours = Math.floor(diffMins / 60);
-			if (diffHours < 24) return `${diffHours}h ago`;
-			const diffDays = Math.floor(diffHours / 24);
-			if (diffDays < 7) return `${diffDays}d ago`;
-			return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: d.getFullYear() !== now.getFullYear() ? 'numeric' : undefined });
-		} catch {
-			return iso;
-		}
+		const date = new Date(iso);
+		return Number.isNaN(date.getTime()) ? iso : historyDateFormatter.format(date);
 	}
 
 	function formatVersionSize(bytes: number): string {
@@ -3730,10 +3776,7 @@
 		saveError = null;
 		retryingSave = false;
 		closeAiMenu();
-		showHistory = false;
-		historyPreview = null;
-		historySelected = null;
-		historyVersions = [];
+		closeHistory();
 		secretModal = null;
 		linkModal = false;
 		textContextMenu = null;
@@ -3745,8 +3788,6 @@
 		linkContextMenu = null;
 		imageToolbar = null;
 		tableContextMenu = null;
-		historyRequest++;
-		historyLoading = false;
 		savedBlobImages = new Map();
 		$editorDirty = false;
 		rememberLoadedNoteScroll();
@@ -4803,8 +4844,8 @@
 		return out.join('\n');
 	}
 
-	function markdownToHtml(md: string): string {
-		let src = stripTitleH1(md);
+	function markdownToHtml(md: string, snapshot = false): string {
+		let src = snapshot ? md : stripTitleH1(md);
 		src = secretFencesToHtml(src);
 
 		// Pre-process: convert [[Note Title]] wiki-links to HTML anchors
@@ -4876,7 +4917,7 @@
 		src = src.replace(/<div[^>]*data-pdf-src="([^"]*)"[^>]*data-pdf-name="([^"]*)"[^>]*>[^<]*<\/div>/gi, (_, pdfSrc, name) => {
 			const vaultRoot = $appConfig?.active_vault ?? '';
 			const absPath = normalizePath(`${vaultRoot}/${decodeURIComponent(pdfSrc)}`);
-			const showInline = !isMobile && ($appConfig?.pdf_preview ?? false);
+			const showInline = !snapshot && !isMobile && ($appConfig?.pdf_preview ?? false);
 			if (showInline) {
 				const pdfHeight = $appConfig?.pdf_height ?? 600;
 				const displaySrc = convertFileSrc(absPath);
@@ -4959,13 +5000,20 @@
 		html = html.replace(/<ul>(\s*<li data-type="taskItem")/gi, '<ul data-type="taskList">$1');
 
 		html = normalizeImageHtml(html);
+		if (snapshot) {
+			html = DOMPurify.sanitize(html, {
+				USE_PROFILES: { html: true },
+				ADD_URI_SAFE_ATTR: ['src'],
+				FORBID_TAGS: ['style', 'iframe', 'object', 'embed', 'form', 'input', 'button', 'video', 'audio', 'source', 'svg', 'math', 'link'],
+			});
+		}
 
 		// Post-process: turn Obsidian callout blockquotes (> [!type] ...) into callout blocks.
 		if (html.includes('[!')) {
-			const tmp = document.createElement('div');
-			tmp.innerHTML = html;
-			transformCalloutBlockquotes(tmp);
-			html = tmp.innerHTML;
+			const template = document.createElement('template');
+			template.innerHTML = html;
+			for (const child of Array.from(template.content.children)) transformCalloutBlockquotes(child);
+			html = template.innerHTML;
 		}
 
 		return html;
@@ -7406,15 +7454,15 @@
 					</button>
 				</div>
 			{/if}
-			<div class="editor-body-row">
-			<div class="editor-body" class:source-body={$sourceMode}>
+			<div class="editor-body-row" class:reviewing-history={showHistory}>
+			<div class="editor-body" class:source-body={$sourceMode} class:history-hidden={showHistory}>
 				{#if isMobile}
-					<SourceEditor controller={source} readonly={$readOnly || !!$viewerNote || externalOperationBusy} visible={$sourceMode} mobile />
+					<SourceEditor controller={source} readonly={showHistory || $readOnly || !!$viewerNote || externalOperationBusy} visible={$sourceMode} mobile />
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div class="tiptap-wrapper" class:large-doc={isLargeDoc} style={$sourceMode ? 'display:none' : ''} spellcheck="false" bind:this={editorElement} onclick={(e) => { closeLinkContextMenu(); handleEditorClick(e); }} onkeydown={(e) => { if (e.key === 'Escape') closeLinkContextMenu(); }}></div>
 				{:else}
 					{#if $sourceMode}
-						<SourceEditor controller={source} readonly={$readOnly || !!$viewerNote || externalOperationBusy} numbers={$appConfig?.show_line_numbers ?? false} />
+						<SourceEditor controller={source} readonly={showHistory || $readOnly || !!$viewerNote || externalOperationBusy} numbers={$appConfig?.show_line_numbers ?? false} />
 					{:else}
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
 						<div class="tiptap-wrapper" class:large-doc={isLargeDoc} spellcheck="false" bind:this={editorElement} onclick={(e) => { closeLinkContextMenu(); handleEditorClick(e); }} onkeydown={(e) => { if (e.key === 'Escape') closeLinkContextMenu(); }} oncontextmenu={handleEditorContextMenu}></div>
@@ -7423,6 +7471,12 @@
 			</div>
 
 			{#if showHistory}
+				<HistoryReview raw={historyPreview} current={historyWorking}
+					selected={historySelected ? formatVersionDate(historySelected.timestamp) : null}
+					loading={historyLoading || historyPreviewLoading} error={historyError ?? historyPreviewError}
+					canRestore={historyPreview !== null && !historyPreviewLoading && canInsert(captureOrigin())}
+					onRetry={() => { if (historySelected) void previewVersion(historySelected); else void loadHistory(); }}
+					onRestore={restoreVersion} renderSnapshot={(body) => markdownToHtml(body, true)} />
 				<div class="history-panel">
 					<div class="history-header">
 						<h3>Version History</h3>
@@ -7433,7 +7487,7 @@
 									<line x1="5" y1="12" x2="19" y2="12" />
 								</svg>
 							</button>
-							<button class="history-close" onclick={() => { showHistory = false; historyPreview = null; historySelected = null; }} aria-label="Close version history">
+							<button class="history-close" onclick={closeHistory} aria-label="Close version history">
 								<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 									<line x1="18" y1="6" x2="6" y2="18" />
 									<line x1="6" y1="6" x2="18" y2="18" />
@@ -7442,16 +7496,33 @@
 						</div>
 					</div>
 					{#if historyLoading}
-						<div class="history-empty">Loading...</div>
+						<div class="history-empty" role="status">Loading...</div>
+					{:else if historyError}
+						<div class="history-empty" role="alert">
+							<p>{historyError}</p>
+							<button class="history-retry-btn" onclick={loadHistory}>Retry</button>
+						</div>
 					{:else if historyVersions.length === 0}
 						<div class="history-empty">No versions yet. Versions are created automatically as you edit (at least 5 minutes apart).</div>
 					{:else}
+						<div class="history-picker">
+							<label for="history-version-picker">Version</label>
+							<select id="history-version-picker" aria-label="Select snapshot version"
+								value={historySelected?.timestamp ?? ''}
+								onchange={(event) => { const version = historyVersions.find((v) => v.timestamp === event.currentTarget.value); if (version) void previewVersion(version); }}>
+								{#each historyVersions as version (version.timestamp)}
+									<option value={version.timestamp}>{formatVersionDate(version.timestamp)}</option>
+								{/each}
+							</select>
+						</div>
 						<div class="history-list">
-							{#each historyVersions as v}
+							{#each historyVersions as v (v.timestamp)}
 								<button
 									class="history-item"
 									class:active={historySelected?.timestamp === v.timestamp}
+									aria-pressed={historySelected?.timestamp === v.timestamp}
 									onclick={() => previewVersion(v)}
+									title={v.timestamp}
 								>
 									<span class="history-date">{formatVersionDate(v.timestamp)}</span>
 									<span class="history-size">{formatVersionSize(v.size)}</span>
@@ -7459,16 +7530,9 @@
 							{/each}
 						</div>
 					{/if}
-					{#if historySelected}
-						<div class="history-actions">
-							<button class="history-restore-btn" onclick={restoreVersion}>
-								Restore this version
-							</button>
-						</div>
-					{/if}
 				</div>
 			{/if}
-			{#if showOutline}
+			{#if showOutline && !showHistory}
 				<ResizeHandle onResize={handleOutlineResize} />
 				<div class="outline-panel" style="width: {$outlineWidth}px">
 					<div class="outline-header">
@@ -7496,7 +7560,7 @@
 					{/if}
 				</div>
 			{/if}
-			{#if showInfo && $activeNote}
+			{#if showInfo && $activeNote && !showHistory}
 				<div class="info-panel">
 					<div class="info-panel-header">
 						<span class="info-panel-title">Note Info</span>
@@ -7578,6 +7642,18 @@
 						{/if}
 					</div>
 
+					{#key $activeNotePath}
+						<details class="info-section info-frontmatter">
+							<summary class="info-section-label">Frontmatter</summary>
+							<p class="info-frontmatter-caption">Last loaded or saved YAML. Unsaved changes are not shown.</p>
+							{#if infoFrontmatter}
+								<pre aria-label="Saved frontmatter">{infoFrontmatter}</pre>
+							{:else}
+								<p class="info-frontmatter-caption">No frontmatter in this note.</p>
+							{/if}
+						</details>
+					{/key}
+
 					{#if onMoveToTrash && $viewMode !== 'trash'}
 						<div class="info-section info-actions">
 							<button type="button" class="info-trash-btn" onclick={moveOpenNoteToTrash} disabled={trashingNote}>
@@ -7594,7 +7670,7 @@
 			</div>
 		</div>
 
-		{#if editorReady && !$sourceMode && !$viewerNote}
+		{#if editorReady && !$sourceMode && !$viewerNote && !showHistory}
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<div
 				class="editor-formatting-bar"
@@ -9355,6 +9431,8 @@
 		position: relative;
 	}
 
+	.editor-body.history-hidden { display: none; }
+
 	/* Inset the scrollbar off the window's right edge so the window resize handle
 	   (ResizeHandles in +layout) has clean space and doesn't swallow the scrollbar. */
 	.editor-container:not(.mobile) .editor-body {
@@ -9366,7 +9444,7 @@
 	}
 
 	.history-panel {
-		width: 240px;
+		width: 220px;
 		border-left: 1px solid var(--border-light);
 		background: var(--bg-secondary);
 		display: flex;
@@ -9379,6 +9457,7 @@
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
+		flex-shrink: 0;
 		padding: 12px 14px;
 		border-bottom: 1px solid var(--border-light);
 	}
@@ -9425,14 +9504,27 @@
 
 	.history-list {
 		flex: 1;
+		min-height: 0;
 		overflow-y: auto;
 		padding: 4px 6px;
 	}
 
+
+	.history-retry-btn {
+		margin-top: 8px;
+		padding: 6px 10px;
+		border: 1px solid var(--border-color);
+		border-radius: 4px;
+		background: var(--bg-tertiary);
+		color: var(--text-primary);
+		cursor: pointer;
+	}
+
 	.history-item {
 		display: flex;
-		align-items: center;
-		justify-content: space-between;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 5px;
 		width: 100%;
 		padding: 8px 10px;
 		border: none;
@@ -9466,28 +9558,30 @@
 		color: var(--text-tertiary);
 	}
 
-	.history-actions {
-		padding: 8px 10px;
-		border-top: 1px solid var(--border-light);
-	}
-
-	.history-restore-btn {
+	.history-picker { display: none; }
+	.history-picker label { font-size: 12px; color: var(--text-secondary); }
+	.history-picker select {
 		width: 100%;
-		padding: 7px 12px;
-		border: 1px solid var(--accent);
+		min-width: 0;
+		padding: 8px 10px;
+		border: 1px solid var(--border-color);
 		border-radius: 6px;
-		background: var(--accent-light);
-		color: var(--accent);
+		background: var(--bg-primary);
+		color: var(--text-primary);
 		font-size: 12px;
-		font-weight: 500;
-		cursor: pointer;
-		transition: all 0.15s;
+	}
+	.history-item:focus-visible, .history-picker select:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+	@media (max-width: 600px) {
+		.editor-body-row.reviewing-history { flex-direction: column-reverse; }
+		.history-panel { width: 100%; border-left: none; border-bottom: 1px solid var(--border-light); flex: none; }
+		.history-header { padding: 8px 12px; }
+		.history-header-actions > button { min-width: 44px; min-height: 44px; }
+		.history-list { display: none; }
+		.history-picker { display: flex; flex-direction: column; gap: 5px; padding: 0 12px 10px; }
+		.history-picker select { min-height: 44px; }
 	}
 
-	.history-restore-btn:hover {
-		background: var(--accent);
-		color: white;
-	}
 
 	.outline-panel {
 		width: 220px;
@@ -12272,12 +12366,10 @@
 		position: relative;
 	}
 
-	.editor-container.mobile .editor-body-row:has(.history-panel) > .editor-body,
 	.editor-container.mobile .editor-body-row:has(.outline-panel) > .editor-body {
 		display: none;
 	}
 
-	.editor-container.mobile .history-panel,
 	.editor-container.mobile .outline-panel {
 		position: static;
 		flex: 1;
@@ -12287,31 +12379,24 @@
 		border-left: none;
 	}
 
+	.editor-container.mobile .editor-body-row.reviewing-history { flex-direction: column-reverse; }
+	.editor-container.mobile .history-panel { width: 100%; flex: none; border-left: none; border-bottom: 1px solid var(--border-light); }
+	.editor-container.mobile .history-list { display: none; }
+	.editor-container.mobile .history-picker { display: flex; flex-direction: column; gap: 5px; padding: 0 12px 10px; }
+	.editor-container.mobile .history-picker select { min-height: 44px; }
+
 	.editor-container.mobile .history-item {
 		padding: 12px 12px;
 		min-height: 48px;
 	}
 
-	.editor-container.mobile .history-list {
-		padding-bottom: 80px;
+	.editor-container.mobile .history-create-btn,
+	.editor-container.mobile .history-close,
+	.editor-container.mobile .history-retry-btn {
+		min-width: 44px;
+		min-height: 44px;
 	}
 
-	.editor-container.mobile .history-restore-btn {
-		padding: 14px 16px;
-		font-size: 15px;
-	}
-
-	.editor-container.mobile .history-actions {
-		position: fixed;
-		bottom: 0;
-		left: 0;
-		right: 0;
-		padding: 12px;
-		padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
-		background: var(--bg-secondary);
-		border-top: 1px solid var(--border-light);
-		z-index: 51;
-	}
 
 	.editor-container.mobile .note-search-bar {
 		padding: 8px 12px;
@@ -12510,6 +12595,17 @@
 		color: var(--text-tertiary);
 		margin-bottom: 8px;
 	}
+
+	.info-frontmatter { flex-shrink: 0; }
+	.info-frontmatter > summary { cursor: pointer; margin-bottom: 0; padding: 2px 0; border-radius: 4px; }
+	.info-frontmatter[open] > summary { margin-bottom: 8px; }
+	.info-frontmatter > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+	.info-frontmatter-caption { margin: 0 0 8px; font-size: 11px; line-height: 1.5; color: var(--text-secondary); }
+	.info-frontmatter pre { margin: 0; font-family: var(--font-mono, monospace); font-size: 11px; line-height: 1.6; color: var(--text-primary); white-space: pre-wrap; overflow-wrap: anywhere; }
+	@media (max-width: 600px) {
+		.info-frontmatter > summary { min-height: 44px; padding: 12px 0; }
+	}
+	.editor-container.mobile .info-frontmatter > summary { min-height: 44px; padding: 12px 0; }
 
 	.info-row {
 		display: flex;

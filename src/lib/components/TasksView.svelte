@@ -4,9 +4,11 @@
 	import { getTasks } from '$lib/api';
 	import { debounce } from '$lib/utils/debounce';
 	import { tasksLayout, tasksHideCompleted, tasksOnlyFlagged, tasksSort, appConfig } from '$lib/stores/app';
-	import { isAndroid } from '$lib/platform';
+	import { isAndroid, isMobile } from '$lib/platform';
 	import type { TaskItem, FileEvent } from '$lib/types';
 	import { isCurrentVaultEvent } from '$lib/utils/note-list-updates';
+	import { formatLocalDate } from '$lib/utils/time';
+	import { matchesTaskDueFilter, type TaskDueFilter } from '$lib/utils/task-filter';
 
 	let { onOpenTask = (_t: TaskItem) => {}, onToggleTask = async (_t: TaskItem) => {}, onSetTaskPriority = async (_t: TaskItem, _p: string | null) => {}, onSetTaskDue = async (_t: TaskItem, _d: string | null) => {} }: {
 		onOpenTask?: (t: TaskItem) => void;
@@ -86,6 +88,19 @@
 
 	onMount(() => {
 		void load();
+		let dayTimer: ReturnType<typeof setTimeout> | undefined;
+		const refreshDay = () => {
+			const now = new Date();
+			today = formatLocalDate(now);
+			clearTimeout(dayTimer);
+			const nextDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+			dayTimer = setTimeout(refreshDay, nextDay.getTime() - now.getTime() + 1);
+		};
+		const resumeDay = () => {
+			if (document.visibilityState === 'visible') refreshDay();
+		};
+		refreshDay();
+		document.addEventListener('visibilitychange', resumeDay);
 		listen<FileEvent>('file-changed', ({ payload }) => handleFileChange(payload)).then((u) => {
 			if (disposed) u();
 			else unlisten = u;
@@ -94,11 +109,13 @@
 			disposed = true;
 			fullLoad += 1;
 			unlisten?.();
+			clearTimeout(dayTimer);
+			document.removeEventListener('visibilitychange', resumeDay);
 		};
 	});
 
-	// Local YYYY-MM-DD (en-CA gives ISO-style date)
-	const today = new Date().toLocaleDateString('en-CA');
+	let today = $state(formatLocalDate(new Date()));
+	let dueFilter = $state<TaskDueFilter>('all');
 
 	const prioRank: Record<string, number> = { high: 0, med: 1, low: 2 };
 	function prank(p: string | null) { return p ? (prioRank[p] ?? 3) : 3; }
@@ -109,11 +126,15 @@
 		return t.text.toLowerCase().includes(q) || t.note_title.toLowerCase().includes(q);
 	}
 
+	const matchingTasks = $derived(tasks.filter((t) =>
+		(!$tasksHideCompleted || !t.completed)
+		&& (!$tasksOnlyFlagged || !!t.due || !!t.priority)
+		&& matchesQuery(t)
+		&& matchesTaskDueFilter(t.due, dueFilter, today)
+	));
+
 	const filtered = $derived.by(() => {
-		let list = tasks.slice();
-		if ($tasksHideCompleted) list = list.filter((t) => !t.completed);
-		if ($tasksOnlyFlagged) list = list.filter((t) => !!t.due || !!t.priority);
-		list = list.filter(matchesQuery);
+		const list = matchingTasks.slice();
 		list.sort((a, b) => {
 			if (a.completed !== b.completed) return a.completed ? 1 : -1; // done last
 			if ($tasksSort === 'priority') {
@@ -168,7 +189,7 @@
 	const calNow = new Date();
 	let calMonth = $state(calNow.getMonth());
 	let calYear = $state(calNow.getFullYear());
-	let selectedDate = $state(today);
+	let selectedDate = $state(formatLocalDate(calNow));
 
 	const calMonthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 	// 0 = Sunday, 1 = Monday (default). Day names + grid offset follow the setting.
@@ -176,12 +197,9 @@
 	const DOW = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
 	const calDayNames = $derived([...DOW.slice(weekStartsOn), ...DOW.slice(0, weekStartsOn)]);
 
-	// Calendar tasks share the list's hide-completed filter (no sort).
-	const calBase = $derived(tasks.filter((t) => (!$tasksHideCompleted || !t.completed) && (!$tasksOnlyFlagged || !!t.due || !!t.priority) && matchesQuery(t)));
-
 	const tasksByDate = $derived.by(() => {
 		const m = new Map<string, TaskItem[]>();
-		for (const t of calBase) {
+		for (const t of matchingTasks) {
 			if (!t.due) continue;
 			const arr = m.get(t.due);
 			if (arr) arr.push(t);
@@ -190,7 +208,7 @@
 		return m;
 	});
 
-	const undatedTasks = $derived(calBase.filter((t) => !t.due));
+	const undatedTasks = $derived(matchingTasks.filter((t) => !t.due));
 
 	function byPriority(a: TaskItem, b: TaskItem) {
 		if (a.completed !== b.completed) return a.completed ? 1 : -1;
@@ -247,13 +265,15 @@
 	}
 </script>
 
-<div class="tasks-view">
+<div class="tasks-view" class:mobile={isMobile}>
 	{#if prioMenuFor || dueMenuFor}
 		<!-- svelte-ignore a11y_consider_explicit_label -->
 		<button class="prio-backdrop" onclick={() => { prioMenuFor = null; dueMenuFor = null; }} aria-label="Close menu"></button>
 	{/if}
 	<div class="tasks-controls">
 		<input class="tasks-filter" type="text" placeholder="Filter tasks…" bind:value={taskQuery} onkeydown={(e) => { if (e.key === 'Escape') taskQuery = ''; }} aria-label="Filter tasks by text" />
+		<button class="tasks-ctl" class:active={dueFilter === 'today'} aria-pressed={dueFilter === 'today'} onclick={() => { dueFilter = dueFilter === 'today' ? 'all' : 'today'; if (dueFilter === 'today') calToday(); }} title="Show tasks due today">Today</button>
+		<button class="tasks-ctl" class:active={dueFilter === 'overdue'} aria-pressed={dueFilter === 'overdue'} onclick={() => { dueFilter = dueFilter === 'overdue' ? 'all' : 'overdue'; }} title="Show tasks due before today">Overdue</button>
 		<button class="tasks-ctl" class:active={$tasksHideCompleted} onclick={() => ($tasksHideCompleted = !$tasksHideCompleted)} title="Hide completed tasks">Hide done</button>
 		<button class="tasks-ctl" class:active={$tasksOnlyFlagged} onclick={() => ($tasksOnlyFlagged = !$tasksOnlyFlagged)} title="Only show tasks with a due date or priority">Flagged</button>
 		{#if !isAndroid}
@@ -388,7 +408,15 @@
 			</div>
 		</div>
 	{:else if filtered.length === 0}
-		<div class="tasks-empty">No tasks. Add <code>- [ ] something</code> to any note.{#if openCount === 0 && tasks.length}{' '}All done!{/if}</div>
+		<div class="tasks-empty">
+			{#if tasks.length === 0}
+				No tasks. Add <code>- [ ] something</code> to any note.
+			{:else if $tasksHideCompleted && openCount === 0}
+				All tasks are complete.
+			{:else}
+				No tasks match these filters.
+			{/if}
+		</div>
 	{:else}
 		<div class="tasks-list">
 			{#each filtered as t (rowKey(t))}{@render taskRow(t, false)}{/each}
@@ -443,6 +471,14 @@
 		background: var(--bg-secondary);
 		color: var(--text-primary);
 		font-size: 12px;
+	}
+	.tasks-view.mobile .tasks-filter {
+		flex-basis: 100%;
+		min-height: 44px;
+	}
+	.tasks-view.mobile .tasks-ctl {
+		min-width: 44px;
+		min-height: 44px;
 	}
 	.tasks-filter::placeholder { color: var(--text-tertiary); }
 	.tasks-filter:focus { outline: none; border-color: var(--accent); }

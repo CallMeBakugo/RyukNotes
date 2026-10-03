@@ -138,23 +138,35 @@ All releases: [gitlab.com/ArkHost/HelixNotes/-/releases](https://gitlab.com/ArkH
 ## Features
 
 - Markdown editor with toolbar, slash commands, source mode, code highlighting
-- **Tasks view**: aggregate `- [ ]` checklists from across all notes, set priority and due dates, work in a list or a calendar (drag a task to reschedule)
+- **Tasks view**: aggregate `- [ ]` checklists from across all notes, set priority and due dates, filter Today or Overdue tasks, work in a list or a calendar (drag a task to reschedule)
 - `[[Wiki-links]]` and graph view
 - Full-text search (Tantivy), CJK-aware for Chinese, Japanese, and Korean
 - Outline panel, daily notes with calendar view, tags with autocomplete, drag-and-drop
 - Live KaTeX math editor (`/math`, `/imath`) with modal preview, double-click to edit
 - Mermaid diagrams (opt-in render, copy as PNG, save as PNG/SVG)
 - Encrypted secret blocks (`/secret`) stored as portable `helix-secret` markdown fences
-- Insert date/time (`/date`, `/time`, `/now`), color swatches (`/color`), configurable week start
+- Insert date/time (`/date`, `/time`, `/now`) with 12-hour or 24-hour timestamps, color swatches (`/color`), configurable week start
 - Manual notebook sorting (drag to reorder above, into, or below)
 - External `.md` viewer mode with import-to-vault flow
 - PDF preview, Obsidian import, "Show in File Manager"
 - AI writing tools (Ollama / OpenAI-compatible / Anthropic / OpenAI)
 - **Optional WebDAV sync** to your own server (Nextcloud, ownCloud, a NAS): manual or automatic, with keep-both conflict copies
-- Version history with diffs, automatic backups
+- Version history with main-area diffs and rendered read-only snapshots, automatic backups
 - Multi-window, file associations, focus mode, view mode
-- Themes (light, dark, and 14 palettes), accent colors, fonts, 80-200% interface scale
+- Themes (light, dark, and 14 palettes), accent colors, fonts including bundled Ubuntu and Ubuntu Mono, 80-200% interface scale
 - Local plain-text files, no company cloud
+
+### Version history
+
+Changes compares the selected snapshot with the current editor contents, including unsaved edits. Added and removed lines show what restoring that version would change; long unchanged sections can be expanded.
+
+Snapshot displays the stored note read-only, with View source available for its Markdown body. Metadata is separate and is not restored. Snapshot links are inactive, secrets stay locked, and diagrams render only when requested.
+
+Restore replaces the current note's body and asks for confirmation if it would replace an unsaved draft. Inspecting versions does not replace the live editor contents or reset their undo history.
+
+### Note Info
+
+Open **Note info** from the editor toolbar. Expand **Frontmatter** to inspect the original YAML header, including custom keys, without editing it. This shows the last loaded or saved metadata; unsaved changes are not included, and the display updates after saving.
 
 Full documentation: [helixnotes.com/docs](https://helixnotes.com/docs.html)
 

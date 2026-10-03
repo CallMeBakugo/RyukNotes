@@ -152,6 +152,65 @@
   src: url("/fonts/open-sans/OpenSans-BoldItalic.woff2") format("woff2");
 }
 
+/* Ubuntu families - unmodified upstream fonts, Ubuntu Font Licence 1.0.
+   Copyright and licence notices are bundled beside each family's local assets. */
+@font-face {
+  font-family: "Ubuntu";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/ubuntu/Ubuntu-R.ttf") format("truetype");
+}
+@font-face {
+  font-family: "Ubuntu";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/ubuntu/Ubuntu-B.ttf") format("truetype");
+}
+@font-face {
+  font-family: "Ubuntu";
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/ubuntu/Ubuntu-RI.ttf") format("truetype");
+}
+@font-face {
+  font-family: "Ubuntu";
+  font-style: italic;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/ubuntu/Ubuntu-BI.ttf") format("truetype");
+}
+@font-face {
+  font-family: "Ubuntu Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/ubuntu-mono/UbuntuMono-R.ttf") format("truetype");
+}
+@font-face {
+  font-family: "Ubuntu Mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/ubuntu-mono/UbuntuMono-B.ttf") format("truetype");
+}
+@font-face {
+  font-family: "Ubuntu Mono";
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/ubuntu-mono/UbuntuMono-RI.ttf") format("truetype");
+}
+@font-face {
+  font-family: "Ubuntu Mono";
+  font-style: italic;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/ubuntu-mono/UbuntuMono-BI.ttf") format("truetype");
+}
+
 :root {
   /* Light theme */
   --bg-primary: #ffffff;

@@ -215,6 +215,8 @@
 					opensans: '"Open Sans", -apple-system, sans-serif',
 					literata: '"Literata", Georgia, serif',
 					mono: '"JetBrains Mono", "Fira Code", "Cascadia Code", monospace',
+					ubuntu: '"Ubuntu", -apple-system, sans-serif',
+					'ubuntu-mono': '"Ubuntu Mono", monospace',
 				};
 				const stack = fontStacks[config.font_family];
 				if (stack) document.documentElement.style.setProperty('--editor-font-family', stack);

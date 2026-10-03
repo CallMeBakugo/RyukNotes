@@ -9,6 +9,22 @@ const fullDateFormatter = new Intl.DateTimeFormat(undefined, {
 const monthFormatter = new Intl.DateTimeFormat(undefined, { month: 'long' });
 const monthYearFormatter = new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric' });
 
+export function formatLocalDate(date: Date): string {
+	const month = String(date.getMonth() + 1).padStart(2, '0');
+	const day = String(date.getDate()).padStart(2, '0');
+	return `${date.getFullYear()}-${month}-${day}`;
+}
+
+export function formatClockTime(date: Date, timeFormat?: string): string {
+	const hours = date.getHours();
+	const minutes = String(date.getMinutes()).padStart(2, '0');
+	if (timeFormat === '12h') {
+		return `${hours % 12 || 12}:${minutes} ${hours < 12 ? 'AM' : 'PM'}`;
+	}
+	// Relative labels are for display, not text permanently inserted into a note.
+	return `${String(hours).padStart(2, '0')}:${minutes}`;
+}
+
 export function formatRelativeTime(dateStr: string): string {
 	const date = new Date(dateStr);
 	if (Number.isNaN(date.getTime())) return date.toString();

@@ -667,6 +667,8 @@
 		{ name: 'Open Sans', value: 'opensans', stack: '"Open Sans", -apple-system, sans-serif' },
 		{ name: 'Literata', value: 'literata', stack: '"Literata", Georgia, serif' },
 		{ name: 'Mono', value: 'mono', stack: '"JetBrains Mono", "Fira Code", "Cascadia Code", monospace' },
+		{ name: 'Ubuntu', value: 'ubuntu', stack: '"Ubuntu", -apple-system, sans-serif' },
+		{ name: 'Ubuntu Mono', value: 'ubuntu-mono', stack: '"Ubuntu Mono", monospace' },
 	];
 
 	const lineHeightPresets = [
@@ -1496,7 +1498,7 @@
 									<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 										<path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/>
 									</svg>
-									Switch Vault
+									Manage Vaults
 								</button>
 							</div>
 							{/if}

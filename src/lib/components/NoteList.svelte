@@ -1466,6 +1466,7 @@
 					class:qa-drag-below={$viewMode === 'quickaccess' && qaDragOver === noteIndex && qaDragFrom !== null && qaDragHalf === 'bottom'}
 					class:note-drag-above={canCustomReorder && noteDragOver === noteIndex && noteDragFrom !== null && noteDragHalf === 'top'}
 					class:note-drag-below={canCustomReorder && noteDragOver === noteIndex && noteDragFrom !== null && noteDragHalf === 'bottom'}
+					title={$viewMode === 'quickaccess' ? note.path : (getNotebookPath(note) ? `${getNotebookPath(note)}/${note.meta.title}` : note.meta.title)}
 					onclick={(e) => handleNoteClick(e, note)}
 					onkeydown={(e) => {
 						if (e.key === 'F2') {
@@ -1542,7 +1543,7 @@
 					ondragend={() => { qaDragFrom = null; qaDragOver = null; resetNoteDrag(); }}
 				>
 					{#if compact}
-						<div class="note-compact-row" title={getNotebookPath(note) ? `${getNotebookPath(note)}/${note.meta.title}` : note.meta.title}>
+						<div class="note-compact-row">
 							<span class="note-title">
 								{#if note.meta.pinned}
 									<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="pin-icon">
@@ -1562,7 +1563,7 @@
 							{#if showDates}<span class="note-date-compact" title={`Created ${formatDate(note.meta.created)}\nModified ${formatDate(note.meta.modified)}`}>{formatRelativeTime($sortMode === 'created' ? note.meta.created : note.meta.modified)}</span>{/if}
 						</div>
 					{:else}
-						<div class="note-title" title={getNotebookPath(note) ? `${getNotebookPath(note)}/${note.meta.title}` : note.meta.title}>
+						<div class="note-title">
 							{#if note.meta.pinned}
 								<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="pin-icon">
 									<path d="M12 17v5"/><path d="M9 2h6l-1 7h4l-2 4H8l-2-4h4L9 2z"/>
