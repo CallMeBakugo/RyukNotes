@@ -409,7 +409,7 @@ impl WebdavClient {
                 "Remote file {relpath} changed during sync; retry sync"
             ));
         }
-        let bytes = resp.bytes().map_err(|e| e.to_string())?.to_vec();
+        let bytes: Vec<u8> = resp.bytes().map_err(|e| e.to_string())?.into();
         if !expected_etag.is_empty() && self.etag_for(relpath)? != expected_etag {
             return Err(format!(
                 "Remote file {relpath} changed during sync; retry sync"
@@ -624,10 +624,34 @@ fn parse_multistatus(xml: &str, base_path: &str) -> Result<Vec<RemoteEntry>, Str
             }
             Ok(Event::Text(e)) => {
                 if cap != Cap::None {
-                    if let Ok(decoded) = e.decode() {
-                        if let Ok(text) = quick_xml::escape::unescape(&decoded) {
-                            buf.push_str(&text);
-                        }
+                    let text = e
+                        .decode()
+                        .map_err(|e| format!("XML text decode error: {e}"))?;
+                    buf.push_str(&text);
+                }
+            }
+            Ok(Event::CData(e)) => {
+                if cap != Cap::None {
+                    let text = e
+                        .decode()
+                        .map_err(|e| format!("XML CDATA decode error: {e}"))?;
+                    buf.push_str(&text);
+                }
+            }
+            Ok(Event::GeneralRef(e)) => {
+                if cap != Cap::None {
+                    if let Some(ch) = e
+                        .resolve_char_ref()
+                        .map_err(|e| format!("XML reference error: {e}"))?
+                    {
+                        buf.push(ch);
+                    } else {
+                        let name = e
+                            .decode()
+                            .map_err(|e| format!("XML reference decode error: {e}"))?;
+                        let text = quick_xml::escape::resolve_xml_entity(&name)
+                            .ok_or_else(|| format!("Unknown XML entity: &{name};"))?;
+                        buf.push_str(text);
                     }
                 }
             }
@@ -1333,6 +1357,17 @@ mod tests {
     fn webdav_test_client(
         responses: Vec<(&'static str, &'static str)>,
     ) -> (WebdavClient, std::thread::JoinHandle<Vec<String>>) {
+        webdav_test_client_bytes(
+            responses
+                .into_iter()
+                .map(|(status, body)| (status, body.as_bytes().to_vec()))
+                .collect(),
+        )
+    }
+
+    fn webdav_test_client_bytes(
+        responses: Vec<(&'static str, Vec<u8>)>,
+    ) -> (WebdavClient, std::thread::JoinHandle<Vec<String>>) {
         use std::io::Write;
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1370,10 +1405,11 @@ mod tests {
                 }
                 requests.push(headers);
                 let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
                 stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(&body).unwrap();
             }
             requests
         });
@@ -1560,5 +1596,210 @@ mod tests {
             .unwrap_err()
             .contains("no strong ETag"));
         assert!(requests.join().unwrap().is_empty());
+    }
+
+    #[test]
+    fn multistatus_preserves_named_and_numeric_references() {
+        let xml = r#"<d:multistatus xmlns:d="DAV:"><d:response>
+            <d:href>/vault/a&amp;b&apos;&lt;&gt;&quot;-&#233;-&#x96EA;.md</d:href>
+            <d:propstat><d:prop>
+                <d:getetag>&quot;v&amp;&apos;&lt;&gt;&#x96EA;&#233;&quot;</d:getetag>
+            </d:prop></d:propstat>
+        </d:response></d:multistatus>"#;
+        let entries = parse_multistatus(xml, "/vault").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].relpath, "a&b'<>\"-é-雪.md");
+        assert_eq!(entries[0].etag, "\"v&'<>雪é\"");
+        assert!(!entries[0].is_dir);
+    }
+
+    #[test]
+    fn multistatus_preserves_mixed_cdata_and_strong_etag_policy() {
+        let xml = r#"<multistatus xmlns="DAV:">
+            <response>
+                <href>/vault/<![CDATA[café&amp;]]>&#x96EA;.md</href>
+                <propstat><prop><getetag>&#34;<![CDATA[v&amp;]]>&#x96EA;&#x22;</getetag></prop></propstat>
+            </response>
+            <response>
+                <href><![CDATA[/vault/folder/]]></href>
+                <propstat><prop><getetag><![CDATA[W/"weak"]]></getetag>
+                <resourcetype><collection/></resourcetype></prop></propstat>
+            </response>
+        </multistatus>"#;
+        let entries = parse_multistatus(xml, "/vault").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].relpath, "café&amp;雪.md");
+        assert_eq!(entries[0].etag, "\"v&amp;雪\"");
+        assert_eq!(entries[1].relpath, "folder");
+        assert!(entries[1].etag.is_empty());
+        assert!(entries[1].is_dir);
+    }
+
+    #[test]
+    fn multistatus_rejects_unknown_and_malformed_captured_references() {
+        for reference in [
+            "&unknown;",
+            "&;",
+            "&#;",
+            "&#xZZ;",
+            "&#xD800;",
+            "&#x110000;",
+            "&#0;",
+            "&amp",
+            "&#123",
+        ] {
+            for field in ["href", "getetag"] {
+                let (href, etag) = if field == "href" {
+                    (format!("/vault/bad{reference}.md"), "\"ok\"".to_string())
+                } else {
+                    ("/vault/bad.md".to_string(), format!("\"bad{reference}\""))
+                };
+                let xml = format!(
+                    "<multistatus><response><href>/vault/good.md</href>\
+                    <getetag>\"good\"</getetag></response><response>\
+                    <href>{href}</href><getetag>{etag}</getetag>\
+                    </response></multistatus>"
+                );
+                assert!(
+                    parse_multistatus(&xml, "/vault").is_err(),
+                    "accepted {reference:?} in {field}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multistatus_does_not_expand_custom_or_external_dtd_entities() {
+        for declaration in [
+            r#"<!ENTITY custom "expanded">"#,
+            r#"<!ENTITY custom SYSTEM "file:///nonexistent-helixnotes-entity">"#,
+        ] {
+            let xml = format!(
+                "<!DOCTYPE multistatus [{declaration}]><multistatus><response>\
+                <href>/vault/&custom;.md</href><getetag>\"etag\"</getetag>\
+                </response></multistatus>"
+            );
+            assert!(parse_multistatus(&xml, "/vault")
+                .err()
+                .unwrap()
+                .contains("Unknown XML entity"));
+        }
+    }
+
+    #[test]
+    fn get_preserves_binary_download_and_rechecks_strong_etag() {
+        let bytes: Vec<u8> = (0..HASH_BUFFER_SIZE * 2 + 137)
+            .map(|i| (i % 256) as u8)
+            .collect();
+        let listing = br#"<d:multistatus xmlns:d="DAV:"><d:response>
+            <d:href>/vault/file.bin</d:href>
+            <d:propstat><d:prop><d:getetag>&quot;stable&quot;</d:getetag></d:prop></d:propstat>
+        </d:response></d:multistatus>"#;
+        let (client, requests) = webdav_test_client_bytes(vec![
+            ("200 OK\r\nETag: \"stable\"", bytes.clone()),
+            ("207 Multi-Status", listing.to_vec()),
+        ]);
+        assert_eq!(client.get("file.bin", "\"stable\"").unwrap(), bytes);
+        let requests = requests.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /vault/file.bin "));
+        assert!(requests[0]
+            .to_ascii_lowercase()
+            .contains("if-match: \"stable\""));
+        assert!(requests[1].starts_with("PROPFIND /vault/file.bin "));
+        assert!(requests[1].to_ascii_lowercase().contains("depth: 0"));
+    }
+
+    #[test]
+    fn get_rejects_etag_changed_after_download_and_http_failures() {
+        let listing = r#"<multistatus><response><href>/vault/note.md</href>
+            <getetag>&quot;new&quot;</getetag></response></multistatus>"#;
+        let (client, requests) = webdav_test_client(vec![
+            ("200 OK\r\nETag: \"old\"", "snapshot"),
+            ("207 Multi-Status", listing),
+        ]);
+        assert!(client
+            .get("note.md", "\"old\"")
+            .unwrap_err()
+            .contains("retry"));
+        assert_eq!(requests.join().unwrap().len(), 2);
+
+        for (status, expected_error) in [
+            ("412 Precondition Failed", "retry"),
+            ("404 Not Found", "HTTP 404"),
+        ] {
+            let (client, requests) = webdav_test_client(vec![(status, "ignored")]);
+            assert!(client
+                .get("note.md", "\"old\"")
+                .unwrap_err()
+                .contains(expected_error));
+            assert_eq!(requests.join().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn get_enforces_whole_body_timeout_for_progressing_chunked_download() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/vault", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            assert!(request.starts_with(b"GET /vault/file.bin "));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\
+                    Connection: close\r\n\r\n1\r\nx\r\n",
+                )
+                .unwrap();
+            let mut chunks_sent = 1;
+            // Each gap is below the 400ms timeout, but the full body takes 1s.
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(50));
+                if stream.write_all(b"1\r\nx\r\n").is_err() {
+                    return chunks_sent;
+                }
+                chunks_sent += 1;
+            }
+            let _ = stream.write_all(b"0\r\n\r\n");
+            chunks_sent
+        });
+        let mut client = WebdavClient::new(WebdavConfig {
+            url,
+            username: String::new(),
+            password: String::new(),
+        })
+        .unwrap();
+        client.client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(400))
+            .build()
+            .unwrap();
+
+        let result = client.get("file.bin", "");
+        let chunks_sent = server.join().unwrap();
+        assert!(
+            chunks_sent > 1,
+            "server must make progress during the download"
+        );
+        assert!(
+            result.is_err(),
+            "accepted a body exceeding the total timeout"
+        );
     }
 }

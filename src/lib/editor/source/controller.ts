@@ -77,6 +77,7 @@ export class SourceController {
 	constructor(onChange: (changes: ChangeDesc, edited: boolean) => void = () => {}, events: {
 		paste?: (event: ClipboardEvent) => boolean;
 		drop?: (event: DragEvent) => boolean;
+		scroll?: () => void;
 	} = {}) {
 		this.onChange = onChange;
 		this.extensions = [
@@ -95,6 +96,7 @@ export class SourceController {
 				},
 				paste: (event, view) => !view.state.readOnly && (events.paste?.(event) ?? false),
 				drop: (event, view) => !view.state.readOnly && (events.drop?.(event) ?? false),
+				scroll: () => { events.scroll?.(); return false; },
 			}),
 			this.configuration.of(this.settings()),
 		];

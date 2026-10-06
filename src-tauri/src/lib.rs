@@ -187,6 +187,7 @@ pub fn run() {
             commands::get_notes,
             commands::read_note,
             commands::save_note,
+            commands::import_note,
             commands::create_note,
             commands::duplicate_note,
             commands::create_daily_note,

@@ -19,7 +19,9 @@ const {
   isPathInDirectory,
   isTrashedNote,
   resolvePathFromFile,
-  resolveVaultFilePath
+  resolveVaultFilePath,
+  resolveFileReference,
+  noteAssetRoot
 } = await import(
   `data:text/javascript;base64,${Buffer.from(code).toString('base64')}`
 );
@@ -116,6 +118,28 @@ test('resolves vault files consistently across platforms', () => {
     resolveVaultFilePath('../assets/image.png', '\\\\server\\share\\Vault\\notes\\Note.md', '\\\\server\\share\\Vault'),
     '//server/share/Vault/assets/image.png'
   );
+});
+
+test('document URI suffixes are excluded from filesystem paths without double-decoding filename escapes', () => {
+  assert.deepEqual(resolveFileReference('.helixnotes/attachments/report%2520%29.pdf#page=2', '/vault/Notes/Note.md', '/vault'), {
+    path: '/vault/.helixnotes/attachments/report%20).pdf', suffix: '#page=2'
+  });
+  assert.deepEqual(resolveFileReference('../files/report%23%3F.pdf?mode=fit#page=2', '/vault/Notes/Note.md', '/vault'), {
+    path: '/vault/files/report#?.pdf', suffix: '?mode=fit#page=2'
+  });
+});
+
+test('older imported managed links stay inside their vault after moving to another notebook depth', () => {
+  for (const note of ['/vault/Projects/Nested/Note.md', '/vault/Note.md', '/vault/Archive/Note.md']) {
+    assert.equal(resolveFileReference('../../.helixnotes/attachments/report.pdf#page=2', note, '/vault').path, '/vault/.helixnotes/attachments/report.pdf');
+  }
+});
+
+test('external source roots use configured ownership without borrowing the active vault', () => {
+  assert.equal(noteAssetRoot('/source/Notes/Note.md', '/destination', ['/source']), '/source');
+  assert.equal(noteAssetRoot('/external/Note.md', '/destination', ['/source']), null);
+  assert.equal(noteAssetRoot('/destination-extra/Note.md', '/destination'), null);
+  assert.equal(noteAssetRoot('C:\\SOURCE\\Note.md', 'C:\\Destination', ['c:/Source']), 'c:/Source');
 });
 
 test('restored Windows and UNC notes remain vault-owned across separator and case differences', () => {

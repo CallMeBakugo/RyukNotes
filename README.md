@@ -168,6 +168,14 @@ Restore replaces the current note's body and asks for confirmation if it would r
 
 Open **Note info** from the editor toolbar. Expand **Frontmatter** to inspect the original YAML header, including custom keys, without editing it. This shows the last loaded or saved metadata; unsaved changes are not included, and the display updates after saving.
 
+### Saving notes
+
+Notes autosave after three seconds without edits. During continuous typing, a save is queued at least every ten seconds. Ctrl+S (Cmd+S on macOS), switching notes, and closing an editor flush pending changes immediately. A failed save leaves the note marked **Unsaved** and blocks leaving that editor.
+
+Note writes run off the UI thread and replace the file atomically. Unchanged notes are not rewritten. Ordinary saves update only the affected note in the list, wiki-link cache, and Tasks view; search-index updates are batched in the background. External file changes are still picked up by the watcher.
+
+With **Close to tray** enabled and a tray icon available, closing the main window hides it after saving. With the setting off, closing the main window closes the application. The close-to-tray setting takes effect immediately; enabling the tray icon itself requires a restart. Explicit **Quit** exits rather than hiding to the tray.
+
 Full documentation: [helixnotes.com/docs](https://helixnotes.com/docs.html)
 
 ## Tech Stack

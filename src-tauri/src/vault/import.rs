@@ -883,29 +883,78 @@ fn pathdiff(target: &str, base: &str) -> Result<String, ()> {
 }
 
 fn percent_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        if b == b'%' {
-            let hi = chars.next();
-            let lo = chars.next();
-            if let (Some(h), Some(l)) = (hi, lo) {
-                if let Ok(byte) = u8::from_str_radix(&format!("{}{}", h as char, l as char), 16) {
-                    result.push(byte as char);
-                    continue;
-                }
-            }
-            result.push('%');
-        } else {
-            result.push(b as char);
-        }
-    }
-    result
+    // Keep the complete original reference if escaped bytes are not valid UTF-8.
+    urlencoding::decode(s)
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| s.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_decode_preserves_unicode_plus_and_malformed_escapes() {
+        for (input, expected) in [
+            ("café 雪+.png", "café 雪+.png"),
+            ("caf%C3%A9%20%E9%9B%AA+.png", "café 雪+.png"),
+            ("bad%GG%20name.png", "bad%GG name.png"),
+            ("tail%", "tail%"),
+            ("tail%2", "tail%2"),
+            ("雪%FF%20+%GG", "雪%FF%20+%GG"),
+            ("%E9%9B", "%E9%9B"),
+        ] {
+            assert_eq!(percent_decode(input), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn import_rewrites_unicode_encoded_and_malformed_attachment_references() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        let note_dir = root.join("笔记");
+        std::fs::create_dir(&note_dir).unwrap();
+        let attachments = [
+            "café 雪+.png",
+            "bad%GG.png",
+            "tail%.png",
+            "tail%2.png",
+            "bytes%FF%20.png",
+        ];
+        for name in attachments {
+            std::fs::write(note_dir.join(name), name.as_bytes()).unwrap();
+        }
+        let note_path = note_dir.join("Entry.md");
+        std::fs::write(
+            &note_path,
+            "# Entry\n\n![raw](café%20雪+.png)\n\
+            [encoded](caf%C3%A9%20%E9%9B%AA+.png#preview)\n\
+            ![malformed](bad%GG.png)\n![percent](tail%.png)\n\
+            [short](tail%2.png)\n[invalid UTF-8](bytes%FF%20.png)\n",
+        )
+        .unwrap();
+
+        let result = import(root.to_str().unwrap()).unwrap();
+        assert_eq!(result.attachments_moved, attachments.len() as u64);
+        let note = std::fs::read_to_string(&note_path).unwrap();
+        for reference in [
+            "![raw](../.helixnotes/attachments/笔记/café%20雪+.png)",
+            "[encoded](../.helixnotes/attachments/笔记/café%20雪+.png#preview)",
+            "![malformed](../.helixnotes/attachments/笔记/bad%GG.png)",
+            "![percent](../.helixnotes/attachments/笔记/tail%.png)",
+            "[short](../.helixnotes/attachments/笔记/tail%2.png)",
+            "[invalid UTF-8](../.helixnotes/attachments/笔记/bytes%FF%20.png)",
+        ] {
+            assert!(note.contains(reference), "missing {reference:?} in {note}");
+        }
+        for name in attachments {
+            assert!(!note_dir.join(name).exists());
+            assert_eq!(
+                std::fs::read(root.join(".helixnotes/attachments/笔记").join(name)).unwrap(),
+                name.as_bytes()
+            );
+        }
+    }
 
     #[test]
     fn test_normalize_tags_comma_string() {

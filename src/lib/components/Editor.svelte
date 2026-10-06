@@ -23,23 +23,19 @@
 	import TextAlign from '@tiptap/extension-text-align';
 	import { common, createLowlight } from 'lowlight';
 	import powershell from 'highlight.js/lib/languages/powershell';
-	import MarkdownIt from 'markdown-it';
-	import markdownItMark from 'markdown-it-mark';
-	import markdownItSup from 'markdown-it-sup';
-	import markdownItSub from 'markdown-it-sub';
 	import katex from 'katex';
 	import 'katex/dist/katex.min.css';
 	import { Extension, Node as TiptapNode, Mark as TiptapMark, mergeAttributes } from '@tiptap/core';
 	import { Plugin, PluginKey, EditorState, Selection, TextSelection } from '@tiptap/pm/state';
 	import { Decoration, DecorationSet } from '@tiptap/pm/view';
-	import { DOMSerializer } from '@tiptap/pm/model';
+	import { DOMSerializer, type Node as ProseMirrorNode } from '@tiptap/pm/model';
 	import { convertFileSrc } from '@tauri-apps/api/core';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { readFile } from '@tauri-apps/plugin-fs';
 	import { openFile, openUrl, copyFileTo, copyImageToClipboard as copyImageToClipboardCmd, writeBytesTo, copyPngToClipboard, copyTextToClipboard } from '$lib/api';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { activeNote, activeNotePath, appConfig, editorDirty, sourceMode, focusMode, readOnly, quickAccessPaths, notes, navHistory, canGoBack, canGoForward, viewerNote, viewMode, notebooks, outlineWidth } from '$lib/stores/app';
-	import { saveNote, createNote, saveImage, saveAttachment, readClipboardImage, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout } from '$lib/api';
+	import { saveNote, importNote, createNote, saveImage, saveAttachment, readClipboardImage, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout } from '$lib/api';
 	import type { NoteContent, VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord, FileEvent, SearchTarget, ToolbarLayout } from '$lib/types';
 	import { listen } from '@tauri-apps/api/event';
 	import { debounce } from '$lib/utils/debounce';
@@ -62,11 +58,14 @@
 	import { clearFormatting } from '$lib/editor/clearFormatting';
 	import { toolbarLabels, resolveToolbarLayout, groupToolbarButtons, moveToolbarButton, toolbarLayoutPreference, type ToolbarButtonId, type ToolbarArea, type ResolvedToolbarLayout } from '$lib/editor/toolbar';
 	import { buildCodeCopyDecorations, buildTaskMetaDecorations, focusedPlaceholderDecorations } from '$lib/editor/decorations';
-	import { serializeInlineMarkdown } from '$lib/editor/markdown';
+	import { serializeInlineMarkdown, serializeCodeBlock } from '$lib/editor/markdown';
 	import { restoreTitleHeading, stripTitleHeading, type HiddenTitleHeading } from '$lib/editor/titleVisibility';
+	import { documentHeadings, sourceHeadings, activeHeadingIndex, mapDocumentHeadings, mapSourceHeadings, type OutlineHeading } from '$lib/editor/outline';
+	import { createEditorMarkdownParser } from '$lib/editor/markdownParser';
+	import { externalNoteReferences } from '$lib/editor/externalNote';
 	import { tagIterationKey } from '$lib/utils/tag-styles';
 	import { replaceWithWikiLink } from '$lib/editor/wikiLinks';
-	import { assetSourceToMarkdown, assetUrlToLocalPath, normalizeLocalAssetPath, resolveVaultFilePath, isTrashedNote } from '$lib/utils/paths';
+	import { assetSourceToMarkdown, assetUrlToLocalPath, resolveFileReference, noteAssetRoot, isTrashedNote } from '$lib/utils/paths';
 	import GraphView from './GraphView.svelte';
 	import TagSuggestInput from './TagSuggestInput.svelte';
 	import TagLabel from './TagLabel.svelte';
@@ -74,8 +73,11 @@
 	import { isMobile, isAndroid } from '$lib/platform';
 	import ResizeHandle from './ResizeHandle.svelte';
 
-	let { onMoveToTrash }: {
+	const componentId = $props.id();
+	const outlinePanelId = `${componentId}-outline`;
+	let { onMoveToTrash, onOutlineChange }: {
 		onMoveToTrash?: (path: string) => Promise<boolean>;
+		onOutlineChange?: (open: boolean, panelId: string) => void;
 	} = $props();
 
 	const modKey = navigator.platform.startsWith('Mac') ? '⌘' : 'Ctrl';
@@ -109,6 +111,31 @@
 			};
 		},
 	});
+	function hasInlineCode(node: ProseMirrorNode): boolean {
+		for (let i = 0; i < node.childCount; i++) {
+			if (node.child(i).marks.some(mark => mark.type.name === 'code')) return true;
+		}
+		return false;
+	}
+	const EditorStarterKit = StarterKit.extend({
+		addExtensions() {
+			return this.parent!().map(extension => extension instanceof TiptapNode && (extension.name === 'paragraph' || extension.name === 'heading') ? extension.extend({
+				parseHTML() {
+					return (this.parent?.() ?? []).flatMap(rule => [
+						{ ...rule, tag: `${rule.tag}[data-helix-code]`, preserveWhitespace: 'full' as const },
+						rule,
+					]);
+				},
+				renderHTML(props) {
+					return this.parent!({
+						...props,
+						HTMLAttributes: hasInlineCode(props.node)
+							? { ...props.HTMLAttributes, 'data-helix-code': '' } : props.HTMLAttributes,
+					});
+				},
+			}) : extension);
+		},
+	});
 	let editorReady = $state(false);
 	const trashPreview = $derived(isTrashedNote($activeNotePath, $appConfig?.active_vault));
 	// CM retains an immutable document; edits never bind a full source string to Svelte.
@@ -117,7 +144,12 @@
 		if (edited) markEdited();
 		scheduleCounts();
 		if (noteSearchOpen) scheduleNoteSearch();
-	}, { paste: handleFilePaste, drop: handleFileDrop });
+		if ($sourceMode && showOutline && outlineOrigin && isOriginCurrent(outlineOrigin)) {
+			outlineHeadings = mapSourceHeadings(outlineHeadings, changes);
+			scheduleOutline();
+			scheduleOutlineActive();
+		}
+	}, { paste: handleFilePaste, drop: handleFileDrop, scroll: scheduleOutlineActive });
 	let loadedPath = '';
 	type NoteScrollPosition = { rich: number; source: number };
 	const MAX_NOTE_SCROLL_POSITIONS = 200;
@@ -155,7 +187,7 @@
 	let morePanel = $state<HTMLDivElement>();
 	let moreOpen = $state(false);
 	let formattingTrigger: HTMLButtonElement | null = null;
-	const morePanelId = $props.id();
+	const morePanelId = `${componentId}-more`;
 	let toolbarDraft = $state<ResolvedToolbarLayout | null>(null);
 	let toolbarSelected = $state<ToolbarButtonId | null>(null);
 	let toolbarSaving = $state(false);
@@ -427,42 +459,129 @@
 	let aiGeneration = 0;
 
 
-	// Outline
+	// Outline entries are mapped immediately; labels are rescanned after typing settles.
 	let showOutline = $state(false);
-	interface OutlineHeading { level: number; text: string; pos: number; }
 	let outlineHeadings = $state<OutlineHeading[]>([]);
+	let outlineOrigin: EditorOrigin | null = null;
+	let outlineActive = $state(-1);
+	let outlineList = $state<HTMLUListElement>();
+	let outlineTrigger: HTMLElement | null = null;
+	let outlineTimer: ReturnType<typeof setTimeout> | null = null;
+	let outlineFrame: number | null = null;
 
-	function updateOutline() {
-		if (!editor) { outlineHeadings = []; return; }
-		const headings: OutlineHeading[] = [];
-		editor.state.doc.descendants((node, pos) => {
-			if (node.type.name === 'heading') {
-				headings.push({ level: node.attrs.level, text: node.textContent, pos });
-			}
-		});
-		outlineHeadings = headings;
+	function clearOutline() {
+		if (outlineTimer !== null) clearTimeout(outlineTimer);
+		if (outlineFrame !== null) cancelAnimationFrame(outlineFrame);
+		outlineTimer = null;
+		outlineFrame = null;
+		outlineHeadings = [];
+		outlineOrigin = null;
+		outlineActive = -1;
 	}
 
-	const scheduleOutline = debounce(updateOutline, 250);
+	function updateOutline() {
+		if (outlineTimer !== null) clearTimeout(outlineTimer);
+		outlineTimer = null;
+		if (editorDisposed || !loadedPath || loadedPath !== $activeNotePath) { clearOutline(); return; }
+		outlineHeadings = $sourceMode ? sourceHeadings(source.state)
+			: editor && pendingContent === null ? documentHeadings(editor.state.doc) : [];
+		outlineOrigin = captureOrigin();
+		scheduleOutlineActive();
+	}
+
+	function scheduleOutline() {
+		if (outlineTimer !== null) clearTimeout(outlineTimer);
+		outlineTimer = setTimeout(() => {
+			outlineTimer = null;
+			if (showOutline && !editorDisposed) updateOutline();
+		}, 250);
+	}
+
+	function updateOutlineActive() {
+		if (!outlineOrigin || !isOriginCurrent(outlineOrigin)) return;
+		if ($sourceMode) {
+			const view = source.view;
+			if (!view || !view.scrollDOM.getClientRects().length) return;
+			const height = Math.max(0, view.scrollDOM.getBoundingClientRect().top + 24 - view.documentTop);
+			outlineActive = activeHeadingIndex(outlineHeadings, view.lineBlockAtHeight(height).to);
+		} else if (editor) {
+			const body = editor.view.dom.closest('.editor-body');
+			if (!body || !body.getClientRects().length) return;
+			const readingTop = body.getBoundingClientRect().top + 32;
+			let active = -1;
+			for (let i = 0; i < outlineHeadings.length; i++) {
+				const element = editor.view.nodeDOM(outlineHeadings[i].pos);
+				if (!(element instanceof HTMLElement) || !element.getClientRects().length) continue;
+				if (element.getBoundingClientRect().top > readingTop) break;
+				active = i;
+			}
+			outlineActive = active;
+		}
+	}
+
+	function scheduleOutlineActive() {
+		if (!showOutline || outlineFrame !== null) return;
+		outlineFrame = requestAnimationFrame(() => {
+			outlineFrame = null;
+			updateOutlineActive();
+		});
+	}
+
+	$effect(() => { onOutlineChange?.(showOutline && !showHistory, outlinePanelId); });
+	$effect(() => {
+		const active = outlineActive;
+		if (!showOutline || active < 0) return;
+		tick().then(() => {
+			if (!outlineList || outlineList.contains(document.activeElement)) return;
+			const item = outlineList.children[active] as HTMLElement | undefined;
+			if (!item) return;
+			const listRect = outlineList.getBoundingClientRect();
+			const itemRect = item.getBoundingClientRect();
+			if (itemRect.top < listRect.top) outlineList.scrollTop -= listRect.top - itemRect.top;
+			else if (itemRect.bottom > listRect.bottom) outlineList.scrollTop += itemRect.bottom - listRect.bottom;
+		});
+	});
 
 	function handleOutlineResize(delta: number) {
 		$outlineWidth = Math.max(160, Math.min(500, $outlineWidth - delta));
 	}
 
-	async function scrollToHeading(pos: number) {
+	async function closeOutline() {
+		showOutline = false;
+		await tick();
+		if (outlineTrigger?.isConnected) outlineTrigger.focus({ preventScroll: true });
+	}
+
+	async function scrollToHeading(heading: OutlineHeading) {
+		if (!outlineOrigin || !isOriginCurrent(outlineOrigin)) { updateOutline(); return; }
+		// A mapped position is not enough: the heading may have been converted or deleted.
+		const current = $sourceMode ? sourceHeadings(source.state) : editor ? documentHeadings(editor.state.doc) : [];
+		const target = current.find(h => h.pos === heading.pos);
+		if (!target) { updateOutline(); return; }
 		const origin = captureOrigin();
 		if (isMobile) {
 			showOutline = false;
 			await tick();
 		}
-		if (!editor || !isOriginCurrent(origin, true)) return;
-		editor.commands.setTextSelection(pos + 1);
-		editor.commands.scrollIntoView();
-		editor.view.focus();
-		if (isMobile) {
-			const heading = editor.view.nodeDOM(pos);
-			if (heading instanceof HTMLElement) heading.scrollIntoView({ block: 'start' });
+		if (!isOriginCurrent(origin, true)) return;
+		if ($sourceMode) {
+			source.view?.requestMeasure();
+			source.select(target.pos, target.pos, true);
+			source.focus();
+		} else if (editor) {
+			const element = editor.view.nodeDOM(target.pos);
+			if (element instanceof HTMLElement) {
+				for (let parent = element.parentElement; parent && parent !== editor.view.dom; parent = parent.parentElement) {
+					if (parent.matches('[data-type="details"]')) openDetailsEl(parent);
+					else if (parent.matches('.callout.is-folded')) parent.classList.remove('is-folded');
+				}
+			}
+			editor.commands.setTextSelection(target.pos + 1);
+			editor.commands.scrollIntoView();
+			editor.view.focus();
+			if (element instanceof HTMLElement) element.scrollIntoView({ block: 'start' });
 		}
+		outlineActive = current.indexOf(target);
 	}
 
 	// Version history
@@ -704,11 +823,21 @@
 			try {
 				html = katex.renderToString(tex, { displayMode, throwOnError: false });
 			} catch {
-				html = `<span class="katex-error">${tex}</span>`;
+				html = `<span class="katex-error">${escapeHtml(tex)}</span>`;
 			}
 			katexCache.set(key, html);
+			if (katexCache.size > 512) katexCache.delete(katexCache.keys().next().value!);
 		}
 		return html;
+	}
+
+	function mathHTML(tex: string, displayMode: boolean): HTMLElement {
+		const dom = document.createElement(displayMode ? 'div' : 'span');
+		dom.setAttribute(displayMode ? 'data-math-block' : 'data-math-inline', encodeURIComponent(tex));
+		dom.className = displayMode ? 'math-block' : 'math-inline';
+		dom.contentEditable = 'false';
+		dom.innerHTML = renderKatex(tex, displayMode);
+		return dom;
 	}
 
 	let mathObserver: IntersectionObserver | null = null;
@@ -746,7 +875,7 @@
 		const out: Array<{ path: string; name: string; depth: number }> = [];
 		const walk = (list: any[], depth: number) => {
 			for (const nb of list) {
-				out.push({ path: nb.path, name: nb.name, depth });
+				out.push({ path: nb.relative_path.replace(/\\/g, '/'), name: nb.name, depth });
 				if (nb.children?.length) walk(nb.children, depth + 1);
 			}
 		};
@@ -775,29 +904,11 @@
 		if (!isCurrent() || !v || !vaultRoot || viewerImportBusy) return;
 		viewerImportBusy = true;
 		try {
-			const filename = v.path.split('/').pop() || 'imported.md';
-			const baseName = filename.replace(/\.md$/i, '');
-			const folder = folderPath ? `${vaultRoot}/${folderPath}` : vaultRoot;
-			let dest = `${folder}/${filename}`;
-			// Conflict resolution: append (2), (3)... if file exists
-			let n = 2;
-			// readNote throws if file doesn't exist; use it as an existence probe
-			while (true) {
-				try {
-					await readNote(vaultRoot, dest);
-					if (!isCurrent()) return;
-				} catch {
-					if (!isCurrent()) return;
-					break;
-				}
-				dest = `${folder}/${baseName} (${n}).md`;
-				n++;
-				if (n > 100) throw new Error('Could not find a free filename');
-			}
-			await copyFileTo(v.path, dest);
+			const raw = $activeNote?.raw;
+			if (raw === undefined || $activeNote?.path !== v.path) throw new Error('Reopen the source note before importing.');
+			const content = await importNote(vaultRoot, v.path, folderPath || null, raw, externalNoteReferences(raw));
 			if (!isCurrent()) return;
-			const content = await readNote(vaultRoot, dest);
-			if (!isCurrent()) return;
+			const dest = content.path;
 			// Switch to the imported note as a real vault note
 			$viewerNote = null;
 			$readOnly = false;
@@ -824,12 +935,7 @@
 	const lowlight = createLowlight(common);
 	lowlight.register('powershell', powershell);
 	const codeLanguages = [...lowlight.listLanguages(), 'mermaid'].sort();
-	const mdit = MarkdownIt({ html: true, linkify: false, breaks: false })
-		.use(markdownItMark)
-		.use(markdownItSup)
-		.use(markdownItSub);
-	// Disable indented code blocks - tab-indented text should stay as text, not become code
-	mdit.disable('code');
+	const mdit = createEditorMarkdownParser();
 
 	function normalizePath(p: string): string {
 		const parts = p.split('/');
@@ -963,10 +1069,10 @@
 			const name = HTMLAttributes.name || 'file.pdf';
 			const showInline = !isMobile && ($appConfig?.pdf_preview ?? false);
 			if (showInline) {
-				const vaultRoot = $appConfig?.active_vault ?? '';
+				const root = currentNoteAssetRoot();
 				const pdfHeight = $appConfig?.pdf_height ?? 600;
-				const absPath = normalizePath(`${vaultRoot}/${decodeURIComponent(src)}`);
-				const displaySrc = convertFileSrc(absPath);
+				const local = resolveFileReference(src, root ? `${root}/.vault-root` : $activeNotePath, root);
+				const displaySrc = convertFileSrc(local.path) + local.suffix;
 				return ['div', mergeAttributes({ 'data-pdf-src': src, 'data-pdf-name': name, class: 'pdf-embed' }),
 					['iframe', { src: displaySrc, width: '100%', height: `${pdfHeight}px`, frameborder: '0' }],
 					['p', { class: 'pdf-label' }, name],
@@ -974,7 +1080,7 @@
 			}
 			// Non-inline: render as a clickable link (mobile + desktop with setting off)
 			return ['div', mergeAttributes({ 'data-pdf-src': src, 'data-pdf-name': name, class: 'pdf-embed-mobile' }),
-				['a', { href: decodeURIComponent(src), class: 'pdf-link-mobile' },
+				['a', { href: src, class: 'pdf-link-mobile' },
 					['span', { class: 'pdf-icon-mobile' }, '\uD83D\uDCC4'],
 					['span', {}, name],
 				],
@@ -1137,9 +1243,7 @@
 			}];
 		},
 		renderHTML({ HTMLAttributes }) {
-			const tex = HTMLAttributes.tex || '';
-			const rendered = renderKatex(tex, true);
-			return ['div', { 'data-math-block': encodeURIComponent(tex), class: 'math-block', contenteditable: 'false' }, ['div', { innerHTML: rendered }]];
+			return { dom: mathHTML(HTMLAttributes.tex || '', true) };
 		},
 		addNodeView() {
 			return ({ node, getPos }) => {
@@ -1175,9 +1279,7 @@
 			}];
 		},
 		renderHTML({ HTMLAttributes }) {
-			const tex = HTMLAttributes.tex || '';
-			const rendered = renderKatex(tex, false);
-			return ['span', { 'data-math-inline': encodeURIComponent(tex), class: 'math-inline', contenteditable: 'false' }, ['span', { innerHTML: rendered }]];
+			return { dom: mathHTML(HTMLAttributes.tex || '', false) };
 		},
 		addNodeView() {
 			return ({ node, getPos }) => {
@@ -3135,6 +3237,10 @@
 		{ name: 'Gray', value: '#374151' },
 	];
 
+	function currentNoteAssetRoot(): string | null {
+		return noteAssetRoot($activeNotePath, $appConfig?.active_vault ?? null, $appConfig?.vaults.map(vault => vault.path) ?? []);
+	}
+
 	function resolveImageSrc(src: string): string {
 		// Already a proxied, asset, data, or blob URL
 		if (src.startsWith('data:') || src.startsWith('asset:') || src.startsWith('blob:') || src.startsWith('imgproxy:') || src.startsWith('http://imgproxy.localhost') || src.startsWith('https://imgproxy.localhost')) {
@@ -3149,40 +3255,8 @@
 		if (src.startsWith('http://') || src.startsWith('https://')) {
 			return convertFileSrc(src, 'imgproxy');
 		}
-		// Decode URL encoding and undo the extra leading slash added to Windows drive paths.
-		let decoded: string;
-		try {
-			decoded = normalizeLocalAssetPath(decodeURIComponent(src));
-		} catch {
-			decoded = normalizeLocalAssetPath(src);
-		}
-		// Keep repairing legacy POSIX paths that were saved with duplicate leading slashes.
-		if (/^\/{2,}/.test(decoded)) decoded = decoded.replace(/^\/{2,}/, '/');
-		if (decoded.startsWith('/') || /^[A-Za-z]:\//.test(decoded)) {
-			return convertFileSrc(normalizePath(decoded));
-		}
-		// Paths containing .helixnotes/ are vault-root relative (our own attachments)
-		if (decoded.includes('.helixnotes/')) {
-			const vaultRoot = $appConfig?.active_vault;
-			if (vaultRoot) {
-				// Extract from .helixnotes/ onward in case of prefixed subdir paths
-				const idx = decoded.indexOf('.helixnotes/');
-				return convertFileSrc(`${vaultRoot}/${decoded.substring(idx)}`);
-			}
-		}
-		// Standard markdown: resolve relative paths against the note's directory
-		const notePath = $activeNotePath;
-		if (notePath) {
-			const normalizedNotePath = notePath.replace(/\\/g, '/');
-			const noteDir = normalizedNotePath.substring(0, normalizedNotePath.lastIndexOf('/'));
-			return convertFileSrc(normalizePath(`${noteDir}/${decoded}`));
-		}
-		// Last fallback: vault root
-		const vaultRoot = $appConfig?.active_vault;
-		if (vaultRoot) {
-			return convertFileSrc(normalizePath(`${vaultRoot}/${decoded}`));
-		}
-		return src;
+		const local = resolveFileReference(src, $activeNotePath, currentNoteAssetRoot());
+		return convertFileSrc(normalizePath(local.path)) + local.suffix;
 	}
 
 	function normalizeImageHtml(html: string): string {
@@ -3770,6 +3844,7 @@
 
 	export function loadNote(path: string, content: string, taskTarget?: TaskRecord) {
 		endToolbarCustomization();
+		clearOutline();
 		cancelCounts();
 		closeNoteSearch(false);
 		saves.startSession($activeNote?.raw ?? content);
@@ -3848,7 +3923,7 @@
 			pendingContent = content;
 			isLoadingNote = false;
 		}
-		if (!isMobile && showOutline) scheduleOutline();
+		if (showOutline) updateOutline();
 		scheduleTaskReveal(path, revealTarget, revealRequest);
 	}
 
@@ -3905,7 +3980,7 @@
 				result += separator + entries[i].text;
 			}
 		}
-		return result.replace(/\n{3,}/g, '\n\n').trim() + '\n';
+		return result.trim() + '\n';
 	}
 
 	function tableToMarkdown(table: any): string {
@@ -3962,27 +4037,30 @@
 		closeTableContextMenu();
 	}
 
+	function serializeHTMLNode(node: ProseMirrorNode): string {
+		const container = document.createElement('div');
+		container.appendChild(DOMSerializer.fromSchema(editor!.schema).serializeNode(node));
+		return container.innerHTML;
+	}
+
 	function serializeNode(node: any): string {
 		switch (node.type.name) {
 			case 'paragraph': {
 				const align = node.attrs.textAlign;
 				if (align && align !== 'left') {
-					return `<p style="text-align: ${align}">${serializeInline(node)}</p>\n`;
+					return serializeHTMLNode(node) + '\n';
 				}
 				return serializeInline(node) + '\n';
 			}
 			case 'heading': {
 				const align = node.attrs.textAlign;
 				if (align && align !== 'left') {
-					return `<h${node.attrs.level} style="text-align: ${align}">${serializeInline(node)}</h${node.attrs.level}>\n`;
+					return serializeHTMLNode(node) + '\n';
 				}
 				return '#'.repeat(node.attrs.level) + ' ' + serializeInline(node) + '\n';
 			}
-			case 'codeBlock': {
-				const lang = node.attrs.language || '';
-				const code = node.textContent.replace(/\n+$/, '');
-				return '```' + lang + '\n' + code + '\n```\n';
-			}
+			case 'codeBlock':
+				return serializeCodeBlock(node.textContent, node.attrs.language || '');
 			case 'blockquote': {
 				const blocks: string[] = [];
 				node.forEach((child: any) => {
@@ -4036,10 +4114,7 @@
 					return true;
 				});
 				if (hasStyling || !hasHeaderRow) {
-					const tempDiv = document.createElement('div');
-					const frag = DOMSerializer.fromSchema(editor!.schema).serializeNode(node);
-					tempDiv.appendChild(frag);
-					return tempDiv.innerHTML + '\n';
+					return serializeHTMLNode(node) + '\n';
 				}
 				return tableToMarkdown(node) + '\n';
 			}
@@ -4059,10 +4134,7 @@
 			case 'details': {
 				// Markdown HTML blocks end at a blank line, including one inside <pre><code>.
 				// Keep the details element on one source line; HTML parsing restores each encoded newline.
-				const detDiv = document.createElement('div');
-				const detFrag = DOMSerializer.fromSchema(editor!.schema).serializeNode(node);
-				detDiv.appendChild(detFrag);
-				return detDiv.innerHTML.replace(/\n/g, '&#10;') + '\n';
+				return serializeHTMLNode(node).replace(/\n/g, '&#10;') + '\n';
 			}
 			case 'image': {
 				const src = stripAssetSrc(node.attrs.src || '');
@@ -4813,191 +4885,28 @@
 		return md.trim() + '\n';
 	}
 
-	function secretFencesToHtml(md: string): string {
-		const lines = md.split('\n');
-		const out: string[] = [];
-		for (let i = 0; i < lines.length; i++) {
-			if (!/^\s*```helix-secret\s*$/.test(lines[i])) {
-				out.push(lines[i]);
-				continue;
-			}
-
-			const payloadLines: string[] = [];
-			let closedAt = -1;
-			for (let j = i + 1; j < lines.length; j++) {
-				if (/^\s*```\s*$/.test(lines[j])) {
-					closedAt = j;
-					break;
-				}
-				payloadLines.push(lines[j]);
-			}
-
-			if (closedAt === -1) {
-				out.push(lines[i], ...payloadLines);
-				break;
-			}
-
-			const payload = payloadLines.join('\n');
-			out.push(`<div data-secret-block="${escapeHtml(encodeURIComponent(payload))}"></div>`);
-			i = closedAt;
-		}
-		return out.join('\n');
-	}
 
 	function markdownToHtml(md: string, snapshot = false): string {
-		let src = snapshot ? md : stripTitleH1(md);
-		src = secretFencesToHtml(src);
-
-		// Pre-process: convert [[Note Title]] wiki-links to HTML anchors
-		// Supports Obsidian syntax: [[note|alias]], [[note#heading]], [[note^block]]
-		if ($appConfig?.enable_wiki_links) {
-			src = src.replace(/\[\[([^\]]+)\]\]/g, (_, raw) => {
-				// Split on pipe: [[note|display text]] → noteRef="note", display="display text"
-				const pipeIdx = raw.indexOf('|');
-				const noteRef = (pipeIdx >= 0 ? raw.slice(0, pipeIdx) : raw).trim();
-				const display = (pipeIdx >= 0 ? raw.slice(pipeIdx + 1) : noteRef).trim();
-				// Strip #heading and ^block anchors for title matching
-				const titleForLookup = noteRef.replace(/#.*$/, '').replace(/\^.*$/, '').trim();
-				// Try to resolve: first by vault-relative path (for disambiguated links), then by title.
-				// entry.path is vault-relative (e.g. "folder/note.md"); match against that.
-				let match: NoteTitleEntry | undefined;
-				if (titleForLookup.includes('/')) {
-					const relPath = titleForLookup + '.md';
-					match = wikiLinkTitlesCache.find(e => e.path === relPath);
-				}
-				if (!match) {
-					// Fallback: resolve by title (use the last segment if path-based)
-					const titleOnly = titleForLookup.includes('/') ? titleForLookup.split('/').pop()! : titleForLookup;
-					const titleLower = titleOnly.toLowerCase();
-					const titleMatches = wikiLinkTitlesCache.filter(e => e.title.toLowerCase() === titleLower);
-					if (titleMatches.length === 1) {
-						match = titleMatches[0];
-					} else if (titleMatches.length > 1) {
-						// Multiple matches - prefer the shallowest path (closest to vault root)
-						match = titleMatches.reduce((a, b) =>
-							a.path.split('/').length <= b.path.split('/').length ? a : b
-						);
-					}
-				}
-				const path = match ? match.path : '';
-				return `<span data-wiki-link data-path="${escapeHtml(path)}" data-title="${escapeHtml(noteRef)}" class="wiki-link">${escapeHtml(display)}</span>`;
-			});
-		}
-
-		// Pre-process: fix image paths with multiple leading slashes (from broken saves)
-		src = src.replace(/!\[([^\]]*)\]\((\/{2,})(home\/)/g, '![$1](/home/');
-
-		// Pre-process: normalize link/image destinations for strict-CommonMark markdown-it.
-		// Handles angle-bracket destinations <url>, optional titles ("..."/'...'/(...)), and the
-		// non-standard %20 separator some exporters (e.g. Notesnook) emit between url and title.
-		// Emits clean [label](encoded-url); titles are dropped (we never serialize them anyway).
-		src = src.replace(
-			/(!?)(\[[^\]]*\])\(<([^>]*)>(?:(?:\s|%20)*(?:"[^"]*"|'[^']*'|\([^)]*\)))?(?:\s|%20)*\)/g,
-			(_m, bang, label, url) => `${bang}${label}(${url.replace(/ /g, '%20')})`
-		);
-		// Bare destination with a trailing quoted title: [label](url "title") -> drop title, encode spaces.
-		// Stops our own space-encoder below from mangling valid CommonMark titled links.
-		src = src.replace(
-			/(!?)(\[[^\]]*\])\(([^()<>]*?)(?:\s|%20)+(?:"[^"]*"|'[^']*')(?:\s|%20)*\)/g,
-			(_m, bang, label, url) => `${bang}${label}(${url.replace(/ /g, '%20')})`
-		);
-
-		// Pre-process: percent-encode spaces in image URLs so markdown-it parses them correctly
-		src = src.replace(/!\[([^\]]*)\]\(([^)]*\s[^)]*)\)/g, (match, alt, url) => {
-			return `![${alt}](${url.replace(/ /g, '%20')})`;
+		const src = snapshot ? md : stripTitleH1(md);
+		// Render once; parser rules keep code and math payloads out of prose transformations.
+		let html = mdit.render(src, {
+			wikiLinkTitles: $appConfig?.enable_wiki_links ? wikiLinkTitlesCache : undefined,
 		});
 
-		// Pre-process: percent-encode spaces in link URLs so markdown-it parses them correctly
-		// Matches [text](url with spaces) but not ![image](url) (already handled above)
-		src = src.replace(/(?<!!)\[([^\]]*)\]\(([^)]*\s[^)]*)\)/g, (_match, text, url) => {
-			return `[${text}](${url.replace(/ /g, '%20')})`;
-		});
-
-		// Pre-process: transform PDF embed divs - iframes when inline preview is on, clickable links otherwise
-		src = src.replace(/<div[^>]*data-pdf-src="([^"]*)"[^>]*data-pdf-name="([^"]*)"[^>]*>[^<]*<\/div>/gi, (_, pdfSrc, name) => {
-			const vaultRoot = $appConfig?.active_vault ?? '';
-			const absPath = normalizePath(`${vaultRoot}/${decodeURIComponent(pdfSrc)}`);
+		// PDF embeds are raw HTML here; literal code is already escaped by the parser.
+		html = html.replace(/<div[^>]*data-pdf-src="([^"]*)"[^>]*data-pdf-name="([^"]*)"[^>]*>[^<]*<\/div>/gi, (_, pdfSrc, name) => {
+			const root = currentNoteAssetRoot();
+			const local = resolveFileReference(pdfSrc, root ? `${root}/.vault-root` : $activeNotePath, root);
 			const showInline = !snapshot && !isMobile && ($appConfig?.pdf_preview ?? false);
+			const safeSrc = mdit.utils.escapeHtml(pdfSrc);
+			const safeName = mdit.utils.escapeHtml(name);
 			if (showInline) {
 				const pdfHeight = $appConfig?.pdf_height ?? 600;
-				const displaySrc = convertFileSrc(absPath);
-				return `<div data-pdf-src="${pdfSrc}" data-pdf-name="${name}" class="pdf-embed"><iframe src="${displaySrc}" width="100%" height="${pdfHeight}px"></iframe><p class="pdf-label">${name}</p></div>`;
+				const displaySrc = convertFileSrc(local.path) + local.suffix;
+				return `<div data-pdf-src="${safeSrc}" data-pdf-name="${safeName}" class="pdf-embed"><iframe src="${mdit.utils.escapeHtml(displaySrc)}" width="100%" height="${pdfHeight}px"></iframe><p class="pdf-label">${safeName}</p></div>`;
 			}
-			return `<div data-pdf-src="${pdfSrc}" data-pdf-name="${name}" class="pdf-embed-mobile"><a href="${decodeURIComponent(pdfSrc)}" class="pdf-link-mobile">\uD83D\uDCC4 ${name}</a></div>`;
+			return `<div data-pdf-src="${safeSrc}" data-pdf-name="${safeName}" class="pdf-embed-mobile"><a href="${mdit.utils.escapeHtml(pdfSrc)}" class="pdf-link-mobile">\uD83D\uDCC4 ${safeName}</a></div>`;
 		});
-
-		// Pre-process: render KaTeX math - only outside fenced code blocks
-		{
-			const lines = src.split('\n');
-			const outLines: string[] = [];
-			let inFence = false;
-			let mathBlock: string[] | null = null;
-			for (let i = 0; i < lines.length; i++) {
-				const line = lines[i];
-				if (/^```/.test(line)) { inFence = !inFence; outLines.push(line); continue; }
-				if (inFence) { outLines.push(line); continue; }
-				// Accumulate block math: $$ on its own line starts/ends a block
-				if (line.trim() === '$$') {
-					if (!mathBlock) { mathBlock = []; continue; }
-					const tex = mathBlock.join('\n').trim();
-					mathBlock = null;
-					outLines.push(`<div data-math-block="${encodeURIComponent(tex)}" class="math-block"></div>`);
-					continue;
-				}
-				if (mathBlock) { mathBlock.push(line); continue; }
-				// Inline math: $...$ (skip content inside backticks)
-				const processed = line.replace(/`[^`]*`/g, m => '\x00'.repeat(m.length));
-				let result = line;
-				let offset = 0;
-				for (const m of processed.matchAll(/(?<!\$)\$(?![\s$])([^\n$]+?)(?<!\s)\$(?!\$)(?!\d)/g)) {
-					const tex = m[1].trim();
-					const html = `<span data-math-inline="${encodeURIComponent(tex)}" class="math-inline"></span>`;
-					result = result.slice(0, m.index! + offset) + html + result.slice(m.index! + m[0].length + offset);
-					offset += html.length - m[0].length;
-				}
-				outLines.push(result);
-			}
-			// If unclosed math block, just output the lines as-is
-			if (mathBlock) { outLines.push('$$', ...mathBlock); }
-			src = outLines.join('\n');
-		}
-
-		// Pre-process: convert task list syntax before markdown-it (it doesn't know TipTap's format)
-		// Support indented (nested) and blockquoted task lists too
-		src = src.replace(/^([\s>]*)-\s\[x\][^\S\n]+(.+)$/gm, '$1- <tiptask checked="true">$2</tiptask>');
-		src = src.replace(/^([\s>]*)-\s\[x\][^\S\n]*$/gm, '$1- <tiptask checked="true">&nbsp;</tiptask>');
-		src = src.replace(/^([\s>]*)-\s\[ \][^\S\n]+(.+)$/gm, '$1- <tiptask checked="false">$2</tiptask>');
-		src = src.replace(/^([\s>]*)-\s\[ \][^\S\n]*$/gm, '$1- <tiptask checked="false">&nbsp;</tiptask>');
-
-		// Pre-process: replace empty-paragraph markers with a div sentinel before markdown-it.
-		// A bare <!-- --> starts an HTML block that swallows the next line; the blank lines
-		// around the div keep it isolated. Post-render converts it back to <p></p>.
-		src = src.replace(/<!-- -->/g, '\n\n<div data-empty-para></div>\n\n');
-
-		// Pre-process: preserve blank lines before image-only lines
-		// markdown-it collapses blank lines into paragraph breaks, losing the empty paragraph.
-		// Insert a <div> marker that markdown-it passes through (html: true), then convert to <p></p>
-		src = src.replace(/\n\n(!\[[^\]]*\]\([^)]*\)\s*$)/gm, '\n\n<div data-img-gap></div>\n\n$1');
-
-		// Run markdown-it (single-pass parser - handles headings, bold, italic, strike, code, blockquote, lists, links, images, hr, tables, raw HTML)
-		let html = mdit.render(src);
-
-		// Post-process: convert image gap markers into empty paragraphs for ProseMirror
-		html = html.replace(/<div data-img-gap><\/div>\n?/g, '<p></p>\n');
-
-		// Post-process: strip trailing newlines inside code blocks (markdown-it adds them, TipTap shows them as blank lines)
-		html = html.replace(/<code([^>]*)>\n?/g, '<code$1>');
-		html = html.replace(/\n<\/code>/g, '</code>');
-
-		// Post-process: convert empty-paragraph div sentinels back to empty paragraphs for TipTap
-		html = html.replace(/<div data-empty-para><\/div>\n?/g, '<p></p>\n');
-
-		// Post-process: convert task list items to TipTap format
-		// Convert opening <li> + <tiptask> into data-attributed <li>, handles both tight and loose (with <p>) lists
-		html = html.replace(/<li>(\s*(?:<p>)?)\s*<tiptask checked="(true|false)">([\s\S]*?)<\/tiptask>\s*(?:<\/p>)?/gi, (_, _pre, checked, text) => {
-			return `<li data-type="taskItem" data-checked="${checked}">${text}`;
-		});
-		html = html.replace(/<ul>(\s*<li data-type="taskItem")/gi, '<ul data-type="taskList">$1');
 
 		html = normalizeImageHtml(html);
 		if (snapshot) {
@@ -5031,6 +4940,7 @@
 				createEditor(pendingContent);
 				pendingContent = null;
 				updateCounts();
+				if (showOutline) updateOutline();
 			} else if (isMobile && !lastSourceMode) {
 				createEditor('');
 			}
@@ -5137,6 +5047,7 @@
 	});
 
 	function destroyEditor() {
+		if (!$sourceMode) clearOutline();
 		saves.cancelScheduled();
 		if (editor) {
 			editor.destroy();
@@ -5165,7 +5076,7 @@
 			editable: !$readOnly,
 			extensions: [
 				MixedListShortcuts,
-				StarterKit.configure({ codeBlock: false, link: false, underline: false }),
+				EditorStarterKit.configure({ code: { HTMLAttributes: { style: 'white-space: pre-wrap' } }, codeBlock: false, link: false, underline: false }),
 				FocusedPlaceholder,
 				TaskList,
 				TaskItem.configure({ nested: true }),
@@ -5417,6 +5328,13 @@
 				},
 			},
 			onTransaction: ({ transaction, appendedTransactions }) => {
+				if (showOutline && !$sourceMode && outlineOrigin && isOriginCurrent(outlineOrigin)
+					&& (transaction.docChanged || appendedTransactions.some(tr => tr.docChanged))) {
+					outlineHeadings = mapDocumentHeadings(outlineHeadings, transaction.mapping);
+					for (const tr of appendedTransactions) outlineHeadings = mapDocumentHeadings(outlineHeadings, tr.mapping);
+					scheduleOutline();
+					scheduleOutlineActive();
+				}
 				if (noteSearchOpen && !$sourceMode && (transaction.docChanged || appendedTransactions.some((tr) => tr.docChanged))) {
 					noteSearchAnchor = transaction.mapping.map(noteSearchAnchor);
 					for (const tr of appendedTransactions) noteSearchAnchor = tr.mapping.map(noteSearchAnchor);
@@ -5451,20 +5369,30 @@
 					return;
 				}
 				markEdited();
-				if (!isMobile && showOutline) scheduleOutline();
 				if (showInfo) scheduleCounts();
 			},
 		});
 		editorReady = true;
+		if (showOutline) updateOutline();
 		// Pre-load note titles for wiki-link autocomplete
 		if ($appConfig?.enable_wiki_links) {
 			refreshWikiLinkTitles();
 		}
 	}
 
-	export function toggleOutlinePanel() {
-		showOutline = !showOutline;
-		if (showOutline) updateOutline();
+	export async function toggleOutlinePanel() {
+		if (showOutline) { await closeOutline(); return; }
+		outlineTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+		showOutline = true;
+		updateOutline();
+		updateOutlineActive();
+		const origin = captureOrigin();
+		await tick();
+		if (!showOutline || !isOriginCurrent(origin)) return;
+		const button = outlineList?.querySelector<HTMLButtonElement>('button[aria-current="location"]')
+			?? outlineList?.querySelector<HTMLButtonElement>('button')
+			?? document.getElementById(outlinePanelId)?.querySelector<HTMLButtonElement>('.outline-close');
+		button?.focus({ preventScroll: true });
 	}
 
 	export function toggleHistoryPanel() {
@@ -5649,11 +5577,7 @@
 	function getImageAbsPath(src: string): string {
 		const assetPath = assetUrlToLocalPath(src);
 		if (assetPath !== null) return assetPath;
-		return resolveVaultFilePath(
-			decodeURIComponent(src),
-			$activeNotePath,
-			$appConfig?.active_vault ?? null,
-		);
+		return resolveFileReference(src, $activeNotePath, currentNoteAssetRoot()).path;
 	}
 
 	async function copyImageToClipboard() {
@@ -6333,9 +6257,8 @@
 
 	/** Resolve a link href to an absolute .md note path, or null if not a note link. */
 	function resolveNoteHref(href: string): string | null {
-		const decoded = decodeURIComponent(href);
-		if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(decoded)) return null;
-		const path = resolveVaultFilePath(decoded, $activeNotePath, $appConfig?.active_vault ?? null);
+		if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(href)) return null;
+		const path = resolveFileReference(href, $activeNotePath, currentNoteAssetRoot()).path;
 		return path.endsWith('.md') ? path : null;
 	}
 
@@ -6397,11 +6320,7 @@
 	}
 
 	function resolveHrefToAbsPath(href: string): string {
-		return resolveVaultFilePath(
-			decodeURIComponent(href),
-			$activeNotePath,
-			$appConfig?.active_vault ?? null,
-		);
+		return resolveFileReference(href, $activeNotePath, currentNoteAssetRoot()).path;
 	}
 
 	function isFileLink(href: string): boolean {
@@ -6575,6 +6494,7 @@
 			&& saves.isCurrentSession(origin.snapshot) && isSource === $sourceMode;
 
 		if (isSource && !lastSourceMode) {
+			clearOutline();
 			// Markdown conversion is lossy; carry both selection ends by visible text.
 			const selection = editor?.state.selection;
 			const visibleBefore = (position: number) => editor
@@ -6585,6 +6505,7 @@
 			const text = stripTitleH1(editor ? editorToMarkdown() : ($activeNote?.content ?? ''));
 			source.load(text);
 			lastSourceMode = true;
+			if (showOutline) updateOutline();
 			const anchor = scanAlign(text, docNonWs, { stopAtNw: anchorNonWs }).srcOffset;
 			const head = headNonWs === anchorNonWs ? anchor : scanAlign(text, docNonWs, { stopAtNw: headNonWs }).srcOffset;
 			tick().then(() => {
@@ -6594,6 +6515,7 @@
 				if (!isMobile) source.focus();
 			});
 		} else if (!isSource && lastSourceMode) {
+			clearOutline();
 			lastSourceMode = false;
 			const selection = source.state.selection.main;
 			const srcText = source.state.doc.toString();
@@ -6612,14 +6534,16 @@
 				requestAnimationFrame(() => { if (isCurrent()) editor?.commands.scrollIntoView(); });
 			};
 			if (isMobile) {
-				// Mobile: editor stays in DOM, just update its content
-				const content = srcText;
+				// A source-only first load has no rich editor yet.
 				if (editor) {
 					ignoreNextUpdate = true;
-					editor.commands.setContent(markdownToHtml(restoreTitleH1(content)));
-					updateCounts();
-					tick().then(restoreRichCaret);
+					editor.commands.setContent(markdownToHtml(restoreTitleH1(srcText)));
+				} else {
+					createEditor(restoreTitleH1(srcText));
 				}
+				updateCounts();
+				if (showOutline) updateOutline();
+				tick().then(restoreRichCaret);
 			} else {
 				// Desktop: destroy old editor (its DOM element is gone),
 				// Wait for the source component to unmount before recreating the rich view.
@@ -6690,6 +6614,7 @@
 		$activeNotePath = migrated;
 		$activeNote = { ...previous, path: migrated };
 		navHistory.remap(payload.old_path, payload.new_path);
+		if (showOutline) updateOutline();
 		void (async () => {
 			try {
 				await saves.idle();
@@ -6750,6 +6675,7 @@
 		if (editorNavigationToken !== null) cancelNoteNavigation(editorNavigationToken);
 		saves.startSession();
 		cancelCounts();
+		clearOutline();
 		cancelNoteSearchWork();
 		searchRevealedDetails.clear();
 		if (wikiTitleRefreshTimer !== null) clearTimeout(wikiTitleRefreshTimer);
@@ -7188,6 +7114,7 @@
 									if (isOriginCurrent(origin)) {
 										loadedPath = newPath;
 										$activeNotePath = newPath;
+										if (showOutline) updateOutline();
 									}
 									if (origin.vault !== $appConfig?.active_vault) return;
 									notes.update(list => list.map(n =>
@@ -7303,9 +7230,12 @@
 				</button>
 				<button
 					class="icon-btn"
-					class:active={showOutline}
-					onclick={() => { showOutline = !showOutline; if (showOutline) updateOutline(); }}
+					class:active={showOutline && !showHistory}
+					onclick={toggleOutlinePanel}
 					title="Outline"
+					aria-label="Outline"
+					aria-expanded={showOutline && !showHistory}
+					aria-controls={outlinePanelId}
 				>
 					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<line x1="4" y1="6" x2="20" y2="6"/><line x1="8" y1="12" x2="20" y2="12"/><line x1="8" y1="18" x2="20" y2="18"/><circle cx="4" cy="12" r="1" fill="currentColor"/><circle cx="4" cy="18" r="1" fill="currentColor"/>
@@ -7455,7 +7385,7 @@
 				</div>
 			{/if}
 			<div class="editor-body-row" class:reviewing-history={showHistory}>
-			<div class="editor-body" class:source-body={$sourceMode} class:history-hidden={showHistory}>
+			<div class="editor-body" class:source-body={$sourceMode} class:history-hidden={showHistory} onscroll={scheduleOutlineActive}>
 				{#if isMobile}
 					<SourceEditor controller={source} readonly={showHistory || $readOnly || !!$viewerNote || externalOperationBusy} visible={$sourceMode} mobile />
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -7533,11 +7463,13 @@
 				</div>
 			{/if}
 			{#if showOutline && !showHistory}
-				<ResizeHandle onResize={handleOutlineResize} />
-				<div class="outline-panel" style="width: {$outlineWidth}px">
+				<ResizeHandle onResize={handleOutlineResize} label="Resize outline" value={$outlineWidth} min={160} max={500} controls={outlinePanelId} />
+				<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+				<nav id={outlinePanelId} class="outline-panel" style="width: {$outlineWidth}px" aria-label="Note outline"
+					onkeydown={(event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); void closeOutline(); } }}>
 					<div class="outline-header">
 						<h3>Outline</h3>
-						<button class="outline-close" onclick={() => { showOutline = false; }} aria-label="Close outline">
+						<button class="outline-close" onclick={closeOutline} aria-label="Close outline">
 							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 								<line x1="18" y1="6" x2="6" y2="18" />
 								<line x1="6" y1="6" x2="18" y2="18" />
@@ -7547,18 +7479,24 @@
 					{#if outlineHeadings.length === 0}
 						<div class="outline-empty">No headings in this note.</div>
 					{:else}
-						<div class="outline-list">
-							{#each outlineHeadings as h}
-								<button
-									class="outline-item outline-level-{h.level}"
-									onclick={() => scrollToHeading(h.pos)}
-								>
-									{h.text}
-								</button>
+						<ul class="outline-list" bind:this={outlineList}>
+							{#each outlineHeadings as h, i}
+								<li>
+									<button
+										class="outline-item outline-level-{h.level}"
+										class:current={i === outlineActive}
+										aria-current={i === outlineActive ? 'location' : undefined}
+										aria-label={`Heading level ${h.level}: ${h.text.trim() || 'Untitled heading'}`}
+										title={h.text.trim() || 'Untitled heading'}
+										onclick={() => scrollToHeading(h)}
+									>
+										{h.text.trim() || 'Untitled heading'}
+									</button>
+								</li>
 							{/each}
-						</div>
+						</ul>
 					{/if}
-				</div>
+				</nav>
 			{/if}
 			{#if showInfo && $activeNote && !showHistory}
 				<div class="info-panel">
@@ -9591,6 +9529,7 @@
 		flex-direction: column;
 		overflow: hidden;
 		flex-shrink: 0;
+		min-height: 0;
 	}
 
 	.outline-header {
@@ -9635,6 +9574,9 @@
 
 	.outline-list {
 		flex: 1;
+		min-height: 0;
+		margin: 0;
+		list-style: none;
 		overflow-y: auto;
 		padding: 4px 0;
 	}
@@ -9649,15 +9591,20 @@
 		font-size: var(--editor-font-size, 14px);
 		color: var(--text-secondary);
 		cursor: pointer;
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
+		white-space: normal;
+		overflow-wrap: anywhere;
 		line-height: 1.5;
 	}
 
 	.outline-item:hover {
 		background: var(--bg-hover);
 		color: var(--text-primary);
+	}
+
+	.outline-item.current {
+		background: color-mix(in srgb, var(--accent) 12%, var(--bg-secondary));
+		color: var(--accent);
+		box-shadow: inset 3px 0 var(--accent);
 	}
 
 	.outline-level-1 { padding-left: 14px; font-weight: 600; }
@@ -9744,6 +9691,8 @@
 		font-family: 'JetBrains Mono', 'Fira Code', monospace;
 		font-size: 0.9em;
 	}
+
+	:global(.tiptap-wrapper .tiptap :not(pre) > code) { white-space: pre-wrap; }
 
 	:global(.tiptap-wrapper .tiptap pre) {
 		background: color-mix(in srgb, var(--accent) 8%, var(--bg-tertiary));
@@ -12378,6 +12327,10 @@
 		max-width: 100%;
 		border-left: none;
 	}
+
+	.editor-container.mobile .outline-item { min-height: 44px; padding-top: 10px; padding-bottom: 10px; }
+	.editor-container.mobile .outline-close { min-width: 44px; min-height: 44px; justify-content: center; }
+	.editor-container.mobile :global(.resize-handle) { display: none; }
 
 	.editor-container.mobile .editor-body-row.reviewing-history { flex-direction: column-reverse; }
 	.editor-container.mobile .history-panel { width: 100%; flex: none; border-left: none; border-bottom: 1px solid var(--border-light); }

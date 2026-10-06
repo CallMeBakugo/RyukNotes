@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { ExternalNoteReference } from "./editor/externalNote";
 import type {
   AppConfig,
   CustomTheme,
@@ -161,6 +162,16 @@ export async function saveNote(
   expectedRaw: string,
 ): Promise<NoteContent> {
   return invoke("save_note", { vaultPath, path, meta, body, expectedRaw });
+}
+
+export async function importNote(
+  vaultPath: string,
+  sourcePath: string,
+  notebookRelative: string | null,
+  expectedRaw: string,
+  references: ExternalNoteReference[],
+): Promise<NoteContent> {
+  return invoke("import_note", { vaultPath, sourcePath, notebookRelative, expectedRaw, references });
 }
 
 export async function createNote(

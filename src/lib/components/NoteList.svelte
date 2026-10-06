@@ -631,12 +631,15 @@
 			$notes = [entry, ...$notes];
 			onNoteMoved();
 			if (!navigationIsCurrent(token)) return;
+			// The first save must use the exact file created on disk, not wait for a watcher echo.
+			const content = await readNote(ownerVault!, entry.path);
+			if (!navigationIsCurrent(token)) return;
 			if (!(await onBeforeNoteSwitch())) return;
 			if (!navigationIsCurrent(token)) return;
-			$activeNote = { path: entry.path, meta: entry.meta, content: '\n', raw: '' };
+			$activeNote = content;
 			$activeNotePath = entry.path;
 			$editorDirty = false;
-			onNoteSelected(entry.path, '\n');
+			onNoteSelected(entry.path, content.content);
 			onNoteCreated(token);
 		} catch (e) {
 			console.error('Failed to create note:', e);
@@ -1578,11 +1581,15 @@
 						</div>
 						<div class="note-preview">{note.preview}</div>
 						<div class="note-meta">
-							{#if getNotebookPath(note)}
-								<span class="note-notebook">{getNotebookPath(note)}</span>
-								{#if showDates}<span class="note-meta-sep">&middot;</span>{/if}
+							{#if getNotebookPath(note) || showDates}
+							<span class="note-context">
+								{#if getNotebookPath(note)}
+									<span class="note-notebook">{getNotebookPath(note)}</span>
+									{#if showDates}<span class="note-meta-sep">&middot;</span>{/if}
+								{/if}
+								{#if showDates}<span class="note-date" title={`Created ${formatDate(note.meta.created)}\nModified ${formatDate(note.meta.modified)}`}>{formatRelativeTime($sortMode === 'created' ? note.meta.created : note.meta.modified)}</span>{/if}
+							</span>
 							{/if}
-							{#if showDates}<span class="note-date" title={`Created ${formatDate(note.meta.created)}\nModified ${formatDate(note.meta.modified)}`}>{formatRelativeTime($sortMode === 'created' ? note.meta.created : note.meta.modified)}</span>{/if}
 							{#if note.meta.tags.length > 0}
 								<span class="note-tags">
 									{#each note.meta.tags.slice(0, 3) as tag, i (tagIterationKey(tag, i))}
@@ -2199,9 +2206,18 @@
 
 	.note-meta {
 		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 4px 8px;
+		margin-top: 4px;
+	}
+
+	.note-context {
+		display: inline-flex;
 		align-items: center;
 		gap: 8px;
-		margin-top: 4px;
+		min-width: 0;
+		max-width: 100%;
 	}
 
 	.note-notebook {
@@ -2216,6 +2232,7 @@
 	.note-meta-sep {
 		color: var(--text-tertiary);
 		font-size: 0.78em;
+		flex-shrink: 0;
 	}
 
 	.note-compact-row .note-notebook {
@@ -2227,10 +2244,15 @@
 	.note-date {
 		font-size: 0.78em;
 		color: var(--text-tertiary);
+		flex-shrink: 0;
+		white-space: nowrap;
 	}
 
 	.note-tags {
 		display: flex;
+		flex-wrap: wrap;
+		min-width: 0;
+		max-width: 100%;
 		gap: 4px;
 	}
 

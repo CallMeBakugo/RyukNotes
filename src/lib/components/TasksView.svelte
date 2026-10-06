@@ -120,10 +120,10 @@
 	const prioRank: Record<string, number> = { high: 0, med: 1, low: 2 };
 	function prank(p: string | null) { return p ? (prioRank[p] ?? 3) : 3; }
 	// Free-text task filter: matches the task text or its note title (case-insensitive).
+	const normalizedTaskQuery = $derived(taskQuery.trim().toLowerCase());
 	function matchesQuery(t: TaskItem): boolean {
-		const q = taskQuery.trim().toLowerCase();
-		if (!q) return true;
-		return t.text.toLowerCase().includes(q) || t.note_title.toLowerCase().includes(q);
+		if (!normalizedTaskQuery) return true;
+		return t.text.toLowerCase().includes(normalizedTaskQuery) || t.note_title.toLowerCase().includes(normalizedTaskQuery);
 	}
 
 	const matchingTasks = $derived(tasks.filter((t) =>

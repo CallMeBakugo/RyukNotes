@@ -714,7 +714,10 @@ pub fn read_vault_note(vault_path: &str, path: &str) -> Result<NoteContent, Stri
     read_note_content(&validated, path)
 }
 
-fn read_note_content(validated: &Path, reported_path: &str) -> Result<NoteContent, String> {
+pub(crate) fn read_note_content(
+    validated: &Path,
+    reported_path: &str,
+) -> Result<NoteContent, String> {
     let p = validated;
     let raw = fs::read_to_string(p).map_err(|e| e.to_string())?;
     let filename = p
@@ -1663,13 +1666,11 @@ pub fn get_all_tags(vault_path: &str) -> Result<Vec<(String, usize)>, String> {
     let hn_dir = helixnotes_dir(vault_path);
     let md_files: Vec<PathBuf> = WalkDir::new(vault_path)
         .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || entry.path() != hn_dir.as_path())
         .filter_map(|e| e.ok())
         .filter(|e| {
             let p = e.path();
-            p.is_file()
-                && p.extension().and_then(|x| x.to_str()) == Some("md")
-                && !is_hidden(p)
-                && !p.starts_with(&hn_dir)
+            p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("md") && !is_hidden(p)
         })
         .map(|e| e.path().to_path_buf())
         .collect();
@@ -1732,6 +1733,256 @@ pub fn save_attachment(vault_path: &str, name: &str, data: &[u8]) -> Result<Stri
             Err(error) => return Err(error.to_string()),
         }
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ExternalNoteReference {
+    pub from: usize,
+    pub to: usize,
+    pub href: String,
+    pub html: bool,
+    #[serde(default)]
+    pub pdf: bool,
+}
+
+/// Import an accepted Markdown snapshot and its scoped relative attachments without overwriting files.
+pub fn import_note(
+    vault_path: &str,
+    source_path: &str,
+    source_root: &Path,
+    notebook_relative: Option<&str>,
+    expected_raw: &str,
+    mut references: Vec<ExternalNoteReference>,
+    authorize: impl Fn(&Path) -> Result<(), String>,
+) -> Result<NoteContent, String> {
+    let source = canonicalize_path(Path::new(source_path), "source note")?;
+    authorize(&source)?;
+    if !source.is_file() || source.extension().and_then(|ext| ext.to_str()) != Some("md") {
+        return Err("Import source must be a Markdown file".into());
+    }
+    let source_root = canonicalize_path(source_root, "source attachment root")?;
+    if !source.starts_with(&source_root) {
+        return Err("Source attachment root does not own the note".into());
+    }
+    let source_attachments = source_root.join(".helixnotes/attachments");
+    let raw = fs::read_to_string(&source).map_err(|error| error.to_string())?;
+    if raw != expected_raw {
+        return Err("The source note changed on disk. Reopen it before importing.".into());
+    }
+    let relative = notebook_relative.map(safe_relative_path).transpose()?;
+    let directory = Path::new(vault_path).join(relative.unwrap_or(Path::new("")));
+    ensure_vault_content_dir(vault_path, &directory)?;
+    let vault = canonicalize_path(Path::new(vault_path), "vault path")?;
+    let canonical_directory = canonicalize_path(&directory, "import destination")?;
+    if canonical_directory != vault.join(relative.unwrap_or(Path::new(""))) {
+        return Err("Import destination must not use symbolic links".into());
+    }
+    let attachments = helixnotes_dir(vault_path).join("attachments");
+    references.sort_by_key(|reference| reference.from);
+    let mut previous = 0;
+    let mut targets = Vec::new();
+    // Validate every range and permission before publishing any attachment.
+    for reference in &references {
+        if reference.from < previous
+            || reference.from >= reference.to
+            || raw.get(reference.from..reference.to).is_none()
+        {
+            return Err("Invalid attachment reference range".into());
+        }
+        previous = reference.to;
+        let (path, suffix) = reference
+            .href
+            .find(['#', '?'])
+            .map(|index| reference.href.split_at(index))
+            .unwrap_or((&reference.href, ""));
+        let decoded = urlencoding::decode(path)
+            .map_err(|error| error.to_string())?
+            .replace('\\', "/");
+        let path = Path::new(&decoded);
+        if decoded.is_empty()
+            || decoded.contains(':')
+            || path.is_absolute()
+            || path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        {
+            return Err("Import attachments must be relative non-Markdown files".into());
+        }
+        let base = if decoded.starts_with(".helixnotes/attachments/") || reference.pdf {
+            source_root.as_path()
+        } else {
+            source.parent().ok_or("Source note has no parent")?
+        };
+        let target = canonicalize_path(&base.join(path), "attachment")?;
+        authorize(&target)?;
+        let relative_target = if let Ok(relative) = target.strip_prefix(&source_attachments) {
+            relative
+        } else {
+            target.strip_prefix(source.parent().ok_or("Source note has no parent")?)
+                .map_err(|_| "Attachments must stay inside the source note's folder or managed attachment root")?
+        };
+        let components: Vec<_> = relative_target.components().collect();
+        let helix_attachment = components
+            .first()
+            .is_some_and(|part| part.as_os_str() == ".helixnotes")
+            && components
+                .get(1)
+                .is_some_and(|part| part.as_os_str() == "attachments");
+        if components.iter().enumerate().any(|(index, part)| {
+            part.as_os_str().to_string_lossy().starts_with('.') && !(helix_attachment && index == 0)
+        }) {
+            return Err("Hidden metadata is not imported as an attachment".into());
+        }
+        if !target.is_file() {
+            return Err("Attachment reference must point to a file".into());
+        }
+        targets.push((target, suffix.to_string()));
+    }
+    if !references.is_empty() {
+        fs::create_dir_all(&attachments).map_err(|error| error.to_string())?;
+        if canonicalize_path(&attachments, "attachment destination")?
+            != vault.join(".helixnotes/attachments")
+        {
+            return Err("Attachment destination must not use symbolic links".into());
+        }
+    }
+    let mut created = Vec::new();
+    let result = (|| {
+        let mut copied = std::collections::HashMap::<PathBuf, String>::new();
+        let mut rewritten = String::with_capacity(raw.len());
+        let mut previous = 0;
+        for (reference, (target, suffix)) in references.iter().zip(targets) {
+            let relative = if let Some(relative) = copied.get(&target) {
+                relative.clone()
+            } else {
+                let name = sanitize_filename(
+                    &target
+                        .file_name()
+                        .ok_or("Attachment has no filename")?
+                        .to_string_lossy(),
+                );
+                let mut temporary = tempfile::Builder::new()
+                    .prefix(".helixnotes-import-")
+                    .tempfile_in(&attachments)
+                    .map_err(|error| error.to_string())?;
+                let mut file = fs::File::open(&target).map_err(|error| error.to_string())?;
+                let before = file.metadata().map_err(|error| error.to_string())?;
+                let bytes = std::io::copy(&mut file, temporary.as_file_mut())
+                    .map_err(|error| error.to_string())?;
+                let after = file.metadata().map_err(|error| error.to_string())?;
+                if bytes != before.len()
+                    || before.len() != after.len()
+                    || before.modified().ok() != after.modified().ok()
+                {
+                    return Err("An attachment changed while importing. Retry the import.".into());
+                }
+                temporary
+                    .as_file()
+                    .sync_all()
+                    .map_err(|error| error.to_string())?;
+                let filename = loop {
+                    let filename = format!("{}_{}", Uuid::new_v4(), name);
+                    let destination = attachments.join(&filename);
+                    match temporary.persist_noclobber(&destination) {
+                        Ok(_) => {
+                            created.push(destination);
+                            break filename;
+                        }
+                        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            temporary = error.file
+                        }
+                        Err(error) => return Err(error.error.to_string()),
+                    }
+                };
+                let relative =
+                    format!(".helixnotes/attachments/{}", urlencoding::encode(&filename));
+                copied.insert(target, relative.clone());
+                relative
+            };
+            // Use the same stable vault-root convention as normal attachment insertion/saving.
+            let mut href = format!("{relative}{suffix}");
+            if reference.html {
+                href = href
+                    .replace('&', "&amp;")
+                    .replace('"', "&quot;")
+                    .replace('\'', "&#39;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;");
+            } else {
+                href = href
+                    .replace(' ', "%20")
+                    .replace('"', "%22")
+                    .replace('<', "%3C")
+                    .replace('>', "%3E");
+            }
+            rewritten.push_str(&raw[previous..reference.from]);
+            rewritten.push_str(&href);
+            previous = reference.to;
+        }
+        rewritten.push_str(&raw[previous..]);
+        let filename = source.file_name().ok_or("Source note has no filename")?;
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".helixnotes-import-")
+            .tempfile_in(&directory)
+            .map_err(|error| error.to_string())?;
+        temporary
+            .write_all(rewritten.as_bytes())
+            .map_err(|error| error.to_string())?;
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|error| error.to_string())?;
+        let mut destination = directory.join(filename);
+        let mut suffix = 2;
+        loop {
+            match temporary.persist_noclobber(&destination) {
+                Ok(_) => break,
+                Err(error)
+                    if error.error.kind() == std::io::ErrorKind::AlreadyExists && suffix <= 100 =>
+                {
+                    temporary = error.file;
+                    destination = directory.join(format!(
+                        "{} ({suffix}).md",
+                        source.file_stem().unwrap_or_default().to_string_lossy()
+                    ));
+                    suffix += 1;
+                }
+                Err(error) => return Err(error.error.to_string()),
+            }
+        }
+        let (meta, content) = frontmatter::parse_note(
+            &rewritten,
+            &destination
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
+        );
+        Ok(NoteContent {
+            path: destination.to_string_lossy().into_owned(),
+            meta,
+            content,
+            raw: rewritten,
+        })
+    })();
+    if let Err(error) = result {
+        let mut failed_cleanup = Vec::new();
+        for path in created {
+            if let Err(cleanup) = fs::remove_file(&path) {
+                if cleanup.kind() != std::io::ErrorKind::NotFound {
+                    failed_cleanup.push(format!("{}: {cleanup}", path.display()));
+                }
+            }
+        }
+        if !failed_cleanup.is_empty() {
+            return Err(format!(
+                "{error}; could not remove unused attachments: {}",
+                failed_cleanup.join("; ")
+            ));
+        }
+        return Err(error);
+    }
+    result
 }
 
 pub(crate) fn normalize_notebook_icon_key(path: &str) -> String {
@@ -2199,6 +2450,71 @@ mod tests {
     use crate::types::{TagStyle, TagStyleChange};
     use std::fs;
     use std::io::Read;
+
+    #[test]
+    fn all_tags_excludes_only_root_metadata_subtree_and_hidden_filenames() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join(".helixnotes");
+        let fixtures = [
+            ("Root.md", "root"),
+            (".helixnotes/history/Stored.md", "excluded"),
+            ("Notebook/.helixnotes/Nested.md", "nested"),
+            (".helixnotes-other/Visible.md", "similar"),
+            (".obsidian/Visible.md", "obsidian"),
+            ("assets/Visible.md", "assets"),
+            (".other/Visible.md", "other"),
+            ("Notebook/.Hidden.md", "hidden"),
+            ("Notebook/Upper.MD", "uppercase"),
+            ("Notebook/other.txt", "text"),
+        ];
+        for (relative, tag) in fixtures {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, format!("---\ntags: [{tag}]\n---\n# Note")).unwrap();
+        }
+
+        assert_eq!(
+            super::get_all_tags(root.to_str().unwrap()).unwrap(),
+            vec![
+                ("assets".to_string(), 1),
+                ("nested".to_string(), 1),
+                ("obsidian".to_string(), 1),
+                ("other".to_string(), 1),
+                ("root".to_string(), 1),
+                ("similar".to_string(), 1),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_tags_keeps_file_symlinks_without_following_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+        let vault = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(
+            outside.path().join("External.md"),
+            "---\ntags: [linked]\n---\n# Note",
+        )
+        .unwrap();
+        symlink(
+            outside.path().join("External.md"),
+            vault.path().join("Linked.md"),
+        )
+        .unwrap();
+        symlink(outside.path(), vault.path().join("Directory")).unwrap();
+        fs::create_dir(vault.path().join(".helixnotes")).unwrap();
+        symlink(
+            outside.path().join("External.md"),
+            vault.path().join(".helixnotes/Excluded.md"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            super::get_all_tags(vault.path().to_str().unwrap()).unwrap(),
+            vec![("linked".to_string(), 1)]
+        );
+    }
 
     #[test]
     fn same_named_attachment_writes_never_replace_each_other() {

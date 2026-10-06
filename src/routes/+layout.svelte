@@ -7,7 +7,7 @@
 	import { darkThemes, isMobile, isAndroid } from '$lib/platform';
 	import type { CustomTheme } from '$lib/types';
 	import ResizeHandles from '$lib/components/ResizeHandles.svelte';
-	import { resolveVaultFilePath } from '$lib/utils/paths';
+	import { noteAssetRoot, resolveFileReference } from '$lib/utils/paths';
 
 	let { children } = $props();
 
@@ -90,11 +90,9 @@
 			openUrl(href).catch((err) => console.error('Failed to open URL:', err));
 		} else if (!href.startsWith('#')) {
 			const config = get(appConfig);
-			const absPath = resolveVaultFilePath(
-				decodeURIComponent(href),
-				get(activeNotePath),
-				config?.active_vault ?? null,
-			);
+			const note = get(activeNotePath);
+			const root = noteAssetRoot(note, config?.active_vault ?? null, config?.vaults.map(vault => vault.path) ?? []);
+			const absPath = resolveFileReference(href, note, root).path;
 			// Internal .md note link - navigate within the app
 			if (absPath.endsWith('.md')) {
 				window.dispatchEvent(new CustomEvent('helixnotes-open-note', { detail: absPath }));

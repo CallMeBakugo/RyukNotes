@@ -11,6 +11,34 @@ type MarkdownMark = {
 
 const identityAssetSource: AssetSourceNormalizer = (source) => source;
 
+function backtickDelimiter(text: string, minimum: number): string {
+  let length = minimum;
+  for (const match of text.matchAll(/`+/g)) {
+    length = Math.max(length, match[0].length + 1);
+  }
+  return '`'.repeat(length);
+}
+
+export function serializeCodeBlock(code: string, language: string = ''): string {
+  const fence = backtickDelimiter(code, 3);
+  return `${fence}${language}\n${code}\n${fence}\n`;
+}
+
+function serializeCodeSpan(text: string): string {
+  const delimiter = backtickDelimiter(text, 1);
+  const needsPadding = text.startsWith('`') || text.endsWith('`')
+    || ((text.startsWith(' ') || text.endsWith(' ')) && /[^ ]/.test(text));
+  const padding = needsPadding ? ' ' : '';
+  return `${delimiter}${padding}${text}${padding}${delimiter}`;
+}
+
+function serializeInlineMath(tex: string, forceEncoded: boolean): string {
+  if (forceEncoded || !tex || /[\r\n$]/.test(tex) || /^\s|\s$/.test(tex) || /(?:^|[^\\])(?:\\\\)*\\$/.test(tex)) {
+    return `<span data-math-inline="${encodeURIComponent(tex)}" class="math-inline"></span>`;
+  }
+  return `$${tex}$`;
+}
+
 function stringAttr(mark: Mark, name: string): string {
   const value = mark.attrs?.[name];
   return typeof value === 'string' ? value : '';
@@ -52,8 +80,6 @@ function markdownMark(mark: Mark, text: string): MarkdownMark | null {
           }
         : null;
     }
-    case 'code':
-      return { key: 'code', priority: 90, open: '`', close: '`' };
     case 'link': {
       const href = stringAttr(mark, 'href');
       return {
@@ -78,8 +104,9 @@ function markdownMark(mark: Mark, text: string): MarkdownMark | null {
   }
 }
 
-function marksForText(node: ProseMirrorNode): MarkdownMark[] {
+function marksForText(node: ProseMirrorNode, code = false): MarkdownMark[] {
   return node.marks
+    .filter((mark) => !code || mark.type.name === 'link' || mark.type.name === 'wikiLink')
     .map((mark) => markdownMark(mark, node.text || ''))
     .filter((mark): mark is MarkdownMark => mark !== null)
     .sort((left, right) => left.priority - right.priority || left.key.localeCompare(right.key));
@@ -110,33 +137,55 @@ export function serializeInlineMarkdown(
     activeMarks = nextMarks;
   };
 
-  node.forEach((child, _offset, index) => {
+  for (let index = 0; index < node.childCount; index += 1) {
+    const child = node.child(index);
     if (child.isText) {
-      transitionMarks(marksForText(child));
+      const isCode = child.marks.some((mark) => mark.type.name === 'code');
+      const marks = marksForText(child, isCode);
+      transitionMarks(marks);
       let text = child.text || '';
-      if (index === 0) {
-        text = text.replace(/^[\t\u2003]+/, (whitespace) => '&emsp;'.repeat(whitespace.length));
+      if (isCode) {
+        while (index + 1 < node.childCount) {
+          const next = node.child(index + 1);
+          if (!next.isText || !next.marks.some((mark) => mark.type.name === 'code')) break;
+          const nextMarks = marksForText(next, true);
+          if (marks.length !== nextMarks.length || commonMarkCount(marks, nextMarks) !== marks.length) break;
+          text += next.text || '';
+          index += 1;
+        }
+        result += serializeCodeSpan(text);
+      } else {
+        if (index === 0) {
+          text = text.replace(/^[\t\u2003]+/, (whitespace) => '&emsp;'.repeat(whitespace.length));
+        }
+        text = text.replace(/\\*\$/g, (match) => '\\'.repeat((match.length - 1) * 2 + 1) + '$');
+        if (index + 1 < node.childCount && node.child(index + 1).type.name === 'mathInline') {
+          text = text.replace(/\\+$/, (backslashes) => backslashes + backslashes);
+        }
+        result += text;
       }
-      result += text;
-      return;
+      continue;
     }
 
     transitionMarks([]);
-
     if (child.type.name === 'image') {
       const source = normalizeAssetSource(child.attrs.src || '');
-      if (!source) return;
+      if (!source) continue;
       const alt = child.attrs.alt || '';
       const size = child.attrs['data-size'] || child.attrs.size || 'full';
       const sizeSuffix = size && size !== 'full' ? `|size=${size}` : '';
       if (result) result += '\n';
       result += `![${alt}${sizeSuffix}](${source})`;
     } else if (child.type.name === 'mathInline') {
-      result += `$${child.attrs.tex || ''}$`;
+      const previous = index > 0 ? node.child(index - 1) : null;
+      const next = index + 1 < node.childCount ? node.child(index + 1) : null;
+      const forceEncoded = previous?.type.name === 'mathInline' || next?.type.name === 'mathInline'
+        || /\$$/.test(previous?.text || '') || /^[\d$]/.test(next?.text || '');
+      result += serializeInlineMath(child.attrs.tex || '', forceEncoded);
     } else if (child.type.name === 'hardBreak') {
       result += '  \n';
     }
-  });
+  }
 
   transitionMarks([]);
   return result;

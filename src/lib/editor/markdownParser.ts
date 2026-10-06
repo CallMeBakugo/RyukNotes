@@ -1,0 +1,350 @@
+import MarkdownIt from 'markdown-it';
+import type Token from 'markdown-it/lib/token.mjs';
+import type StateBlock from 'markdown-it/lib/rules_block/state_block.mjs';
+import type StateInline from 'markdown-it/lib/rules_inline/state_inline.mjs';
+import fenceRule from 'markdown-it/lib/rules_block/fence.mjs';
+import markdownItMark from 'markdown-it-mark';
+import markdownItSup from 'markdown-it-sup';
+import markdownItSub from 'markdown-it-sub';
+
+interface WikiTitle { path: string; title: string }
+export interface MarkdownEnvironment { wikiLinkTitles?: readonly WikiTitle[] }
+const wikiIndexKey = Symbol('wiki-index');
+type WikiIndex = { paths: Map<string, string>; titles: Map<string, { path: string; depth: number }> };
+
+function displayMath(state: StateBlock, startLine: number, endLine: number, silent: boolean): boolean {
+  const start = state.bMarks[startLine] + state.tShift[startLine];
+  if (state.src.slice(start, state.eMarks[startLine]).trim() !== '$$') return false;
+  let closing = startLine + 1;
+  for (; closing < endLine; closing++) {
+    if (state.sCount[closing] < state.blkIndent && !state.isEmpty(closing)) return false;
+    const from = state.bMarks[closing] + state.tShift[closing];
+    if (state.src.slice(from, state.eMarks[closing]).trim() === '$$') break;
+  }
+  if (closing === endLine) return false;
+  if (silent) return true;
+  const token = state.push('helix_math_block', 'div', 0);
+  token.block = true;
+  token.content = state.getLines(startLine + 1, closing, state.blkIndent, false).trim();
+  token.map = [startLine, closing + 1];
+  token.meta = { sourceStart: start };
+  token.attrSet('data-math-block', encodeURIComponent(token.content));
+  token.attrSet('class', 'math-block');
+  state.line = closing + 1;
+  return true;
+}
+
+function inlineMath(state: StateInline, silent: boolean): boolean {
+  const start = state.pos;
+  if (state.src[start] !== '$' || state.src[start - 1] === '$' ||
+    start + 1 >= state.posMax || /[\s$]/u.test(state.src[start + 1])) return false;
+  let end = start + 1;
+  for (; end < state.posMax; end++) {
+    const char = state.src[end];
+    if (char === '\n') return false;
+    if (char === '\\') { end++; continue; }
+    if (char === '$') break;
+  }
+  if (end >= state.posMax || end === start + 1 || /\s/u.test(state.src[end - 1]) ||
+    state.src[end + 1] === '$' || /[0-9]/.test(state.src[end + 1] ?? '')) return false;
+  if (!silent) {
+    const token = state.push('helix_math_inline', 'span', 0);
+    token.content = state.src.slice(start + 1, end).trim();
+    token.meta = { from: start, to: end + 1 };
+    token.attrSet('data-math-inline', encodeURIComponent(token.content));
+    token.attrSet('class', 'math-inline');
+  }
+  state.pos = end + 1;
+  return true;
+}
+
+// markdown-it trims two spaces even when a code span contains only spaces.
+// Preserve CommonMark's all-space exception without replacing its normal backtick parser.
+function spaceCode(state: StateInline, silent: boolean): boolean {
+  if (state.src[state.pos] !== '`') return false;
+  let content = state.pos;
+  while (content < state.posMax && state.src[content] === '`') content++;
+  const length = content - state.pos;
+  let closing = content;
+  while (closing < state.posMax && (state.src[closing] === ' ' || state.src[closing] === '\n')) closing++;
+  if (closing === content) return false;
+  let end = closing;
+  while (end < state.posMax && state.src[end] === '`') end++;
+  if (end - closing !== length) return false;
+  if (!silent) {
+    const token = state.push('code_inline', 'code', 0);
+    token.markup = state.src.slice(state.pos, content);
+    token.content = state.src.slice(content, closing).replace(/\n/g, ' ');
+  }
+  state.pos = end;
+  return true;
+}
+
+function installMath(md: MarkdownIt) {
+  md.block.ruler.before('fence', 'helix_math_block', displayMath, { alt: ['paragraph', 'reference', 'blockquote', 'list'] });
+  md.inline.ruler.after('backticks', 'helix_math_inline', inlineMath);
+  md.renderer.rules.helix_math_block = (tokens, index, _options, _env, renderer) =>
+    `<div${renderer.renderAttrs(tokens[index])}></div>\n`;
+  md.renderer.rules.helix_math_inline = (tokens, index, _options, _env, renderer) =>
+    `<span${renderer.renderAttrs(tokens[index])}></span>`;
+}
+
+function wikiLink(state: StateInline, silent: boolean): boolean {
+  const notes: readonly WikiTitle[] | undefined = state.env.wikiLinkTitles;
+  if (!notes || state.src.slice(state.pos, state.pos + 2) !== '[[') return false;
+  const end = state.src.indexOf(']]', state.pos + 2);
+  if (end < 0 || end + 2 > state.posMax) return false;
+  const raw = state.src.slice(state.pos + 2, end);
+  if (!raw || raw.includes(']')) return false;
+  if (!silent) {
+    let index: WikiIndex | undefined = state.env[wikiIndexKey];
+    if (!index) {
+      index = { paths: new Map(), titles: new Map() };
+      for (const note of notes) {
+        if (!index.paths.has(note.path)) index.paths.set(note.path, note.path);
+        const title = note.title.toLowerCase();
+        let depth = 0;
+        for (let i = 0; i < note.path.length; i++) if (note.path[i] === '/') depth++;
+        const previous = index.titles.get(title);
+        if (!previous || depth < previous.depth) index.titles.set(title, { path: note.path, depth });
+      }
+      state.env[wikiIndexKey] = index;
+    }
+    const pipe = raw.indexOf('|');
+    const reference = (pipe < 0 ? raw : raw.slice(0, pipe)).trim();
+    const display = (pipe < 0 ? reference : raw.slice(pipe + 1)).trim();
+    const title = reference.replace(/#.*$/, '').replace(/\^.*$/, '').trim();
+    const basename = title.includes('/') ? title.slice(title.lastIndexOf('/') + 1) : title;
+    const path = (title.includes('/') ? index.paths.get(title + '.md') : undefined)
+      ?? index.titles.get(basename.toLowerCase())?.path ?? '';
+    const token = state.push('helix_wiki', 'span', 0);
+    token.attrSet('data-wiki-link', '');
+    token.attrSet('data-path', path);
+    token.attrSet('data-title', reference);
+    token.attrSet('class', 'wiki-link');
+    token.content = display;
+  }
+  state.pos = end + 2;
+  return true;
+}
+
+/** Preserve legacy space-containing and %20/title destinations only in real link syntax. */
+function legacyLink(state: StateInline, silent: boolean): boolean {
+  const start = state.pos;
+  const image = state.src[start] === '!' && state.src[start + 1] === '[';
+  const labelStart = start + (image ? 1 : 0);
+  if (state.src[labelStart] !== '[') return false;
+  const labelEnd = state.md.helpers.parseLinkLabel(state, labelStart, !image);
+  if (labelEnd < 0 || state.src[labelEnd + 1] !== '(') return false;
+  const destinationStart = labelEnd + 2;
+  let end = destinationStart;
+  let depth = 0;
+  let quote = '';
+  let angle = false;
+  for (; end < state.posMax; end++) {
+    const char = state.src[end];
+    if (char === '\n') return false;
+    if (char === '\\') { end++; continue; }
+    if (quote) { if (char === quote) quote = ''; continue; }
+    if (angle) { if (char === '>') angle = false; continue; }
+    if (char === '<') { angle = true; continue; }
+    if ((char === '"' || char === "'") &&
+      (/\s/u.test(state.src[end - 1]) || state.src.slice(end - 3, end) === '%20')) { quote = char; continue; }
+    if (char === '(') depth++;
+    else if (char === ')') { if (!depth) break; depth--; }
+  }
+  if (end >= state.posMax) return false;
+  const raw = state.src.slice(destinationStart, end);
+  // Native CommonMark links, including nested destinations, retain their normal parser.
+  if (!/\s|%20["'(]/u.test(raw)) return false;
+  let destination = raw.trim();
+  if (destination.startsWith('<')) {
+    const angle = destination.match(/^<([^>]*)>(?:(?:\s|%20)*(?:"[^"]*"|'[^']*'|\([^)]*\)))?(?:\s|%20)*$/u);
+    if (!angle) return false;
+    destination = angle[1];
+  } else {
+    destination = destination.replace(/(?:\s|%20)+(?:"[^"]*"|'[^']*')(?:\s|%20)*$/u, '').trim();
+  }
+  const href = state.md.normalizeLink(destination.replace(/ /g, '%20'));
+  if (!state.md.validateLink(href)) return false;
+  if (!silent) {
+    const label = state.src.slice(labelStart + 1, labelEnd);
+    const from = destinationStart + raw.indexOf(destination);
+    const sourceHref = { from, to: from + destination.length };
+    if (image) {
+      const children: Token[] = [];
+      state.md.inline.parse(label, state.md, state.env, children);
+      const token = state.push('image', 'img', 0);
+      token.meta = { sourceHref };
+      token.attrSet('src', href.replace(/^\/{2,}(?=home\/)/u, '/'));
+      token.attrSet('alt', '');
+      token.children = children;
+      token.content = label;
+    } else {
+      const token = state.push('link_open', 'a', 1);
+      token.meta = { sourceHref };
+      token.attrSet('href', href);
+      const oldMax = state.posMax;
+      state.pos = labelStart + 1;
+      state.posMax = labelEnd;
+      const linkState = state as StateInline & { linkLevel: number };
+      linkState.linkLevel++;
+      state.md.inline.tokenize(state);
+      linkState.linkLevel--;
+      state.push('link_close', 'a', -1);
+      state.posMax = oldMax;
+    }
+  }
+  state.pos = end + 1;
+  return true;
+}
+
+function emptyParagraph(state: StateBlock, startLine: number, _endLine: number, silent: boolean): boolean {
+  const from = state.bMarks[startLine] + state.tShift[startLine];
+  if (state.src.slice(from, state.eMarks[startLine]).trim() !== '<!-- -->') return false;
+  if (silent) return true;
+  const token = state.push('helix_empty', 'p', 0);
+  token.block = true;
+  token.map = [startLine, startLine + 1];
+  state.line = startLine + 1;
+  return true;
+}
+
+export function createEditorMarkdownParser(): MarkdownIt {
+  const md = MarkdownIt({ html: true, linkify: false, breaks: false })
+    .use(markdownItMark).use(markdownItSup).use(markdownItSub);
+  // Existing editor convention: tab-indented prose does not become an indented code block.
+  md.disable('code');
+  installMath(md);
+  md.inline.ruler.before('link', 'helix_wiki', wikiLink);
+  md.inline.ruler.before('backticks', 'helix_space_code', spaceCode);
+  md.inline.ruler.before('link', 'helix_legacy_link', legacyLink);
+  md.block.ruler.before('html_block', 'helix_empty', emptyParagraph, { alt: ['paragraph', 'reference', 'blockquote', 'list'] });
+  md.renderer.rules.helix_empty = () => '<p></p>\n';
+  md.renderer.rules.helix_wiki = (tokens, index, _options, _env, renderer) =>
+    `<span${renderer.renderAttrs(tokens[index])}>${md.utils.escapeHtml(tokens[index].content)}</span>`;
+  md.core.ruler.before('block', 'helix_wiki_index', state => { delete state.env[wikiIndexKey]; });
+
+  md.core.ruler.before('inline', 'helix_tasks', state => {
+    const lists: { open: Token; firstItem: boolean; item: Token | null; firstParagraph: boolean }[] = [];
+    for (const token of state.tokens) {
+      if (token.type === 'bullet_list_open' || token.type === 'ordered_list_open') {
+        lists.push({ open: token, firstItem: true, item: null, firstParagraph: true });
+      } else if (token.type === 'bullet_list_close' || token.type === 'ordered_list_close') lists.pop();
+      else if (token.type === 'list_item_open' && lists.length) {
+        const list = lists[lists.length - 1];
+        list.item = token;
+        list.firstParagraph = true;
+      } else if (token.type === 'list_item_close' && lists.length) {
+        const list = lists[lists.length - 1];
+        list.item = null;
+        list.firstItem = false;
+      } else if (token.type === 'inline' && lists.length) {
+        const list = lists[lists.length - 1];
+        if (!list.item || !list.firstParagraph || token.level !== list.item.level + 2) continue;
+        list.firstParagraph = false;
+        const checkbox = token.content.match(/^\[(x| )\](?:[^\S\n]+|$)/u);
+        if (!checkbox) continue;
+        token.content = token.content.slice(checkbox[0].length);
+        list.item.attrSet('data-type', 'taskItem');
+        list.item.attrSet('data-checked', checkbox[1] === 'x' ? 'true' : 'false');
+        if (list.firstItem && list.open.type === 'bullet_list_open') list.open.attrSet('data-type', 'taskList');
+      }
+    }
+  });
+
+  md.core.ruler.after('inline', 'helix_images', state => {
+    let paragraph: Token | null = null;
+    let lines: string[] | undefined;
+    for (const token of state.tokens) {
+      if (token.type === 'paragraph_open' || token.type === 'heading_open') paragraph = token;
+      else if (token.type === 'paragraph_close' || token.type === 'heading_close') paragraph = null;
+      if (token.type !== 'inline') continue;
+      for (const child of token.children ?? []) {
+        // ProseMirror's DOM parser otherwise collapses or drops whitespace-only code spans.
+        if (child.type === 'code_inline') {
+          child.attrSet('style', 'white-space: pre-wrap');
+          paragraph?.attrSet('data-helix-code', '');
+        }
+        if (child.type === 'image') {
+          const src = child.attrGet('src');
+          if (src?.startsWith('//')) child.attrSet('src', src.replace(/^\/{2,}(?=home\/)/u, '/'));
+        }
+        if (child.type === 'image' || child.type === 'link_open') {
+          child.attrs = child.attrs?.filter(([name]) => name !== 'title') ?? null;
+        }
+      }
+      if (!paragraph || paragraph.type !== 'paragraph_open' || paragraph.level !== 0 || token.children?.length !== 1 ||
+        token.children[0].type !== 'image' || !token.map || token.map[0] < 2) continue;
+      lines ??= state.src.split('\n');
+      const line = token.map[0];
+      if (lines[line].startsWith('![') && lines[line - 1].trim() === '') paragraph.meta = { helixImageGap: true };
+    }
+  });
+  md.renderer.rules.paragraph_open = (tokens, index, options, _env, renderer) =>
+    (tokens[index].meta?.helixImageGap ? '<p></p>\n' : '') + renderer.renderToken(tokens, index, options);
+
+  md.block.ruler.at('fence', (state, startLine, endLine, silent) => {
+    if (!fenceRule(state, startLine, endLine, silent)) return false;
+    if (silent) return true;
+    const token = state.tokens[state.tokens.length - 1];
+    if (token.info.trim() === 'helix-secret' && token.map) {
+      const line = token.map[1] - 1;
+      const closing = state.src.slice(state.bMarks[line] + state.tShift[line], state.eMarks[line]);
+      let length = 0;
+      while (closing[length] === token.markup[0]) length++;
+      const indentation = state.sCount[line] - state.blkIndent;
+      token.meta = { helixSecretClosed: indentation >= 0 && indentation < 4 &&
+        length >= token.markup.length && /^[ \t]*$/u.test(closing.slice(length)) };
+    }
+    return true;
+  }, { alt: ['paragraph', 'reference', 'blockquote', 'list'] });
+  const renderFence = md.renderer.rules.fence!;
+  md.renderer.rules.fence = (tokens, index, options, env, renderer) => {
+    const token = tokens[index];
+    if (token.info.trim() === 'helix-secret' && token.meta?.helixSecretClosed) {
+      return `<div data-secret-block="${md.utils.escapeHtml(encodeURIComponent(token.content.replace(/\n$/, '')))}"></div>\n`;
+    }
+    // Only the final structural LF is parser-added; leading and extra trailing blank lines are literal.
+    return renderFence(tokens, index, options, env, renderer).replace(/\n<\/code>/u, '</code>');
+  };
+  md.renderer.rules.softbreak = () => ' ';
+  md.renderer.rules.hardbreak = () => '<br>';
+  return md;
+}
+
+const mathBlocks = MarkdownIt({ html: true });
+installMath(mathBlocks);
+mathBlocks.inline.ruler.before('link', 'helix_legacy_link', legacyLink);
+
+/** Source destinations for the editor's legacy space/title link compatibility. */
+export function legacyLinkRanges(source: string): { from: number; to: number }[] {
+  if (!source.includes('](')) return [];
+  const tokens: Token[] = [];
+  mathBlocks.inline.parse(source, mathBlocks, {}, tokens);
+  return tokens.filter(token => token.meta?.sourceHref).map(token => token.meta.sourceHref);
+}
+
+/** Inline math coordinates use the same delimiter and escape rules as rendering. */
+export function inlineMathRanges(source: string): { from: number; to: number }[] {
+  if (!source.includes('$')) return [];
+  const tokens: Token[] = [];
+  mathBlocks.inline.parse(source, mathBlocks, {}, tokens);
+  return tokens.filter(token => token.type === 'helix_math_inline').map(token => token.meta);
+}
+
+/** Source coordinates of semantic display-math blocks, including nested containers. */
+export function displayMathRanges(source: string): { from: number; to: number; prefix: string }[] {
+  if (!source.includes('$$')) return [];
+  const tokens: Token[] = [];
+  mathBlocks.block.parse(source, mathBlocks, {}, tokens);
+  const ranges = tokens.filter(token => token.type === 'helix_math_block' && token.map);
+  if (!ranges.length) return [];
+  const starts = [0];
+  for (let i = 0; i < source.length; i++) if (source[i] === '\n') starts.push(i + 1);
+  return ranges.map(token => {
+    const from = starts[token.map![0]];
+    return { from, to: starts[token.map![1]] ?? source.length,
+      prefix: source.slice(from, token.meta.sourceStart) };
+  });
+}

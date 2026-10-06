@@ -776,15 +776,31 @@ pub async fn get_notes(
 }
 
 #[tauri::command]
-pub async fn read_note(
+pub async fn read_note<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppState>,
     vault_path: String,
     path: String,
 ) -> Result<NoteContent, String> {
     state.validate_vault(&vault_path)?;
-    tauri::async_runtime::spawn_blocking(move || operations::read_note(&vault_path, &path))
-        .await
-        .map_err(|error| error.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        let vault = std::fs::canonicalize(&vault_path).map_err(|error| error.to_string())?;
+        let target = std::fs::canonicalize(&path).map_err(|error| error.to_string())?;
+        if target.starts_with(vault) {
+            // Keep vault/trash validation, even if app metadata was explicitly selected.
+            return operations::read_note(&vault_path, &path);
+        }
+        // OS file-open requests, dialogs and drops grant this scope. Never grant it here.
+        ensure_scoped_path(&app, &target)?;
+        if !target.is_file()
+            || target.extension().and_then(|extension| extension.to_str()) != Some("md")
+        {
+            return Err("Note path must point to a Markdown file".to_string());
+        }
+        operations::read_note_content(&target, &path)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -820,6 +836,44 @@ pub async fn save_note(
             index_note_bg(search, &path);
         }
         operations::read_vault_note(&vault_path, &path)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn import_note<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    vault_path: String,
+    source_path: String,
+    notebook_relative: Option<String>,
+    expected_raw: String,
+    references: Vec<operations::ExternalNoteReference>,
+) -> Result<NoteContent, String> {
+    let search = state.vault_snapshot(&vault_path)?;
+    let maintenance = state.vault_maintenance.clone().lock_owned().await;
+    let writes = state.note_save.clone().lock_owned().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        let (_maintenance, _writes) = (maintenance, writes);
+        let source_root = asset_scope::external_note_root(&app, Path::new(&source_path))?;
+        let note = operations::import_note(
+            &vault_path,
+            &source_path,
+            &source_root,
+            notebook_relative.as_deref(),
+            &expected_raw,
+            references,
+            |path| ensure_scoped_path(&app, path),
+        )?;
+        index_note_bg(search, &note.path);
+        let event = crate::vault::watcher::changed_entry(
+            PathBuf::from(&note.path),
+            "create",
+            Path::new(&vault_path),
+        );
+        let _ = app.emit("file-changed", event);
+        Ok(note)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -2977,10 +3031,13 @@ fn open_url_with_system(url: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod external_access_tests {
-    use super::{ensure_readable_path, ensure_writable_path, validate_external_url};
+    use super::{
+        ensure_readable_path, ensure_writable_path, read_note, save_note, validate_external_url,
+    };
     use crate::state::AppState;
     use crate::types::AppConfig;
     use std::fs;
+    use tauri::Manager;
     use tauri_plugin_fs::FsExt;
 
     #[test]
@@ -3005,6 +3062,250 @@ mod external_access_tests {
             "not a URL",
         ] {
             assert!(validate_external_url(url).is_err(), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_external_markdown_can_be_viewed_but_not_saved_in_place() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = root.path().join("vault");
+        let vault_path = vault.to_string_lossy().into_owned();
+        crate::vault::operations::ensure_vault_structure(&vault_path).unwrap();
+        let outside = root.path().join("café 雪.md");
+        let raw = "---\ntitle: External note\ncustom: preserved\n---\n# External note\n\n![Image](images/picture.png)\n";
+        fs::write(&outside, raw).unwrap();
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_fs::init())
+            .manage(AppState::new(AppConfig {
+                active_vault: Some(vault_path.clone()),
+                ..Default::default()
+            }))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let path = outside.to_string_lossy().into_owned();
+
+        assert!(read_note(
+            app.handle().clone(),
+            app.state(),
+            vault_path.clone(),
+            path.clone()
+        )
+        .await
+        .is_err());
+        app.fs_scope().allow_file(&outside).unwrap();
+        let note = read_note(
+            app.handle().clone(),
+            app.state(),
+            vault_path.clone(),
+            path.clone(),
+        )
+        .await
+        .expect("an explicitly selected external Markdown file must open in the viewer");
+        assert_eq!(note.path, path);
+        assert_eq!(note.raw, raw);
+        assert_eq!(note.meta.title, "External note");
+        assert!(note.content.contains("![Image](images/picture.png)"));
+        assert!(save_note(
+            app.state(),
+            vault_path,
+            path,
+            note.meta,
+            "Changed".into(),
+            note.raw
+        )
+        .await
+        .is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), raw);
+    }
+
+    #[tokio::test]
+    async fn external_import_requires_scoped_attachments_and_keeps_its_queued_vault() {
+        use futures::FutureExt;
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("A").to_string_lossy().into_owned();
+        let b = root.path().join("B").to_string_lossy().into_owned();
+        crate::vault::operations::ensure_vault_structure(&a).unwrap();
+        crate::vault::operations::ensure_vault_structure(&b).unwrap();
+        let external = root.path().join("external");
+        fs::create_dir(&external).unwrap();
+        let source = external.join("External.md");
+        let image = external.join("photo.png");
+        let raw = "![Image](photo.png)";
+        fs::write(&source, raw).unwrap();
+        fs::write(&image, b"image bytes").unwrap();
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_fs::init())
+            .manage(AppState::new(AppConfig {
+                active_vault: Some(a.clone()),
+                vaults: vec![
+                    crate::types::VaultConfig {
+                        path: a.clone(),
+                        ..Default::default()
+                    },
+                    crate::types::VaultConfig {
+                        path: b.clone(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.fs_scope().allow_file(&source).unwrap();
+        let plan = || {
+            vec![crate::vault::operations::ExternalNoteReference {
+                from: raw.find("photo.png").unwrap(),
+                to: raw.find("photo.png").unwrap() + "photo.png".len(),
+                href: "photo.png".into(),
+                html: false,
+                pdf: false,
+            }]
+        };
+        let run = || {
+            super::import_note(
+                app.handle().clone(),
+                app.state(),
+                a.clone(),
+                source.to_string_lossy().into_owned(),
+                None,
+                raw.into(),
+                plan(),
+            )
+        };
+        assert!(run().await.unwrap_err().contains("selected"));
+        assert!(!std::path::Path::new(&a).join("External.md").exists());
+        app.fs_scope().allow_file(&image).unwrap();
+        let state = app.state::<AppState>();
+        let writes = state.note_save.lock().await;
+        let mut importing = Box::pin(run());
+        assert!(importing.as_mut().now_or_never().is_none());
+        state.config.lock().unwrap().active_vault = Some(b.clone());
+        drop(writes);
+        let note = importing.await.unwrap();
+        assert!(std::path::Path::new(&note.path).starts_with(&a));
+        assert!(!std::path::Path::new(&b).join("External.md").exists());
+        assert_eq!(fs::read_to_string(source).unwrap(), raw);
+        assert_eq!(fs::read(image).unwrap(), b"image bytes");
+    }
+
+    #[tokio::test]
+    async fn imported_external_managed_attachments_use_the_source_vault_with_real_scopes() {
+        use crate::{asset_scope, types::VaultConfig, vault::operations};
+        let root = tempfile::tempdir().unwrap();
+        let source_root = root.path().join("source");
+        let destination = root
+            .path()
+            .join("destination")
+            .to_string_lossy()
+            .into_owned();
+        operations::ensure_vault_structure(source_root.to_str().unwrap()).unwrap();
+        operations::ensure_vault_structure(&destination).unwrap();
+        std::fs::create_dir(source_root.join("Notebook")).unwrap();
+        let source = source_root.join("Notebook/Note.md");
+        let image = source_root.join(".helixnotes/attachments/photo%20).png");
+        let href = ".helixnotes/attachments/photo%2520%29.png";
+        let raw = format!("![Image]({href})");
+        std::fs::write(&source, &raw).unwrap();
+        std::fs::write(&image, b"source image").unwrap();
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_fs::init())
+            .manage(AppState::new(AppConfig {
+                active_vault: Some(destination.clone()),
+                vaults: vec![VaultConfig {
+                    path: source_root.to_string_lossy().into_owned(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.fs_scope().allow_file(&source).unwrap();
+        app.fs_scope()
+            .allow_directory(source.parent().unwrap(), true)
+            .unwrap();
+        asset_scope::allow_external_note_assets(app.handle(), &source).unwrap();
+        let from = raw.find(href).unwrap();
+        let note = super::import_note(
+            app.handle().clone(),
+            app.state(),
+            destination.clone(),
+            source.to_string_lossy().into_owned(),
+            None,
+            raw.clone(),
+            vec![operations::ExternalNoteReference {
+                from,
+                to: from + href.len(),
+                href: href.into(),
+                html: false,
+                pdf: false,
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(note.raw.contains(".helixnotes/attachments/"));
+        assert_eq!(std::fs::read_to_string(source).unwrap(), raw);
+        assert_eq!(std::fs::read(image).unwrap(), b"source image");
+        let files: Vec<_> =
+            std::fs::read_dir(std::path::Path::new(&destination).join(".helixnotes/attachments"))
+                .unwrap()
+                .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            std::fs::read(files[0].as_ref().unwrap().path()).unwrap(),
+            b"source image"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_note_scope_does_not_allow_other_files_or_internal_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = root.path().join("vault");
+        let vault_path = vault.to_string_lossy().into_owned();
+        crate::vault::operations::ensure_vault_structure(&vault_path).unwrap();
+        let outside = root.path().join("outside.md");
+        let non_markdown = root.path().join("outside.txt");
+        let internal = vault.join(".helixnotes/history/snapshot.md");
+        fs::create_dir_all(internal.parent().unwrap()).unwrap();
+        for path in [&outside, &non_markdown, &internal] {
+            fs::write(path, "Original").unwrap();
+        }
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_fs::init())
+            .manage(AppState::new(AppConfig {
+                active_vault: Some(vault_path.clone()),
+                ..Default::default()
+            }))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let read = |path: &std::path::Path| {
+            read_note(
+                app.handle().clone(),
+                app.state(),
+                vault_path.clone(),
+                path.to_string_lossy().into_owned(),
+            )
+        };
+        assert!(read(&outside).await.is_err());
+        for path in [&non_markdown, &internal] {
+            app.fs_scope().allow_file(path).unwrap();
+            assert!(read(path).await.is_err());
+        }
+        app.fs_scope().allow_file(&outside).unwrap();
+        assert!(read_note(
+            app.handle().clone(),
+            app.state(),
+            root.path().to_string_lossy().into_owned(),
+            outside.to_string_lossy().into_owned()
+        )
+        .await
+        .is_err());
+        #[cfg(unix)]
+        {
+            let unselected = root.path().join("unselected.md");
+            let link = vault.join("escape.md");
+            fs::write(&unselected, "Private").unwrap();
+            std::os::unix::fs::symlink(&unselected, &link).unwrap();
+            assert!(read(&link).await.is_err());
         }
     }
 
@@ -4279,13 +4580,22 @@ mod mutation_order_tests {
         .await
         .unwrap();
         assert_eq!(
-            read_note(app.state(), a.clone(), alpha.path.clone())
-                .await
-                .unwrap()
-                .content,
+            read_note(
+                app.handle().clone(),
+                app.state(),
+                a.clone(),
+                alpha.path.clone()
+            )
+            .await
+            .unwrap()
+            .content,
             "# Shared\n\nDetached save"
         );
-        assert!(read_note(app.state(), b.clone(), alpha.path).await.is_err());
+        assert!(
+            read_note(app.handle().clone(), app.state(), b.clone(), alpha.path)
+                .await
+                .is_err()
+        );
         assert_eq!(std::fs::read(&beta.path).unwrap(), beta_before);
     }
 

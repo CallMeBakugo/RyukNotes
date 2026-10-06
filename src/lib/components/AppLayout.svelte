@@ -89,6 +89,13 @@
 	let sidebar = $state<Sidebar>();
 	let noteList = $state<NoteList>();
 	let editor = $state<Editor>();
+	let outlineOpen = $state(false);
+	let outlinePanelId = $state('');
+
+	function handleOutlineChange(open: boolean, panelId: string) {
+		outlineOpen = open;
+		outlinePanelId = panelId;
+	}
 	let pendingSearchReveal = $state<{ path: string; token: number } | null>(null);
 	let unlistenFileChange: (() => void) | null = null;
 	let unlistenClose: (() => void) | null = null;
@@ -979,7 +986,9 @@
 			if (!ownerIsCurrent()) return;
 			$sidebarWidth = state.sidebar_width;
 			$notelistWidth = state.notelist_width;
-			if (typeof state.outline_width === 'number') $outlineWidth = state.outline_width;
+			if (typeof state.outline_width === 'number' && Number.isFinite(state.outline_width)) {
+				$outlineWidth = Math.max(160, Math.min(500, state.outline_width));
+			}
 			$sidebarCollapsed = state.sidebar_collapsed;
 			$notelistCollapsed = state.notelist_collapsed ?? false;
 			$collapsedNotebooks = state.collapsed_notebooks ?? [];
@@ -1190,7 +1199,8 @@
 							<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
 						</svg>
 					</button>
-					<button class="mobile-header-btn" onclick={() => editor?.toggleOutlinePanel()} title="Outline">
+					<button class="mobile-header-btn" class:active={outlineOpen} onclick={() => editor?.toggleOutlinePanel()}
+						title="Outline" aria-label="Outline" aria-expanded={outlineOpen} aria-controls={outlinePanelId || undefined}>
 						<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<line x1="4" y1="6" x2="20" y2="6"/><line x1="8" y1="12" x2="20" y2="12"/><line x1="8" y1="18" x2="20" y2="18"/><circle cx="4" cy="12" r="1" fill="currentColor"/><circle cx="4" cy="18" r="1" fill="currentColor"/>
 						</svg>
@@ -1268,7 +1278,7 @@
 				<NoteList bind:this={noteList} onNoteSelected={handleNoteSelected} onBeforeNoteSwitch={() => editor?.flushSave() ?? Promise.resolve(true)} onBeforeNoteDuplicate={() => editor?.forceSave() ?? Promise.resolve(true)} onBeforePathMutation={() => editor?.beginPathMutation() ?? Promise.resolve(() => {})} onPathsMoved={handlePathsMoved} onUpdateActiveNote={updateActiveNoteMetadata} onTagsChanged={handleTagsChanged} onRefreshTags={() => { if (!isMobile) void sidebar?.refreshTags(); }} onNoteMoved={() => sidebar?.refresh()} onNoteCreated={(token) => { editor?.focusTitle(token); }} onToggleTask={toggleTask} onSetTaskPriority={changeTaskPriority} onSetTaskDue={changeTaskDue} />
 			</div>
 			<div class="mobile-panel" class:active={$mobileView === 'editor'}>
-				<Editor bind:this={editor} onMoveToTrash={trashOpenNote} />
+				<Editor bind:this={editor} onMoveToTrash={trashOpenNote} onOutlineChange={handleOutlineChange} />
 			</div>
 		</div>
 
