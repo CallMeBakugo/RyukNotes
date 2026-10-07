@@ -130,7 +130,7 @@
 		(!$tasksHideCompleted || !t.completed)
 		&& (!$tasksOnlyFlagged || !!t.due || !!t.priority)
 		&& matchesQuery(t)
-		&& matchesTaskDueFilter(t.due, dueFilter, today)
+		&& matchesTaskDueFilter(t.due, dueFilter, today, t.completed)
 	));
 
 	const filtered = $derived.by(() => {
@@ -155,8 +155,8 @@
 
 	const openCount = $derived(tasks.filter((t) => !t.completed).length);
 
-	function dueClass(due: string | null): string {
-		if (!due) return '';
+	function dueClass(due: string | null, completed: boolean): string {
+		if (!due || completed) return '';
 		if (due < today) return 'overdue';
 		if (due === today) return 'duetoday';
 		return '';
@@ -326,7 +326,7 @@
 					<span class="task-label">{t.text}</span>
 					<span class="task-due-wrap">
 						<button
-							class="task-due {dueClass(t.due)}"
+							class="task-due {dueClass(t.due, t.completed)}"
 							class:set={!!t.due}
 							title="Set due date"
 							aria-label="Set due date"

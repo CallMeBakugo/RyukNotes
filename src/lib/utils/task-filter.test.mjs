@@ -14,6 +14,13 @@ test('Overdue excludes today, future dates, and undated tasks across a year boun
   assert.deepEqual(dates.filter(due => matchesTaskDueFilter(due, 'overdue', today)), ['2026-12-31']);
 });
 
+test('Overdue never includes a completed task, while Today and all still do', () => {
+  assert.equal(matchesTaskDueFilter('2026-12-31', 'overdue', today, false), true);
+  assert.equal(matchesTaskDueFilter('2026-12-31', 'overdue', today, true), false);
+  assert.equal(matchesTaskDueFilter(today, 'today', today, true), true);
+  assert.equal(matchesTaskDueFilter('2026-12-31', 'all', today, true), true);
+});
+
 test('clearing the date filter restores dated and undated tasks', () => {
   assert.equal(matchesTaskDueFilter(null, 'all', today), true);
   assert.equal(matchesTaskDueFilter('2027-01-02', 'all', today), true);
