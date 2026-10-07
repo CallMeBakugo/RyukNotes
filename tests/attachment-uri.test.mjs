@@ -70,3 +70,37 @@ test('an unconfigured external note resolves its own relative assets without bor
   assert.equal(assetPath(f.resolve('.helixnotes/attachments/image.png')), '/external/.helixnotes/attachments/image.png');
   assert.equal(assetPath(f.resolve('images/image.png')), '/external/images/image.png');
 });
+
+for (const name of ['Screenshot #1.png', '100% (final).png', 'a%20b #c?d.png', "café 雪 + 'x'.png"]) {
+  test(`a newly stored attachment ${JSON.stringify(name)} resolves to its own file and saves back unchanged`, () => {
+    const f = fixture();
+    // The backend returns the raw stored path, which uploadAsset must encode before using it as a destination.
+    const stored = `.helixnotes/attachments/0b1c2d3e_${name}`;
+    const destination = paths.encodeMarkdownPath(stored);
+    assert.equal(imageSource(`![x](${destination})`), destination, 'the encoded destination parses as one image');
+    const asset = f.resolve(destination);
+    assert.equal(assetPath(asset), `/vault/${stored}`);
+    assert.equal(new URL(asset).search, '');
+    assert.equal(paths.assetSourceToMarkdown(asset, '/vault/Projects/Note.md', '/vault'), destination);
+  });
+}
+
+test('uploadAsset encodes the stored path before every Markdown or URI use', () => {
+  const start = source.indexOf('async function uploadAsset');
+  const body = source.slice(start, source.indexOf('async function insertFile'));
+  assert.match(body, /const destination = encodeMarkdownPath\(relativePath\)/);
+  assert.equal(body.replace('encodeMarkdownPath(relativePath)', '').includes('relativePath)'), false);
+  assert.equal((body.match(/\$\{relativePath\}|src: relativePath|href: relativePath|resolveImageSrc\(relativePath\)/g) ?? []).length, 0);
+});
+
+test('Windows drive letters stay literal when a path outside the vault is written to Markdown', () => {
+  assert.equal(paths.encodeMarkdownPath('C:/Users/me/pic one.png'), 'C:/Users/me/pic%20one.png');
+  assert.equal(paths.encodeMarkdownPath('C:\\Users\\me\\a#b.png'), 'C:/Users/me/a%23b.png');
+  assert.equal(paths.encodeMarkdownPath('/home/me/pic one.png'), '/home/me/pic%20one.png');
+  assert.equal(paths.encodeMarkdownPath('relative/a:b.png'), 'relative/a%3Ab.png');
+  assert.equal(
+    paths.assetSourceToMarkdown('http://asset.localhost/C%3A%2FUsers%2Fme%2Fpic%20one.png', '/v/Note.md', '/v'),
+    'C:/Users/me/pic%20one.png',
+  );
+  assert.equal(paths.resolveFileReference('C:/Users/me/pic%20one.png', '/v/Note.md', '/v').path, 'C:/Users/me/pic one.png');
+});

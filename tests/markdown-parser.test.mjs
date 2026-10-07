@@ -187,3 +187,21 @@ test('task markers only turn bullet-list items into tasks, never numbered items'
   assert.equal([...nested.matchAll(/data-type="taskItem"/g)].length, 1);
   assert.doesNotMatch(nested, /<ol[^>]*data-type/);
 });
+
+test('code spans mark simple list items and table cells so whitespace-only code survives DOM import', () => {
+  assert.match(parser.render('- a `  ` b\n- plain'), /<li data-helix-code="">a <code[^>]*>  <\/code> b<\/li>\s*<li>plain<\/li>/);
+  assert.match(parser.render('1. one `  ` two'), /<li data-helix-code="">one /);
+  assert.match(parser.render('- [ ] task `  ` x'), /<li data-type="taskItem" data-checked="false" data-helix-code="">/);
+  assert.match(parser.render('| a | b |\n| - | - |\n| `  ` | c |'), /<td data-helix-code=""><code[^>]*>  <\/code><\/td>\s*<td>c<\/td>/);
+  assert.match(parser.render('| `  ` | b |\n| - | - |\n| x | y |'), /<th data-helix-code="">/);
+});
+
+test('list items with nested blocks are not marked, so no stray whitespace text appears around them', () => {
+  const nested = parser.render('- a `x`\n  - nested `y`');
+  assert.match(nested, /<li>a <code/);
+  assert.match(nested, /<li data-helix-code="">nested /);
+  assert.doesNotMatch(parser.render('- item `x`\n\n  ```js\n  code\n  ```'), /<li data-helix-code/);
+  assert.doesNotMatch(parser.render('- no code here\n- still none'), /data-helix-code/);
+  // Loose lists keep their paragraph marker as before.
+  assert.match(parser.render('- loose `  ` x\n\n- second'), /<li>\s*<p data-helix-code="">loose /);
+});

@@ -61,8 +61,11 @@ export function resolveFileReference(source: string, notePath: string | null, va
 	return { path: resolveVaultFilePath(path, notePath, vaultRoot), suffix: boundary < 0 ? '' : source.slice(boundary) };
 }
 
-function encodeMarkdownPath(path: string): string {
-	return path.replace(/\\/g, '/').split('/').map(segment => encodeURIComponent(segment)
+/** Percent-encode each path segment for a Markdown destination; a Windows drive prefix stays literal. */
+export function encodeMarkdownPath(path: string): string {
+	const normalized = path.replace(/\\/g, '/');
+	const drive = /^[A-Za-z]:(?=\/|$)/.exec(normalized)?.[0] ?? '';
+	return drive + normalized.slice(drive.length).split('/').map(segment => encodeURIComponent(segment)
 		.replace(/[!'()*]/g, character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`)).join('/');
 }
 

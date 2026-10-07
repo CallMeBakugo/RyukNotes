@@ -257,16 +257,28 @@ export function createEditorMarkdownParser(): MarkdownIt {
 
   md.core.ruler.after('inline', 'helix_images', state => {
     let paragraph: Token | null = null;
+    let cell: Token | null = null;
+    // Tight list items render no <p>, so a simple item (open, hidden paragraph, inline, close) carries the marker.
+    const items: { token: Token; index: number; hasCode: boolean }[] = [];
     let lines: string[] | undefined;
-    for (const token of state.tokens) {
+    for (const [index, token] of state.tokens.entries()) {
       if (token.type === 'paragraph_open' || token.type === 'heading_open') paragraph = token;
       else if (token.type === 'paragraph_close' || token.type === 'heading_close') paragraph = null;
+      else if (token.type === 'th_open' || token.type === 'td_open') cell = token;
+      else if (token.type === 'th_close' || token.type === 'td_close') cell = null;
+      else if (token.type === 'list_item_open') items.push({ token, index, hasCode: false });
+      else if (token.type === 'list_item_close') {
+        const item = items.pop();
+        if (item?.hasCode && index - item.index === 4) item.token.attrSet('data-helix-code', '');
+      }
       if (token.type !== 'inline') continue;
       for (const child of token.children ?? []) {
         // ProseMirror's DOM parser otherwise collapses or drops whitespace-only code spans.
         if (child.type === 'code_inline') {
           child.attrSet('style', 'white-space: pre-wrap');
           paragraph?.attrSet('data-helix-code', '');
+          cell?.attrSet('data-helix-code', '');
+          if (paragraph?.hidden && items.length) items[items.length - 1].hasCode = true;
         }
         if (child.type === 'image') {
           const src = child.attrGet('src');

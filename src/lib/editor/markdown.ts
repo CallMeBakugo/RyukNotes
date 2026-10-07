@@ -149,9 +149,15 @@ function commonMarkCount(active: MarkdownMark[], next: MarkdownMark[]): number {
   return index;
 }
 
+export interface InlineSerializeOptions {
+  /** Leave `$` unescaped (only backslashes before it are doubled); callers must check it cannot form math. */
+  literalDollars?: boolean;
+}
+
 export function serializeInlineMarkdown(
   node: ProseMirrorNode,
   normalizeAssetSource: AssetSourceNormalizer = identityAssetSource,
+  options: InlineSerializeOptions = {},
 ): string {
   let result = '';
   let activeMarks: MarkdownMark[] = [];
@@ -188,7 +194,9 @@ export function serializeInlineMarkdown(
         if (index === 0) {
           text = text.replace(/^[\t\u2003]+/, (whitespace) => '&emsp;'.repeat(whitespace.length));
         }
-        text = text.replace(/\\*\$/g, (match) => '\\'.repeat((match.length - 1) * 2 + 1) + '$');
+        text = options.literalDollars
+          ? text.replace(/\\+(?=\$)/g, (backslashes) => backslashes + backslashes)
+          : text.replace(/\\*\$/g, (match) => '\\'.repeat((match.length - 1) * 2 + 1) + '$');
         if (index + 1 < node.childCount && node.child(index + 1).type.name === 'mathInline') {
           text = text.replace(/\\+$/, (backslashes) => backslashes + backslashes);
         }
@@ -219,4 +227,24 @@ export function serializeInlineMarkdown(
 
   transitionMarks([]);
   return result;
+}
+
+/**
+ * Like serializeInlineMarkdown, but writes a `$` as typed unless that could change the note's
+ * math. `inlineMathPayloads` returns the TeX of each inline formula the parser finds in a string;
+ * if plain dollars would add, remove or re-pair a formula, every `$` is escaped as before.
+ */
+export function serializeInlineMarkdownKeepingDollars(
+  node: ProseMirrorNode,
+  normalizeAssetSource: AssetSourceNormalizer,
+  inlineMathPayloads: (markdown: string) => string[],
+): string {
+  const escaped = serializeInlineMarkdown(node, normalizeAssetSource);
+  if (!escaped.includes('$')) return escaped;
+  const plain = serializeInlineMarkdown(node, normalizeAssetSource, { literalDollars: true });
+  // A `$$` could start a display formula in a later block, so only single dollars are left alone.
+  if (plain.includes('$$')) return escaped;
+  const expected = inlineMathPayloads(escaped);
+  const actual = inlineMathPayloads(plain);
+  return actual.length === expected.length && actual.every((tex, index) => tex === expected[index]) ? plain : escaped;
 }

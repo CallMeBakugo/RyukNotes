@@ -292,3 +292,49 @@ test('a stripped current body matches a snapshot that keeps its file whitespace'
     [['removed', 'body'], ['added', 'edited']],
   );
 });
+
+const numbered = (count, prefix) => Array.from({ length: count }, (_, index) => `${prefix} ${index}`).join('\n') + '\n';
+
+test('a heavily rewritten note is compared quickly and still reports every change', async () => {
+  const started = performance.now();
+  const comparison = await compare(numbered(1000, 'old line'), numbered(1000, 'new text'));
+  assert.ok(performance.now() - started < 1500, 'the comparison must not wait on timers per edit');
+  assert.equal(comparison.added, 1000);
+  assert.equal(comparison.removed, 1000);
+});
+
+test('beyond the diff limit, shared start and end lines stay unchanged and the middle is replaced', async () => {
+  const head = numbered(100, 'same start');
+  const tail = numbered(100, 'same end');
+  const current = head + numbered(2500, 'old middle') + tail;
+  const snapshot = head + numbered(1800, 'new middle') + tail;
+  const started = performance.now();
+  const comparison = await compare(current, snapshot);
+  assert.ok(performance.now() - started < 1500);
+  assert.equal(comparison.removed, 2500);
+  assert.equal(comparison.added, 1800);
+  assert.equal(rowsOf(comparison).filter((row) => row.kind === 'same').length, 200);
+  assert.equal(rowsOf(comparison)[0].text, 'same start 0');
+  assert.equal(rowsOf(comparison).at(-1).text, 'same end 99');
+});
+
+test('the coarse fallback handles CRLF, missing final newlines and empty sides', async () => {
+  const big = numbered(2000, 'a').replace(/\n/g, '\r\n');
+  const other = numbered(2000, 'b');
+  const crlf = await compare(big, other);
+  assert.equal(crlf.added + crlf.removed, 4000);
+  const noFinalNewline = await compare(numbered(1500, 'a').slice(0, -1), numbered(1500, 'b').slice(0, -1));
+  assert.equal(noFinalNewline.added, 1500);
+  assert.equal(rowsOf(noFinalNewline).at(-1).newline, false);
+  const empty = await compare('', numbered(2000, 'b'));
+  assert.deepEqual([empty.added, empty.removed], [2000, 0]);
+  const emptied = await compare(numbered(2000, 'b'), '');
+  assert.deepEqual([emptied.added, emptied.removed], [0, 2000]);
+});
+
+test('differences under the limit still use the minimal line diff', async () => {
+  const current = numbered(5000, 'line');
+  const snapshot = current.replace('line 10\n', 'edited 10\n').replace('line 4000\n', 'edited 4000\n');
+  const comparison = await compare(current, snapshot);
+  assert.deepEqual([comparison.added, comparison.removed], [2, 2]);
+});

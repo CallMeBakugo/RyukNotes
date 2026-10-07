@@ -58,14 +58,14 @@
 	import { clearFormatting } from '$lib/editor/clearFormatting';
 	import { toolbarLabels, resolveToolbarLayout, groupToolbarButtons, moveToolbarButton, toolbarLayoutPreference, type ToolbarButtonId, type ToolbarArea, type ResolvedToolbarLayout } from '$lib/editor/toolbar';
 	import { buildCodeCopyDecorations, buildTaskMetaDecorations, focusedPlaceholderDecorations } from '$lib/editor/decorations';
-	import { serializeInlineMarkdown, serializeCodeBlock, joinMarkdownBlocks, type MarkdownBlock } from '$lib/editor/markdown';
+	import { serializeInlineMarkdownKeepingDollars, serializeCodeBlock, joinMarkdownBlocks, type MarkdownBlock } from '$lib/editor/markdown';
 	import { restoreTitleHeading, stripTitleHeading, type HiddenTitleHeading } from '$lib/editor/titleVisibility';
 	import { documentHeadings, sourceHeadings, activeHeadingIndex, mapDocumentHeadings, mapSourceHeadings, type OutlineHeading } from '$lib/editor/outline';
 	import { createEditorMarkdownParser } from '$lib/editor/markdownParser';
 	import { externalNoteReferences } from '$lib/editor/externalNote';
 	import { tagIterationKey } from '$lib/utils/tag-styles';
 	import { replaceWithWikiLink } from '$lib/editor/wikiLinks';
-	import { assetSourceToMarkdown, assetUrlToLocalPath, resolveFileReference, noteAssetRoot, isTrashedNote } from '$lib/utils/paths';
+	import { assetSourceToMarkdown, assetUrlToLocalPath, encodeMarkdownPath, resolveFileReference, noteAssetRoot, isTrashedNote } from '$lib/utils/paths';
 	import GraphView from './GraphView.svelte';
 	import TagSuggestInput from './TagSuggestInput.svelte';
 	import TagLabel from './TagLabel.svelte';
@@ -117,15 +117,20 @@
 		}
 		return false;
 	}
+	// The parser marks blocks holding code spans so whitespace-only code survives DOM import.
+	const keepCodeWhitespace = {
+		parseHTML(this: any) {
+			return (this.parent?.() ?? []).flatMap((rule: any) => [
+				{ ...rule, tag: `${rule.tag}[data-helix-code]`, preserveWhitespace: 'full' as const },
+				rule,
+			]);
+		},
+	};
 	const EditorStarterKit = StarterKit.extend({
 		addExtensions() {
-			return this.parent!().map(extension => extension instanceof TiptapNode && (extension.name === 'paragraph' || extension.name === 'heading') ? extension.extend({
-				parseHTML() {
-					return (this.parent?.() ?? []).flatMap(rule => [
-						{ ...rule, tag: `${rule.tag}[data-helix-code]`, preserveWhitespace: 'full' as const },
-						rule,
-					]);
-				},
+			return this.parent!().map(extension => extension instanceof TiptapNode && extension.name === 'listItem' ? extension.extend(keepCodeWhitespace)
+				: extension instanceof TiptapNode && (extension.name === 'paragraph' || extension.name === 'heading') ? extension.extend({
+				...keepCodeWhitespace,
 				renderHTML(props) {
 					return this.parent!({
 						...props,
@@ -1034,12 +1039,14 @@
 	}
 
 	const CustomTableCell = TableCell.extend({
+		...keepCodeWhitespace,
 		addAttributes() {
 			return { ...this.parent?.(), ...cellColorAttributes() };
 		},
 	});
 
 	const CustomTableHeader = TableHeader.extend({
+		...keepCodeWhitespace,
 		addAttributes() {
 			return { ...this.parent?.(), ...cellColorAttributes() };
 		},
@@ -4024,6 +4031,8 @@
 	function serializeHTMLNode(node: ProseMirrorNode): string {
 		const container = document.createElement('div');
 		container.appendChild(DOMSerializer.fromSchema(editor!.schema).serializeNode(node));
+		// The editor shows images through machine-specific asset URLs; notes store portable paths.
+		for (const image of container.querySelectorAll('img[src]')) image.setAttribute('src', stripAssetSrc(image.getAttribute('src') ?? ''));
 		return container.innerHTML;
 	}
 
@@ -4151,8 +4160,13 @@
 		return parts.join('\n') + '\n';
 	}
 
+	function inlineMathPayloads(markdown: string): string[] {
+		const children = mdit.parseInline(markdown, {})[0]?.children ?? [];
+		return children.filter(token => token.type === 'helix_math_inline').map(token => token.content);
+	}
+
 	function serializeInline(node: any): string {
-		return serializeInlineMarkdown(node, stripAssetSrc);
+		return serializeInlineMarkdownKeepingDollars(node, stripAssetSrc, inlineMathPayloads);
 	}
 
 	function autofocus(el: HTMLElement) {
@@ -5063,7 +5077,7 @@
 				EditorStarterKit.configure({ code: { HTMLAttributes: { style: 'white-space: pre-wrap' } }, codeBlock: false, link: false, underline: false }),
 				FocusedPlaceholder,
 				TaskList,
-				TaskItem.configure({ nested: true }),
+				TaskItem.extend(keepCodeWhitespace).configure({ nested: true }),
 				Table.configure({ resizable: true }),
 				TableRow,
 				CustomTableCell,
@@ -6389,18 +6403,20 @@
 			: await saveAttachment(origin.vault!, name, data);
 		if (!canInsert(origin)) return;
 		const label = `${name} (${Math.round(data.length / 1024)} kB)`;
+		// The stored name may contain #, %, spaces or parentheses; every use below is a URI or Markdown destination.
+		const destination = encodeMarkdownPath(relativePath);
 		if (origin.sourceMode) {
 			const { from, to } = source.state.selection.main;
 			const escaped = (kind === 'image' ? name : label).replace(/[[\]\\]/g, '\\$&');
-			source.replace(`${kind === 'image' ? '!' : ''}[${escaped}](${relativePath}) `, from, to);
+			source.replace(`${kind === 'image' ? '!' : ''}[${escaped}](${destination}) `, from, to);
 		} else if (editor) {
 			// Async completion may insert into its origin, but must never take focus.
-			if (kind === 'image') editor.commands.setImage({ src: resolveImageSrc(relativePath) });
+			if (kind === 'image') editor.commands.setImage({ src: resolveImageSrc(destination) });
 			else if (kind === 'pdf' && !isMobile && $appConfig?.pdf_preview) {
-				editor.commands.insertContent({ type: 'pdfEmbed', attrs: { src: relativePath, name } });
+				editor.commands.insertContent({ type: 'pdfEmbed', attrs: { src: destination, name } });
 			} else {
 				editor.commands.insertContent([
-					{ type: 'text', text: label, marks: [{ type: 'link', attrs: { href: relativePath } }] },
+					{ type: 'text', text: label, marks: [{ type: 'link', attrs: { href: destination } }] },
 					{ type: 'text', text: ' ' },
 				]);
 			}

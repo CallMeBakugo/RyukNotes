@@ -44,17 +44,38 @@ export function comparableBody(body: string): string {
   return trimmed === '' ? '' : trimmed + '\n';
 }
 
+/** Diff cost grows with the square of the edit distance; beyond this, a coarse diff is shown instead. */
+const MAX_EDIT_LENGTH = 1000;
+
+/** Always-correct fallback: shared leading and trailing lines stay unchanged, the middle is replaced. */
+function coarseChanges(current: string, snapshot: string): Change[] {
+  const lines = (text: string) => text.replace(/\r\n/g, '\n').match(/[^\n]*\n|[^\n]+$/g) ?? [];
+  const before = lines(current);
+  const after = lines(snapshot);
+  let start = 0;
+  while (start < before.length && start < after.length && before[start] === after[start]) start++;
+  let end = 0;
+  while (end < before.length - start && end < after.length - start
+    && before[before.length - 1 - end] === after[after.length - 1 - end]) end++;
+  const part = (items: string[], kind: 'same' | 'added' | 'removed'): Change[] => items.length
+    ? [{ value: items.join(''), count: items.length, added: kind === 'added', removed: kind === 'removed' }]
+    : [];
+  return [
+    ...part(before.slice(0, start), 'same'),
+    ...part(before.slice(start, before.length - end), 'removed'),
+    ...part(after.slice(start, after.length - end), 'added'),
+    ...part(before.slice(before.length - end), 'same'),
+  ];
+}
+
 /** Added/removed rows describe restoring the snapshot over the current editor body. */
 export async function compareHistory(
   currentBody: string,
   snapshotBody: string,
 ): Promise<HistoryComparison> {
-  const changes = await new Promise<Change[]>((resolve) => {
-    diffLines(currentBody, snapshotBody, {
-      stripTrailingCr: true,
-      callback: resolve,
-    });
-  });
+  // jsdiff's callback mode waits on a timer for every step, which takes seconds on large changes.
+  const changes = diffLines(currentBody, snapshotBody, { stripTrailingCr: true, maxEditLength: MAX_EDIT_LENGTH })
+    ?? coarseChanges(currentBody, snapshotBody);
 
   const chunks: HistoryChunk[] = [];
   let added = 0;

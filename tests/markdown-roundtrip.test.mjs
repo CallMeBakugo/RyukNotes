@@ -14,7 +14,7 @@ const { code } = await transformWithEsbuild(source, 'markdown.ts', {
   format: 'esm',
   target: 'esnext'
 });
-const { joinMarkdownBlocks, serializeCodeBlock, serializeInlineMarkdown } = await import(
+const { joinMarkdownBlocks, serializeCodeBlock, serializeInlineMarkdown, serializeInlineMarkdownKeepingDollars } = await import(
   `data:text/javascript;base64,${Buffer.from(code).toString('base64')}`
 );
 
@@ -407,4 +407,71 @@ test('joining never collapses blank lines inside code blocks', () => {
   const code = serializeCodeBlock('a\n\n\n\nb');
   assert.equal(joinMarkdownBlocks([block(code), block('after\n')]), code + '\nafter\n');
   assert.ok(joinMarkdownBlocks([block(code), block('after\n')]).includes('a\n\n\n\nb'));
+});
+
+const mathPayloads = (markdown) => (editorMarkdown.parseInline(markdown, {})[0]?.children ?? [])
+  .filter((token) => token.type === 'helix_math_inline').map((token) => token.content);
+const keepDollars = (children) => serializeInlineMarkdownKeepingDollars(schema.node('paragraph', null, children), undefined, mathPayloads);
+const mathAtom = (tex) => schema.node('mathInline', { tex });
+// What a reader of the saved Markdown sees: plain text and formulas, in order.
+const readBack = (markdown) => (editorMarkdown.parseInline(markdown, {})[0]?.children ?? []).map((token) =>
+  token.type === 'helix_math_inline' ? `\u0000${token.content}\u0000` : token.type === 'text' ? token.content : '').join('');
+const authored = (children) => children.map((child) => child.type.name === 'mathInline' ? `\u0000${child.attrs.tex}\u0000` : child.text).join('');
+
+test('dollar signs that cannot form a formula are saved as typed', () => {
+  for (const text of ['Cost $5 and $6 total', 'Price is $5.', 'Only $', '$ spaced $', 'a$b', '5$ and 6$', 'two $5 or $10']) {
+    assert.equal(keepDollars([schema.text(text)]), text, text);
+  }
+});
+
+test('dollar signs that would form a formula stay escaped, so literal text is never turned into math', () => {
+  for (const text of ['$x$', 'cost $x$ here', '$a+b$', 'x $y$ z $w$', '$$', 'a $$ b']) {
+    const saved = keepDollars([schema.text(text)]);
+    assert.deepEqual(mathPayloads(saved), [], `${text} -> ${saved}`);
+    assert.equal(readBack(saved), text, `${text} -> ${saved}`);
+  }
+});
+
+test('real formulas keep their dollars and are not re-paired with neighbouring text', () => {
+  const nodes = [schema.text('cost $5 and '), mathAtom('x'), schema.text(' then $6')];
+  const saved = keepDollars(nodes);
+  assert.deepEqual(mathPayloads(saved), ['x']);
+  assert.equal(readBack(saved), authored(nodes));
+  const pairing = [schema.text('$a'), mathAtom('x'), schema.text('b')];
+  const pairingSaved = keepDollars(pairing);
+  assert.deepEqual(mathPayloads(pairingSaved), ['x'], pairingSaved);
+  assert.equal(readBack(pairingSaved), authored(pairing));
+});
+
+test('backslashes before an unescaped dollar are doubled so the dollar stays literal', () => {
+  for (const text of ['a\\$5', 'a\\\\$5', 'path\\ $5 and $6']) {
+    const saved = keepDollars([schema.text(text)]);
+    assert.equal(readBack(saved), text, `${text} -> ${saved}`);
+  }
+});
+
+test('fuzz: saving text and formulas keeps exactly what was written, whatever the dollars do', () => {
+  const alphabet = ['a', 'b', '1', '5', ' ', '$', '$', '\\', '*', '_', '`', 'x', '.', '\n'.slice(0, 0) || ' '];
+  let seed = 12345;
+  const random = (n) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
+  for (let round = 0; round < 4000; round++) {
+    const children = [];
+    for (let part = 0, count = 1 + random(4); part < count; part++) {
+      if (random(5) === 0) children.push(mathAtom(['x', 'a+b', '5', 'y z'][random(4)]));
+      else {
+        const text = Array.from({ length: 1 + random(8) }, () => alphabet[random(alphabet.length)]).join('');
+        if (text.length) children.push(schema.text(text));
+      }
+    }
+    // Adjacent text nodes would merge; adjacent atoms are covered by the serializer's own encoding rules.
+    const merged = children.reduce((list, child) => {
+      const last = list[list.length - 1];
+      if (last?.isText && child.isText) list[list.length - 1] = schema.text(last.text + child.text); else list.push(child);
+      return list;
+    }, []);
+    if (!merged.length) continue;
+    const saved = keepDollars(merged);
+    const baseline = serializeInlineMarkdown(schema.node('paragraph', null, merged));
+    assert.equal(readBack(saved), readBack(baseline), JSON.stringify({ saved, baseline, merged: authored(merged) }));
+  }
 });
