@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createEditorMarkdownParser, displayMathRanges } from '../src/lib/editor/markdownParser.ts';
+import { createEditorMarkdownParser, displayMathRanges, stripLinkTitle } from '../src/lib/editor/markdownParser.ts';
 
 const parser = createEditorMarkdownParser();
 const payload = '$x$\n$$\na+b\n$$\n[[Note]]\n[label](path with spaces)\n![image](<image path> "title")\n- [x] task\n<!-- -->\n<div data-pdf-src="a.pdf" data-pdf-name="A"></div>';
@@ -204,4 +204,32 @@ test('list items with nested blocks are not marked, so no stray whitespace text 
   assert.doesNotMatch(parser.render('- no code here\n- still none'), /data-helix-code/);
   // Loose lists keep their paragraph marker as before.
   assert.match(parser.render('- loose `  ` x\n\n- second'), /<li>\s*<p data-helix-code="">loose /);
+});
+
+test('stripLinkTitle behaves exactly like the title expression it replaced, on every short combination', () => {
+  const oracle = (destination) => destination.replace(/(?:\s|%20)+(?:"[^"]*"|'[^']*')(?:\s|%20)*$/u, '').trim();
+  const tokens = ['%20', ' ', '"', "'", 'a', '\t', '%2', '<'];
+  let checked = 0;
+  const walk = (prefix, depth) => {
+    const input = prefix.trim();      // the parser trims the destination first
+    assert.equal(stripLinkTitle(input), oracle(input), JSON.stringify(input));
+    checked++;
+    if (depth === 0) return;
+    for (const token of tokens) walk(prefix + token, depth - 1);
+  };
+  walk('', 6);
+  assert.ok(checked > 200000);
+  for (const title of ['page.png "Caption"', "page.png 'Caption'", 'page.png%20"Caption"', 'a "b" "c"', 'a"b"', 'x "it\'s"%20%20']) {
+    assert.equal(stripLinkTitle(title), oracle(title), title);
+  }
+});
+
+test('a link destination with a very long run of spaces is parsed in linear time', () => {
+  for (const spaces of [5000, 40000]) {
+    const started = performance.now();
+    parser.render('[a](x' + ' '.repeat(spaces) + 'y)');
+    assert.ok(performance.now() - started < 300, `${spaces} spaces took ${Math.round(performance.now() - started)} ms`);
+  }
+  // Titles still work next to long whitespace.
+  assert.match(parser.render('![a](images/photo one.png "Caption")'), /src="images\/photo%20one.png"/);
 });

@@ -128,6 +128,24 @@ function wikiLink(state: StateInline, silent: boolean): boolean {
   return true;
 }
 
+/**
+ * Remove a trailing `"title"` or `'title'` (preceded by whitespace or %20, optionally followed by %20) from a
+ * legacy link destination. A single scan from the end: the equivalent regular expression is quadratic on a
+ * long run of spaces.
+ */
+export function stripLinkTitle(destination: string): string {
+  const skippableBefore = (index: number) => (index >= 3 && destination.startsWith('%20', index - 3) ? 3 : /\s/u.test(destination[index - 1] ?? '') ? 1 : 0);
+  let end = destination.length;
+  for (let width = skippableBefore(end); width; width = skippableBefore(end)) end -= width;
+  const quote = destination[end - 1];
+  if (quote !== '"' && quote !== "'") return destination.trim();
+  const open = destination.lastIndexOf(quote, end - 2);
+  if (open <= 0) return destination.trim();
+  let start = open;
+  for (let width = skippableBefore(start); width; width = skippableBefore(start)) start -= width;
+  return start === open ? destination.trim() : destination.slice(0, start).trim();
+}
+
 /** Preserve legacy space-containing and %20/title destinations only in real link syntax. */
 function legacyLink(state: StateInline, silent: boolean): boolean {
   const start = state.pos;
@@ -163,7 +181,7 @@ function legacyLink(state: StateInline, silent: boolean): boolean {
     if (!angle) return false;
     destination = angle[1];
   } else {
-    destination = destination.replace(/(?:\s|%20)+(?:"[^"]*"|'[^']*')(?:\s|%20)*$/u, '').trim();
+    destination = stripLinkTitle(destination);
   }
   const href = state.md.normalizeLink(destination.replace(/ /g, '%20'));
   if (!state.md.validateLink(href)) return false;

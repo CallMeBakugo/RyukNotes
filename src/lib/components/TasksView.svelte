@@ -480,6 +480,13 @@
 		min-width: 44px;
 		min-height: 44px;
 	}
+	/* Marking a task done is the main action on a phone: widen the tap area without changing how the box looks,
+	   staying clear of the priority control that follows it. */
+	.tasks-view.mobile .task-check::before {
+		content: '';
+		position: absolute;
+		inset: -16px -6px -16px -16px;
+	}
 	.tasks-filter::placeholder { color: var(--text-tertiary); }
 	.tasks-filter:focus { outline: none; border-color: var(--accent); }
 	.tasks-list {

@@ -107,7 +107,7 @@
 					{#key raw}
 						{#each comparison.chunks as chunk}
 							{#if chunk.kind === 'unchanged'}
-								<details class="unchanged-lines"><summary>{chunk.rows.length} unchanged lines</summary>{@render lines(chunk.rows)}</details>
+								<details class="unchanged-lines"><summary>{chunk.rows.length} unchanged {chunk.rows.length === 1 ? 'line' : 'lines'}</summary>{@render lines(chunk.rows)}</details>
 							{:else}
 								{@render lines(chunk.rows)}
 							{/if}
