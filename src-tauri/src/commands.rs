@@ -1026,7 +1026,9 @@ fn scan_all_note_titles(vault_path: &str) -> Result<Vec<NoteTitleEntry>, String>
         .into_iter()
         // Cross-platform exclusion (string "/.helixnotes/" checks miss Windows
         // backslash paths, which leaked .helixnotes/history snapshots in as dupes).
-        .filter_entry(|e| !operations::is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
+        .filter_entry(|e| {
+            e.depth() == 0 || (!operations::is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
+        })
         .filter_map(|e| e.ok())
         .filter(|e| {
             e.path().is_file() && e.path().extension().and_then(|x| x.to_str()) == Some("md")
@@ -1134,7 +1136,9 @@ fn scan_graph_data(vault_path: &str) -> Result<crate::types::GraphData, String> 
     // Windows backslash paths; is_hidden also covers .stversions/.stfolder/.trash/.git).
     let candidates: Vec<PathBuf> = walkdir::WalkDir::new(vault)
         .into_iter()
-        .filter_entry(|e| !operations::is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
+        .filter_entry(|e| {
+            e.depth() == 0 || (!operations::is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
+        })
         .filter_map(|e| e.ok())
         .filter(|entry| {
             let path = entry.path();
@@ -1335,7 +1339,8 @@ fn scan_tasks(vault_path: &str, note_path: Option<&str>) -> Result<Vec<TaskItem>
     let paths: Vec<PathBuf> = walkdir::WalkDir::new(vault)
         .into_iter()
         .filter_entry(|entry| {
-            !operations::is_hidden(entry.path()) && !entry.path().starts_with(&hn_dir)
+            entry.depth() == 0
+                || (!operations::is_hidden(entry.path()) && !entry.path().starts_with(&hn_dir))
         })
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
@@ -1517,6 +1522,40 @@ mod graph_scan_tests {
                 "A.md|Alpha>other/Twin.md|Twin:false",
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod dot_named_vault_tests {
+    use super::{scan_all_note_titles, scan_graph_data, scan_tasks};
+    use std::fs;
+
+    #[test]
+    fn vault_scans_do_not_treat_a_dot_named_vault_folder_as_hidden() {
+        // tempdir() names its folder ".tmpXXXX", like a vault kept in ~/.notes.
+        let vault = tempfile::tempdir().unwrap();
+        assert!(vault
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with('.'));
+        let vault_path = vault.path().to_str().unwrap();
+        fs::write(
+            vault.path().join("A.md"),
+            "---\ntitle: Alpha\n---\n[[Beta]]\n- [ ] Task\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.path().join("B.md"),
+            "---\ntitle: Beta\n---\n[[Alpha]]\n",
+        )
+        .unwrap();
+
+        assert_eq!(scan_all_note_titles(vault_path).unwrap().len(), 2);
+        let graph = scan_graph_data(vault_path).unwrap();
+        assert_eq!((graph.nodes.len(), graph.edges.len()), (2, 1));
+        assert_eq!(scan_tasks(vault_path, None).unwrap().len(), 1);
     }
 }
 

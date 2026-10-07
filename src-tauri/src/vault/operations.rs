@@ -549,7 +549,9 @@ pub fn scan_notes(vault_path: &str, notebook_path: Option<&str>) -> Result<Vec<N
             WalkDir::new(root)
                 .into_iter()
                 // filter_entry skips descending into hidden dirs (unlike filter)
-                .filter_entry(|e| !is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
+                .filter_entry(|e| {
+                    e.depth() == 0 || (!is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
+                })
                 .filter_map(|e| e.ok())
                 .map(|e| e.path().to_path_buf())
                 .filter(|p| p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("md"))
@@ -579,7 +581,9 @@ pub fn scan_notes(vault_path: &str, notebook_path: Option<&str>) -> Result<Vec<N
             WalkDir::new(root)
                 .into_iter()
                 .filter_entry(|e| {
-                    !is_hidden(e.path()) && !e.path().starts_with(helixnotes_dir(vault_path))
+                    e.depth() == 0
+                        || (!is_hidden(e.path())
+                            && !e.path().starts_with(helixnotes_dir(vault_path)))
                 })
                 .filter_map(|e| e.ok())
                 .map(|e| e.path().to_path_buf())
@@ -1356,7 +1360,9 @@ fn update_wikilinks_after_rename(
     // vs. the other note with the same title.
     let title_is_unique = !WalkDir::new(vault)
         .into_iter()
-        .filter_entry(|e| !is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
+        .filter_entry(|e| {
+            e.depth() == 0 || (!is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
+        })
         .filter_map(|e| e.ok())
         .any(|e| {
             let p = e.path();
@@ -1375,7 +1381,9 @@ fn update_wikilinks_after_rename(
 
     for entry in WalkDir::new(vault)
         .into_iter()
-        .filter_entry(|e| !is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
+        .filter_entry(|e| {
+            e.depth() == 0 || (!is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
+        })
         .filter_map(|e| e.ok())
     {
         let path = entry.path();
@@ -3656,6 +3664,52 @@ mod tests {
         assert_eq!(super::read_note_head(&path).unwrap().len(), 2048);
         fs::write(&path, "---\n---\nShort").unwrap();
         assert_eq!(super::read_note_head(&path).unwrap(), "---\n---\nShort");
+    }
+
+    #[test]
+    fn dot_named_vault_folder_is_still_scanned_and_renames_update_links() {
+        // tempdir() names its folder ".tmpXXXX", like a vault kept in ~/.notes.
+        let vault = tempfile::tempdir().unwrap();
+        assert!(vault
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with('.'));
+        let vault_path = vault.path().to_str().unwrap();
+        fs::write(vault.path().join("Old.md"), "---\ntitle: Old\n---\n# Old\n").unwrap();
+        let other = vault.path().join("Other.md");
+        fs::write(&other, "---\ntitle: Other\n---\nSee [[Old]].\n").unwrap();
+
+        assert_eq!(super::scan_notes(vault_path, None).unwrap().len(), 2);
+        fs::create_dir(vault.path().join("Notebook")).unwrap();
+        fs::write(
+            vault.path().join("Notebook/Tagged.md"),
+            "---\ntags: [work]\n---\n# Tagged\n",
+        )
+        .unwrap();
+        assert_eq!(super::scan_notebooks(vault_path).unwrap().len(), 1);
+        assert_eq!(
+            super::get_all_tags(vault_path).unwrap(),
+            [("work".to_string(), 1)]
+        );
+        assert_eq!(
+            super::scan_notes(
+                vault_path,
+                Some(vault.path().join("Notebook").to_str().unwrap())
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+
+        super::rename_note(
+            vault.path().join("Old.md").to_str().unwrap(),
+            "Renamed",
+            vault_path,
+        )
+        .unwrap();
+        assert!(fs::read_to_string(other).unwrap().contains("Renamed"));
     }
 
     #[test]
