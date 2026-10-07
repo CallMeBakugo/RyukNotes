@@ -5425,7 +5425,10 @@
 		const origin = captureOrigin();
 		linkOrigin = origin;
 		if (!origin.vault) return;
-		getAllNoteTitles(origin.vault).then(t => {
+		// The wiki-link cache is kept current by file events; skip a vault-wide scan when it is loaded.
+		if ($appConfig?.enable_wiki_links && wikiTitleVault === origin.vault && !wikiTitleRefresh && wikiLinkTitlesCache.length) {
+			linkSuggestTitles = [...wikiLinkTitlesCache];
+		} else getAllNoteTitles(origin.vault).then(t => {
 			if (linkModal && linkOrigin === origin && isOriginCurrent(origin)) linkSuggestTitles = t;
 		}).catch(() => {});
 		tick().then(() => {

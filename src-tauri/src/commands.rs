@@ -1017,50 +1017,48 @@ pub async fn get_all_note_titles(
 }
 
 fn scan_all_note_titles(vault_path: &str) -> Result<Vec<NoteTitleEntry>, String> {
+    use rayon::prelude::*;
+
     let vault = std::path::Path::new(vault_path);
     let hn_dir = operations::helixnotes_dir(vault_path);
-    let mut entries = Vec::new();
 
-    for entry in walkdir::WalkDir::new(vault)
+    let paths: Vec<PathBuf> = walkdir::WalkDir::new(vault)
         .into_iter()
         // Cross-platform exclusion (string "/.helixnotes/" checks miss Windows
         // backslash paths, which leaked .helixnotes/history snapshots in as dupes).
         .filter_entry(|e| !operations::is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
         .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        // Read frontmatter title, fallback to filename
-        let title = if let Ok(raw) = std::fs::read_to_string(path) {
-            crate::vault::frontmatter::extract_title(&raw).unwrap_or_else(|| {
-                path.file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string()
-            })
-        } else {
-            path.file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string()
-        };
+        .filter(|e| {
+            e.path().is_file() && e.path().extension().and_then(|x| x.to_str()) == Some("md")
+        })
+        .map(|e| e.into_path())
+        .collect();
 
-        // Store vault-relative path with forward slashes for cross-platform portability.
-        // Absolute paths (e.g. C:\Users\...) break when the vault is synced to another device.
-        let rel = path
-            .strip_prefix(vault)
-            .map(|r| r.to_string_lossy().replace('\\', "/").to_string())
-            .unwrap_or_else(|_| path.to_string_lossy().to_string());
+    // Only the frontmatter is needed, so read the note head in parallel instead of whole files.
+    Ok(paths
+        .par_iter()
+        .map(|path| {
+            // Read frontmatter title, fallback to filename
+            let title = operations::read_note_head(path)
+                .ok()
+                .and_then(|head| crate::vault::frontmatter::extract_title(&head))
+                .unwrap_or_else(|| {
+                    path.file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                });
 
-        entries.push(NoteTitleEntry { title, path: rel });
-    }
+            // Store vault-relative path with forward slashes for cross-platform portability.
+            // Absolute paths (e.g. C:\Users\...) break when the vault is synced to another device.
+            let rel = path
+                .strip_prefix(vault)
+                .map(|r| r.to_string_lossy().replace('\\', "/").to_string())
+                .unwrap_or_else(|_| path.to_string_lossy().to_string());
 
-    Ok(entries)
+            NoteTitleEntry { title, path: rel }
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -1096,65 +1094,109 @@ pub async fn get_graph_data(
         .map_err(|error| error.to_string())?
 }
 
+/// Wiki-link targets in `body`, in order, with `|alias`, `#heading` and `^block` removed and
+/// lowercased (inline scan, no regex).
+fn extract_wiki_links(body: &str) -> Vec<String> {
+    let mut links = Vec::new();
+    let bytes = body.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i + 1 < len {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            i += 2;
+            let start = i;
+            while i + 1 < len && !(bytes[i] == b']' && bytes[i + 1] == b']') {
+                i += 1;
+            }
+            if i + 1 < len {
+                let link_raw = &body[start..i];
+                let link = link_raw.split('|').next().unwrap_or(link_raw);
+                let link = link.split('#').next().unwrap_or(link);
+                let link = link.split('^').next().unwrap_or(link);
+                links.push(link.trim().to_lowercase());
+                i += 2;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    links
+}
+
 fn scan_graph_data(vault_path: &str) -> Result<crate::types::GraphData, String> {
+    use rayon::prelude::*;
     use std::collections::{HashMap, HashSet};
 
     let vault = std::path::Path::new(vault_path);
+    let hn_dir = operations::helixnotes_dir(vault_path);
+
+    // Collect every note path first. Cross-platform exclusion (string "/.helixnotes/" checks miss
+    // Windows backslash paths; is_hidden also covers .stversions/.stfolder/.trash/.git).
+    let candidates: Vec<PathBuf> = walkdir::WalkDir::new(vault)
+        .into_iter()
+        .filter_entry(|e| !operations::is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
+        .filter_map(|e| e.ok())
+        .filter(|entry| {
+            let path = entry.path();
+            path.is_file()
+                && path.extension().and_then(|e| e.to_str()) == Some("md")
+                // Skip Syncthing conflict files
+                && !path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| name.contains(".sync-conflict-"))
+        })
+        .map(|entry| entry.into_path())
+        .collect();
+
+    // Deduplicate by canonical path (handles symlinks), keeping the first of each in walk order.
+    let canonical: Vec<String> = candidates
+        .par_iter()
+        .map(|path| {
+            path.canonicalize()
+                .unwrap_or_else(|_| path.clone())
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+    let mut seen_paths: HashSet<String> = HashSet::new();
+    let paths: Vec<&PathBuf> = candidates
+        .iter()
+        .zip(canonical)
+        .filter_map(|(path, canonical)| seen_paths.insert(canonical).then_some(path))
+        .collect();
+
+    // Read each note once, in parallel, and keep only its title and links so note bodies
+    // never accumulate in memory.
+    let scanned: Vec<(String, Vec<String>)> = paths
+        .par_iter()
+        .map(|path| {
+            let raw = std::fs::read_to_string(path).unwrap_or_default();
+            // Fast title extraction: scan for "title: " line in frontmatter without full YAML parse
+            let title = extract_title_fast(&raw).unwrap_or_else(|| {
+                path.file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            });
+            (title, extract_wiki_links(&raw))
+        })
+        .collect();
 
     // Pass 1: collect ALL notes as nodes (no title deduplication - every note must appear)
-    let mut graph_nodes = Vec::new();
+    let mut graph_nodes = Vec::with_capacity(paths.len());
     // title → list of node indices (one title can map to multiple notes in different folders)
     let mut title_to_idxs: HashMap<String, Vec<usize>> = HashMap::new();
     // vault-relative path without extension → idx (for [[subfolder/note]] style links)
     let mut relpath_to_idx: HashMap<String, usize> = HashMap::new();
-    // absolute path → idx (for fast active-note lookup)
-    let mut path_to_idx: HashMap<String, usize> = HashMap::new();
-    let mut seen_paths: HashSet<String> = HashSet::new();
-    let mut contents: Vec<String> = Vec::new();
+    let mut links_by_source: Vec<Vec<String>> = Vec::with_capacity(paths.len());
 
-    let hn_dir = operations::helixnotes_dir(vault_path);
-    for entry in walkdir::WalkDir::new(vault)
-        .into_iter()
-        // Cross-platform exclusion (string "/.helixnotes/" checks miss Windows
-        // backslash paths; is_hidden also covers .stversions/.stfolder/.trash/.git).
-        .filter_entry(|e| !operations::is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let path_str = path.to_string_lossy().to_string();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        // Skip Syncthing conflict files
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.contains(".sync-conflict-") {
-                continue;
-            }
-        }
-        // Deduplicate by canonical path (handles symlinks)
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let canonical_str = canonical.to_string_lossy().to_string();
-        if !seen_paths.insert(canonical_str) {
-            continue;
-        }
-
-        let raw = std::fs::read_to_string(path).unwrap_or_default();
-
-        // Fast title extraction: scan for "title: " line in frontmatter without full YAML parse
-        let title = extract_title_fast(&raw).unwrap_or_else(|| {
-            path.file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string()
-        });
-
+    for (path, (title, links)) in paths.iter().zip(scanned) {
         let idx = graph_nodes.len();
-        let title_lower = title.to_lowercase();
-        title_to_idxs.entry(title_lower).or_default().push(idx);
-        path_to_idx.insert(path_str.clone(), idx);
+        title_to_idxs
+            .entry(title.to_lowercase())
+            .or_default()
+            .push(idx);
 
         // Also index by vault-relative path without extension (e.g. "subfolder/note name")
         if let Ok(rel) = path.strip_prefix(vault) {
@@ -1169,12 +1211,12 @@ fn scan_graph_data(vault_path: &str) -> Result<crate::types::GraphData, String> 
 
         graph_nodes.push(crate::types::GraphNode {
             title,
-            path: path_str,
+            path: path.to_string_lossy().to_string(),
         });
-        contents.push(raw);
+        links_by_source.push(links);
     }
 
-    // Pass 2: extract edges from wiki-links (inline scan, no regex)
+    // Pass 2: resolve wiki-links to edges
     // edge_map: (src, tgt) → index in edges vec, used to detect reverse links
     let mut edges: Vec<crate::types::GraphEdge> = Vec::new();
     let mut edge_map: HashMap<(usize, usize), usize> = HashMap::new();
@@ -1203,47 +1245,25 @@ fn scan_graph_data(vault_path: &str) -> Result<crate::types::GraphData, String> 
         }
     };
 
-    for (source_idx, body) in contents.iter().enumerate() {
-        let bytes = body.as_bytes();
-        let len = bytes.len();
-        let mut i = 0;
-        while i + 1 < len {
-            if bytes[i] == b'[' && bytes[i + 1] == b'[' {
-                i += 2;
-                let start = i;
-                while i + 1 < len && !(bytes[i] == b']' && bytes[i + 1] == b']') {
-                    i += 1;
+    for (source_idx, links) in links_by_source.iter().enumerate() {
+        for link in links {
+            // 1. Try vault-relative path match (e.g. "arkhost/note name")
+            if let Some(&target_idx) = relpath_to_idx.get(link) {
+                add_edge(&mut edges, &mut edge_map, source_idx, target_idx);
+            } else if let Some(targets) = title_to_idxs.get(link) {
+                // 2. Title match - connect to all notes with this title
+                for &target_idx in targets {
+                    add_edge(&mut edges, &mut edge_map, source_idx, target_idx);
                 }
-                if i + 1 < len {
-                    let link_raw = &body[start..i];
-                    // Strip |alias, #heading, ^block
-                    let link = link_raw.split('|').next().unwrap_or(link_raw);
-                    let link = link.split('#').next().unwrap_or(link);
-                    let link = link.split('^').next().unwrap_or(link);
-                    let link = link.trim().to_lowercase();
-
-                    // 1. Try vault-relative path match (e.g. "arkhost/note name")
-                    if let Some(&target_idx) = relpath_to_idx.get(&link) {
-                        add_edge(&mut edges, &mut edge_map, source_idx, target_idx);
-                    } else if let Some(targets) = title_to_idxs.get(&link) {
-                        // 2. Title match - connect to all notes with this title
+            } else if link.contains('/') {
+                // 3. Path-based ref: try last segment as title fallback
+                if let Some(seg) = link.rsplit('/').next() {
+                    if let Some(targets) = title_to_idxs.get(seg) {
                         for &target_idx in targets {
                             add_edge(&mut edges, &mut edge_map, source_idx, target_idx);
                         }
-                    } else if link.contains('/') {
-                        // 3. Path-based ref: try last segment as title fallback
-                        if let Some(seg) = link.rsplit('/').next() {
-                            if let Some(targets) = title_to_idxs.get(seg) {
-                                for &target_idx in targets {
-                                    add_edge(&mut edges, &mut edge_map, source_idx, target_idx);
-                                }
-                            }
-                        }
                     }
-                    i += 2;
                 }
-            } else {
-                i += 1;
             }
         }
     }
@@ -1384,6 +1404,120 @@ fn parse_note_tasks(note_path: &str, note_title: &str, body: &str) -> Vec<TaskIt
         });
     }
     tasks
+}
+
+#[cfg(test)]
+mod note_title_scan_tests {
+    use super::scan_all_note_titles;
+    use std::fs;
+
+    #[test]
+    fn titles_come_from_complete_frontmatter_with_filename_fallback_and_relative_paths() {
+        let parent = tempfile::tempdir().unwrap();
+        let vault = parent.path().join("vault");
+        fs::create_dir(&vault).unwrap();
+        let tags = (0..200)
+            .map(|index| format!("tag-{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        fs::create_dir_all(vault.join("Notebook/.helixnotes")).unwrap();
+        fs::create_dir_all(vault.join(".helixnotes/history")).unwrap();
+        fs::write(
+            vault.join("Notebook/Long.md"),
+            format!("---\ntags: [{tags}]\ntitle: Long Title\n---\n# Long Title\n"),
+        )
+        .unwrap();
+        fs::write(vault.join("Plain.md"), "# No frontmatter\n").unwrap();
+        fs::write(
+            vault.join(".helixnotes/history/Old.md"),
+            "---\ntitle: Old\n---\n",
+        )
+        .unwrap();
+        fs::write(vault.join("Other.txt"), "---\ntitle: Skip\n---\n").unwrap();
+
+        let mut titles = scan_all_note_titles(vault.to_str().unwrap()).unwrap();
+        titles.sort_by(|a, b| a.path.cmp(&b.path));
+        let found: Vec<_> = titles
+            .iter()
+            .map(|t| (t.path.as_str(), t.title.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [("Notebook/Long.md", "Long Title"), ("Plain.md", "Plain")]
+        );
+    }
+}
+
+#[cfg(test)]
+mod graph_scan_tests {
+    use super::scan_graph_data;
+    use std::fs;
+
+    #[test]
+    fn graph_links_resolve_by_path_and_title_and_mark_reverse_links() {
+        let parent = tempfile::tempdir().unwrap();
+        let vault = parent.path().join("vault");
+        fs::create_dir_all(vault.join("folder")).unwrap();
+        fs::create_dir_all(vault.join("other")).unwrap();
+        fs::create_dir_all(vault.join(".helixnotes")).unwrap();
+        let write = |path: &str, text: &str| fs::write(vault.join(path), text).unwrap();
+        write("A.md", "---\ntitle: \"Alpha\"\n---\n[[Beta]] [[folder/C|alias]] [[Twin#Head]] [[missing]] [[unterminated");
+        write(
+            "B.md",
+            "---\ntitle: Beta\n---\nback to [[alpha]] and [[Beta]] and [[nested/ghost/Beta]]",
+        );
+        write("folder/C.md", "---\ntitle: Gamma\n---\n[[A^block]]");
+        write("folder/Twin.md", "---\ntitle: Twin\n---\n");
+        write("other/Twin.md", "---\ntitle: Twin\n---\n");
+        write("A.sync-conflict-20260101.md", "[[Beta]]");
+        write(".helixnotes/Hidden.md", "[[Beta]]");
+        write("ignored.txt", "[[Beta]]");
+
+        let graph = scan_graph_data(vault.to_str().unwrap()).unwrap();
+        let name = |index: usize| {
+            let node = &graph.nodes[index];
+            let relative = node.path.strip_prefix(vault.to_str().unwrap()).unwrap();
+            format!(
+                "{}|{}",
+                relative.trim_start_matches(['/', '\\']).replace('\\', "/"),
+                node.title
+            )
+        };
+        let mut nodes: Vec<_> = (0..graph.nodes.len()).map(name).collect();
+        nodes.sort();
+        assert_eq!(
+            nodes,
+            [
+                "A.md|Alpha",
+                "B.md|Beta",
+                "folder/C.md|Gamma",
+                "folder/Twin.md|Twin",
+                "other/Twin.md|Twin"
+            ]
+        );
+        let mut edges: Vec<_> = graph
+            .edges
+            .iter()
+            .map(|edge| {
+                let mut pair = [name(edge.source), name(edge.target)];
+                // Which side of a two-way link is stored first follows directory order.
+                if edge.bidirectional {
+                    pair.sort();
+                }
+                format!("{}>{}:{}", pair[0], pair[1], edge.bidirectional)
+            })
+            .collect();
+        edges.sort();
+        assert_eq!(
+            edges,
+            [
+                "A.md|Alpha>B.md|Beta:true",
+                "A.md|Alpha>folder/C.md|Gamma:true",
+                "A.md|Alpha>folder/Twin.md|Twin:false",
+                "A.md|Alpha>other/Twin.md|Twin:false",
+            ]
+        );
+    }
 }
 
 #[cfg(test)]

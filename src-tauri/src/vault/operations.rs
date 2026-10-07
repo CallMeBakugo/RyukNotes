@@ -606,12 +606,7 @@ fn read_note_entry(path: &Path, vault_root: &Path) -> Result<NoteEntry, String> 
 /// Persisted creation dates survive atomic file replacement.
 #[cfg(any(mobile, test))]
 fn read_note_entry_metadata_only(path: &Path, vault_root: &Path) -> Result<NoteEntry, String> {
-    // Read first 2KB - enough for frontmatter with tags, title, pinned
-    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut buf = vec![0u8; 2048];
-    let bytes_read = file.read(&mut buf).map_err(|e| e.to_string())?;
-    buf.truncate(bytes_read);
-    let raw = String::from_utf8_lossy(&buf);
+    let raw = read_note_head(path)?;
 
     let filename = path
         .file_name()
@@ -649,13 +644,54 @@ fn read_note_entry_metadata_only(path: &Path, vault_root: &Path) -> Result<NoteE
     })
 }
 
-/// Fast version: reads only the first ~2KB of the file (enough for frontmatter + preview).
-pub(crate) fn read_note_entry_fast(path: &Path, vault_root: &Path) -> Result<NoteEntry, String> {
+const NOTE_HEAD_BLOCK: usize = 2048;
+const NOTE_HEAD_LIMIT: usize = 256 * 1024;
+
+/// Where the YAML frontmatter stands within a partially read note: `None` when the note has
+/// none, `Some(None)` while the closing delimiter is still unread, else the offset after it.
+fn frontmatter_state(head: &[u8]) -> Option<Option<usize>> {
+    let rest = head.strip_prefix(b"---")?;
+    if !matches!(rest.first(), None | Some(b'\n' | b'\r')) {
+        return None;
+    }
+    let mut offset = 3;
+    for line in head[3..].split_inclusive(|byte| *byte == b'\n') {
+        offset += line.len();
+        if line.ends_with(b"\n") && line.trim_ascii_end() == b"---" {
+            return Some(Some(offset));
+        }
+    }
+    Some(None)
+}
+
+/// Reads the start of a note: its whole frontmatter plus a block of body for previews, instead
+/// of a fixed prefix that truncates long frontmatter and loses its title and tags.
+pub(crate) fn read_note_head(path: &Path) -> Result<String, String> {
     let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut buf = vec![0u8; 2048];
-    let bytes_read = file.read(&mut buf).map_err(|e| e.to_string())?;
-    buf.truncate(bytes_read);
-    let raw = String::from_utf8_lossy(&buf);
+    let mut head = Vec::with_capacity(NOTE_HEAD_BLOCK);
+    let mut target = NOTE_HEAD_BLOCK;
+    loop {
+        let wanted = target - head.len();
+        (&mut file)
+            .take(wanted as u64)
+            .read_to_end(&mut head)
+            .map_err(|e| e.to_string())?;
+        if head.len() < target || head.len() >= NOTE_HEAD_LIMIT {
+            break;
+        }
+        target = match frontmatter_state(&head) {
+            None => break,
+            Some(None) => (head.len() * 2).min(NOTE_HEAD_LIMIT),
+            Some(Some(end)) if head.len() >= end + NOTE_HEAD_BLOCK => break,
+            Some(Some(end)) => end + NOTE_HEAD_BLOCK,
+        };
+    }
+    Ok(String::from_utf8_lossy(&head).into_owned())
+}
+
+/// Fast version: reads the frontmatter and the start of the body (enough for a preview).
+pub(crate) fn read_note_entry_fast(path: &Path, vault_root: &Path) -> Result<NoteEntry, String> {
+    let raw = read_note_head(path)?;
     read_note_entry_from_str(&raw, path, vault_root)
 }
 
@@ -1675,15 +1711,11 @@ pub fn get_all_tags(vault_path: &str) -> Result<Vec<(String, usize)>, String> {
         .map(|e| e.path().to_path_buf())
         .collect();
 
-    // Read frontmatter in parallel (only need tags, so partial read is fine)
+    // Read frontmatter in parallel (only need tags, so the body is not read)
     let all_tags: Vec<Vec<String>> = md_files
         .par_iter()
         .filter_map(|path| {
-            let mut file = fs::File::open(path).ok()?;
-            let mut buf = vec![0u8; 1024]; // Tags are in frontmatter, 1KB is plenty
-            let n = file.read(&mut buf).ok()?;
-            buf.truncate(n);
-            let raw = String::from_utf8_lossy(&buf);
+            let raw = read_note_head(path).ok()?;
             let filename = path.file_name()?.to_string_lossy().to_string();
             let (meta, _) = frontmatter::parse_note(&raw, &filename);
             Some(meta.tags)
@@ -3562,6 +3594,68 @@ mod tests {
         assert!(restore_notebook(vault_path, notebook.to_str().unwrap()).is_err());
         assert!(notebook.join("Keep.md").exists());
         assert!(!outside.join("Stashed").exists());
+    }
+
+    #[test]
+    fn header_reads_keep_metadata_when_frontmatter_exceeds_the_first_block() {
+        let vault = tempfile::tempdir().unwrap();
+        let tags: Vec<String> = (0..120)
+            .map(|index| format!("long-tag-name-{index}"))
+            .collect();
+        let raw = format!(
+            "---\nid: existing\ntitle: Long Frontmatter\ntags: [{}]\n---\n# Long Frontmatter\n\nBody.\n",
+            tags.join(", ")
+        );
+        assert!(raw.find("\n---\n#").unwrap() > 2048);
+        fs::write(vault.path().join("Long.md"), raw).unwrap();
+
+        let entry =
+            super::read_note_entry_fast(&vault.path().join("Long.md"), vault.path()).unwrap();
+        assert_eq!(entry.meta.title, "Long Frontmatter");
+        assert_eq!(entry.meta.tags, tags);
+        let counted = super::get_all_tags(vault.path().to_str().unwrap()).unwrap();
+        assert_eq!(counted.len(), tags.len());
+    }
+
+    #[test]
+    fn note_head_stops_after_frontmatter_and_one_body_block() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().join("Note.md");
+        let tags = (0..400)
+            .map(|i| format!("tag-{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for newline in ["\n", "\r\n"] {
+            let body = "x".repeat(100_000);
+            let raw = format!("---{newline}tags: [{tags}]{newline}---{newline}{body}");
+            fs::write(&path, &raw).unwrap();
+            let head = super::read_note_head(&path).unwrap();
+            let end = raw.find(&format!("{newline}---{newline}")).unwrap() + newline.len() * 2 + 3;
+            assert!(head.len() >= end + 2048 && head.len() < end + 2 * 2048);
+            assert!(raw.starts_with(&head));
+        }
+    }
+
+    #[test]
+    fn note_head_without_frontmatter_reads_one_block_and_unterminated_is_capped() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().join("Note.md");
+        fs::write(&path, "# Title\n".to_string() + &"y".repeat(50_000)).unwrap();
+        assert_eq!(super::read_note_head(&path).unwrap().len(), 2048);
+        fs::write(
+            &path,
+            "---\ntitle: Open\n".to_string() + &"z\n".repeat(300_000),
+        )
+        .unwrap();
+        assert_eq!(super::read_note_head(&path).unwrap().len(), 256 * 1024);
+        fs::write(
+            &path,
+            "---not frontmatter\n".to_string() + &"y".repeat(50_000),
+        )
+        .unwrap();
+        assert_eq!(super::read_note_head(&path).unwrap().len(), 2048);
+        fs::write(&path, "---\n---\nShort").unwrap();
+        assert_eq!(super::read_note_head(&path).unwrap(), "---\n---\nShort");
     }
 
     #[test]
