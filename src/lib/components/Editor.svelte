@@ -28,7 +28,7 @@
 	import { Extension, Node as TiptapNode, Mark as TiptapMark, mergeAttributes } from '@tiptap/core';
 	import { Plugin, PluginKey, EditorState, Selection, TextSelection } from '@tiptap/pm/state';
 	import { Decoration, DecorationSet } from '@tiptap/pm/view';
-	import { DOMSerializer, type Node as ProseMirrorNode } from '@tiptap/pm/model';
+	import { DOMParser as PMDOMParser, DOMSerializer, type Node as ProseMirrorNode } from '@tiptap/pm/model';
 	import { convertFileSrc } from '@tauri-apps/api/core';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { readFile } from '@tauri-apps/plugin-fs';
@@ -109,6 +109,14 @@
 				'Mod-Shift-8': () => toggleBulletList(),
 				'Mod-Shift-9': () => toggleTaskList(),
 			};
+		},
+	});
+	// While a very large note is still being built in slices, its document is partial. Nothing may edit
+	// it then; a user action first finishes the build (see loadDocumentProgressively).
+	const ProgressiveLoadGuard = Extension.create({
+		name: 'progressiveLoadGuard',
+		addProseMirrorPlugins() {
+			return [new Plugin({ key: new PluginKey('progressiveLoadGuard'), filterTransaction: (tr) => !(progressiveLoad && tr.docChanged) })];
 		},
 	});
 	function hasInlineCode(node: ProseMirrorNode): boolean {
@@ -3858,6 +3866,7 @@
 	}
 
 	export function loadNote(path: string, content: string, taskTarget?: TaskRecord) {
+		cancelProgressiveLoad();
 		endToolbarCustomization();
 		clearOutline();
 		cancelCounts();
@@ -3914,24 +3923,36 @@
 		} else if (editorElement && editor) {
 			// Editor already exists, just swap content
 			const html = markdownToHtml(content);
+			const settle = () => {
+				updateCounts();
+				// Restore scroll and reset the cursor after all ProseMirror/Svelte DOM updates settle.
+				tick().then(() => {
+					if (!saves.isCurrentSession(loadSnapshot) || path !== loadedPath) return;
+					if (editorBody) restoreNoteScroll(editorBody, scrollPosition?.rich ?? 0, path);
+					// Explicitly reset ProseMirror selection to start so TipTap's focus()
+					// (triggered by checkbox clicks etc.) doesn't scroll to the old note's cursor position.
+					if (editor) {
+						const tr = editor.state.tr.setSelection(TextSelection.atStart(editor.state.doc));
+						// No tr.scrollIntoView() - must not trigger any scroll
+						editor.view.dispatch(tr);
+					}
+					isLoadingNote = false;
+				});
+			};
+			if (content.length > LARGE_DOC_CHARS) {
+				// Very large note: show the start at once and build the rest in slices.
+				loadDocumentProgressively(html, () => {
+					settle();
+					if (showOutline) updateOutline();
+					scheduleTaskReveal(path, revealTarget, revealRequest);
+				});
+				return;
+			}
 			ignoreNextUpdate = true;
 			editor.commands.setContent(html);
 			// Clear undo/redo history so it doesn't bleed across notes
 			clearEditorHistory();
-			updateCounts();
-			// Restore scroll and reset the cursor after all ProseMirror/Svelte DOM updates settle.
-			tick().then(() => {
-				if (!saves.isCurrentSession(loadSnapshot) || path !== loadedPath) return;
-				if (editorBody) restoreNoteScroll(editorBody, scrollPosition?.rich ?? 0, path);
-				// Explicitly reset ProseMirror selection to start so TipTap's focus()
-				// (triggered by checkbox clicks etc.) doesn't scroll to the old note's cursor position.
-				if (editor) {
-					const tr = editor.state.tr.setSelection(TextSelection.atStart(editor.state.doc));
-					// No tr.scrollIntoView() - must not trigger any scroll
-					editor.view.dispatch(tr);
-				}
-				isLoadingNote = false;
-			});
+			settle();
 		} else {
 			// Editor element not in DOM yet (first note load).
 			// Store content and let the $effect on editorElement handle init.
@@ -3940,6 +3961,88 @@
 		}
 		if (showOutline) updateOutline();
 		scheduleTaskReveal(path, revealTarget, revealRequest);
+	}
+
+	// ---- Progressive loading of very large notes
+	// Building the page for a few hundred KB of Markdown in one go freezes it for about half a second.
+	// Instead the document is built in slices, the first screen at once. Until it is complete the
+	// document is partial: the guard plugin rejects edits to it, and any interaction with the editor,
+	// or anything that serializes it, first finishes the build synchronously.
+	const FIRST_SLICE_BLOCKS = 40;
+	const SLICE_BLOCKS = 150;
+	const LOAD_INTERRUPTS = ['keydown', 'beforeinput', 'compositionstart', 'paste', 'cut', 'drop', 'pointerdown'] as const;
+	let progressiveLoad: { finish: () => void; cancel: () => void } | null = null;
+
+	function cancelProgressiveLoad() {
+		progressiveLoad?.cancel();
+	}
+
+	function finishProgressiveLoad() {
+		progressiveLoad?.finish();
+	}
+
+	function loadDocumentProgressively(html: string, whenLoaded: () => void) {
+		const view = editor!.view;
+		const schema = editor!.schema;
+		const plugins = editor!.state.plugins;
+		const nodes = Array.from(new DOMParser().parseFromString(`<body>${html}</body>`, 'text/html').body.childNodes);
+		const parser = PMDOMParser.fromSchema(schema);
+		const blocks: ProseMirrorNode[] = [];
+		let next = 0;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let rendered: ProseMirrorNode | null = null;
+
+		let dirty = false;
+		const addSlice = (count: number) => {
+			dirty = true;
+			const container = document.createElement('div');
+			for (const node of nodes.slice(next, next + count)) container.append(node);
+			next += count;
+			parser.parse(container).forEach((block) => blocks.push(block));
+		};
+		const render = () => {
+			if (!dirty) return;
+			dirty = false;
+			// updateState does not run plugins' appendTransaction, so no stray trailing paragraph appears mid-note.
+			view.updateState(EditorState.create({ doc: schema.topNodeType.create(null, blocks), plugins }));
+			rendered = view.state.doc;
+		};
+		const interrupt = (event: Event) => {
+			// Only interaction with the editor itself (its text, toolbar and menus) counts, not choosing another note.
+			if (event.target instanceof Element && event.target.closest('.editor-container')) finish();
+		};
+		const stop = () => {
+			clearTimeout(timer);
+			for (const type of LOAD_INTERRUPTS) window.removeEventListener(type, interrupt, true);
+			if (progressiveLoad === handle) progressiveLoad = null;
+		};
+		const finish = () => {
+			if (progressiveLoad !== handle) return;
+			if (view.state.doc === rendered && !view.isDestroyed) {
+				while (next < nodes.length) addSlice(SLICE_BLOCKS);
+				render();
+			}
+			stop();
+			// TipTap normalizes a new document on its first transaction (a trailing paragraph); run it now.
+			ignoreNextUpdate = true;
+			if (!view.isDestroyed) view.dispatch(view.state.tr);
+			ignoreNextUpdate = false;
+			whenLoaded();
+		};
+		const step = () => {
+			if (progressiveLoad !== handle) return;
+			if (view.state.doc !== rendered) { finish(); return; }  // something else replaced the document
+			// Each render re-walks everything already built, so slices double in size: few renders, no long freeze.
+			addSlice(Math.max(SLICE_BLOCKS, next));
+			render();
+			if (next < nodes.length) timer = setTimeout(step, 0); else finish();
+		};
+		const handle = { finish, cancel: stop };
+		progressiveLoad = handle;
+		addSlice(FIRST_SLICE_BLOCKS);
+		render();
+		for (const type of LOAD_INTERRUPTS) window.addEventListener(type, interrupt, true);
+		if (next < nodes.length) timer = setTimeout(step, 0); else finish();
 	}
 
 	function stripTitleH1(md: string): string {
@@ -3954,6 +4057,7 @@
 
 	function editorToMarkdown(): string {
 		if (!editor) return '';
+		finishProgressiveLoad();
 		const md = prosemirrorToMarkdown(editor.state.doc);
 		return restoreTitleH1(md);
 	}
@@ -5049,6 +5153,7 @@
 	function destroyEditor() {
 		if (!$sourceMode) clearOutline();
 		saves.cancelScheduled();
+		cancelProgressiveLoad();
 		if (editor) {
 			editor.destroy();
 			editor = null;
@@ -5061,6 +5166,7 @@
 
 	function createEditor(content: string) {
 		if (!editorElement) return;
+		cancelProgressiveLoad();
 		if (editor) {
 			editor.destroy();
 			editor = null;
@@ -5076,6 +5182,7 @@
 			editable: !$readOnly,
 			extensions: [
 				MixedListShortcuts,
+				ProgressiveLoadGuard,
 				EditorStarterKit.configure({ code: { HTMLAttributes: { style: 'white-space: pre-wrap' } }, codeBlock: false, link: false, underline: false }),
 				FocusedPlaceholder,
 				TaskList,
@@ -6680,6 +6787,7 @@
 	window.addEventListener('helixnotes-open-note', handleOpenNote);
 
 	onDestroy(() => {
+		cancelProgressiveLoad();
 		void flushSave();
 		closeAiMenu();
 		endToolbarCustomization();
