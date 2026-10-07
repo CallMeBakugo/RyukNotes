@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { tick } from 'svelte';
 	import SnapshotDocument from './SnapshotDocument.svelte';
-	import { compareHistory, splitSnapshot, type HistoryComparison, type HistoryRow } from '$lib/utils/history-comparison';
+	import { comparableBody, compareHistory, splitSnapshot, type HistoryComparison, type HistoryRow } from '$lib/utils/history-comparison';
 
 	let { raw, current, selected, loading, error, canRestore, onRetry, onRestore, renderSnapshot }: {
 		raw: string | null;
@@ -40,7 +40,7 @@
 		comparisonError = null;
 		comparing = content !== null;
 		if (content !== null) {
-			compareHistory(working, body).then((result) => {
+			compareHistory(comparableBody(working), comparableBody(body)).then((result) => {
 				if (generation !== request) return;
 				comparison = result;
 			}).catch((cause) => {

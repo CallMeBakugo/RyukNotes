@@ -19,6 +19,36 @@ function backtickDelimiter(text: string, minimum: number): string {
   return '`'.repeat(length);
 }
 
+export interface MarkdownBlock {
+  text: string;
+  isImage: boolean;
+  /** An empty paragraph, which is kept as a marker line so its vertical space round-trips. */
+  isEmpty?: boolean;
+}
+
+const EMPTY_PARAGRAPH_MARKER = '<!-- -->';
+
+/**
+ * Join serialized top-level blocks into a note body. Blocks that already end in a blank line
+ * (lists) get no extra separator, and an empty paragraph directly before an image is written as
+ * the blank line the parser turns back into that paragraph, not as a marker glued to the image.
+ */
+export function joinMarkdownBlocks(blocks: readonly MarkdownBlock[]): string {
+  const entries = [...blocks];
+  while (entries.length > 0 && entries[entries.length - 1].isEmpty) entries.pop();
+  let result = '';
+  entries.forEach((entry, index) => {
+    if (entry.isEmpty && entries[index + 1]?.isImage) {
+      if (index > 0 && !result.endsWith('\n\n')) result += result.endsWith('\n') ? '\n' : '\n\n';
+      return;
+    }
+    const text = entry.isEmpty ? EMPTY_PARAGRAPH_MARKER : entry.text;
+    // Images follow their predecessor directly; every other block needs a blank line before it.
+    result += index === 0 ? text : (entry.isImage || result.endsWith('\n\n') ? '' : '\n') + text;
+  });
+  return result.trim() + '\n';
+}
+
 export function serializeCodeBlock(code: string, language: string = ''): string {
   const fence = backtickDelimiter(code, 3);
   return `${fence}${language}\n${code}\n${fence}\n`;

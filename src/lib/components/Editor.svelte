@@ -58,7 +58,7 @@
 	import { clearFormatting } from '$lib/editor/clearFormatting';
 	import { toolbarLabels, resolveToolbarLayout, groupToolbarButtons, moveToolbarButton, toolbarLayoutPreference, type ToolbarButtonId, type ToolbarArea, type ResolvedToolbarLayout } from '$lib/editor/toolbar';
 	import { buildCodeCopyDecorations, buildTaskMetaDecorations, focusedPlaceholderDecorations } from '$lib/editor/decorations';
-	import { serializeInlineMarkdown, serializeCodeBlock } from '$lib/editor/markdown';
+	import { serializeInlineMarkdown, serializeCodeBlock, joinMarkdownBlocks, type MarkdownBlock } from '$lib/editor/markdown';
 	import { restoreTitleHeading, stripTitleHeading, type HiddenTitleHeading } from '$lib/editor/titleVisibility';
 	import { documentHeadings, sourceHeadings, activeHeadingIndex, mapDocumentHeadings, mapSourceHeadings, type OutlineHeading } from '$lib/editor/outline';
 	import { createEditorMarkdownParser } from '$lib/editor/markdownParser';
@@ -3956,31 +3956,15 @@
 	}
 
 	function prosemirrorToMarkdown(doc: any): string {
-		const entries: { text: string; isImage: boolean }[] = [];
+		const blocks: MarkdownBlock[] = [];
 		doc.forEach((node: any) => {
+			// Preserve every empty paragraph so markdown round-trip keeps the user's vertical
+			// spacing exactly. The parser converts the marker (or a blank line before an image)
+			// back to <p></p> on load.
 			const isEmpty = node.type.name === 'paragraph' && node.childCount === 0;
-			// Preserve every empty paragraph as <!-- --> so markdown round-trip keeps the user's
-			// vertical spacing exactly. markdownToHtml converts the marker back to <p></p> on load.
-			if (isEmpty) {
-				entries.push({ text: '<!-- -->', isImage: false });
-				return;
-			}
-			entries.push({ text: serializeNode(node), isImage: isImageNode(node) });
+			blocks.push({ text: isEmpty ? '' : serializeNode(node), isImage: !isEmpty && isImageNode(node), isEmpty });
 		});
-		while (entries.length > 0 && entries[entries.length - 1].text === '<!-- -->') {
-			entries.pop();
-		}
-		// Join: skip extra \n separator before image nodes so they don't get unwanted blank lines
-		let result = '';
-		for (let i = 0; i < entries.length; i++) {
-			if (i === 0) {
-				result = entries[i].text;
-			} else {
-				const separator = entries[i].isImage ? '' : '\n';
-				result += separator + entries[i].text;
-			}
-		}
-		return result.trim() + '\n';
+		return joinMarkdownBlocks(blocks);
 	}
 
 	function tableToMarkdown(table: any): string {

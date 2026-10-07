@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { compareHistory, splitSnapshot } from './history-comparison.ts';
+import { comparableBody, compareHistory, splitSnapshot } from './history-comparison.ts';
 
 function rowsOf(comparison) {
   return comparison.chunks.flatMap((chunk) => chunk.rows);
@@ -258,4 +258,37 @@ test('large notes preserve hidden content as well as an appended snapshot line',
   assert.deepEqual(comparison.chunks.map((chunk) => [chunk.kind, chunk.rows.length]), [
     ['unchanged', 2997], ['lines', 4],
   ]);
+});
+
+test('comparable bodies ignore only leading and trailing blank lines', () => {
+  assert.equal(comparableBody(''), '');
+  assert.equal(comparableBody('\n\n'), '');
+  assert.equal(comparableBody('body'), 'body\n');
+  assert.equal(comparableBody('\n\n# T\nbody\n\n'), '# T\nbody\n');
+  assert.equal(comparableBody('\r\n# T\r\nbody\r\n'), '# T\r\nbody\n');
+  assert.equal(comparableBody('a\n\n\nb'), 'a\n\n\nb\n');
+  assert.equal(comparableBody(comparableBody('x\n')), 'x\n');
+});
+
+test('a stripped current body matches a snapshot that keeps its file whitespace', async () => {
+  // The app hands the review the note body without edge newlines; the stored snapshot keeps them.
+  const current = '# T\nbody';
+  for (const raw of [
+    '---\ntitle: T\n---\n# T\nbody\n',
+    '---\ntitle: T\n---\n\n# T\nbody\n',
+    '---\r\ntitle: T\r\n---\r\n\r\n# T\r\nbody\r\n',
+  ]) {
+    const comparison = await compareHistory(comparableBody(current), comparableBody(splitSnapshot(raw).body));
+    assert.equal(comparison.added, 0, JSON.stringify(raw));
+    assert.equal(comparison.removed, 0, JSON.stringify(raw));
+  }
+  const changed = await compareHistory(
+    comparableBody(current),
+    comparableBody(splitSnapshot('---\ntitle: T\n---\n# T\nedited\n').body),
+  );
+  assert.deepEqual([changed.added, changed.removed], [1, 1]);
+  assert.deepEqual(
+    rowsOf(changed).filter((row) => row.kind !== 'same').map((row) => [row.kind, row.text]),
+    [['removed', 'body'], ['added', 'edited']],
+  );
 });

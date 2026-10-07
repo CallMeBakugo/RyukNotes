@@ -165,3 +165,25 @@ test('code whitespace is marked for DOM import without changing soft or hard lin
   assert.match(html, /<p data-helix-code="">/);
   assert.match(html, /<\/code> next<br>last/);
 });
+
+test('a callout keeps a newline between its title line and body, while ordinary soft breaks stay spaces', () => {
+  assert.match(parser.render('> [!warning] Heads up\n> body here\n> more'), /\[!warning\] Heads up\nbody here more/);
+  assert.match(parser.render('> [!note]\n> body\n> more'), /\[!note\]\nbody more/);
+  assert.match(parser.render('> [!todo] Outer\n> > [!tip] Inner\n> > body'), /\[!todo\] Outer<\/p>[\s\S]*\[!tip\] Inner\nbody/);
+  assert.match(parser.render('> > [!tip] Inner\n> > body'), /\[!tip\] Inner\nbody/);
+  assert.match(parser.render('> plain\n> quote'), /plain quote/);
+  assert.match(parser.render('one\ntwo'), /one two/);
+  assert.match(parser.render('> [!tip] Title only'), /\[!tip\] Title only<\/p>/);
+});
+
+test('task markers only turn bullet-list items into tasks, never numbered items', () => {
+  const ordered = parser.render('1. [x] done\n2. [ ] todo\n3. plain');
+  assert.doesNotMatch(ordered, /data-type|data-checked/);
+  assert.match(ordered, /<li>\[x\] done<\/li>\s*<li>\[ \] todo<\/li>/);
+  const bullets = parser.render('- [x] done\n- [ ] todo');
+  assert.equal([...bullets.matchAll(/data-type="taskItem"/g)].length, 2);
+  assert.match(bullets, /<ul data-type="taskList">/);
+  const nested = parser.render('1. one\n   - [x] nested task');
+  assert.equal([...nested.matchAll(/data-type="taskItem"/g)].length, 1);
+  assert.doesNotMatch(nested, /<ol[^>]*data-type/);
+});

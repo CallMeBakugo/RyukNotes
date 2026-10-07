@@ -34,6 +34,16 @@ export function splitSnapshot(raw: string): { body: string; metadata: string } {
   return { body: raw.slice(bodyStart), metadata: raw.slice(0, bodyStart) };
 }
 
+/**
+ * Make two note bodies comparable. The note body the app loads has its leading and trailing
+ * blank lines removed, while a stored snapshot keeps the file's exact text, so differences in
+ * those lines are not changes the editor can show or restore.
+ */
+export function comparableBody(body: string): string {
+  const trimmed = body.replace(/^(?:\r?\n)+/, '').replace(/(?:\r?\n)+$/, '');
+  return trimmed === '' ? '' : trimmed + '\n';
+}
+
 /** Added/removed rows describe restoring the snapshot over the current editor body. */
 export async function compareHistory(
   currentBody: string,

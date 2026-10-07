@@ -243,12 +243,14 @@ export function createEditorMarkdownParser(): MarkdownIt {
         const list = lists[lists.length - 1];
         if (!list.item || !list.firstParagraph || token.level !== list.item.level + 2) continue;
         list.firstParagraph = false;
+        // Task items only exist in bullet lists; `1. [x] text` stays an ordinary numbered item.
+        if (list.open.type !== 'bullet_list_open') continue;
         const checkbox = token.content.match(/^\[(x| )\](?:[^\S\n]+|$)/u);
         if (!checkbox) continue;
         token.content = token.content.slice(checkbox[0].length);
         list.item.attrSet('data-type', 'taskItem');
         list.item.attrSet('data-checked', checkbox[1] === 'x' ? 'true' : 'false');
-        if (list.firstItem && list.open.type === 'bullet_list_open') list.open.attrSet('data-type', 'taskList');
+        if (list.firstItem) list.open.attrSet('data-type', 'taskList');
       }
     }
   });
@@ -281,6 +283,17 @@ export function createEditorMarkdownParser(): MarkdownIt {
       if (lines[line].startsWith('![') && lines[line - 1].trim() === '') paragraph.meta = { helixImageGap: true };
     }
   });
+  // Callout rendering splits the title line from the body at the first newline of the opening
+  // paragraph, so that one soft break must stay a newline instead of becoming a space.
+  md.core.ruler.after('inline', 'helix_callout_title', state => {
+    for (let index = 0; index + 2 < state.tokens.length; index++) {
+      const [quote, paragraph, inline] = [state.tokens[index], state.tokens[index + 1], state.tokens[index + 2]];
+      if (quote.type !== 'blockquote_open' || paragraph.type !== 'paragraph_open' || inline.type !== 'inline') continue;
+      if (!/^\[![\w-]+\]/u.test(inline.content)) continue;
+      const softbreak = inline.children?.find(child => child.type === 'softbreak');
+      if (softbreak) softbreak.meta = { helixCalloutTitle: true };
+    }
+  });
   md.renderer.rules.paragraph_open = (tokens, index, options, _env, renderer) =>
     (tokens[index].meta?.helixImageGap ? '<p></p>\n' : '') + renderer.renderToken(tokens, index, options);
 
@@ -308,7 +321,7 @@ export function createEditorMarkdownParser(): MarkdownIt {
     // Only the final structural LF is parser-added; leading and extra trailing blank lines are literal.
     return renderFence(tokens, index, options, env, renderer).replace(/\n<\/code>/u, '</code>');
   };
-  md.renderer.rules.softbreak = () => ' ';
+  md.renderer.rules.softbreak = (tokens, index) => (tokens[index].meta?.helixCalloutTitle ? '\n' : ' ');
   md.renderer.rules.hardbreak = () => '<br>';
   return md;
 }

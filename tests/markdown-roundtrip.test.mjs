@@ -14,7 +14,7 @@ const { code } = await transformWithEsbuild(source, 'markdown.ts', {
   format: 'esm',
   target: 'esnext'
 });
-const { serializeCodeBlock, serializeInlineMarkdown } = await import(
+const { joinMarkdownBlocks, serializeCodeBlock, serializeInlineMarkdown } = await import(
   `data:text/javascript;base64,${Buffer.from(code).toString('base64')}`
 );
 
@@ -360,4 +360,51 @@ test('splits contiguous code at link boundaries without losing code text or link
     editorMarkdown.render(serialized),
     '<p data-helix-code=""><code style="white-space: pre-wrap">`first</code><a href="https://example.com"><code style="white-space: pre-wrap">second`</code></a><a href="https://other.example"><code style="white-space: pre-wrap">third</code></a><code style="white-space: pre-wrap">last</code></p>\n'
   );
+});
+
+const block = (text) => ({ text, isImage: false });
+const image = { text: '![x](a.png)\n', isImage: true };
+const emptyParagraph = { text: '', isImage: false, isEmpty: true };
+
+test('joined blocks are separated by exactly one blank line, including after lists', () => {
+  assert.equal(joinMarkdownBlocks([block('one\n'), block('two\n')]), 'one\n\ntwo\n');
+  assert.equal(joinMarkdownBlocks([block('- a\n- b\n\n'), block('text\n')]), '- a\n- b\n\ntext\n');
+  assert.equal(joinMarkdownBlocks([block('- a\n\n'), block('1. b\n\n'), block('text\n')]), '- a\n\n1. b\n\ntext\n');
+  assert.equal(joinMarkdownBlocks([block('text\n'), block('- a\n\n')]), 'text\n\n- a\n');
+});
+
+test('empty paragraphs stay as marker lines between blocks and are dropped at the end', () => {
+  assert.equal(
+    joinMarkdownBlocks([block('a\n'), emptyParagraph, emptyParagraph, block('b\n'), emptyParagraph, emptyParagraph]),
+    'a\n\n<!-- -->\n<!-- -->\nb\n'
+  );
+  assert.equal(joinMarkdownBlocks([emptyParagraph]), '\n');
+});
+
+test('an empty paragraph before an image is written as a blank line that parses back to it', () => {
+  const gap = '<p></p>\n<p><img';
+  for (const before of [block('# T\n'), block('para\n'), block('- a\n\n'), block('```\ncode\n```\n')]) {
+    const joined = joinMarkdownBlocks([before, emptyParagraph, image, block('text\n')]);
+    assert.equal(joined, `${before.text.replace(/\n*$/, '\n')}\n![x](a.png)\n\ntext\n`, before.text);
+    assert.doesNotMatch(joined, /<!--/);
+    assert.ok(editorMarkdown.render(joined).includes(gap), joined);
+    // Saving what was just loaded must not change it.
+    assert.equal(joinMarkdownBlocks([before, emptyParagraph, image, block('text\n')]), joined);
+  }
+  // A second empty paragraph keeps its marker and still leaves a blank line before the image.
+  const twice = joinMarkdownBlocks([block('para\n'), emptyParagraph, emptyParagraph, image]);
+  assert.equal(twice, 'para\n\n<!-- -->\n\n![x](a.png)\n');
+  assert.equal(editorMarkdown.render(twice).match(/<p><\/p>/g)?.length, 2);
+});
+
+test('an image placed directly after a block stays directly after it', () => {
+  const joined = joinMarkdownBlocks([block('# T\n'), image]);
+  assert.equal(joined, '# T\n![x](a.png)\n');
+  assert.doesNotMatch(editorMarkdown.render(joined), /<p><\/p>/);
+});
+
+test('joining never collapses blank lines inside code blocks', () => {
+  const code = serializeCodeBlock('a\n\n\n\nb');
+  assert.equal(joinMarkdownBlocks([block(code), block('after\n')]), code + '\nafter\n');
+  assert.ok(joinMarkdownBlocks([block(code), block('after\n')]).includes('a\n\n\n\nb'));
 });
