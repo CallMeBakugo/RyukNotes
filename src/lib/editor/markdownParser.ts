@@ -342,20 +342,50 @@ const mathBlocks = MarkdownIt({ html: true });
 installMath(mathBlocks);
 mathBlocks.inline.ruler.before('link', 'helix_legacy_link', legacyLink);
 
+/**
+ * Inline tokens of each blank-line-separated block, parsed on its own like the editor does, with
+ * source ranges relative to the whole note. Inline syntax such as a code span cannot pair across
+ * blocks, so one stray backtick must not hide the links and formulas after it.
+ */
+function inlineTokensByBlock(source: string): Token[] {
+  const tokens: Token[] = [];
+  let start = 0;
+  let offset = 0;
+  const flush = (end: number) => {
+    if (end <= start) return;
+    const found: Token[] = [];
+    mathBlocks.inline.parse(source.slice(start, end), mathBlocks, {}, found);
+    for (const token of found) {
+      if (token.meta?.sourceHref) {
+        const { from, to } = token.meta.sourceHref;
+        token.meta = { ...token.meta, sourceHref: { from: from + start, to: to + start } };
+      } else if (token.type === 'helix_math_inline') {
+        token.meta = { ...token.meta, from: token.meta.from + start, to: token.meta.to + start };
+      }
+      tokens.push(token);
+    }
+  };
+  for (const line of source.split('\n')) {
+    if (/^[ \t\r]*$/.test(line)) {
+      flush(offset);
+      start = offset + line.length + 1;
+    }
+    offset += line.length + 1;
+  }
+  flush(source.length);
+  return tokens;
+}
+
 /** Source destinations for the editor's legacy space/title link compatibility. */
 export function legacyLinkRanges(source: string): { from: number; to: number }[] {
   if (!source.includes('](')) return [];
-  const tokens: Token[] = [];
-  mathBlocks.inline.parse(source, mathBlocks, {}, tokens);
-  return tokens.filter(token => token.meta?.sourceHref).map(token => token.meta.sourceHref);
+  return inlineTokensByBlock(source).filter(token => token.meta?.sourceHref).map(token => token.meta.sourceHref);
 }
 
 /** Inline math coordinates use the same delimiter and escape rules as rendering. */
 export function inlineMathRanges(source: string): { from: number; to: number }[] {
   if (!source.includes('$')) return [];
-  const tokens: Token[] = [];
-  mathBlocks.inline.parse(source, mathBlocks, {}, tokens);
-  return tokens.filter(token => token.type === 'helix_math_inline').map(token => token.meta);
+  return inlineTokensByBlock(source).filter(token => token.type === 'helix_math_inline').map(token => token.meta);
 }
 
 /** Source coordinates of semantic display-math blocks, including nested containers. */

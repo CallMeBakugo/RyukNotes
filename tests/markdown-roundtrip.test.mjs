@@ -14,7 +14,7 @@ const { code } = await transformWithEsbuild(source, 'markdown.ts', {
   format: 'esm',
   target: 'esnext'
 });
-const { joinMarkdownBlocks, serializeCodeBlock, serializeInlineMarkdown, serializeInlineMarkdownKeepingDollars } = await import(
+const { joinListItemBlocks, joinMarkdownBlocks, serializeCodeBlock, serializeInlineMarkdown, serializeInlineMarkdownKeepingDollars } = await import(
   `data:text/javascript;base64,${Buffer.from(code).toString('base64')}`
 );
 
@@ -474,4 +474,45 @@ test('fuzz: saving text and formulas keeps exactly what was written, whatever th
     const baseline = serializeInlineMarkdown(schema.node('paragraph', null, merged));
     assert.equal(readBack(saved), readBack(baseline), JSON.stringify({ saved, baseline, merged: authored(merged) }));
   }
+});
+
+const item = (text, isList = false) => ({ text, isList });
+
+test('blocks after a list item\'s first paragraph stay inside the item, separated by a blank line', () => {
+  assert.equal(joinListItemBlocks([item('only')]), 'only\n');
+  assert.equal(joinListItemBlocks([item('first'), item('second\n')]), 'first\n\n    second\n');
+  assert.equal(
+    joinListItemBlocks([item('step'), item('```sh\nrun\n\n\nagain\n```\n'), item('after\n')]),
+    'step\n\n    ```sh\n    run\n\n\n    again\n    ```\n\n    after\n',
+  );
+  assert.equal(joinListItemBlocks([item('quoted'), item('> a\n>\n> b\n')]), 'quoted\n\n    > a\n    >\n    > b\n');
+  assert.equal(joinListItemBlocks([item('first'), item('\n'), item('   \n'), item('real\n')]), 'first\n\n    real\n');
+});
+
+test('nested lists keep their direct four-space indentation under the item', () => {
+  assert.equal(joinListItemBlocks([item('a'), item('- b\n', true)]), 'a\n    - b\n');
+  assert.equal(joinListItemBlocks([item('a'), item('- b\n', true), item('```\nc\n```\n')]), 'a\n    - b\n\n    ```\n    c\n    ```\n');
+});
+
+test('joined list items parse back with their code, paragraphs and quotes still inside the item', () => {
+  for (const marker of ['- ', '1. ', '10. ', '- [ ] ']) {
+    const text = marker + joinListItemBlocks([item('step'), item('```js\nconst a = 1;\n\nconst b = 2;\n```\n'), item('more text\n'), item('> quoted\n')]);
+    const html = editorMarkdown.render(text + '- next\n');
+    const listItem = html.match(/<li[^>]*>[\s\S]*?<\/li>/)[0];
+    assert.match(listItem, /<pre><code[^>]*>const a = 1;\n\nconst b = 2;<\/code><\/pre>/, marker);
+    assert.match(listItem, /<p>more text<\/p>/, marker);
+    assert.match(listItem, /<blockquote>\s*<p>quoted<\/p>/, marker);
+    assert.equal(html.match(/<li[ >]/g).length, 2, `${marker}: the following item is a separate item`);
+  }
+});
+
+test('joining a very large note takes linear time', () => {
+  const blocks = Array.from({ length: 30000 }, (_, index) => block(`Paragraph ${index} with some words in it.\n`));
+  for (let index = 0; index < blocks.length; index += 200) blocks[index] = block('- a\n- b\n\n');
+  const started = performance.now();
+  const joined = joinMarkdownBlocks(blocks);
+  assert.ok(performance.now() - started < 500, 'building the note must not re-read the growing text for every block');
+  assert.ok(joined.startsWith('- a\n- b\n\nParagraph 1 with'));
+  assert.equal(joined.endsWith('Paragraph 29999 with some words in it.\n'), true);
+  assert.ok(!joined.includes('\n\n\n'));
 });

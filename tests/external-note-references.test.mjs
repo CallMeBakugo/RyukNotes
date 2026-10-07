@@ -80,3 +80,34 @@ test('escaped Markdown paths are decoded without consuming code examples or link
   assert.equal(ranges(raw)[0].href, 'files/report(1).pdf');
   assert.equal(ranges(raw)[0].original, 'files/report\\(1\\).pdf');
 });
+
+test('a stray backtick in one paragraph does not hide attachments in later paragraphs', () => {
+  const raw = 'a ` b\n\n![x](my pic.png)\n\nc ` d\n\n![y](plain.png)\n';
+  assert.deepEqual(ranges(raw).map(reference => [reference.href, reference.original]), [
+    ['my pic.png', 'my pic.png'], ['plain.png', 'plain.png']
+  ]);
+  // Real code spans still hide what they contain, and only within their own paragraph.
+  assert.deepEqual(ranges('`![x](code only.png)` then ![y](real one.png)\n\n![z](next one.png)\n').map(reference => reference.href),
+    ['real one.png', 'next one.png']);
+});
+
+test('byte offsets stay correct for legacy links after other blocks, blank lines and CRLF', () => {
+  for (const newline of ['\n', '\r\n']) {
+    const raw = `# Héllo${newline}${newline}text ${newline}${newline}  ${newline}![x](my pic.png)${newline}${newline}![y](other pic.png)${newline}`;
+    const found = ranges(raw);
+    assert.deepEqual(found.map(reference => reference.original), ['my pic.png', 'other pic.png'], JSON.stringify(newline));
+  }
+});
+
+test('indented images are imported because the editor never treats indented text as code', () => {
+  assert.deepEqual(ranges('para\n\n    ![x](a.png)\n').map(reference => reference.href), ['a.png']);
+  assert.deepEqual(ranges('para\n\n\t![x](b.png)\n').map(reference => reference.href), ['b.png']);
+  assert.deepEqual(ranges('- item\n\n      ![x](c.png)\n').map(reference => reference.href), ['c.png']);
+  // Fenced code stays literal, indented or not.
+  assert.deepEqual(ranges('```\n![x](a.png)\n```\n\n    ```\n    ![y](b.png)\n    ```\n'), []);
+});
+
+test('formulas after a stray backtick no longer hide attachments inside them', () => {
+  const raw = 'a ` b\n\n$![x](not a file.png)$\n\n![y](real file.png)\n';
+  assert.deepEqual(ranges(raw).map(reference => reference.href), ['real file.png']);
+});

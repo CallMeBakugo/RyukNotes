@@ -11,6 +11,10 @@ export interface ExternalNoteReference {
 }
 
 const markdown = createEditorMarkdownParser();
+// The editor never treats indented text as a code block, so an indented image is still an image here.
+const editorSyntax = (markdownLanguage.parser as unknown as {
+  configure(spec: { remove: string[] }): typeof markdownLanguage.parser;
+}).configure({ remove: ['IndentedCode'] });
 
 /** Byte ranges for local attachment destinations, without reserializing the user's Markdown. */
 export function externalNoteReferences(raw: string): ExternalNoteReference[] {
@@ -22,7 +26,7 @@ export function externalNoteReferences(raw: string): ExternalNoteReference[] {
   const math = [...displayMathRanges(body), ...inlineMathRanges(body)];
   const environment: { references?: Record<string, { href: string }> } = {};
   markdown.parse(body, environment);
-  const tree = markdownLanguage.parser.parse(body);
+  const tree = editorSyntax.parse(body);
   const usedLabels = new Set<string>();
   const label = (node: { from: number; to: number }) => markdown.utils.normalizeReference(body.slice(node.from + 1, node.to - 1));
   tree.iterate({ enter(node) {

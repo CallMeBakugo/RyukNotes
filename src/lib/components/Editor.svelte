@@ -58,7 +58,7 @@
 	import { clearFormatting } from '$lib/editor/clearFormatting';
 	import { toolbarLabels, resolveToolbarLayout, groupToolbarButtons, moveToolbarButton, toolbarLayoutPreference, type ToolbarButtonId, type ToolbarArea, type ResolvedToolbarLayout } from '$lib/editor/toolbar';
 	import { buildCodeCopyDecorations, buildTaskMetaDecorations, focusedPlaceholderDecorations } from '$lib/editor/decorations';
-	import { serializeInlineMarkdownKeepingDollars, serializeCodeBlock, joinMarkdownBlocks, type MarkdownBlock } from '$lib/editor/markdown';
+	import { serializeInlineMarkdownKeepingDollars, serializeCodeBlock, joinMarkdownBlocks, joinListItemBlocks, type ListItemBlock, type MarkdownBlock } from '$lib/editor/markdown';
 	import { restoreTitleHeading, stripTitleHeading, type HiddenTitleHeading } from '$lib/editor/titleVisibility';
 	import { documentHeadings, sourceHeadings, activeHeadingIndex, mapDocumentHeadings, mapSourceHeadings, type OutlineHeading } from '$lib/editor/outline';
 	import { createEditorMarkdownParser } from '$lib/editor/markdownParser';
@@ -578,7 +578,11 @@
 			if (element instanceof HTMLElement) {
 				for (let parent = element.parentElement; parent && parent !== editor.view.dom; parent = parent.parentElement) {
 					if (parent.matches('[data-type="details"]')) openDetailsEl(parent);
-					else if (parent.matches('.callout.is-folded')) parent.classList.remove('is-folded');
+					else if (parent.matches('.callout.is-folded')) {
+						// Reveal without changing the saved fold state; the node view keeps it open while it lives.
+						parent.setAttribute('data-revealed', '');
+						parent.classList.remove('is-folded');
+					}
 				}
 			}
 			editor.commands.setTextSelection(target.pos + 1);
@@ -1348,7 +1352,7 @@
 				const apply = (n: any) => {
 					dom.className = 'callout';
 					dom.classList.toggle('is-foldable', !!n.attrs.foldable);
-					dom.classList.toggle('is-folded', !!n.attrs.folded);
+					dom.classList.toggle('is-folded', !!n.attrs.folded && !dom.hasAttribute('data-revealed'));
 					dom.setAttribute('data-callout', n.attrs.type || 'note');
 					dom.setAttribute('data-callout-group', calloutGroup(n.attrs.type));
 				};
@@ -1404,9 +1408,13 @@
 				foldBtn.addEventListener('mousedown', (e) => e.preventDefault());
 				foldBtn.addEventListener('click', (e) => {
 					e.preventDefault();
-					const nowFolded = !dom.classList.contains('is-folded');
+					// A callout revealed from the Outline is open on screen but still folded in the note.
+					const revealed = dom.hasAttribute('data-revealed');
+					dom.removeAttribute('data-revealed');
+					const nowFolded = revealed || !dom.classList.contains('is-folded');
 					if (editor.isEditable) {
 						updateAttr({ folded: nowFolded, foldable: true });
+						if (revealed) dom.classList.add('is-folded');
 					} else {
 						dom.classList.toggle('is-folded', nowFolded);
 						dom.classList.add('is-foldable');
@@ -4143,21 +4151,15 @@
 	}
 
 	function serializeListItem(node: any): string {
-		const parts: string[] = [];
-		node.forEach((child: any) => {
-			if (child.type.name === 'paragraph') {
-				parts.push(serializeInline(child));
-			} else if (child.type.name === 'bulletList' || child.type.name === 'orderedList' || child.type.name === 'taskList') {
-				// Indent nested lists so markdown parsers recognize nesting
-				// Use 4 spaces - works for both bullet (- ) and ordered (1. ) parent markers
-				const nested = serializeNode(child).replace(/\n$/, '');
-				const indented = nested.split('\n').map((line: string) => '    ' + line).join('\n');
-				parts.push(indented);
-			} else {
-				parts.push(serializeNode(child));
-			}
+		const blocks: ListItemBlock[] = [];
+		node.forEach((child: any, _offset: number, index: number) => {
+			const isList = child.type.name === 'bulletList' || child.type.name === 'orderedList' || child.type.name === 'taskList';
+			blocks.push({
+				isList,
+				text: index === 0 && child.type.name === 'paragraph' ? serializeInline(child) : serializeNode(child),
+			});
 		});
-		return parts.join('\n') + '\n';
+		return joinListItemBlocks(blocks);
 	}
 
 	function inlineMathPayloads(markdown: string): string[] {
@@ -5370,6 +5372,13 @@
 				if (showInfo) scheduleCounts();
 			},
 		});
+		// TipTap normalizes a newly created document on its first transaction (it adds a paragraph
+		// after a final list, for example). Run that now so it is not taken for the user's first
+		// edit, which would save, and possibly reformat, a note that was only opened.
+		ignoreNextUpdate = true;
+		editor.view.dispatch(editor.state.tr);
+		ignoreNextUpdate = false;
+		clearEditorHistory();
 		editorReady = true;
 		if (showOutline) updateOutline();
 		// Pre-load note titles for wiki-link autocomplete

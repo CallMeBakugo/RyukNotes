@@ -36,17 +36,52 @@ const EMPTY_PARAGRAPH_MARKER = '<!-- -->';
 export function joinMarkdownBlocks(blocks: readonly MarkdownBlock[]): string {
   const entries = [...blocks];
   while (entries.length > 0 && entries[entries.length - 1].isEmpty) entries.pop();
-  let result = '';
+  const parts: string[] = [];
+  // Only the last two characters decide the separator. Reading them from the growing result would
+  // flatten it on every block, which makes joining a large note quadratic.
+  let tail = '';
+  const append = (piece: string) => {
+    parts.push(piece);
+    tail = (tail + piece).slice(-2);
+  };
   entries.forEach((entry, index) => {
     if (entry.isEmpty && entries[index + 1]?.isImage) {
-      if (index > 0 && !result.endsWith('\n\n')) result += result.endsWith('\n') ? '\n' : '\n\n';
+      if (index > 0 && tail !== '\n\n') append(tail.endsWith('\n') ? '\n' : '\n\n');
       return;
     }
     const text = entry.isEmpty ? EMPTY_PARAGRAPH_MARKER : entry.text;
     // Images follow their predecessor directly; every other block needs a blank line before it.
-    result += index === 0 ? text : (entry.isImage || result.endsWith('\n\n') ? '' : '\n') + text;
+    if (index === 0) append(text);
+    else append((entry.isImage || tail === '\n\n' ? '' : '\n') + text);
   });
-  return result.trim() + '\n';
+  return parts.join('').trim() + '\n';
+}
+
+export interface ListItemBlock {
+  text: string;
+  /** A nested bullet, numbered or task list. */
+  isList: boolean;
+}
+
+/**
+ * Join the serialized children of one list item. The first block follows the list marker; a nested
+ * list is indented four spaces directly under it; any other block (a further paragraph, a code
+ * block, a quote) is separated by a blank line and indented the same way so it stays in the item.
+ */
+export function joinListItemBlocks(blocks: readonly ListItemBlock[]): string {
+  const parts: string[] = [];
+  blocks.forEach((block, index) => {
+    if (block.isList) {
+      parts.push(block.text.replace(/\n$/, '').split('\n').map((line) => '    ' + line).join('\n'));
+    } else if (index === 0) {
+      parts.push(block.text);
+    } else {
+      const body = block.text.replace(/\n+$/, '');
+      if (body.trim() === '') return;
+      parts.push('', body.split('\n').map((line) => (line ? '    ' + line : line)).join('\n'));
+    }
+  });
+  return parts.join('\n') + '\n';
 }
 
 export function serializeCodeBlock(code: string, language: string = ''): string {
