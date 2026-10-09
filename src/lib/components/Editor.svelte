@@ -3923,6 +3923,13 @@
 		} else if (editorElement && editor) {
 			// Editor already exists, just swap content
 			const html = markdownToHtml(content);
+			// Retire the outgoing native selection before its DOM is replaced, or the webview can keep
+			// painting the old caret. Selections in other controls are left alone.
+			const editorDom = editor.view.dom;
+			const domSelection = editorDom.ownerDocument.getSelection();
+			if (domSelection && (editorDom.contains(domSelection.anchorNode) || editorDom.contains(domSelection.focusNode))) {
+				domSelection.removeAllRanges();
+			}
 			const settle = () => {
 				updateCounts();
 				// Restore scroll and reset the cursor after all ProseMirror/Svelte DOM updates settle.
