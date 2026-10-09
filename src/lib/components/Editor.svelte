@@ -58,7 +58,7 @@
 	import { clearFormatting } from '$lib/editor/clearFormatting';
 	import { toolbarLabels, resolveToolbarLayout, groupToolbarButtons, moveToolbarButton, toolbarLayoutPreference, type ToolbarButtonId, type ToolbarArea, type ResolvedToolbarLayout } from '$lib/editor/toolbar';
 	import { buildCodeCopyDecorations, buildTaskMetaDecorations, focusedPlaceholderDecorations } from '$lib/editor/decorations';
-	import { serializeInlineMarkdownKeepingDollars, serializeCodeBlock, joinMarkdownBlocks, joinListItemBlocks, type ListItemBlock, type MarkdownBlock } from '$lib/editor/markdown';
+	import { serializeImageTitle, serializeInlineMarkdownKeepingDollars, serializeCodeBlock, joinMarkdownBlocks, joinListItemBlocks, type ListItemBlock, type MarkdownBlock } from '$lib/editor/markdown';
 	import { restoreTitleHeading, stripTitleHeading, type HiddenTitleHeading } from '$lib/editor/titleVisibility';
 	import { documentHeadings, sourceHeadings, activeHeadingIndex, mapDocumentHeadings, mapSourceHeadings, type OutlineHeading } from '$lib/editor/outline';
 	import { createEditorMarkdownParser } from '$lib/editor/markdownParser';
@@ -720,7 +720,8 @@
 	});
 	let textContextMenu = $state<{ x: number; y: number; submenuLeft: boolean } | null>(null);
 	let tableContextMenu = $state<{ x: number; y: number; hasStyling: boolean } | null>(null);
-	let imageToolbar = $state<{ pos: number; x: number; y: number; size: string; src: string; alt: string } | null>(null);
+	let imageToolbar = $state<{ pos: number; x: number; y: number; size: string; src: string; alt: string; title: string } | null>(null);
+	let imageTitleModal = $state<{ title: string } | null>(null);
 	let imageViewer = $state<{ src: string; alt: string } | null>(null);
 	let copyToast = $state<'copying' | 'done' | null>(null);
 
@@ -4254,7 +4255,7 @@
 				const alt = node.attrs.alt || '';
 				const size = node.attrs['data-size'] || node.attrs.size || 'full';
 				const sizeSuffix = size && size !== 'full' ? `|size=${size}` : '';
-				return `![${alt}${sizeSuffix}](${src})\n`;
+				return `![${alt}${sizeSuffix}](${src}${serializeImageTitle(node.attrs.title)})\n`;
 			}
 			default:
 				return node.textContent || '';
@@ -5670,11 +5671,12 @@
 			const currentSize = node?.attrs.size || 'full';
 			const imgSrc = node?.attrs.src || (target as HTMLImageElement).src || '';
 			const imgAlt = node?.attrs.alt || (target as HTMLImageElement).alt || '';
+			const imgTitle = node?.attrs.title || '';
 			const toolbarW = isAndroid ? 188 : isMobile ? 130 : 250;
 			const toolbarH = isAndroid ? 48 : 38;
 			const x = Math.max(8, Math.min(event.clientX, window.innerWidth - toolbarW - 8));
 			const y = Math.max(8, Math.min(event.clientY, window.innerHeight - toolbarH - 8));
-			imageToolbar = { pos, x, y, size: currentSize, src: imgSrc, alt: imgAlt };
+			imageToolbar = { pos, x, y, size: currentSize, src: imgSrc, alt: imgAlt, title: imgTitle };
 			// Move cursor after the image to clear ProseMirror's node selection highlight
 			const afterPos = pos + (node?.nodeSize || 1);
 			editor.chain().setTextSelection(afterPos).run();
@@ -5696,6 +5698,26 @@
 		const tr = editor.state.tr.setNodeAttribute(pos, 'size', size);
 		editor.view.dispatch(tr);
 		imageToolbar = { ...imageToolbar, size };
+	}
+
+	function openImageTitleModal() {
+		if (!editor || !imageToolbar) return;
+		imageTitleModal = { title: editor.state.doc.nodeAt(imageToolbar.pos)?.attrs.title || imageToolbar.title };
+	}
+
+	/** Set or clear the toolbar image's hover text, saved as `![alt](src "title")`. */
+	function commitImageTitleModal() {
+		if (!editor || !imageToolbar || !imageTitleModal) return;
+		const node = editor.state.doc.nodeAt(imageToolbar.pos);
+		if (node?.type.name !== 'image') { imageTitleModal = null; return; }
+		const title = imageTitleModal.title.trim();
+		editor.view.dispatch(editor.state.tr.setNodeAttribute(imageToolbar.pos, 'title', title || null));
+		imageToolbar = { ...imageToolbar, title };
+		imageTitleModal = null;
+	}
+
+	function cancelImageTitleModal() {
+		imageTitleModal = null;
 	}
 
 	function getImageAbsPath(src: string): string {
@@ -8103,6 +8125,7 @@
 			<button class:active={imageToolbar.size === 'small'} onclick={() => setImageSize('small')} title="Small (33%)">S</button>
 			<button class:active={imageToolbar.size === 'medium'} onclick={() => setImageSize('medium')} title="Medium (50%)">M</button>
 			<button class:active={imageToolbar.size === 'full'} onclick={() => setImageSize('full')} title="Full width">L</button>
+			<button class:active={!!imageToolbar.title} onclick={openImageTitleModal} title={imageToolbar.title ? `Hover text: ${imageToolbar.title}` : 'Set hover text'} aria-label="Image hover text">T</button>
 			{#if isAndroid}
 				<span class="img-toolbar-sep"></span>
 				<button class="img-toolbar-view" onclick={openImageViewer} title="View and zoom image" aria-label="View and zoom image">
@@ -8124,6 +8147,37 @@
 
 {#if imageViewer}
 	<ImageViewer src={imageViewer.src} alt={imageViewer.alt} onclose={() => (imageViewer = null)} />
+{/if}
+
+{#if imageTitleModal}
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="math-modal-overlay" onclick={(e) => closeFromOverlay(e, cancelImageTitleModal)} onkeydown={(e) => closeOnEscape(e, cancelImageTitleModal)}>
+		<div class="math-modal" role="dialog" aria-modal="true" aria-label="Image hover text" tabindex="-1">
+			<div class="math-modal-header">
+				<span>Image hover text</span>
+				<button type="button" class="math-modal-close" onclick={cancelImageTitleModal} aria-label="Close">
+					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+				</button>
+			</div>
+			<input
+				class="math-modal-input img-title-input"
+				placeholder="Shown when hovering the image. Leave empty to remove it."
+				bind:value={imageTitleModal.title}
+				onkeydown={(e) => {
+					if (e.key === 'Enter') { e.preventDefault(); commitImageTitleModal(); }
+					if (e.key === 'Escape') { e.preventDefault(); cancelImageTitleModal(); }
+				}}
+				use:autofocus
+			/>
+			<div class="math-modal-footer">
+				<span class="math-modal-hint">Saved as ![alt](image "hover text") · Enter to apply · Esc to cancel</span>
+				<div class="math-modal-actions">
+					<button type="button" onclick={cancelImageTitleModal}>Cancel</button>
+					<button type="button" class="primary" onclick={commitImageTitleModal}>Apply</button>
+				</div>
+			</div>
+		</div>
+	</div>
 {/if}
 
 {#if copyToast}
@@ -10115,6 +10169,11 @@
 		outline: none;
 	}
 	.math-modal-input:focus { border-color: var(--accent); }
+	.img-title-input {
+		min-height: 0;
+		resize: none;
+		font-family: inherit;
+	}
 	.math-modal-preview {
 		min-height: 60px;
 		padding: 14px;

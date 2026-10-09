@@ -119,7 +119,10 @@ test('ordinary and legacy links/images remain functional while unsafe schemes re
   assert.match(html, /href="path"/);
   assert.match(html, /src="image%20path"/);
   assert.match(html, /src="\/home\/user\/image\.png"/);
-  assert.doesNotMatch(html, / title=/);
+  // Links never keep titles; images keep theirs as hover text, legacy destinations included.
+  assert.doesNotMatch(html, /<a [^>]*title=/);
+  assert.match(html, /<img src="image%20path" alt="d" title="title">/);
+  assert.match(html, /<img src="\/home\/user\/image\.png" alt="e">/);
   assert.doesNotMatch(parser.render('[bad](javascript:alert with spaces) ![bad](data:text/html;base64,foo bar)'), /href=|src=/);
 });
 
