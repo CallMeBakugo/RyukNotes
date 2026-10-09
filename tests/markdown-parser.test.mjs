@@ -236,3 +236,18 @@ test('a link destination with a very long run of spaces is parsed in linear time
   // Titles still work next to long whitespace.
   assert.match(parser.render('![a](images/photo one.png "Caption")'), /src="images\/photo%20one.png"/);
 });
+
+test('a line with thousands of unclosed link starts is parsed in linear time', () => {
+  // Each start used to read to the end of the line looking for its `)`: about 1 s at 4000 starts.
+  for (const unit of ['![a](x.png "a ', '![a](x.png (t ', '[a](x.png "a ', '![a]( ']) {
+    for (const closer of ['', ')']) {
+      const started = performance.now();
+      parser.render(unit.repeat(8000) + closer);
+      assert.ok(performance.now() - started < 400, `${JSON.stringify(unit)} x 8000${closer} took ${Math.round(performance.now() - started)} ms`);
+    }
+  }
+  // Legacy links still resolve after many failed starts on the same line, and on later lines.
+  const noise = '[a]( '.repeat(500);
+  assert.match(parser.render(noise + '[doc](my file.md) and ![pic](photo one.png "Caption")'), /href="my%20file.md".*src="photo%20one.png"/s);
+  assert.match(parser.render(noise + '\n[doc](my file.md)'), /href="my%20file.md"/);
+});

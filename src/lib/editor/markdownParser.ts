@@ -181,6 +181,16 @@ function isCommonMarkDestination(state: StateInline, start: number, end: number)
   return pos === end;
 }
 
+/**
+ * Looking for the `)` that ends a destination reads to the end of the line when there is none, and a
+ * line can hold thousands of `[label](` starts (pasted or generated text), which made parsing it
+ * quadratic. Two guards keep it linear: no search starts beyond the block's last `)`, and once the
+ * searches that found nothing have read this many characters in one block, the rest of the block
+ * is left to the CommonMark link rule.
+ */
+const LEGACY_LINK_SCAN_BUDGET = 2_000_000;
+const legacyLinkScans = new WeakMap<StateInline, { max: number; lastClose: number; wasted: number }>();
+
 /** Preserve legacy space-containing and %20/title destinations only in real link syntax. */
 function legacyLink(state: StateInline, silent: boolean): boolean {
   const start = state.pos;
@@ -190,13 +200,19 @@ function legacyLink(state: StateInline, silent: boolean): boolean {
   const labelEnd = state.md.helpers.parseLinkLabel(state, labelStart, !image);
   if (labelEnd < 0 || state.src[labelEnd + 1] !== '(') return false;
   const destinationStart = labelEnd + 2;
+  let scans = legacyLinkScans.get(state);
+  if (!scans || scans.max < state.posMax) {
+    scans = { max: state.posMax, lastClose: state.src.lastIndexOf(')', state.posMax - 1), wasted: scans?.wasted ?? 0 };
+    legacyLinkScans.set(state, scans);
+  }
+  if (destinationStart > scans.lastClose || scans.wasted > LEGACY_LINK_SCAN_BUDGET) return false;
   let end = destinationStart;
   let depth = 0;
   let quote = '';
   let angle = false;
   for (; end < state.posMax; end++) {
     const char = state.src[end];
-    if (char === '\n') return false;
+    if (char === '\n') { scans.wasted += end - destinationStart; return false; }
     if (char === '\\') { end++; continue; }
     if (quote) { if (char === quote) quote = ''; continue; }
     if (angle) { if (char === '>') angle = false; continue; }
@@ -206,7 +222,7 @@ function legacyLink(state: StateInline, silent: boolean): boolean {
     if (char === '(') depth++;
     else if (char === ')') { if (!depth) break; depth--; }
   }
-  if (end >= state.posMax) return false;
+  if (end >= state.posMax) { scans.wasted += end - destinationStart; return false; }
   const raw = state.src.slice(destinationStart, end);
   // Images with a valid CommonMark destination and title keep the native parser (and their title).
   // A `%20"title"` suffix (exported by some apps) is still legacy syntax, not part of the path.

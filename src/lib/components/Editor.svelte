@@ -5451,6 +5451,7 @@
 				},
 			},
 			onTransaction: ({ transaction, appendedTransactions }) => {
+				if (imageToolbar && (transaction.docChanged || appendedTransactions.some((tr) => tr.docChanged))) closeStaleImageToolbar();
 				if (showOutline && !$sourceMode && outlineOrigin && isOriginCurrent(outlineOrigin)
 					&& (transaction.docChanged || appendedTransactions.some(tr => tr.docChanged))) {
 					outlineHeadings = mapDocumentHeadings(outlineHeadings, transaction.mapping);
@@ -5701,12 +5702,25 @@
 		imageToolbar = null;
 	}
 
+	/**
+	 * The image toolbar remembers its image by position. Undo, redo or any other edit made while it
+	 * is open can leave a different node there, and its buttons would then change that one instead.
+	 */
+	function closeStaleImageToolbar() {
+		if (!editor || !imageToolbar) return;
+		const { pos, src } = imageToolbar;
+		const node = pos < editor.state.doc.content.size ? editor.state.doc.nodeAt(pos) : null;
+		if (node?.type.name === 'image' && node.attrs.src === src) return;
+		imageToolbar = null;
+		imageTitleModal = null;
+	}
+
 	function setImageSize(size: string) {
 		if (!editor || !imageToolbar) return;
 		const { pos } = imageToolbar;
 		const tr = editor.state.tr.setNodeAttribute(pos, 'size', size);
 		editor.view.dispatch(tr);
-		imageToolbar = { ...imageToolbar, size };
+		if (imageToolbar) imageToolbar = { ...imageToolbar, size };
 	}
 
 	function openImageTitleModal() {
@@ -5721,7 +5735,7 @@
 		if (node?.type.name !== 'image') { imageTitleModal = null; return; }
 		const title = imageTitleModal.title.trim();
 		editor.view.dispatch(editor.state.tr.setNodeAttribute(imageToolbar.pos, 'title', title || null));
-		imageToolbar = { ...imageToolbar, title };
+		if (imageToolbar) imageToolbar = { ...imageToolbar, title };
 		imageTitleModal = null;
 	}
 
@@ -6198,10 +6212,11 @@
 		const children = gridChildren(grid);
 		[children[index], children[next]] = [children[next], children[index]];
 		const gridPos = resolved.before();
-		editor.view.dispatch(state.tr.replaceWith(gridPos, gridPos + grid.nodeSize, grid.type.create(grid.attrs, children)));
 		let newPos = gridPos + 1;
 		for (let i = 0; i < next; i++) newPos += children[i].nodeSize;
+		// Follow the image before the change lands, so the toolbar is not taken for a stale one.
 		imageToolbar = { ...imageToolbar, pos: newPos };
+		editor.view.dispatch(state.tr.replaceWith(gridPos, gridPos + grid.nodeSize, grid.type.create(grid.attrs, children)));
 	}
 
 	/** Drag-and-drop: move an image within a grid or into another grid. An emptied source grid is removed. */
