@@ -40,7 +40,7 @@ function parseGrids(markdown) {
         // The editor splits `|size=` off the alt text when it loads images (normalizeImageHtml).
         const alt = child.content;
         const size = /\|size=(small|medium|full)$/.exec(alt);
-        current.images.push({ src: child.attrGet('src'), alt: size ? alt.slice(0, size.index) : alt, size: size ? size[1] : 'full' });
+        current.images.push({ src: child.attrGet('src'), alt: size ? alt.slice(0, size.index) : alt, size: size ? size[1] : 'full', title: child.attrGet('title') });
       }
     }
   }
@@ -141,9 +141,10 @@ test('never partially converts: captions, links, text and gaps keep the whole bl
 test('parses titles and angle-bracket destinations like any other image (Yuri: title encoded into the URL)', () => {
   const [grid] = parseGrids(':::img-grid\n![cat](cat.png "Photo (2024)")\n![](<my file.png>)\n![](<a (1).png>)\n:::\n');
   assert.deepEqual(grid.images.map((image) => image.src), ['cat.png', 'my%20file.png', 'a%20(1).png']);
-  // Titles are not kept on images yet (as for images outside grids); the image itself must survive.
+  // Grid images follow the same title policy as every other image; either way the image must survive.
   const saved = roundTrip(':::img-grid\n![cat](cat.png "Photo (2024)")\n![](b.png)\n:::\n');
-  assert.equal(saved, ':::img-grid\n![cat](cat.png)\n![](b.png)\n:::\n');
+  assert.match(saved, /^:::img-grid\n!\[cat\]\(cat\.png[ )]/);
+  assert.deepEqual(parseGrids(saved)[0].images.map((image) => image.src), ['cat.png', 'b.png']);
   assert.equal(roundTrip(saved), saved);
 });
 
