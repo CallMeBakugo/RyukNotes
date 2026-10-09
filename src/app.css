@@ -1291,6 +1291,25 @@ body.resizing {
     page-break-inside: avoid;
   }
 
+  /* Image grids print as compact 2-column rows without their editing controls. */
+  .ProseMirror .img-grid-header {
+    display: none !important;
+  }
+  .ProseMirror .img-grid,
+  .ProseMirror .img-grid[data-layout='masonry'] {
+    display: grid !important;
+    grid-template-columns: repeat(2, 1fr) !important;
+    columns: auto !important;
+    gap: 8px !important;
+    break-inside: avoid;
+  }
+  .ProseMirror .img-grid img {
+    margin: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    break-inside: avoid;
+  }
+
   /* Avoid breaking inside these elements */
   h1,
   h2,

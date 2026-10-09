@@ -49,6 +49,8 @@
 	import { encryptSecretText, decryptSecretText, readSecretTitle } from '$lib/utils/secrets';
 	import { WrapSelectedText } from '$lib/editor/extensions/wrapSelectedText';
 	import { CodeBlockInputScroll } from '$lib/editor/extensions/codeBlockInputScroll';
+	import { ImageGrid } from '$lib/editor/extensions/imageGrid';
+	import { defaultGridCols, expandImageRange, reorderTarget, serializeImgGrid } from '$lib/editor/imageGrid';
 	import { calloutGroup, calloutIcon, calloutLabel, CALLOUT_MENU, transformCalloutBlockquotes, serializeCallout } from '$lib/editor/callouts';
 	import SourceEditor from './SourceEditor.svelte';
 	import { SourceController } from '$lib/editor/source/controller';
@@ -683,6 +685,7 @@
 			{ label: 'Collapsible Section', aliases: ['details', 'accordion', 'collapse', 'toggle', 'summary'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><polyline points="10 8 14 12 10 16"/></svg>', action: () => insertDetails() },
 			{ label: 'Callout', aliases: ['callout', 'admonition', 'note', 'info', 'tip', 'warning', 'caution', 'danger', 'success', 'question', 'quote', 'aside', 'box'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><line x1="7" y1="5" x2="7" y2="19"/></svg>', action: () => insertCallout('note') },
 			{ label: 'Table', aliases: ['table', 'grid'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="3" x2="9" y2="21"/><line x1="15" y1="3" x2="15" y2="21"/></svg>', action: () => { slashTablePicker = true; slashTableHover = { rows: 0, cols: 0 }; } },
+			{ label: 'Image Grid', aliases: ['imagegrid', 'image-grid', 'imggrid', 'gallery', 'masonry', 'images', 'side-by-side'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>', action: () => openAssetPicker('insert-grid-input') },
 			{ label: 'Horizontal Rule', aliases: ['hr', 'divider', 'line', 'separator', 'rule'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="2" y1="12" x2="22" y2="12"/></svg>', action: () => editor?.chain().focus().setHorizontalRule().run() },
 			{ label: 'Page Break', aliases: ['pagebreak', 'page', 'break', 'newpage', 'print'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="2" y1="9" x2="22" y2="9" stroke-dasharray="4 2"/><line x1="2" y1="15" x2="22" y2="15" stroke-dasharray="4 2"/><path d="M6 5v4M18 5v4M6 15v4M18 15v4"/></svg>', action: () => editor?.chain().focus().insertContent({ type: 'pageBreak' }).run() },
 			{ label: 'Math Block', aliases: ['math', 'latex', 'equation', 'formula', 'tex', 'katex'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h6l4 14h6"/><path d="M7 19l10-14"/></svg>', action: () => openMathInsert('block') },
@@ -720,7 +723,7 @@
 	});
 	let textContextMenu = $state<{ x: number; y: number; submenuLeft: boolean } | null>(null);
 	let tableContextMenu = $state<{ x: number; y: number; hasStyling: boolean } | null>(null);
-	let imageToolbar = $state<{ pos: number; x: number; y: number; size: string; src: string; alt: string } | null>(null);
+	let imageToolbar = $state<{ pos: number; x: number; y: number; size: string; src: string; alt: string; inGrid: boolean } | null>(null);
 	let imageViewer = $state<{ src: string; alt: string } | null>(null);
 	let copyToast = $state<'copying' | 'done' | null>(null);
 
@@ -4256,6 +4259,9 @@
 				const sizeSuffix = size && size !== 'full' ? `|size=${size}` : '';
 				return `![${alt}${sizeSuffix}](${src})\n`;
 			}
+			case 'imageGrid':
+				// Images serialize exactly as they do in a paragraph, one per line.
+				return serializeImgGrid({ cols: node.attrs.cols, layout: node.attrs.layout }, serializeInline(node));
 			default:
 				return node.textContent || '';
 		}
@@ -5219,6 +5225,7 @@
 				PageBreak,
 				Callout,
 				CalloutTyping,
+				ImageGrid.configure({ onUngroup: ungroupImageGridAt, onMoveImage: moveGridImageByIndex }),
 				Details.configure({ persist: true, HTMLAttributes: { class: 'editor-details' } }),
 				DetailsSummary,
 				DetailsContent,
@@ -5674,7 +5681,8 @@
 			const toolbarH = isAndroid ? 48 : 38;
 			const x = Math.max(8, Math.min(event.clientX, window.innerWidth - toolbarW - 8));
 			const y = Math.max(8, Math.min(event.clientY, window.innerHeight - toolbarH - 8));
-			imageToolbar = { pos, x, y, size: currentSize, src: imgSrc, alt: imgAlt };
+			const inGrid = editor.state.doc.resolve(pos).parent.type.name === 'imageGrid';
+			imageToolbar = { pos, x, y, size: currentSize, src: imgSrc, alt: imgAlt, inGrid };
 			// Move cursor after the image to clear ProseMirror's node selection highlight
 			const afterPos = pos + (node?.nodeSize || 1);
 			editor.chain().setTextSelection(afterPos).run();
@@ -6019,6 +6027,134 @@
 			document.addEventListener('keydown', onKey, true);
 			window.addEventListener('scroll', close, true);
 		}, 0);
+	}
+
+	function handleGridInput(event: Event) {
+		const input = event.currentTarget as HTMLInputElement;
+		const origin = assetPickerOrigins.get(input);
+		assetPickerOrigins.delete(input);
+		const files = Array.from(input.files ?? []).filter((file) => file.type.startsWith('image/'));
+		input.value = '';
+		if (origin && files.length) void insertImageGrid(files, origin);
+	}
+
+	/** Save the picked images and insert them as one grid (a single image is inserted normally). */
+	async function insertImageGrid(files: File[], origin: EditorOrigin) {
+		if (files.length === 1 || origin.sourceMode) {
+			for (const file of files) await insertFile(file, origin);
+			return;
+		}
+		const sources: string[] = [];
+		for (const file of files) {
+			if (!canInsert(origin)) return;
+			try {
+				const data = Array.from(new Uint8Array(await file.arrayBuffer()));
+				if (!canInsert(origin)) return;
+				sources.push(resolveImageSrc(encodeMarkdownPath(await saveImage(origin.vault!, file.name, data))));
+			} catch (e) {
+				console.error('Failed to insert image:', e);
+			}
+		}
+		if (!canInsert(origin) || !editor || sources.length === 0) return;
+		editor.commands.insertContent(sources.length === 1
+			? { type: 'image', attrs: { src: sources[0] } }
+			: { type: 'imageGrid', attrs: { cols: defaultGridCols(sources.length), layout: 'grid' },
+				content: sources.map((src) => ({ type: 'image', attrs: { src } })) });
+	}
+
+	function countBlockImages(node: ProseMirrorNode): number {
+		if (node.type.name === 'imageGrid') return node.childCount;
+		if (!isImageNode(node)) return 0;
+		let count = 0;
+		node.forEach((child) => { if (child.type.name === 'image') count++; });
+		return count;
+	}
+
+	/** Group the toolbar's image and its neighboring image-only blocks (and grids) into one grid. */
+	function wrapNearbyImagesInGrid() {
+		if (!editor || !imageToolbar) return;
+		const { state } = editor;
+		const blocks: { node: ProseMirrorNode; offset: number }[] = [];
+		state.doc.forEach((node, offset) => blocks.push({ node, offset }));
+		const { pos } = imageToolbar;
+		const target = blocks.findIndex((block) => pos >= block.offset && pos < block.offset + block.node.nodeSize);
+		const range = expandImageRange(blocks.map((block) => ({ isImage: countBlockImages(block.node) > 0, imageCount: countBlockImages(block.node) })), target);
+		if (!range) return;
+		const images: ProseMirrorNode[] = [];
+		for (let i = range.start; i <= range.end; i++) {
+			blocks[i].node.forEach((child) => { if (child.type.name === 'image') images.push(child); });
+		}
+		const grid = state.schema.nodes.imageGrid.create({ cols: defaultGridCols(images.length), layout: 'grid' }, images);
+		const from = blocks[range.start].offset;
+		const to = blocks[range.end].offset + blocks[range.end].node.nodeSize;
+		editor.view.dispatch(state.tr.replaceWith(from, to, grid));
+		imageToolbar = null;
+	}
+
+	/** Replace a grid with one image paragraph per image. */
+	function ungroupImageGridAt(gridPos: number) {
+		if (!editor) return;
+		const { state } = editor;
+		const grid = state.doc.nodeAt(gridPos);
+		if (!grid || grid.type.name !== 'imageGrid') return;
+		const paragraphs: ProseMirrorNode[] = [];
+		grid.forEach((image) => paragraphs.push(state.schema.nodes.paragraph.create(null, image)));
+		editor.view.dispatch(state.tr.replaceWith(gridPos, gridPos + grid.nodeSize, paragraphs));
+		imageToolbar = null;
+	}
+
+	function gridChildren(grid: ProseMirrorNode): ProseMirrorNode[] {
+		const children: ProseMirrorNode[] = [];
+		grid.forEach((child) => children.push(child));
+		return children;
+	}
+
+	/** Move the toolbar's image one place left or right inside its grid. */
+	function moveGridImage(direction: -1 | 1) {
+		if (!editor || !imageToolbar?.inGrid) return;
+		const { state } = editor;
+		const resolved = state.doc.resolve(imageToolbar.pos);
+		const grid = resolved.parent;
+		if (grid.type.name !== 'imageGrid') return;
+		const index = resolved.index();
+		const next = index + direction;
+		if (next < 0 || next >= grid.childCount) return;
+		const children = gridChildren(grid);
+		[children[index], children[next]] = [children[next], children[index]];
+		const gridPos = resolved.before();
+		editor.view.dispatch(state.tr.replaceWith(gridPos, gridPos + grid.nodeSize, grid.type.create(grid.attrs, children)));
+		let newPos = gridPos + 1;
+		for (let i = 0; i < next; i++) newPos += children[i].nodeSize;
+		imageToolbar = { ...imageToolbar, pos: newPos };
+	}
+
+	/** Drag-and-drop: move an image within a grid or into another grid. An emptied source grid is removed. */
+	function moveGridImageByIndex(fromGridPos: number, fromIndex: number, toGridPos: number, toIndex: number) {
+		if (!editor) return;
+		const { state } = editor;
+		const source = state.doc.nodeAt(fromGridPos);
+		if (!source || source.type.name !== 'imageGrid' || fromIndex < 0 || fromIndex >= source.childCount) return;
+		const sourceChildren = gridChildren(source);
+		if (fromGridPos === toGridPos) {
+			const target = reorderTarget(fromIndex, toIndex, sourceChildren.length);
+			if (target === null) return;
+			const [moved] = sourceChildren.splice(fromIndex, 1);
+			sourceChildren.splice(target, 0, moved);
+			editor.view.dispatch(state.tr.replaceWith(fromGridPos, fromGridPos + source.nodeSize, source.type.create(source.attrs, sourceChildren)));
+		} else {
+			const destination = state.doc.nodeAt(toGridPos);
+			if (!destination || destination.type.name !== 'imageGrid') return;
+			const [moved] = sourceChildren.splice(fromIndex, 1);
+			const tr = state.tr;
+			if (sourceChildren.length === 0) tr.delete(fromGridPos, fromGridPos + source.nodeSize);
+			else tr.replaceWith(fromGridPos, fromGridPos + source.nodeSize, source.type.create(source.attrs, sourceChildren));
+			const mapped = tr.mapping.map(toGridPos);
+			const destinationChildren = gridChildren(destination);
+			destinationChildren.splice(Math.max(0, Math.min(destinationChildren.length, toIndex)), 0, moved);
+			tr.replaceWith(mapped, mapped + destination.nodeSize, destination.type.create(destination.attrs, destinationChildren));
+			editor.view.dispatch(tr);
+		}
+		imageToolbar = null;
 	}
 
 	function insertDetails() {
@@ -7840,6 +7976,7 @@
 
 	<!-- Hidden file inputs for Insert dropdown -->
 	<input type="file" id="insert-image-input" accept="image/*" style="display:none" onchange={handleAssetInput} />
+	<input type="file" id="insert-grid-input" accept="image/*" multiple style="display:none" onchange={handleGridInput} />
 	{#if isAndroid}
 		<input type="file" id="insert-camera-input" accept="image/*" capture="environment" style="display:none" onchange={handleAssetInput} />
 	{/if}
@@ -8103,6 +8240,13 @@
 			<button class:active={imageToolbar.size === 'small'} onclick={() => setImageSize('small')} title="Small (33%)">S</button>
 			<button class:active={imageToolbar.size === 'medium'} onclick={() => setImageSize('medium')} title="Medium (50%)">M</button>
 			<button class:active={imageToolbar.size === 'full'} onclick={() => setImageSize('full')} title="Full width">L</button>
+			<span class="img-toolbar-sep"></span>
+			{#if imageToolbar.inGrid}
+				<button onclick={() => moveGridImage(-1)} title="Move left in grid" aria-label="Move left in grid">←</button>
+				<button onclick={() => moveGridImage(1)} title="Move right in grid" aria-label="Move right in grid">→</button>
+			{:else}
+				<button onclick={wrapNearbyImagesInGrid} title="Group neighboring images into a grid">Grid</button>
+			{/if}
 			{#if isAndroid}
 				<span class="img-toolbar-sep"></span>
 				<button class="img-toolbar-view" onclick={openImageViewer} title="View and zoom image" aria-label="View and zoom image">
@@ -10952,6 +11096,93 @@
 		max-width: 100%;
 	}
 
+	/* Image grids (#254). These come after the size rules above so grid cells can override them. */
+	:global(.tiptap-wrapper .tiptap .img-grid-wrap) {
+		margin: 1em 0;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid-header) {
+		display: none;
+		gap: 4px;
+		margin-bottom: 6px;
+	}
+	:global(.tiptap-wrapper .tiptap[contenteditable="true"] .img-grid-header) {
+		display: flex;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid-control) {
+		font-size: 11px;
+		font-weight: 600;
+		padding: 2px 8px;
+		border-radius: 6px;
+		border: 1px solid var(--border-color);
+		background: var(--bg-secondary);
+		color: var(--text-secondary);
+		cursor: pointer;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid) {
+		display: grid;
+		grid-template-columns: repeat(2, 1fr);
+		gap: 8px;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid[data-cols="3"]) {
+		grid-template-columns: repeat(3, 1fr);
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid[data-cols="4"]) {
+		grid-template-columns: repeat(4, 1fr);
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid[data-layout="masonry"]) {
+		display: block;
+		columns: 2;
+		column-gap: 8px;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid[data-layout="masonry"][data-cols="3"]) {
+		columns: 3;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid[data-layout="masonry"][data-cols="4"]) {
+		columns: 4;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid img) {
+		margin: 0;
+		width: 100%;
+		max-width: 100%;
+	}
+	/* S/M/L still applies inside a cell. */
+	:global(.tiptap-wrapper .tiptap .img-grid img[data-size="small"]) {
+		width: 55%;
+		justify-self: center;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid img[data-size="medium"]) {
+		width: 80%;
+		justify-self: center;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid[data-layout="masonry"] img) {
+		display: block;
+		break-inside: avoid;
+		margin-bottom: 8px;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid[data-layout="masonry"] img[data-size="small"]),
+	:global(.tiptap-wrapper .tiptap .img-grid[data-layout="masonry"] img[data-size="medium"]) {
+		margin-left: auto;
+		margin-right: auto;
+	}
+	:global(.tiptap-wrapper .tiptap[contenteditable="true"] .img-grid img) {
+		cursor: grab;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid.img-grid-dropping) {
+		outline: 2px dashed var(--accent);
+		outline-offset: 4px;
+	}
+	/* Phones: 3 and 4 column grids collapse to 2. */
+	@media (max-width: 640px) {
+		:global(.tiptap-wrapper .tiptap .img-grid[data-cols="3"]),
+		:global(.tiptap-wrapper .tiptap .img-grid[data-cols="4"]) {
+			grid-template-columns: repeat(2, 1fr);
+		}
+		:global(.tiptap-wrapper .tiptap .img-grid[data-layout="masonry"][data-cols="3"]),
+		:global(.tiptap-wrapper .tiptap .img-grid[data-layout="masonry"][data-cols="4"]) {
+			columns: 2;
+		}
+	}
+
 	.img-toolbar-overlay {
 		position: fixed;
 		inset: 0;
@@ -10962,6 +11193,8 @@
 		position: fixed;
 		display: flex;
 		align-items: center;
+		flex-wrap: wrap;
+		max-width: calc(100vw - 16px);
 		gap: 2px;
 		background: var(--bg-primary);
 		border: 1px solid var(--border-color);

@@ -6,6 +6,7 @@ import fenceRule from 'markdown-it/lib/rules_block/fence.mjs';
 import markdownItMark from 'markdown-it-mark';
 import markdownItSup from 'markdown-it-sup';
 import markdownItSub from 'markdown-it-sub';
+import { IMG_GRID_CLOSER, parseImgGridHeader, splitTrailingCloser } from './imageGrid.ts';
 
 interface WikiTitle { path: string; title: string }
 export interface MarkdownEnvironment { wikiLinkTitles?: readonly WikiTitle[] }
@@ -228,6 +229,60 @@ function emptyParagraph(state: StateBlock, startLine: number, _endLine: number, 
   return true;
 }
 
+/** True when `text` is exactly one Markdown image and nothing else (no caption, no link around it). */
+function isSingleImage(state: StateBlock, text: string): boolean {
+  if (!text.startsWith('![')) return false;
+  const tokens: Token[] = [];
+  state.md.inline.parse(text, state.md, state.env, tokens);
+  return tokens.length === 1 && tokens[0].type === 'image';
+}
+
+/**
+ * `:::img-grid` image grids (see imageGrid.ts). As a block rule, it never sees lines inside code
+ * blocks. A block that isn't a well-formed grid is left completely to the other rules.
+ */
+function imageGrid(state: StateBlock, startLine: number, endLine: number, silent: boolean): boolean {
+  if (state.sCount[startLine] - state.blkIndent >= 4) return false;
+  const lineText = (line: number) => state.src.slice(state.bMarks[line] + state.tShift[line], state.eMarks[line]);
+  const header = lineText(startLine);
+  if (!header.startsWith(':::img-grid')) return false;
+  const attrs = parseImgGridHeader(header);
+  if (!attrs) return false;
+  const images: { line: number; content: string }[] = [];
+  let closing = -1;
+  for (let line = startLine + 1; line < endLine && closing < 0; line++) {
+    if (state.isEmpty(line) || state.sCount[line] < state.blkIndent) return false;
+    const text = lineText(line).replace(/[ \t]+$/, '');
+    if (text === IMG_GRID_CLOSER) {
+      closing = line;
+      break;
+    }
+    const beforeCloser = splitTrailingCloser(text);
+    const image = beforeCloser ?? text;
+    if (!isSingleImage(state, image)) return false;
+    images.push({ line, content: image });
+    if (beforeCloser !== null) closing = line;
+  }
+  if (closing < 0 || images.length === 0) return false;
+  if (silent) return true;
+  const open = state.push('helix_img_grid_open', 'div', 1);
+  open.block = true;
+  open.map = [startLine, closing + 1];
+  open.attrSet('data-img-grid', '');
+  open.attrSet('data-cols', String(attrs.cols));
+  open.attrSet('data-layout', attrs.layout);
+  open.attrSet('class', 'img-grid');
+  for (const image of images) {
+    const inline = state.push('inline', '', 0);
+    inline.content = image.content;
+    inline.map = [image.line, image.line + 1];
+    inline.children = [];
+  }
+  state.push('helix_img_grid_close', 'div', -1).block = true;
+  state.line = closing + 1;
+  return true;
+}
+
 export function createEditorMarkdownParser(): MarkdownIt {
   const md = MarkdownIt({ html: true, linkify: false, breaks: false })
     .use(markdownItMark).use(markdownItSup).use(markdownItSub);
@@ -238,6 +293,7 @@ export function createEditorMarkdownParser(): MarkdownIt {
   md.inline.ruler.before('backticks', 'helix_space_code', spaceCode);
   md.inline.ruler.before('link', 'helix_legacy_link', legacyLink);
   md.block.ruler.before('html_block', 'helix_empty', emptyParagraph, { alt: ['paragraph', 'reference', 'blockquote', 'list'] });
+  md.block.ruler.before('fence', 'helix_img_grid', imageGrid, { alt: ['paragraph', 'reference', 'blockquote', 'list'] });
   md.renderer.rules.helix_empty = () => '<p></p>\n';
   md.renderer.rules.helix_wiki = (tokens, index, _options, _env, renderer) =>
     `<span${renderer.renderAttrs(tokens[index])}>${md.utils.escapeHtml(tokens[index].content)}</span>`;
