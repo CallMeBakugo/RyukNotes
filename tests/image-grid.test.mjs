@@ -225,6 +225,24 @@ test('groups neighboring image blocks only when there are at least two images', 
   assert.equal(expandImageRange(blocks, 0), null);
 });
 
+test('groups images a blank line apart, which load with an empty paragraph between them', () => {
+  const text = { isImage: false, imageCount: 0 };
+  const image = { isImage: true, imageCount: 1 };
+  const empty = { isImage: false, imageCount: 0, isEmpty: true };
+  // text, blank line, image, blank line, image, blank line, image, text
+  const blocks = [text, empty, image, empty, image, empty, image, text];
+  for (const target of [2, 4, 6]) {
+    // The empty paragraph above the first image goes too, or it would be saved as a marker above the grid.
+    assert.deepEqual(expandImageRange(blocks, target), { start: 1, end: 6, total: 3 });
+  }
+  // Two empty paragraphs are deliberate spacing and are not bridged.
+  assert.equal(expandImageRange([image, empty, empty, image], 0), null);
+  // An empty paragraph that does not lead to another image stays out of the range.
+  assert.deepEqual(expandImageRange([image, image, empty, text], 0), { start: 0, end: 1, total: 2 });
+  assert.deepEqual(expandImageRange([empty, image, empty, image], 1), { start: 0, end: 3, total: 2 });
+  assert.deepEqual(expandImageRange([image, empty, image], 2), { start: 0, end: 2, total: 2 });
+});
+
 test('drag reorder targets account for the removed item', () => {
   assert.equal(reorderTarget(0, 3, 3), 2, 'drop at the end');
   assert.equal(reorderTarget(2, 0, 3), 0, 'drop at the start');

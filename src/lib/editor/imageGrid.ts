@@ -105,10 +105,15 @@ export function defaultGridCols(imageCount: number): number {
 export interface ImageBlockInfo {
 	isImage: boolean;
 	imageCount: number;
+	/** An empty paragraph. One of these before an image is how the editor holds the blank line above it. */
+	isEmpty?: boolean;
 }
 
 /**
- * Grow from `target` across adjacent image-only blocks (image paragraphs and existing grids).
+ * Grow from `target` across neighboring image-only blocks (image paragraphs and existing grids).
+ * Images a blank line apart load with one empty paragraph between them, so a single empty paragraph
+ * between two image blocks is part of the range, and so is the one directly above the first image:
+ * left behind, it would be saved as an empty-paragraph marker above the grid.
  * Returns the block range and its image total, or null unless it holds at least two images.
  */
 export function expandImageRange(
@@ -116,13 +121,25 @@ export function expandImageRange(
 	target: number,
 ): { start: number; end: number; total: number } | null {
 	if (target < 0 || target >= blocks.length || !blocks[target].isImage) return null;
+	const isImage = (index: number) => index >= 0 && index < blocks.length && blocks[index].isImage;
+	const isEmpty = (index: number) => index >= 0 && index < blocks.length && !!blocks[index].isEmpty;
 	let start = target;
 	let end = target;
-	while (start - 1 >= 0 && blocks[start - 1].isImage) start -= 1;
-	while (end + 1 < blocks.length && blocks[end + 1].isImage) end += 1;
+	for (;;) {
+		if (isImage(start - 1)) start -= 1;
+		else if (isEmpty(start - 1) && isImage(start - 2)) start -= 2;
+		else break;
+	}
+	for (;;) {
+		if (isImage(end + 1)) end += 1;
+		else if (isEmpty(end + 1) && isImage(end + 2)) end += 2;
+		else break;
+	}
 	let total = 0;
 	for (let i = start; i <= end; i++) total += blocks[i].imageCount;
-	return total < 2 ? null : { start, end, total };
+	if (total < 2) return null;
+	if (isEmpty(start - 1)) start -= 1;
+	return { start, end, total };
 }
 
 /**

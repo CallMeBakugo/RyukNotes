@@ -6139,7 +6139,11 @@
 		state.doc.forEach((node, offset) => blocks.push({ node, offset }));
 		const { pos } = imageToolbar;
 		const target = blocks.findIndex((block) => pos >= block.offset && pos < block.offset + block.node.nodeSize);
-		const range = expandImageRange(blocks.map((block) => ({ isImage: countBlockImages(block.node) > 0, imageCount: countBlockImages(block.node) })), target);
+		const range = expandImageRange(blocks.map((block) => ({
+			isImage: countBlockImages(block.node) > 0,
+			imageCount: countBlockImages(block.node),
+			isEmpty: block.node.type.name === 'paragraph' && block.node.childCount === 0,
+		})), target);
 		if (!range) return;
 		const images: ProseMirrorNode[] = [];
 		for (let i = range.start; i <= range.end; i++) {
@@ -6152,14 +6156,25 @@
 		imageToolbar = null;
 	}
 
-	/** Replace a grid with one image paragraph per image. */
+	/**
+	 * Replace a grid with one image paragraph per image. At the top level each image gets the empty
+	 * paragraph that stands for the blank line above it, so the images are saved a blank line apart
+	 * instead of being glued to the paragraph above (the reverse of grouping them).
+	 */
 	function ungroupImageGridAt(gridPos: number) {
 		if (!editor) return;
 		const { state } = editor;
 		const grid = state.doc.nodeAt(gridPos);
 		if (!grid || grid.type.name !== 'imageGrid') return;
+		const resolved = state.doc.resolve(gridPos);
+		const before = resolved.nodeBefore;
+		const topLevel = resolved.depth === 0;
 		const paragraphs: ProseMirrorNode[] = [];
-		grid.forEach((image) => paragraphs.push(state.schema.nodes.paragraph.create(null, image)));
+		grid.forEach((image, _offset, index) => {
+			const blankLineAbove = index > 0 || (!!before && !(before.type.name === 'paragraph' && before.childCount === 0));
+			if (topLevel && blankLineAbove) paragraphs.push(state.schema.nodes.paragraph.create());
+			paragraphs.push(state.schema.nodes.paragraph.create(null, image));
+		});
 		editor.view.dispatch(state.tr.replaceWith(gridPos, gridPos + grid.nodeSize, paragraphs));
 		imageToolbar = null;
 	}
