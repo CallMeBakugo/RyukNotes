@@ -146,6 +146,40 @@ export function stripLinkTitle(destination: string): string {
   return start === open ? destination.trim() : destination.slice(0, start).trim();
 }
 
+/** The title text after a legacy destination (`"title"` or `'title'`, maybe after `>` or %20), or null. */
+function legacyImageTitle(rest: string): string | null {
+  let text = rest.startsWith('>') ? rest.slice(1) : rest;
+  text = text.replace(/^(?:\s|%20)+/u, '');
+  while (text.endsWith('%20') || /\s$/u.test(text)) text = text.endsWith('%20') ? text.slice(0, -3) : text.slice(0, -1);
+  const quote = text[0];
+  if ((quote !== '"' && quote !== "'") || text.length < 2 || text[text.length - 1] !== quote) return null;
+  return text.slice(1, -1);
+}
+
+/**
+ * Whether `src[start, end)` is a valid CommonMark destination with an optional title. Such images
+ * are left to markdown-it's own image rule, which handles escaped quotes and `(title)` correctly.
+ */
+function isCommonMarkDestination(state: StateInline, start: number, end: number): boolean {
+  const { helpers } = state.md;
+  const skipSpace = (pos: number) => {
+    while (pos < end && /[ \t\n]/u.test(state.src[pos])) pos++;
+    return pos;
+  };
+  let pos = skipSpace(start);
+  const destination = helpers.parseLinkDestination(state.src, pos, end);
+  if (!destination.ok) return false;
+  pos = destination.pos;
+  const afterDestination = pos;
+  pos = skipSpace(pos);
+  if (pos < end && pos !== afterDestination) {
+    const title = helpers.parseLinkTitle(state.src, pos, end);
+    if (!title.ok) return false;
+    pos = skipSpace(title.pos);
+  }
+  return pos === end;
+}
+
 /** Preserve legacy space-containing and %20/title destinations only in real link syntax. */
 function legacyLink(state: StateInline, silent: boolean): boolean {
   const start = state.pos;
@@ -173,6 +207,9 @@ function legacyLink(state: StateInline, silent: boolean): boolean {
   }
   if (end >= state.posMax) return false;
   const raw = state.src.slice(destinationStart, end);
+  // Images with a valid CommonMark destination and title keep the native parser (and their title).
+  // A `%20"title"` suffix (exported by some apps) is still legacy syntax, not part of the path.
+  if (image && !/%20["'(]/u.test(raw) && isCommonMarkDestination(state, destinationStart, end)) return false;
   // Native CommonMark links, including nested destinations, retain their normal parser.
   if (!/\s|%20["'(]/u.test(raw)) return false;
   let destination = raw.trim();
@@ -196,6 +233,8 @@ function legacyLink(state: StateInline, silent: boolean): boolean {
       token.meta = { sourceHref };
       token.attrSet('src', href.replace(/^\/{2,}(?=home\/)/u, '/'));
       token.attrSet('alt', '');
+      const title = legacyImageTitle(raw.slice(raw.indexOf(destination) + destination.length));
+      if (title) token.attrSet('title', state.md.utils.unescapeAll(title));
       token.children = children;
       token.content = label;
     } else {
@@ -302,7 +341,8 @@ export function createEditorMarkdownParser(): MarkdownIt {
           const src = child.attrGet('src');
           if (src?.startsWith('//')) child.attrSet('src', src.replace(/^\/{2,}(?=home\/)/u, '/'));
         }
-        if (child.type === 'image' || child.type === 'link_open') {
+        // Images keep their "title" as hover text; link titles are not kept.
+        if (child.type === 'link_open') {
           child.attrs = child.attrs?.filter(([name]) => name !== 'title') ?? null;
         }
       }

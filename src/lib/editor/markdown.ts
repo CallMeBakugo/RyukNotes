@@ -29,6 +29,16 @@ export interface MarkdownBlock {
 const EMPTY_PARAGRAPH_MARKER = '<!-- -->';
 
 /**
+ * ` "title"` suffix for an image destination, or '' without a title. Uses CommonMark backslash
+ * escapes, which the parser undoes exactly, so a title survives any number of saves unchanged.
+ * `&` is only escaped where it would otherwise read as an entity (`&amp;`, `&#38;`).
+ */
+export function serializeImageTitle(title: string | null | undefined): string {
+  if (!title) return '';
+  return ` "${title.replace(/[\\"]/g, '\\$&').replace(/&(?=#?[a-z0-9]+;)/gi, '\\&')}"`;
+}
+
+/**
  * Join serialized top-level blocks into a note body. Blocks that already end in a blank line
  * (lists) get no extra separator, and an empty paragraph directly before an image is written as
  * the blank line the parser turns back into that paragraph, not as a marker glued to the image.
@@ -248,7 +258,7 @@ export function serializeInlineMarkdown(
       const size = child.attrs['data-size'] || child.attrs.size || 'full';
       const sizeSuffix = size && size !== 'full' ? `|size=${size}` : '';
       if (result) result += '\n';
-      result += `![${alt}${sizeSuffix}](${source})`;
+      result += `![${alt}${sizeSuffix}](${source}${serializeImageTitle(child.attrs.title)})`;
     } else if (child.type.name === 'mathInline') {
       const previous = index > 0 ? node.child(index - 1) : null;
       const next = index + 1 < node.childCount ? node.child(index + 1) : null;
