@@ -280,8 +280,13 @@ export async function readClipboardImage(): Promise<number[]> {
   return invoke("read_clipboard_image");
 }
 
-export async function readClipboardText(): Promise<string> {
-  return invoke("read_clipboard_text");
+export interface ClipboardContents {
+  text: string | null;
+  html: string | null;
+}
+
+export async function readClipboardContents(): Promise<ClipboardContents> {
+  return invoke("read_clipboard_contents");
 }
 
 export async function copyImageToClipboard(path: string): Promise<void> {

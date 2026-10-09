@@ -62,6 +62,28 @@ export interface ClipboardPastePayload {
 	files: File[];
 }
 
+/** Web clipboard data still missing formats a keyboard paste would carry, so the native clipboard is needed. */
+export function needsNativeClipboard(payload: ClipboardPastePayload | null): boolean {
+	return !payload || (!payload.html && payload.files.length === 0);
+}
+
+/**
+ * Fill in what the web clipboard didn't provide from the native clipboard. WebKitGTK often returns
+ * nothing, or only `text/plain`, for content copied from other applications; Ctrl+V would still
+ * have received the HTML (formatting, links), so a paste without it is not the same paste.
+ */
+export function withNativeClipboard(
+	payload: ClipboardPastePayload | null,
+	native: { text?: string | null; html?: string | null },
+): ClipboardPastePayload {
+	return {
+		text: payload?.text || native.text || '',
+		html: payload?.html || native.html || '',
+		strings: payload?.strings ?? [],
+		files: payload?.files ?? [],
+	};
+}
+
 export function isEmptyPayload(payload: ClipboardPastePayload): boolean {
 	return !payload.text && !payload.html && payload.files.length === 0;
 }

@@ -4,8 +4,10 @@ import {
   classifyClipboardType,
   collectClipboardPayload,
   isEmptyPayload,
+  needsNativeClipboard,
   pastedFileName,
-  plainTextFromUriList
+  plainTextFromUriList,
+  withNativeClipboard
 } from './clipboard-paste.ts';
 
 const item = entries => ({
@@ -78,4 +80,24 @@ test('pasted file names use friendly extensions', () => {
   assert.equal(pastedFileName('image/jpeg', 0), 'pasted-image.jpg');
   assert.equal(pastedFileName('image/svg+xml', 1), 'pasted-image-2.svg');
   assert.equal(pastedFileName('application/pdf', 0), 'pasted-file.pdf');
+});
+
+test('formatting from other apps survives when the web clipboard only offers plain text (P6)', async () => {
+  // WebKitGTK: navigator.clipboard.read() gives just text/plain for a web page copied in a browser.
+  const web = await collectClipboardPayload([item({ 'text/plain': 'Bold link' })]);
+  assert.equal(needsNativeClipboard(web), true);
+  const merged = withNativeClipboard(web, { text: 'Bold link (native)', html: '<b>Bold</b> <a href="https://x.example">link</a>' });
+  assert.equal(merged.html, '<b>Bold</b> <a href="https://x.example">link</a>');
+  assert.equal(merged.text, 'Bold link', 'web text is kept when present');
+});
+
+test('a failed web clipboard read falls back to native text and HTML entirely', () => {
+  assert.equal(needsNativeClipboard(null), true);
+  assert.deepEqual(withNativeClipboard(null, { text: 'plain', html: null }), { text: 'plain', html: '', strings: [], files: [] });
+  assert.equal(isEmptyPayload(withNativeClipboard(null, {})), true, 'nothing textual: the native image read comes next');
+});
+
+test('the native clipboard is not consulted when the web clipboard already has HTML or files', async () => {
+  assert.equal(needsNativeClipboard(await collectClipboardPayload([item({ 'text/html': '<b>x</b>' })])), false);
+  assert.equal(needsNativeClipboard(await collectClipboardPayload([item({ 'image/png': png })])), false);
 });

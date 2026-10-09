@@ -35,7 +35,7 @@
 	import { openFile, openUrl, copyFileTo, copyImageToClipboard as copyImageToClipboardCmd, writeBytesTo, copyPngToClipboard, copyTextToClipboard } from '$lib/api';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { activeNote, activeNotePath, appConfig, editorDirty, sourceMode, focusMode, readOnly, quickAccessPaths, notes, navHistory, canGoBack, canGoForward, viewerNote, viewMode, notebooks, outlineWidth } from '$lib/stores/app';
-	import { saveNote, importNote, createNote, saveImage, saveAttachment, readClipboardImage, readClipboardText, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout } from '$lib/api';
+	import { saveNote, importNote, createNote, saveImage, saveAttachment, readClipboardImage, readClipboardContents, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout } from '$lib/api';
 	import type { NoteContent, VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord, FileEvent, SearchTarget, ToolbarLayout } from '$lib/types';
 	import { listen } from '@tauri-apps/api/event';
 	import { debounce } from '$lib/utils/debounce';
@@ -62,7 +62,7 @@
 	import { restoreTitleHeading, stripTitleHeading, type HiddenTitleHeading } from '$lib/editor/titleVisibility';
 	import { documentHeadings, sourceHeadings, activeHeadingIndex, mapDocumentHeadings, mapSourceHeadings, type OutlineHeading } from '$lib/editor/outline';
 	import { createEditorMarkdownParser } from '$lib/editor/markdownParser';
-	import { collectClipboardPayload, isEmptyPayload, type ClipboardPastePayload } from '$lib/utils/clipboard-paste';
+	import { collectClipboardPayload, isEmptyPayload, needsNativeClipboard, withNativeClipboard, type ClipboardPastePayload } from '$lib/utils/clipboard-paste';
 	import { externalNoteReferences } from '$lib/editor/externalNote';
 	import { tagIterationKey } from '$lib/utils/tag-styles';
 	import { replaceWithWikiLink } from '$lib/editor/wikiLinks';
@@ -5880,31 +5880,37 @@
 		}
 	}
 
+	async function readNativeClipboard(): Promise<{ text?: string | null; html?: string | null }> {
+		try {
+			return await readClipboardContents();
+		} catch (e) {
+			console.error('Native clipboard read failed:', e);
+			return {};
+		}
+	}
+
 	async function ctxPaste() {
 		// insertClipboardImage() saves the attachment before inserting it, so an
 		// unguarded paste here would leave an orphan file behind when the editor
 		// cannot accept the insertion.
 		if (!editor || $readOnly || $viewerNote) { closeTextContextMenu(); return; }
 		const origin = captureOrigin();
-		const payload = await readWebClipboard();
+		let payload = await readWebClipboard();
 		if (!canInsert(origin) || !editor) return;
-		if (payload && replayPaste(payload)) {
+		// WebKitGTK (bug #218519) often gives nothing, or only plain text, for content from other
+		// apps. Fill in text and HTML from the native clipboard so formatting survives like Ctrl+V.
+		if (needsNativeClipboard(payload)) {
+			payload = withNativeClipboard(payload, await readNativeClipboard());
+			if (!canInsert(origin) || !editor) return;
+		}
+		// Replaying the event runs Ctrl+V's handlers, including the WebKitGTK image fallback for a
+		// clipboard holding only an image (or a bare <img>).
+		if (payload && !isEmptyPayload(payload) && replayPaste(payload)) {
 			closeTextContextMenu();
 			return;
 		}
-		// Native fallback when the web clipboard is unavailable or empty. An image comes first, so a
-		// browser "Copy image" pastes the bitmap rather than the image URL that may come with it.
-		if (await insertClipboardImage(origin)) {
-			if (isOriginCurrent(origin)) closeTextContextMenu();
-			return;
-		}
-		try {
-			const text = await readClipboardText();
-			if (!canInsert(origin) || !editor) return;
-			if (text) replayPaste({ text, html: '', strings: [], files: [] });
-		} catch (e) {
-			console.error('Native clipboard read failed:', e);
-		}
+		// Nothing textual at all: the clipboard may still hold a bitmap only the native reader sees.
+		await insertClipboardImage(origin);
 		if (isOriginCurrent(origin)) closeTextContextMenu();
 	}
 

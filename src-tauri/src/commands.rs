@@ -2029,19 +2029,27 @@ pub fn copy_text_to_clipboard(_text: String) -> Result<(), String> {
     Err("Text clipboard copy is only supported on desktop".to_string())
 }
 
-/// Read text from the system clipboard through the native backend.
+/// Text and HTML on the system clipboard, read through the native backend.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct ClipboardContents {
+    pub text: Option<String>,
+    pub html: Option<String>,
+}
+
+/// Read text and HTML from the system clipboard through the native backend.
 /// Works around the WebKitGTK clipboard bug where the async `navigator.clipboard`
-/// API returns empty for text copied from external applications.
+/// API returns nothing, or only plain text, for content copied from external
+/// applications. Each format is optional; a missing one is not an error.
 #[cfg(desktop)]
 #[tauri::command]
-pub async fn read_clipboard_text() -> Result<String, String> {
+pub async fn read_clipboard_contents() -> Result<ClipboardContents, String> {
     // Reading the clipboard can block while the owning application answers, like the image read below.
     tauri::async_runtime::spawn_blocking(move || {
         let mut clipboard =
             arboard::Clipboard::new().map_err(|e| format!("Clipboard init failed: {}", e))?;
-        clipboard
-            .get_text()
-            .map_err(|e| format!("Failed to read text from clipboard: {}", e))
+        let text = clipboard.get_text().ok().filter(|text| !text.is_empty());
+        let html = clipboard.get().html().ok().filter(|html| !html.is_empty());
+        Ok(ClipboardContents { text, html })
     })
     .await
     .map_err(|error| error.to_string())?
@@ -2049,8 +2057,8 @@ pub async fn read_clipboard_text() -> Result<String, String> {
 
 #[cfg(mobile)]
 #[tauri::command]
-pub async fn read_clipboard_text() -> Result<String, String> {
-    Err("Text clipboard read is only supported on desktop".to_string())
+pub async fn read_clipboard_contents() -> Result<ClipboardContents, String> {
+    Err("Native clipboard read is only supported on desktop".to_string())
 }
 
 /// Read image from system clipboard (bypasses WebKitGTK clipboard bug).
