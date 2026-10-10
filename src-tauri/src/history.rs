@@ -18,10 +18,44 @@ fn safe_path_component<'a>(value: &'a str, label: &str) -> Result<&'a str, Strin
 
 /// Directory: .helixnotes/history/<note-id>/
 fn history_dir(vault_path: &str, note_id: &str) -> Result<PathBuf, String> {
-    Ok(Path::new(vault_path)
-        .join(".helixnotes")
-        .join("history")
-        .join(safe_path_component(note_id, "note ID")?))
+    let mut dir = PathBuf::from(vault_path);
+    // Each level must be a real folder. A link here (carried in by git, a file-sync tool or an
+    // extracted archive) would send snapshots, and the pruning that deletes old ones, to whatever
+    // folder it points at.
+    for part in [
+        ".helixnotes",
+        "history",
+        safe_path_component(note_id, "note ID")?,
+    ] {
+        dir.push(part);
+        if fs::symlink_metadata(&dir).is_ok_and(|meta| !meta.file_type().is_dir()) {
+            return Err("Version history folder is not a real folder".to_string());
+        }
+    }
+    Ok(dir)
+}
+
+/// `2026-01-02T03-04-05.md` or `2026-01-02T03-04-05.678.md`: the only names snapshots are given.
+fn is_snapshot_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".md") else {
+        return false;
+    };
+    let (Some(time), Some(fraction)) = (stem.get(..19), stem.get(19..)) else {
+        return false;
+    };
+    chrono::NaiveDateTime::parse_from_str(time, "%Y-%m-%dT%H-%M-%S").is_ok()
+        && (fraction.is_empty()
+            || fraction.strip_prefix('.').is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+            }))
+}
+
+/// A snapshot the app wrote: a regular file (never a link) with a snapshot name.
+fn is_snapshot_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_snapshot_name)
+        && fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
 }
 
 fn snapshot_path(dir: &Path, raw_content: &str) -> Result<(), String> {
@@ -167,7 +201,7 @@ pub fn list_versions(vault_path: &str, note_id: &str) -> Result<Vec<VersionEntry
     for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "md") {
+        if is_snapshot_file(&path) {
             let filename = path
                 .file_stem()
                 .unwrap_or_default()
@@ -195,6 +229,9 @@ pub fn get_version(vault_path: &str, note_id: &str, timestamp: &str) -> Result<S
     let filename = snapshot_filename(timestamp);
 
     let path = history_dir(vault_path, note_id)?.join(&filename);
+    if !is_snapshot_file(&path) {
+        return Err("Version not found".to_string());
+    }
     fs::read_to_string(&path).map_err(|e| format!("Version not found: {}", e))
 }
 
@@ -204,7 +241,8 @@ fn prune_versions(dir: &Path, max: u32) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "md"))
+        // Only snapshots are counted and removed, never other Markdown files that ended up here.
+        .filter(|p| is_snapshot_file(p))
         .collect();
 
     // Sort by name (timestamps sort lexicographically) - newest last
@@ -279,7 +317,8 @@ mod tests {
         super::force_snapshot(root, "note", "new", 0).unwrap();
         super::maybe_snapshot(root, "note", "too soon", 0);
         let versions = list_versions(root, "note").unwrap();
-        assert_eq!(versions.len(), 3);
+        // The file that is not named like a snapshot is neither a version nor in the way.
+        assert_eq!(versions.len(), 2);
         assert_eq!(
             get_version(root, "note", "2026-01-01T00:00:00Z").unwrap(),
             "legacy"
@@ -288,5 +327,65 @@ mod tests {
             get_version(root, "note", &versions[0].timestamp).unwrap(),
             "new"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_history_folder_is_never_written_to_or_pruned() {
+        use std::os::unix::fs::symlink;
+        let vault = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = vault.path().to_str().unwrap();
+        // A folder of ordinary notes somewhere else, more than the pruning limit.
+        for index in 0..25 {
+            fs::write(
+                outside.path().join(format!("note-{index:02}.md")),
+                "precious",
+            )
+            .unwrap();
+        }
+        let history = vault.path().join(".helixnotes/history");
+        fs::create_dir_all(&history).unwrap();
+        symlink(outside.path(), history.join("linked")).unwrap();
+
+        assert!(super::force_snapshot(root, "linked", "new", 20).is_err());
+        super::maybe_snapshot(root, "linked", "new", 20);
+        assert!(list_versions(root, "linked").is_err());
+        assert!(get_version(root, "linked", "note-00").is_err());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 25);
+
+        // The same when a higher level is the link.
+        let second = tempfile::tempdir().unwrap();
+        fs::create_dir_all(second.path().join(".helixnotes")).unwrap();
+        symlink(outside.path(), second.path().join(".helixnotes/history")).unwrap();
+        assert!(super::force_snapshot(second.path().to_str().unwrap(), "note", "new", 20).is_err());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 25);
+    }
+
+    #[test]
+    fn pruning_and_listing_only_touch_snapshots() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().to_str().unwrap();
+        let history = vault.path().join(".helixnotes/history/note");
+        fs::create_dir_all(&history).unwrap();
+        // Markdown files that are not snapshots, sorting before and after real ones.
+        fs::write(history.join("README.md"), "keep").unwrap();
+        fs::write(history.join("zz-00.md"), "keep").unwrap();
+        fs::write(history.join("2026-01-01T00-00-00.md"), "old").unwrap();
+        fs::write(history.join("2026-01-02T00-00-00.123.md"), "newer").unwrap();
+        super::force_snapshot(root, "note", "newest", 2).unwrap();
+        let versions = list_versions(root, "note").unwrap();
+        assert_eq!(versions.len(), 2);
+        assert!(!history.join("2026-01-01T00-00-00.md").exists());
+        assert!(history.join("README.md").exists() && history.join("zz-00.md").exists());
+        assert!(get_version(root, "note", "zz-00").is_err());
+        #[cfg(unix)]
+        {
+            let target = vault.path().join("secret.md");
+            fs::write(&target, "outside history").unwrap();
+            std::os::unix::fs::symlink(&target, history.join("2026-01-03T00-00-00.md")).unwrap();
+            assert!(get_version(root, "note", "2026-01-03T00:00:00Z").is_err());
+            assert_eq!(list_versions(root, "note").unwrap().len(), 2);
+        }
     }
 }
