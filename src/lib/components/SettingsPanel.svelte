@@ -2226,6 +2226,9 @@
 												<div class="backup-info">
 													<span class="backup-date">{formatBackupDate(entry.created)}</span>
 													<span class="backup-size">{formatBackupSize(entry.size)}</span>
+													{#if entry.other_vault}
+														<span class="backup-size" title="This backup was made from a different vault folder">other vault</span>
+													{/if}
 												</div>
 												<div class="backup-item-actions">
 													<button class="backup-action-btn" title="Restore" onclick={() => restoreConfirm = entry}>
@@ -2253,6 +2256,9 @@
 									<div class="restore-confirm" role="alertdialog" aria-modal="true" aria-labelledby="restore-confirm-title" tabindex="-1">
 										<h4 id="restore-confirm-title">Restore Backup?</h4>
 										<p>This will replace all notes in your vault with the backup from <strong>{formatBackupDate(restoreConfirm.created)}</strong>. This action cannot be undone.</p>
+										{#if restoreConfirm.other_vault}
+											<p><strong>This backup was made from a different vault folder.</strong> Restoring it replaces this vault's notes with that vault's. Continue only if this vault was moved or renamed since then.</p>
+										{/if}
 										<div class="restore-confirm-actions">
 											<button class="restore-cancel" onclick={() => restoreConfirm = null}>Cancel</button>
 											<button class="restore-confirm-btn" onclick={() => handleRestore(restoreConfirm!)}>Restore</button>

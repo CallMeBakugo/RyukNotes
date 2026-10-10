@@ -251,6 +251,8 @@ export interface BackupEntry {
   path: string;
   size: number;
   created: string;
+  /** Made from a different vault folder; all vaults share one backup folder. */
+  other_vault?: boolean;
 }
 
 export interface VersionEntry {

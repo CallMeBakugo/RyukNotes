@@ -54,7 +54,9 @@ fn excluded_path(path: &Path, vault: &Path, backup_dir: &Path, attachments: bool
     if path == vault {
         return false;
     }
-    if path.starts_with(backup_dir) {
+    // Only a backup folder inside the vault is skipped. One that contains the vault (its parent,
+    // the home folder) used to match every path, leaving archives with nothing but the manifest.
+    if backup_dir.starts_with(vault) && path.starts_with(backup_dir) {
         return true;
     }
     // Old configured backup folders may remain inside the vault after relocation.
@@ -203,6 +205,7 @@ pub fn create_backup(
         path: backup_path.to_string_lossy().to_string(),
         size: meta.len(),
         created: now.to_rfc3339(),
+        other_vault: false,
     })
 }
 
@@ -243,12 +246,15 @@ fn list_owned_backups(
         }
         let filename = entry.file_name().to_string_lossy().to_string();
         if let Some((created, owned)) = archive_name(&filename, &id) {
+            // Archives from before vault identities carry none, so they cannot be told apart.
+            let names_a_vault = filename.len() > "helixnotes-backup-0000-00-00T00-00-00.zip".len();
             entries.push((
                 BackupEntry {
                     filename,
                     path: path.to_string_lossy().to_string(),
                     size: meta.len(),
                     created,
+                    other_vault: names_a_vault && !owned,
                 },
                 owned,
             ));
@@ -262,7 +268,8 @@ fn list_owned_backups(
     Ok(entries)
 }
 
-/// List backups from every vault; only automatic pruning uses vault identity.
+/// List backups from every vault, each marked when it belongs to another one; a vault that was
+/// moved or renamed must still be able to restore its earlier archives.
 pub fn list_backups(backup_dir: &Path, vault_path: &str) -> Result<Vec<BackupEntry>, String> {
     Ok(list_owned_backups(backup_dir, vault_path)?
         .into_iter()
@@ -703,6 +710,12 @@ pub fn restore_backup(
             ));
         }
     }
+    // An archive holding only its manifest would replace the vault with nothing.
+    if seen.keys().all(|entry| entry == Path::new(MANIFEST)) {
+        return Err(
+            "This backup contains no notes, so restoring it would empty the vault".to_string(),
+        );
+    }
     let attachments = if let Some(meta) = manifest {
         if meta.version != 1
             || meta.vault.len() != 64
@@ -1093,5 +1106,103 @@ mod tests {
             fs::read_to_string(recovered.join("note.md")).unwrap(),
             "source content"
         );
+    }
+
+    fn archive_names(path: &str) -> Vec<String> {
+        let mut archive = ZipArchive::new(File::open(path).unwrap()).unwrap();
+        (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_backup_folder_that_contains_the_vault_still_archives_the_notes() {
+        let root = tempdir().unwrap();
+        let vault = root.path().join("Documents/Notes");
+        fs::create_dir_all(vault.join("Sub")).unwrap();
+        fs::write(vault.join("note.md"), "content").unwrap();
+        fs::write(vault.join("Sub/deep.md"), "deep").unwrap();
+        // The parent folder, and the folder above that.
+        for output in [root.path().join("Documents"), root.path().to_path_buf()] {
+            let entry = create_backup(&vault_string(&vault), &output, false).unwrap();
+            let names = archive_names(&entry.path);
+            assert!(names.iter().any(|name| name == "note.md"), "{names:?}");
+            assert!(names.iter().any(|name| name == "Sub/deep.md"), "{names:?}");
+            // A second run does not swallow the first archive, which now lies beside the vault.
+            let again = create_backup(&vault_string(&vault), &output, false).unwrap();
+            assert!(!archive_names(&again.path)
+                .iter()
+                .any(|name| name.ends_with(".zip")));
+        }
+    }
+
+    #[test]
+    fn an_archive_without_content_is_not_restored() {
+        let root = tempdir().unwrap();
+        let vault = root.path().join("vault");
+        let output = root.path().join("backups");
+        fs::create_dir_all(&vault).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        fs::write(vault.join("note.md"), "keep me").unwrap();
+        // What the old exclusion produced: nothing but the manifest.
+        let empty = output.join(format!(
+            "helixnotes-backup-2026-01-01T00-00-00-{}-{}.zip",
+            "a".repeat(64),
+            Uuid::new_v4()
+        ));
+        let mut writer = ZipWriter::new(File::create(&empty).unwrap());
+        writer
+            .start_file(super::MANIFEST, SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(
+                format!(
+                    r#"{{"version":1,"vault":"{}","attachments":false}}"#,
+                    "a".repeat(64)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+        let error =
+            restore_backup(&vault_string(&vault), &output, &empty.to_string_lossy()).unwrap_err();
+        assert!(error.contains("contains no notes"), "{error}");
+        assert_eq!(
+            fs::read_to_string(vault.join("note.md")).unwrap(),
+            "keep me"
+        );
+    }
+
+    #[test]
+    fn backups_from_another_vault_are_marked() {
+        let root = tempdir().unwrap();
+        let output = root.path().join("backups");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("note.md"), "one").unwrap();
+        fs::write(second.join("note.md"), "two").unwrap();
+        let own = create_backup(&vault_string(&first), &output, false).unwrap();
+        let foreign = create_backup(&vault_string(&second), &output, false).unwrap();
+        // An archive from before vault identities: it cannot be attributed, so it is not flagged.
+        fs::copy(
+            &own.path,
+            output.join("helixnotes-backup-2020-01-01T00-00-00.zip"),
+        )
+        .unwrap();
+        assert!(!own.other_vault);
+        let listed = list_backups(&output, &vault_string(&first)).unwrap();
+        let marked = |path: &str| {
+            listed
+                .iter()
+                .find(|entry| entry.path == path)
+                .unwrap()
+                .other_vault
+        };
+        assert!(!marked(&own.path));
+        assert!(marked(&foreign.path));
+        assert!(listed.iter().filter(|entry| entry.other_vault).count() == 1);
+        assert_eq!(listed.len(), 3);
     }
 }

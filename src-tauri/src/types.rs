@@ -568,6 +568,9 @@ pub struct BackupEntry {
     pub path: String,
     pub size: u64,
     pub created: String,
+    /// The archive was made from a different vault folder. All vaults share one backup folder.
+    #[serde(default)]
+    pub other_vault: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

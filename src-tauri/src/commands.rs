@@ -3727,7 +3727,9 @@ pub fn restore_backup(
         let result = {
             let _writes = state.note_save.blocking_lock();
             state.importing.store(true, Ordering::Release);
-            let result = crate::backup::restore_backup(&vault_path, &backup_dir, &backup_path);
+            let result = crate::backup::restore_backup(&vault_path, &backup_dir, &backup_path)
+                // Still under the maintenance lock, so no sync can run in between.
+                .and_then(|()| crate::sync::forget_baseline(&vault_path));
             state.importing.store(false, Ordering::Release);
             result
         };

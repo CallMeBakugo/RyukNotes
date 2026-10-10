@@ -119,6 +119,19 @@ fn local_path(vault: &Path, relpath: &str) -> Result<PathBuf, String> {
     Ok(vault.join(relpath))
 }
 
+/// Forgets what the last sync saw. After a backup restore the vault no longer matches it: kept,
+/// the next sync would read the rollback as local edits, delete everything newer on the server and
+/// overwrite newer notes there with the restored ones. Without it the next sync starts over as a
+/// first sync, which merges both sides and deletes nothing.
+pub(crate) fn forget_baseline(vault: &str) -> Result<(), String> {
+    let path = manifest_path(vault);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(local_error("reset sync state", &path, error)),
+    }
+}
+
 fn load_manifest(vault: &str) -> Result<SyncManifest, String> {
     match fs::read(manifest_path(vault)) {
         Ok(bytes) => serde_json::from_slice(&bytes)
@@ -1437,6 +1450,24 @@ mod tests {
         let event = changed_entry(path, "modify", vault.path());
         assert_eq!(event.note.unwrap().preview, "remote content");
     }
+    #[test]
+    fn forgetting_the_baseline_makes_the_next_sync_a_first_sync() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().to_str().unwrap();
+        let mut recorded = SyncManifest::default();
+        recorded.files.insert(
+            "gone.md".to_string(),
+            manifest_entry("hash".to_string(), "\"etag\""),
+        );
+        save_manifest(root, &recorded).unwrap();
+        assert!(!load_manifest(root).unwrap().files.is_empty());
+        forget_baseline(root).unwrap();
+        // No record of earlier files means none can be read as deleted on either side.
+        assert!(load_manifest(root).unwrap().files.is_empty());
+        // Nothing to forget is fine too.
+        forget_baseline(root).unwrap();
+    }
+
     #[test]
     fn remote_paths_cannot_leave_the_vault() {
         // Literal and percent-encoded traversal, as a hostile server could list it.
