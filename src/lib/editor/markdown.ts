@@ -200,6 +200,8 @@ function commonMarkCount(active: MarkdownMark[], next: MarkdownMark[]): number {
 export interface InlineSerializeOptions {
   /** Leave `$` unescaped (only backslashes before it are doubled); callers must check it cannot form math. */
   literalDollars?: boolean;
+  /** Rewrites the text of a plain (non-code) text child before it is written; see `literalTextEscapes`. */
+  literalText?: (text: string, childIndex: number) => string;
 }
 
 export function serializeInlineMarkdown(
@@ -271,6 +273,7 @@ export function serializeInlineMarkdown(
         transitionMarks(marks);
         result += serializeCodeSpan(text);
       } else {
+        if (options.literalText) text = options.literalText(text, index);
         if (index === 0) {
           text = text.replace(/^[\t\u2003]+/, (whitespace) => '&emsp;'.repeat(whitespace.length));
         }
@@ -320,6 +323,148 @@ export function serializeInlineMarkdown(
   return result;
 }
 
+// ---- Keeping plain text plain
+// Text in the editor is literal: `*not italic*`, `<b>` or `&amp;` typed or loaded as text must come
+// back as the same text. Written as they are, such characters can turn into formatting, HTML or an
+// entity on the next load. They are escaped with a backslash, but only where the parser would
+// otherwise read them differently, so ordinary notes are written exactly as before.
+
+/**
+ * Characters that can start or end inline formatting, HTML or an entity in the place they stand.
+ * Cheap: no parsing. Brackets are left out on purpose: text that reads as a link or an image is
+ * left to become one, as it always has (images damaged by an old save bug come back that way).
+ */
+const LITERAL_BACKSLASH = /\\(?=[!-#%-/:-@[-`{-~])/g;
+const LITERAL_DELIMITER = /[*`~^_]|<(?=[A-Za-z/!?])|&(?=#?[A-Za-z0-9]+;)|=(?==)/g;
+const LITERAL_CANDIDATE = /\\(?=[!-#%-/:-@[-`{-~])|[*`~^]|(?:^|[^\p{L}\p{N}])_|_(?![\p{L}\p{N}])|<(?=[A-Za-z/!?])|&(?=#?[A-Za-z0-9]+;)|==/u;
+const MAX_MINIMIZED_ESCAPES = 40;
+
+/** Reads a string of inline Markdown back and returns the text it shows (formatting removed). */
+export type InlinePlainText = (markdown: string) => string;
+
+const squash = (text: string) => text.replace(/[\s\u00a0\u2003]+/g, '');
+
+/** A literal backslash before punctuation would be read as an escape, so it is always doubled. */
+function escapeBackslashes(text: string): string {
+  return text.replace(LITERAL_BACKSLASH, '\\$&');
+}
+
+function escapeEveryCandidate(text: string): string {
+  return escapeBackslashes(text).replace(LITERAL_DELIMITER, '\\$&');
+}
+
+/** The fewest backslashes that make `text`, on its own, read back as itself. */
+function escapeWhereNeeded(raw: string, plainText: InlinePlainText): string {
+  const wanted = squash(raw);
+  if (squash(plainText(raw)) === wanted) return raw;
+  const text = escapeBackslashes(raw);
+  if (squash(plainText(text)) === wanted) return text;
+  const positions: number[] = [];
+  for (const match of text.matchAll(LITERAL_DELIMITER)) positions.push(match.index);
+  const build = (escaped: ReadonlySet<number>) => {
+    let result = '';
+    let from = 0;
+    for (const position of positions) {
+      if (!escaped.has(position)) continue;
+      result += text.slice(from, position) + '\\';
+      from = position;
+    }
+    return result + text.slice(from);
+  };
+  const escaped = new Set(positions);
+  if (positions.length > MAX_MINIMIZED_ESCAPES) return build(escaped);
+  // Last to first, so the backslashes that stay are the leading ones (`\\*not italic*`).
+  for (const position of [...positions].reverse()) {
+    escaped.delete(position);
+    if (squash(plainText(build(escaped))) !== wanted) escaped.add(position);
+  }
+  return build(escaped);
+}
+
+/**
+ * Decides how the plain text children of `node` must be escaped so the whole line reads back as
+ * the same text, and returns that as a `literalText` option (undefined when nothing needs it).
+ * Tries the unescaped form first, then each text child fixed on its own, then every candidate
+ * escaped; if even that does not read back, the line is left as it was written before.
+ */
+export function literalTextEscapes(
+  node: ProseMirrorNode,
+  normalizeAssetSource: AssetSourceNormalizer,
+  plainText: InlinePlainText,
+): InlineSerializeOptions['literalText'] {
+  // Nodes are immutable and reused between saves, so each line is judged once, not on every save.
+  const known = literalDecisions.get(node);
+  if (known) return known === 'none' ? undefined : known;
+  const decision = decideLiteralText(node, normalizeAssetSource, plainText);
+  literalDecisions.set(node, decision ?? 'none');
+  return decision;
+}
+
+const literalDecisions = new WeakMap<ProseMirrorNode, NonNullable<InlineSerializeOptions['literalText']> | 'none'>();
+
+function decideLiteralText(
+  node: ProseMirrorNode,
+  normalizeAssetSource: AssetSourceNormalizer,
+  plainText: InlinePlainText,
+): InlineSerializeOptions['literalText'] {
+  let wanted = '';
+  let plain = '';
+  let formatted = false;
+  node.forEach((child) => {
+    if (!child.isText) return;
+    wanted += child.text || '';
+    if (child.marks.length) formatted = true;
+    if (!child.marks.some((mark) => mark.type.name === 'code')) plain += (child.text || '') + '\n';
+  });
+  if (!LITERAL_CANDIDATE.test(plain)) return undefined;
+  // Without formatting on the line, a delimiter needs a partner of its own kind to mean anything:
+  // one `*`, `_`, `~`, `^` or backtick on its own stays text. This spares most lines the check.
+  if (!formatted && !/\\(?=[!-#%-/:-@[-`{-~])|<(?=[A-Za-z/!?])|&(?=#?[A-Za-z0-9]+;)|==[^]*==/.test(plain)
+    && !/\*[^]*\*|_[^]*_|`[^]*`|~[^]*~|\^[^]*\^/.test(plain)) return undefined;
+  wanted = squash(wanted);
+  const readsBack = (literalText?: InlineSerializeOptions['literalText']) =>
+    squash(plainText(serializeInlineMarkdown(node, normalizeAssetSource, { literalText }))) === wanted;
+  if (readsBack()) return undefined;
+  const minimal = new Map<string, string>();
+  const each: InlineSerializeOptions['literalText'] = (text) => {
+    if (!LITERAL_CANDIDATE.test(text)) return text;
+    if (!minimal.has(text)) minimal.set(text, escapeWhereNeeded(text, plainText));
+    return minimal.get(text)!;
+  };
+  if (readsBack(each)) return each;
+  const all: InlineSerializeOptions['literalText'] = (text) => escapeEveryCandidate(text);
+  return readsBack(all) ? all : undefined;
+}
+
+/** Whether a serialized paragraph is still read as one paragraph. */
+export type ReadsAsParagraph = (markdown: string) => boolean;
+
+/** Whether the note, as last loaded or saved, has this line (compared without indentation). */
+export type InNoteSource = (line: string) => boolean;
+
+const BLOCK_START = /^ {0,3}(?:#{1,6}(?:\s|$)|>|[-+*](?:\s|$)|\d{1,9}[.)](?:\s|$)|`{3}|~{3}|=+\s*$|[-*_](?:\s*[-*_]){2,}\s*$|\[[^\]]*\]:|:::)/m;
+
+/**
+ * A paragraph whose line starts like a heading, quote, list item, fence, rule or link definition
+ * would become that block on the next load. Such starts get a backslash, but only when the parser
+ * confirms the paragraph would not come back as a paragraph.
+ *
+ * One exception keeps a long-standing behavior: the editor does not read indented code, so a
+ * source line such as `    - item` is shown as text and has always been saved as `- item`, which
+ * the next load reads as the list its author meant. A line the note's source already has in that
+ * unescaped form is therefore left alone; only text from elsewhere (typed, pasted, or escaped in
+ * the source) is escaped.
+ */
+export function escapeBlockStarts(markdown: string, readsAsParagraph: ReadsAsParagraph, inNoteSource?: InNoteSource): string {
+  if (!BLOCK_START.test(markdown) || readsAsParagraph(markdown)) return markdown;
+  return markdown
+    .split('\n')
+    .map((line) => (inNoteSource?.(line) ? line : line
+      .replace(/^( {0,3})(\d{1,9})([.)])(?=\s|$)/, '$1$2\\$3')
+      .replace(/^( {0,3})(#{1,6}(?:\s|$)|>|[-+*](?:\s|$)|`{3}|~{3}|=+\s*$|[-*_](?:\s*[-*_]){2,}\s*$|\[[^\]]*\]:|:::)/, '$1\\$2')))
+    .join('\n');
+}
+
 /**
  * Like serializeInlineMarkdown, but writes a `$` as typed unless that could change the note's
  * math. `inlineMathPayloads` returns the TeX of each inline formula the parser finds in a string;
@@ -329,10 +474,12 @@ export function serializeInlineMarkdownKeepingDollars(
   node: ProseMirrorNode,
   normalizeAssetSource: AssetSourceNormalizer,
   inlineMathPayloads: (markdown: string) => string[],
+  plainText?: InlinePlainText,
 ): string {
-  const escaped = serializeInlineMarkdown(node, normalizeAssetSource);
+  const literalText = plainText ? literalTextEscapes(node, normalizeAssetSource, plainText) : undefined;
+  const escaped = serializeInlineMarkdown(node, normalizeAssetSource, { literalText });
   if (!escaped.includes('$')) return escaped;
-  const plain = serializeInlineMarkdown(node, normalizeAssetSource, { literalDollars: true });
+  const plain = serializeInlineMarkdown(node, normalizeAssetSource, { literalDollars: true, literalText });
   // A `$$` could start a display formula in a later block, so only single dollars are left alone.
   if (plain.includes('$$')) return escaped;
   const expected = inlineMathPayloads(escaped);

@@ -14,7 +14,7 @@ const { code } = await transformWithEsbuild(source, 'markdown.ts', {
   format: 'esm',
   target: 'esnext'
 });
-const { joinListItemBlocks, joinMarkdownBlocks, serializeCodeBlock, serializeInlineMarkdown, serializeInlineMarkdownKeepingDollars } = await import(
+const { escapeBlockStarts, joinListItemBlocks, joinMarkdownBlocks, literalTextEscapes, serializeCodeBlock, serializeInlineMarkdown, serializeInlineMarkdownKeepingDollars } = await import(
   `data:text/javascript;base64,${Buffer.from(code).toString('base64')}`
 );
 
@@ -232,6 +232,105 @@ test('drops formatting around a code span that a letter or digit touches', () =>
   // Next to spaces or punctuation the formatting is kept.
   assert.equal(serializeInlineMarkdown(paragraph([{ text: '(', marks: [] }, { text: 'x', marks: [codeMark, bold] }, { text: ').', marks: [] }])), '(**`x`**).');
   assert.match(editorMarkdown.renderInline('(**`x`**).'), /<strong><code[^>]*>x<\/code><\/strong>/);
+});
+
+// What the editor does when it saves a paragraph: escape only what would read back differently.
+const inlinePlainText = (markdown) => (editorMarkdown.parseInline(markdown, {})[0]?.children ?? [])
+  .map((token) => (token.type === 'text' || token.type === 'code_inline' || token.type === 'helix_wiki' ? token.content : '')).join('');
+const readsAsParagraph = (markdown) => {
+  const tokens = editorMarkdown.parse(markdown, {});
+  return tokens.length === 3 && tokens[0].type === 'paragraph_open';
+};
+function saveParagraph(segments) {
+  const node = paragraph(segments);
+  const literalText = literalTextEscapes(node, (source) => source, inlinePlainText);
+  return escapeBlockStarts(serializeInlineMarkdown(node, (source) => source, { literalText }), readsAsParagraph);
+}
+/** Block types and visible text a saved paragraph has when it is loaded again. */
+function reload(markdown) {
+  const tokens = editorMarkdown.parse(markdown, {});
+  return {
+    blocks: tokens.filter((token) => token.nesting === 1).map((token) => token.type.replace('_open', '')).join(','),
+    text: tokens.filter((token) => token.type === 'inline').flatMap((token) => token.children)
+      .filter((token) => token.type === 'text' || token.type === 'code_inline').map((token) => token.content).join(''),
+    formatted: tokens.filter((token) => token.type === 'inline').flatMap((token) => token.children)
+      .some((token) => /^(em|strong|s|link|html_inline|mark)/.test(token.type)),
+  };
+}
+
+test('text that looks like Markdown is saved so that it stays text', () => {
+  const cases = [
+    ['*not italic*', '\\*not italic*'],
+    ['a*b*c in a formula', 'a\\*b*c in a formula'],
+    ['__init__ is a method', '\\_\\_init__ is a method'],
+    ['`not code`', '\\`not code`'],
+    ['~~not struck~~', '\\~~not struck~~'],
+    ['<b> shown as text', '\\<b> shown as text'],
+    ['&amp; literal entity', '\\&amp; literal entity'],
+    ['1. not a list', '1\\. not a list'],
+    ['12) not a list', '12\\) not a list'],
+    ['# not a heading', '\\# not a heading'],
+    ['> not a quote', '\\> not a quote'],
+    ['- not a bullet', '\\- not a bullet'],
+    ['+ not a bullet', '\\+ not a bullet'],
+    ['---', '\\---'],
+    ['[x]: http://not.a/definition', '\\[x]: http://not.a/definition'],
+    ['\\\\server\\share and C:\\.', '\\\\\\server\\share and C:\\\\.'],
+  ];
+  for (const [text, expected] of cases) {
+    const saved = saveParagraph([{ text, marks: [] }]);
+    assert.equal(saved, expected, text);
+    assert.deepEqual(reload(saved), { blocks: 'paragraph', text, formatted: false }, saved);
+    // Saving what was loaded again changes nothing more.
+    assert.equal(saveParagraph([{ text: reload(saved).text, marks: [] }]), saved);
+  }
+});
+
+test('text that reads as a link or an image is left to become one', () => {
+  // Deliberate: images damaged by an old save bug (`<!-- -->![](a b.png)`) load as text and come
+  // back as images this way. Brackets are never escaped.
+  for (const text of ['![](.helixnotes/attachments/a b.png)', '[docs](https://example.com)', '[[Other note]]']) {
+    assert.equal(saveParagraph([{ text, marks: [] }]), text);
+  }
+});
+
+test('a line the note already has unescaped keeps its meaning from before', () => {
+  // The editor shows a source line such as `    - item` as text; saving it as `- item` lets the
+  // next load read the list its author wrote. Only text from elsewhere is escaped.
+  const node = paragraph([{ text: '- item from an indented source line', marks: [] }]);
+  const line = serializeInlineMarkdown(node, (source) => source);
+  const source = new Set(['- item from an indented source line']);
+  assert.equal(escapeBlockStarts(line, readsAsParagraph, (text) => source.has(text.trim())), '- item from an indented source line');
+  assert.equal(escapeBlockStarts(line, readsAsParagraph, () => false), '\\- item from an indented source line');
+  // Line by line: one known line does not excuse another.
+  assert.equal(
+    escapeBlockStarts('1. typed here\n2. from the source', readsAsParagraph, (text) => text.trim() === '2. from the source'),
+    '1\\. typed here\n2. from the source'
+  );
+});
+
+test('ordinary text is written exactly as before, without added backslashes', () => {
+  for (const text of [
+    '2 * 3 * 4', 'snake_case_name and file_name.md', 'price is [10] and a < b & c', 'R&D, AT&T, x = y, 5^2?',
+    'a lone * star and a lone ` tick', 'TODO [ ] check', 'version 1.2.3 and #hashtag', 'C:\\Users\\tom\\notes',
+    'e.g. 1.5x faster - really', 'Q&A: why? because!', 'a_b_c', '100% (approx.) ~ 3', 'email@example.com', '(a) [b] {c}',
+  ]) {
+    assert.equal(saveParagraph([{ text, marks: [] }]), text);
+  }
+});
+
+test('literal text next to real formatting keeps both', () => {
+  const codeMark = schema.marks.code.create();
+  // Asterisks in plain text around bold text must not join the bold markers.
+  let saved = saveParagraph([{ text: 'a*', marks: [] }, { text: 'b', marks: [bold] }, { text: '*c', marks: [] }]);
+  assert.equal(reload(saved).text, 'a*b*c');
+  assert.equal(editorMarkdown.renderInline(saved), 'a*<strong>b</strong>*c');
+  // Text in a code span is never escaped.
+  saved = saveParagraph([{ text: 'x ', marks: [] }, { text: 'a*b*c', marks: [codeMark] }, { text: ' and [docs]', marks: [] }]);
+  assert.equal(saved, 'x `a*b*c` and [docs]');
+  // A paragraph with formatting and harmless brackets gets no backslashes.
+  saved = saveParagraph([{ text: 'Note:', marks: [bold] }, { text: ' see [docs] and file_name', marks: [] }]);
+  assert.equal(saved, '**Note:** see [docs] and file_name');
 });
 
 test('preserves formatting on non-code parts of a link', () => {

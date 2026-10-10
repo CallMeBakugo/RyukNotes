@@ -60,7 +60,7 @@
 	import { clearFormatting } from '$lib/editor/clearFormatting';
 	import { toolbarLabels, resolveToolbarLayout, groupToolbarButtons, moveToolbarButton, toolbarLayoutPreference, type ToolbarButtonId, type ToolbarArea, type ResolvedToolbarLayout } from '$lib/editor/toolbar';
 	import { buildCodeCopyDecorations, buildTaskMetaDecorations, focusedPlaceholderDecorations } from '$lib/editor/decorations';
-	import { serializeImageTitle, serializeInlineMarkdownKeepingDollars, serializeCodeBlock, joinMarkdownBlocks, joinListItemBlocks, type ListItemBlock, type MarkdownBlock } from '$lib/editor/markdown';
+	import { escapeBlockStarts, serializeImageTitle, serializeInlineMarkdownKeepingDollars, serializeCodeBlock, joinMarkdownBlocks, joinListItemBlocks, type ListItemBlock, type MarkdownBlock } from '$lib/editor/markdown';
 	import { restoreTitleHeading, stripTitleHeading, type HiddenTitleHeading } from '$lib/editor/titleVisibility';
 	import { documentHeadings, sourceHeadings, activeHeadingIndex, mapDocumentHeadings, mapSourceHeadings, type OutlineHeading } from '$lib/editor/outline';
 	import { createEditorMarkdownParser } from '$lib/editor/markdownParser';
@@ -4289,7 +4289,7 @@
 				if (align && align !== 'left') {
 					return serializeHTMLNode(node) + '\n';
 				}
-				return serializeInline(node) + '\n';
+				return serializeParagraphText(node) + '\n';
 			}
 			case 'heading': {
 				const align = node.attrs.textAlign;
@@ -4397,7 +4397,10 @@
 			const isList = child.type.name === 'bulletList' || child.type.name === 'orderedList' || child.type.name === 'taskList';
 			blocks.push({
 				isList,
-				text: index === 0 && child.type.name === 'paragraph' ? serializeInline(child) : serializeNode(child),
+				// Text that starts like a task box in a plain list item must not become a task.
+				text: index === 0 && child.type.name === 'paragraph'
+					? (node.type.name === 'listItem' ? serializeParagraphText(child).replace(/^\[(?=[ xX]\](?:\s|$))/, '\\[') : serializeParagraphText(child))
+					: serializeNode(child),
 			});
 		});
 		return joinListItemBlocks(blocks);
@@ -4408,9 +4411,44 @@
 		return children.filter(token => token.type === 'helix_math_inline').map(token => token.content);
 	}
 
-	function serializeInline(node: any): string {
-		return serializeInlineMarkdownKeepingDollars(node, stripAssetSrc, inlineMathPayloads);
+	/** The text a line of inline Markdown shows when it is read back, without its formatting. */
+	function inlinePlainText(markdown: string): string {
+		let text = '';
+		for (const token of mdit.parseInline(markdown, {})[0]?.children ?? []) {
+			if (token.type === 'text' || token.type === 'code_inline' || token.type === 'helix_wiki') text += token.content;
+		}
+		return text;
 	}
+
+	function readsAsParagraph(markdown: string): boolean {
+		const tokens = mdit.parse(markdown, {});
+		return tokens.length === 3 && tokens[0].type === 'paragraph_open';
+	}
+
+	function serializeInline(node: any): string {
+		return serializeInlineMarkdownKeepingDollars(node, stripAssetSrc, inlineMathPayloads, inlinePlainText);
+	}
+
+	// Lines of the note as it was last loaded or saved, without indentation; see escapeBlockStarts.
+	let sourceLines: { raw: string; lines: Set<string> } | null = null;
+	function inNoteSource(line: string): boolean {
+		const raw = saves.raw;
+		if (sourceLines?.raw !== raw) sourceLines = { raw, lines: new Set(raw.split('\n').map((text) => text.trim())) };
+		return sourceLines.lines.has(line.trim());
+	}
+
+	/** A paragraph's text, kept from turning into a heading, list, quote or other block on reload. */
+	function serializeParagraphText(node: any): string {
+		return escapeBlockStarts(serializeInline(node), (markdown) => {
+			// Nodes are reused between saves, so an unchanged paragraph is parsed back only once.
+			const known = paragraphChecks.get(node);
+			if (known?.markdown === markdown) return known.reads;
+			const reads = readsAsParagraph(markdown);
+			paragraphChecks.set(node, { markdown, reads });
+			return reads;
+		}, inNoteSource);
+	}
+	const paragraphChecks = new WeakMap<object, { markdown: string; reads: boolean }>();
 
 	function autofocus(el: HTMLElement) {
 		requestAnimationFrame(() => el.focus());
