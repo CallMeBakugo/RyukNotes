@@ -203,6 +203,37 @@ test('keeps formatting that covers a whole code span', () => {
   assert.match(editorMarkdown.render('**`x.ps1`**'), /<strong><code[^>]*>x\.ps1<\/code><\/strong>/);
 });
 
+test('writes spaces at the edges of bold and italic outside the delimiters (issues #240, #276)', () => {
+  const cases = [
+    [[{ text: 'bold ', marks: [bold] }, { text: 'rest', marks: [] }], '**bold** rest', '<strong>bold</strong> rest'],
+    [[{ text: 'pre', marks: [] }, { text: ' bold', marks: [bold] }, { text: ' rest', marks: [] }], 'pre **bold** rest', 'pre <strong>bold</strong> rest'],
+    [[{ text: 'word ', marks: [italic] }, { text: '.', marks: [] }], '*word* .', '<em>word</em> .'],
+    [[{ text: 'a ', marks: [] }, { text: 'bold ', marks: [bold] }, { text: 'it ', marks: [bold, italic] }, { text: 'end', marks: [] }], 'a **bold *it*** end', 'a <strong>bold <em>it</em></strong> end'],
+    [[{ text: 'one ', marks: [bold] }, { text: 'two ', marks: [italic] }, { text: 'three', marks: [] }], '**one** *two* three', '<strong>one</strong> <em>two</em> three'],
+    [[{ text: '  both  ', marks: [bold] }], '  **both**  ', '  <strong>both</strong>  '],
+    // Spaces inside a formatted run stay inside it.
+    [[{ text: 'a', marks: [bold] }, { text: ' ', marks: [bold] }, { text: 'b', marks: [bold] }], '**a b**', '<strong>a b</strong>'],
+    // A mark over nothing but spaces is not written.
+    [[{ text: ' ', marks: [bold] }, { text: 'x', marks: [] }], ' x', ' x'],
+    [[{ text: 'link ', marks: [bold, link] }, { text: 'x', marks: [] }], '**[link](https://example.com)** x', '<strong><a href="https://example.com">link</a></strong> x'],
+  ];
+  for (const [segments, markdown, html] of cases) {
+    assert.equal(serializeInlineMarkdown(paragraph(segments)), markdown);
+    assert.equal(editorMarkdown.renderInline(markdown), html, markdown);
+  }
+});
+
+test('drops formatting around a code span that a letter or digit touches', () => {
+  const codeMark = schema.marks.code.create();
+  // `**\`code\`**s` is not emphasis in Markdown, so the code span is written plain there.
+  assert.equal(serializeInlineMarkdown(paragraph([{ text: 'code', marks: [codeMark, bold] }, { text: 's', marks: [] }])), '`code`s');
+  assert.equal(serializeInlineMarkdown(paragraph([{ text: 'the', marks: [] }, { text: 'code', marks: [codeMark, bold] }, { text: ' x', marks: [] }])), 'the`code` x');
+  assert.equal(serializeInlineMarkdown(paragraph([{ text: 'Run ', marks: [bold] }, { text: 'make', marks: [codeMark, bold] }, { text: 's', marks: [] }])), '**Run** `make`s');
+  // Next to spaces or punctuation the formatting is kept.
+  assert.equal(serializeInlineMarkdown(paragraph([{ text: '(', marks: [] }, { text: 'x', marks: [codeMark, bold] }, { text: ').', marks: [] }])), '(**`x`**).');
+  assert.match(editorMarkdown.renderInline('(**`x`**).'), /<strong><code[^>]*>x<\/code><\/strong>/);
+});
+
 test('preserves formatting on non-code parts of a link', () => {
   const codeMark = schema.marks.code.create();
   const serialized = serializeInlineMarkdown(paragraph([

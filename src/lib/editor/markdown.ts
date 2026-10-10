@@ -207,14 +207,31 @@ export function serializeInlineMarkdown(
 ): string {
   let result = '';
   let activeMarks: MarkdownMark[] = [];
+  // Length of `result` right after each active mark was opened, to tell when a mark holds nothing.
+  let openEnds: number[] = [];
+
+  // `**word **` is not emphasis in Markdown: delimiters must touch the text they wrap. Spaces at the
+  // edges of bold, italic and similar marks are therefore written outside the delimiters, and a mark
+  // that covers only spaces is not written at all.
+  const isDelimiter = (mark: MarkdownMark) => mark.open === mark.close && !mark.open.startsWith('<');
 
   const transitionMarks = (nextMarks: MarkdownMark[]) => {
     const shared = commonMarkCount(activeMarks, nextMarks);
-    for (let index = activeMarks.length - 1; index >= shared; index -= 1) {
-      result += activeMarks[index].close;
+    let trailing = '';
+    if (activeMarks.slice(shared).some(isDelimiter)) {
+      trailing = result.match(/[ \t\u00a0]+$/)?.[0] ?? '';
+      if (trailing) result = result.slice(0, -trailing.length);
     }
+    for (let index = activeMarks.length - 1; index >= shared; index -= 1) {
+      const mark = activeMarks[index];
+      if (isDelimiter(mark) && result.length === openEnds[index]) result = result.slice(0, result.length - mark.open.length);
+      else result += mark.close;
+    }
+    result += trailing;
+    openEnds = openEnds.slice(0, shared);
     for (let index = shared; index < nextMarks.length; index += 1) {
       result += nextMarks[index].open;
+      openEnds.push(result.length);
     }
     activeMarks = nextMarks;
   };
@@ -240,13 +257,32 @@ export function serializeInlineMarkdown(
           text += next.text || '';
           index += 1;
         }
+        // Delimiters next to a code span sit between punctuation (the backtick) and the neighbor:
+        // `**\`x\`**s` is not emphasis when a letter or digit follows, nor `a**\`x\`**` when one
+        // precedes. Formatting that would open or close against such a neighbor is dropped.
+        const after = index + 1 < node.childCount ? node.child(index + 1) : null;
+        const afterKeys = new Set(after?.isText ? marksForText(after).map((mark) => mark.key) : []);
+        const wordAfter = /^[\p{L}\p{N}_]/u.test(after?.isText ? after.text || '' : '');
+        const wordBefore = /[\p{L}\p{N}_]$/u.test(result);
+        marks = marks.filter((mark) => !isDelimiter(mark)
+          || !((wordAfter && !afterKeys.has(mark.key)) || (wordBefore && !activeMarks.some((active) => active.key === mark.key))));
         transitionMarks(marks);
         result += serializeCodeSpan(text);
       } else {
-        transitionMarks(marksForText(child));
         if (index === 0) {
           text = text.replace(/^[\t\u2003]+/, (whitespace) => '&emsp;'.repeat(whitespace.length));
         }
+        const marks = marksForText(child);
+        const shared = commonMarkCount(activeMarks, marks);
+        const leading = marks.slice(shared).some(isDelimiter) ? text.match(/^[ \t\u00a0]+/)?.[0] ?? '' : '';
+        if (leading) {
+          // Spaces before newly opened delimiters stay outside them.
+          transitionMarks(marks.slice(0, shared));
+          result += leading;
+          text = text.slice(leading.length);
+          if (!text) continue;
+        }
+        transitionMarks(marks);
         text = options.literalDollars
           ? text.replace(/\\+(?=\$)/g, (backslashes) => backslashes + backslashes)
           : text.replace(/\\*\$/g, (match) => '\\'.repeat((match.length - 1) * 2 + 1) + '$');
