@@ -101,14 +101,60 @@ pub fn parse_date_flexible(s: &str) -> Option<chrono::DateTime<Utc>> {
     None
 }
 
+/// Reads the known keys one by one. Frontmatter written by other editors is often shaped a little
+/// differently (`tags: work`, `pinned: yes`, a numeric title or id); reading it as one strict
+/// record dropped every field when a single one did not fit, and the next save then wrote a new id,
+/// the file name as title and no tags over the originals.
+fn read_frontmatter(data: Option<Pod>) -> RawFrontmatter {
+    let Some(serde_json::Value::Object(fields)) =
+        data.and_then(|data| data.deserialize::<serde_json::Value>().ok())
+    else {
+        return RawFrontmatter::default();
+    };
+    let text = |value: &serde_json::Value| match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    };
+    let tags = fields.get("tags").map(|value| match value {
+        serde_json::Value::Array(items) => items.iter().filter_map(text).collect(),
+        // `tags: work` and `tags: a, b` are common outside this app.
+        other => text(other)
+            .map(|joined| {
+                joined
+                    .split(',')
+                    .map(|tag| tag.trim().to_string())
+                    .filter(|tag| !tag.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    });
+    let pinned = fields.get("pinned").and_then(|value| match value {
+        serde_json::Value::Bool(flag) => Some(*flag),
+        serde_json::Value::Number(number) => Some(number.as_f64() != Some(0.0)),
+        serde_json::Value::String(word) => match word.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "on" | "1" => Some(true),
+            "false" | "no" | "off" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    });
+    RawFrontmatter {
+        id: fields.get("id").and_then(text),
+        title: fields.get("title").and_then(text),
+        tags,
+        pinned,
+        created: fields.get("created").and_then(text),
+        modified: fields.get("modified").and_then(text),
+    }
+}
+
 pub fn parse_note(raw: &str, filename: &str) -> (NoteMeta, String) {
     let matter = Matter::<BoundedYaml>::new();
     let result = matter.parse(raw);
 
-    let fm: RawFrontmatter = result
-        .data
-        .and_then(|d| d.deserialize().ok())
-        .unwrap_or_default();
+    let fm = read_frontmatter(result.data);
 
     let title = fm.title.unwrap_or_else(|| filename_to_title(filename));
 
@@ -161,29 +207,24 @@ fn ensure_title_heading(body: &str, title: &str) -> String {
     format!("# {}\n\n{}", title, body)
 }
 
+/// The frontmatter block for a note that has none yet. Written through the YAML serializer like
+/// `merge_frontmatter`: assembled by hand, a title with a backslash or a tag such as `2024`,
+/// `true` or `a: b` came out as YAML the app could not read back.
 pub fn serialize_frontmatter(meta: &NoteMeta) -> String {
-    let tags_str = if meta.tags.is_empty() {
-        "[]".to_string()
-    } else {
-        format!(
-            "[{}]",
-            meta.tags
-                .iter()
-                .map(|t| t.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-
-    format!(
-        "---\nid: \"{}\"\ntitle: \"{}\"\ntags: {}\npinned: {}\ncreated: {}\nmodified: {}\n---\n",
-        meta.id,
-        meta.title.replace('"', "\\\""),
-        tags_str,
-        meta.pinned,
-        meta.created.to_rfc3339(),
-        meta.modified.to_rfc3339(),
-    )
+    let text = |value: &str| serde_yaml::Value::String(value.to_string());
+    let mut mapping = serde_yaml::Mapping::new();
+    mapping.insert(text("id"), text(&meta.id));
+    mapping.insert(text("title"), text(&meta.title));
+    mapping.insert(
+        text("tags"),
+        serde_yaml::Value::Sequence(meta.tags.iter().map(|tag| text(tag)).collect()),
+    );
+    mapping.insert(text("pinned"), serde_yaml::Value::Bool(meta.pinned));
+    mapping.insert(text("created"), text(&meta.created.to_rfc3339()));
+    mapping.insert(text("modified"), text(&meta.modified.to_rfc3339()));
+    let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(mapping))
+        .expect("strings, booleans and a list always serialize");
+    format!("---\n{yaml}---\n")
 }
 
 pub fn update_note_raw(meta: &NoteMeta, body: &str) -> String {
@@ -277,11 +318,7 @@ pub fn filename_to_title(filename: &str) -> String {
 pub fn extract_title(raw: &str) -> Option<String> {
     let matter = Matter::<BoundedYaml>::new();
     let result = matter.parse(raw);
-    let fm: RawFrontmatter = result
-        .data
-        .and_then(|d| d.deserialize().ok())
-        .unwrap_or_default();
-    fm.title
+    read_frontmatter(result.data).title
 }
 
 pub fn extract_preview(content: &str, max_len: usize) -> String {
@@ -574,5 +611,79 @@ mod tests {
             "title: {}",
             "x".repeat(MAX_FRONTMATTER_BYTES - 16)
         )));
+    }
+    #[test]
+    fn one_field_of_another_shape_no_longer_drops_the_rest() {
+        let note = |extra: &str| format!("---\nid: keep-me\ntitle: Kept\n{extra}\n---\nbody\n");
+        let (meta, _) = parse_note(&note("tags: work"), "File.md");
+        assert_eq!((meta.id.as_str(), meta.title.as_str()), ("keep-me", "Kept"));
+        assert_eq!(meta.tags, vec!["work"]);
+        let (meta, _) = parse_note(&note("tags: a, b ,c\npinned: yes"), "File.md");
+        assert_eq!(meta.tags, vec!["a", "b", "c"]);
+        assert!(meta.pinned);
+        assert_eq!(meta.id, "keep-me");
+        // Numbers where text is expected are read as text.
+        let (meta, _) = parse_note(
+            "---\nid: 20231014\ntitle: 2024\ntags: [1, two, true]\npinned: 0\n---\nbody\n",
+            "File.md",
+        );
+        assert_eq!(
+            (meta.id.as_str(), meta.title.as_str()),
+            ("20231014", "2024")
+        );
+        assert_eq!(meta.tags, vec!["1", "two", "true"]);
+        assert!(!meta.pinned);
+        assert_eq!(
+            extract_title("---\ntitle: 2024\ntags: work\n---\nbody\n").as_deref(),
+            Some("2024")
+        );
+        // A field that makes no sense is skipped on its own.
+        let (meta, _) = parse_note(&note("tags: {a: b}\npinned: maybe"), "File.md");
+        assert_eq!(meta.id, "keep-me");
+        assert!(meta.tags.is_empty());
+        assert!(!meta.pinned);
+        // Saving keeps the identity and writes the tags as a list.
+        let (meta, content) = parse_note(&note("tags: work\naliases: [x]"), "File.md");
+        let saved = merge_frontmatter(&note("tags: work\naliases: [x]"), &meta, &content);
+        let (again, _) = parse_note(&saved, "File.md");
+        assert_eq!(
+            (again.id.as_str(), again.title.as_str()),
+            ("keep-me", "Kept")
+        );
+        assert_eq!(again.tags, vec!["work"]);
+        assert!(saved.contains("aliases:"));
+    }
+
+    #[test]
+    fn new_frontmatter_reads_back_whatever_the_title_and_tags_contain() {
+        for (title, tags) in [
+            ("C:\\Users\\tom", vec!["2024", "true"]),
+            ("Plain", vec!["foo: bar", "a,b"]),
+            ("Say \"hi\" and 'bye'", vec!["#hash", "- dash"]),
+            ("\\sum x", vec!["null", "~", "1.5"]),
+            (
+                "Tab\there: colon # hash",
+                vec!["[x]", "{y}", "*star", "&amp"],
+            ),
+            ("- leading dash", vec![]),
+            ("", vec!["yes"]),
+        ] {
+            let meta = NoteMeta {
+                id: "the-id".into(),
+                title: title.into(),
+                tags: tags.iter().map(|tag| tag.to_string()).collect(),
+                pinned: true,
+                created: Utc::now(),
+                modified: Utc::now(),
+            };
+            let raw = update_note_raw(&meta, "body\n");
+            let (back, content) = parse_note(&raw, "Fallback.md");
+            assert_eq!(back.id, "the-id", "{raw}");
+            assert_eq!(back.title, title, "{raw}");
+            assert_eq!(back.tags, meta.tags, "{raw}");
+            assert!(back.pinned);
+            assert_eq!(back.created.timestamp(), meta.created.timestamp());
+            assert!(content.ends_with("body"));
+        }
     }
 }
