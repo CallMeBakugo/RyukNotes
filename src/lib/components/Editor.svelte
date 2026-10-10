@@ -9059,6 +9059,9 @@
 
 	.editor-toolbar {
 		display: flex;
+		/* In a narrow pane the buttons move to their own row instead of squeezing the title away. */
+		flex-wrap: wrap;
+		row-gap: 4px;
 		align-items: center;
 		justify-content: space-between;
 		padding: 12px 20px 4px;
@@ -9101,6 +9104,8 @@
 
 	.editor-title {
 		flex: 1;
+		/* The title used to be the only thing that could shrink, down to nothing. */
+		min-width: min(12rem, 100%);
 	}
 
 	.editor-title input {
@@ -9184,6 +9189,7 @@
 		display: flex;
 		align-items: center;
 		gap: 8px;
+		margin-left: auto;
 	}
 
 	.save-indicator {
@@ -12726,12 +12732,18 @@
 		padding: 8px 16px 6px 16px;
 		flex-shrink: 0;
 		flex-direction: column;
+		flex-wrap: nowrap;
 		align-items: stretch;
 		gap: 2px;
 	}
 
+	.editor-container.mobile .editor-title {
+		min-width: 0;
+	}
+
 	.editor-container.mobile .toolbar-actions {
 		gap: 4px;
+		margin-left: 0;
 	}
 
 	.editor-container.mobile .toolbar-actions .icon-btn {
