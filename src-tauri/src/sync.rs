@@ -60,6 +60,20 @@ fn manifest_path(vault: &str) -> PathBuf {
     helixnotes_dir(vault).join("sync_state.json")
 }
 
+/// A local filesystem failure, named as such with the operation and the file. The bare OS error
+/// ("Operation not permitted (os error 1)") names no file and reads like a server problem.
+fn local_error(operation: &str, path: impl AsRef<Path>, error: impl std::fmt::Display) -> String {
+    format!(
+        "Local file error: cannot {operation} \"{}\": {error}",
+        path.as_ref().display()
+    )
+}
+
+/// A request that never got an answer from the server (connection, TLS, timeout).
+fn webdav_error(operation: &str, relpath: &str, error: impl std::fmt::Display) -> String {
+    format!("WebDAV error: cannot {operation} \"{relpath}\": {error}")
+}
+
 fn load_manifest(vault: &str) -> Result<SyncManifest, String> {
     match fs::read(manifest_path(vault)) {
         Ok(bytes) => serde_json::from_slice(&bytes)
@@ -72,8 +86,10 @@ fn load_manifest(vault: &str) -> Result<SyncManifest, String> {
 fn save_manifest(vault: &str, m: &SyncManifest) -> Result<(), String> {
     let bytes = serde_json::to_vec(m).map_err(|e| e.to_string())?;
     let target = manifest_path(vault);
-    fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
+    let folder = target.parent().unwrap();
+    fs::create_dir_all(folder).map_err(|e| local_error("create folder", folder, e))?;
     crate::vault::operations::replace_file_atomically(&target, &bytes)
+        .map_err(|e| local_error("save sync state", &target, e))
 }
 
 fn baseline_for_endpoint(manifest: SyncManifest, identity: &str) -> SyncManifest {
@@ -154,7 +170,7 @@ fn write_local(
         return Ok(());
     }
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        fs::create_dir_all(parent).map_err(|e| local_error("create folder for", relpath, e))?;
     }
     if matches!(
         relpath,
@@ -166,7 +182,8 @@ fn write_local(
             content,
         )?;
     }
-    crate::vault::operations::replace_file_atomically(&target, bytes)?;
+    crate::vault::operations::replace_file_atomically(&target, bytes)
+        .map_err(|e| local_error("write", relpath, e))?;
     changes.insert(target, "modify");
     Ok(())
 }
@@ -175,10 +192,10 @@ fn require_unchanged_local(path: &Path, expected_hash: Option<&str>) -> Result<(
     let actual = match fs::File::open(path) {
         Ok(mut file) => Some(
             sha256_reader(&mut file, &mut [0; HASH_BUFFER_SIZE])
-                .map_err(|error| error.to_string())?,
+                .map_err(|error| local_error("read", path, error))?,
         ),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.to_string()),
+        Err(error) => return Err(local_error("read", path, error)),
     };
     if actual.as_deref() != expected_hash {
         return Err(format!(
@@ -385,7 +402,9 @@ impl WebdavClient {
         if !expected_etag.is_empty() {
             request = request.header("If-Match", expected_etag);
         }
-        let resp = request.send().map_err(|e| e.to_string())?;
+        let resp = request
+            .send()
+            .map_err(|e| webdav_error("download", relpath, e))?;
         if resp.status().as_u16() == 412 {
             return Err(format!(
                 "Remote file {relpath} changed during sync; retry sync"
@@ -433,7 +452,9 @@ impl WebdavClient {
             }
             None => request.header("If-None-Match", "*"),
         };
-        let resp = request.send().map_err(|e| e.to_string())?;
+        let resp = request
+            .send()
+            .map_err(|e| webdav_error("upload", relpath, e))?;
         if resp.status().as_u16() == 412 {
             return Err(format!(
                 "Remote file {relpath} changed during sync; retry sync"
@@ -460,7 +481,7 @@ impl WebdavClient {
             .basic_auth(&self.user, Some(&self.pass))
             .header("If-Match", etag)
             .send()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| webdav_error("delete", relpath, e))?;
         if resp.status().as_u16() == 412 || resp.status().as_u16() == 404 {
             return Err(format!(
                 "Remote file {relpath} changed during sync; retry sync"
@@ -483,7 +504,7 @@ impl WebdavClient {
             .request(method, self.url_for(relpath))
             .basic_auth(&self.user, Some(&self.pass))
             .send()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| webdav_error("create folder", relpath, e))?;
         let s = resp.status().as_u16();
         if resp.status().is_success() || s == 405 || s == 301 || s == 403 {
             Ok(())
@@ -827,7 +848,7 @@ fn apply_changes(
                 Some(_) => {
                     let _guard = write_guard.blocking_lock();
                     require_unchanged_local(&lf.path, Some(&lf.hash))?;
-                    fs::remove_file(&lf.path).map_err(|e| e.to_string())?;
+                    fs::remove_file(&lf.path).map_err(|e| local_error("delete", &lf.path, e))?;
                     changes.insert(lf.path.clone(), "remove");
                     sum.deleted_local += 1;
                 }
@@ -1343,13 +1364,18 @@ mod tests {
         )
         .unwrap();
         fs::write(vault.path().join("blocked"), b"not a directory").unwrap();
-        assert!(write_local(
+        let error = write_local(
             vault.path(),
             "blocked/note.md",
             b"cannot write",
-            &mut changes
+            &mut changes,
         )
-        .is_err());
+        .unwrap_err();
+        // The failure names itself as local, the operation and the file (issue #249).
+        assert!(
+            error.starts_with("Local file error: cannot create folder for \"blocked/note.md\": "),
+            "{error}"
+        );
         assert_eq!(changes, HashMap::from([(path.clone(), "modify")]));
         let event = changed_entry(path, "modify", vault.path());
         assert_eq!(event.note.unwrap().preview, "remote content");
