@@ -139,7 +139,9 @@
 	};
 	const EditorStarterKit = StarterKit.extend({
 		addExtensions() {
-			return this.parent!().map(extension => extension instanceof TiptapNode && extension.name === 'listItem' ? extension.extend(keepCodeWhitespace)
+			// Inline code may carry other marks, so **`code`** and [`code`](url) keep their formatting.
+			return this.parent!().map(extension => extension instanceof TiptapMark && extension.name === 'code' ? extension.extend({ excludes: '' })
+				: extension instanceof TiptapNode && extension.name === 'listItem' ? extension.extend(keepCodeWhitespace)
 				: extension instanceof TiptapNode && (extension.name === 'paragraph' || extension.name === 'heading') ? extension.extend({
 				...keepCodeWhitespace,
 				renderHTML(props) {
@@ -1055,17 +1057,31 @@
 		};
 	}
 
+	/** Column alignment from a Markdown table's delimiter row (`:---`, `:---:`, `---:`), kept per cell. */
+	function cellAlignAttributes() {
+		return {
+			align: {
+				default: null,
+				parseHTML: (element: HTMLElement) => {
+					const align = element.style.textAlign || element.getAttribute('align') || '';
+					return align === 'left' || align === 'center' || align === 'right' ? align : null;
+				},
+				renderHTML: (attributes: Record<string, any>) => attributes.align ? { style: `text-align: ${attributes.align}` } : {},
+			},
+		};
+	}
+
 	const CustomTableCell = TableCell.extend({
 		...keepCodeWhitespace,
 		addAttributes() {
-			return { ...this.parent?.(), ...cellColorAttributes() };
+			return { ...this.parent?.(), ...cellColorAttributes(), ...cellAlignAttributes() };
 		},
 	});
 
 	const CustomTableHeader = TableHeader.extend({
 		...keepCodeWhitespace,
 		addAttributes() {
-			return { ...this.parent?.(), ...cellColorAttributes() };
+			return { ...this.parent?.(), ...cellColorAttributes(), ...cellAlignAttributes() };
 		},
 	});
 
@@ -4100,12 +4116,14 @@
 
 	function tableToMarkdown(table: any): string {
 		const rows: string[][] = [];
+		const aligns: (string | null)[] = [];
 		let hasHeader = false;
 		table.forEach((row: any) => {
 			if (row.type.name !== 'tableRow') return;
 			const cells: string[] = [];
 			row.forEach((cell: any) => {
 				if (cell.type.name === 'tableHeader') hasHeader = true;
+				if (rows.length === 0) aligns.push(cell.attrs.align || null);
 				const cellText: string[] = [];
 				cell.forEach((p: any) => {
 					cellText.push(serializeInline(p));
@@ -4120,7 +4138,9 @@
 		rows.forEach((row, i) => {
 			lines.push('| ' + row.join(' | ') + ' |');
 			if (i === 0 && hasHeader) {
-				lines.push('| ' + Array(colCount).fill('---').join(' | ') + ' |');
+				const delimiters = Array.from({ length: colCount }, (_, column) =>
+					aligns[column] === 'left' ? ':---' : aligns[column] === 'center' ? ':---:' : aligns[column] === 'right' ? '---:' : '---');
+				lines.push('| ' + delimiters.join(' | ') + ' |');
 			}
 		});
 		return lines.join('\n');

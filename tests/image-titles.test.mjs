@@ -74,8 +74,32 @@ test('legacy space and %20 destinations keep their image titles', () => {
   assert.equal(load('![a](my file.png)').title, null);
 });
 
-test('link titles are still not kept', () => {
+test('links keep their titles too', () => {
   const html = parser.render('[a](x.md "Link title") ![b](y.png "Image title")');
-  assert.doesNotMatch(html, /<a [^>]*title=/);
+  assert.match(html, /<a href="x.md" title="Link title">a<\/a>/);
   assert.match(html, /<img src="y.png" alt="b" title="Image title">/);
+  // A link without a title, or with an empty one, gets no title attribute.
+  assert.doesNotMatch(parser.render('[a](x.md) [b](y.md "")'), /title=/);
+});
+
+test('link titles round-trip exactly through save and load', () => {
+  const linkOf = (markdown) => parser.parseInline(markdown, {})[0].children.find((token) => token.type === 'link_open');
+  for (const title of titles) {
+    for (const href of ['https://example.com/a', 'notes/other.md']) {
+      const mark = schema.marks.link.create({ href, title });
+      let markdown = serializeInlineMarkdown(schema.nodes.paragraph.create(null, schema.text('label', [mark])));
+      for (let i = 0; i < 3; i++) {
+        const token = linkOf(markdown);
+        assert.deepEqual([token.attrGet('href'), token.attrGet('title')], [href, title], markdown);
+        const again = schema.marks.link.create({ href: token.attrGet('href'), title: token.attrGet('title') });
+        const next = serializeInlineMarkdown(schema.nodes.paragraph.create(null, schema.text('label', [again])));
+        assert.equal(next, markdown, 'the written form must not change over repeated saves');
+        markdown = next;
+      }
+    }
+  }
+  // Legacy destinations (spaces in the path) keep their title as well.
+  assert.equal(linkOf('[doc](my file.md "Caption")').attrGet('title'), 'Caption');
+  // No title, no suffix.
+  assert.equal(serializeInlineMarkdown(schema.nodes.paragraph.create(null, schema.text('a', [schema.marks.link.create({ href: 'x.md' })]))), '[a](x.md)');
 });

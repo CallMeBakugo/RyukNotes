@@ -193,6 +193,16 @@ test('keeps link syntax outside code and joins code across formatting changes wi
   );
 });
 
+test('keeps formatting that covers a whole code span', () => {
+  const codeMark = schema.marks.code.create();
+  assert.equal(serializeInlineMarkdown(paragraph([{ text: 'x.ps1', marks: [codeMark, bold] }])), '**`x.ps1`**');
+  assert.equal(serializeInlineMarkdown(paragraph([{ text: 'x', marks: [codeMark, italic] }, { text: ' rest', marks: [] }])), '*`x`* rest');
+  // Bold text running into bold code stays one bold run.
+  assert.equal(serializeInlineMarkdown(paragraph([{ text: 'Run ', marks: [bold] }, { text: 'make', marks: [codeMark, bold] }, { text: ' now', marks: [bold] }])), '**Run `make` now**');
+  // What is written loads back as bold code.
+  assert.match(editorMarkdown.render('**`x.ps1`**'), /<strong><code[^>]*>x\.ps1<\/code><\/strong>/);
+});
+
 test('preserves formatting on non-code parts of a link', () => {
   const codeMark = schema.marks.code.create();
   const serialized = serializeInlineMarkdown(paragraph([

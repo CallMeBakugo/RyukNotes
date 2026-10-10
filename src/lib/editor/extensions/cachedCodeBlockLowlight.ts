@@ -120,6 +120,12 @@ export const CachedCodeBlockLowlight = CodeBlock.extend<CodeBlockOptions & { low
 	addOptions() {
 		return { ...this.parent!(), lowlight: null };
 	},
+	addAttributes() {
+		// A block written without a language keeps none, so a bare fence is not saved as the default
+		// language. Highlighting still falls back to the default language for such blocks.
+		const attributes: Record<string, object> = this.parent?.() ?? {};
+		return { ...attributes, language: { ...attributes.language, default: null } };
+	},
 	addProseMirrorPlugins() {
 		if (!this.options.lowlight) throw new Error('Code block highlighting requires a lowlight instance');
 		return [

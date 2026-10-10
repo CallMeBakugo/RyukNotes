@@ -157,11 +157,12 @@ function markdownMark(mark: Mark, text: string): MarkdownMark | null {
     }
     case 'link': {
       const href = stringAttr(mark, 'href');
+      const title = stringAttr(mark, 'title');
       return {
-        key: `link:${href}`,
+        key: `link:${href}:${title}`,
         priority: 100,
         open: '[',
-        close: `](${href})`,
+        close: `](${href}${serializeImageTitle(title)})`,
       };
     }
     case 'wikiLink': {
@@ -179,9 +180,9 @@ function markdownMark(mark: Mark, text: string): MarkdownMark | null {
   }
 }
 
-function marksForText(node: ProseMirrorNode, code = false): MarkdownMark[] {
+function marksForText(node: ProseMirrorNode, linksOnly = false): MarkdownMark[] {
   return node.marks
-    .filter((mark) => !code || mark.type.name === 'link' || mark.type.name === 'wikiLink')
+    .filter((mark) => !linksOnly || mark.type.name === 'link' || mark.type.name === 'wikiLink')
     .map((mark) => markdownMark(mark, node.text || ''))
     .filter((mark): mark is MarkdownMark => mark !== null)
     .sort((left, right) => left.priority - right.priority || left.key.localeCompare(right.key));
@@ -222,20 +223,27 @@ export function serializeInlineMarkdown(
     const child = node.child(index);
     if (child.isText) {
       const isCode = child.marks.some((mark) => mark.type.name === 'code');
-      const marks = marksForText(child, isCode);
-      transitionMarks(marks);
       let text = child.text || '';
       if (isCode) {
+        // One code span per run of code text under the same link. Formatting that covers the whole
+        // run is written around the span (**`code`**); formatting on only part of it is dropped,
+        // since it cannot be written inside a code span.
+        const links = marksForText(child, true);
+        let marks = marksForText(child);
         while (index + 1 < node.childCount) {
           const next = node.child(index + 1);
           if (!next.isText || !next.marks.some((mark) => mark.type.name === 'code')) break;
-          const nextMarks = marksForText(next, true);
-          if (marks.length !== nextMarks.length || commonMarkCount(marks, nextMarks) !== marks.length) break;
+          const nextLinks = marksForText(next, true);
+          if (links.length !== nextLinks.length || commonMarkCount(links, nextLinks) !== links.length) break;
+          const nextKeys = new Set(marksForText(next).map((mark) => mark.key));
+          marks = marks.filter((mark) => nextKeys.has(mark.key));
           text += next.text || '';
           index += 1;
         }
+        transitionMarks(marks);
         result += serializeCodeSpan(text);
       } else {
+        transitionMarks(marksForText(child));
         if (index === 0) {
           text = text.replace(/^[\t\u2003]+/, (whitespace) => '&emsp;'.repeat(whitespace.length));
         }

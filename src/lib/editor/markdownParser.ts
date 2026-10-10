@@ -224,9 +224,9 @@ function legacyLink(state: StateInline, silent: boolean): boolean {
   }
   if (end >= state.posMax) { scans.wasted += end - destinationStart; return false; }
   const raw = state.src.slice(destinationStart, end);
-  // Images with a valid CommonMark destination and title keep the native parser (and their title).
-  // A `%20"title"` suffix (exported by some apps) is still legacy syntax, not part of the path.
-  if (image && !/%20["'(]/u.test(raw) && isCommonMarkDestination(state, destinationStart, end)) return false;
+  // Links and images with a valid CommonMark destination and title keep the native parser (and
+  // their title). A `%20"title"` suffix (exported by some apps) is still legacy syntax, not part of the path.
+  if (!/%20["'(]/u.test(raw) && isCommonMarkDestination(state, destinationStart, end)) return false;
   // Native CommonMark links, including nested destinations, retain their normal parser.
   if (!/\s|%20["'(]/u.test(raw)) return false;
   let destination = raw.trim();
@@ -258,6 +258,8 @@ function legacyLink(state: StateInline, silent: boolean): boolean {
       const token = state.push('link_open', 'a', 1);
       token.meta = { sourceHref };
       token.attrSet('href', href);
+      const title = legacyImageTitle(raw.slice(raw.indexOf(destination) + destination.length));
+      if (title) token.attrSet('title', state.md.utils.unescapeAll(title));
       const oldMax = state.posMax;
       state.pos = labelStart + 1;
       state.posMax = labelEnd;
@@ -412,10 +414,6 @@ export function createEditorMarkdownParser(): MarkdownIt {
         if (child.type === 'image') {
           const src = child.attrGet('src');
           if (src?.startsWith('//')) child.attrSet('src', src.replace(/^\/{2,}(?=home\/)/u, '/'));
-        }
-        // Images keep their "title" as hover text; link titles are not kept.
-        if (child.type === 'link_open') {
-          child.attrs = child.attrs?.filter(([name]) => name !== 'title') ?? null;
         }
       }
       if (!paragraph || paragraph.type !== 'paragraph_open' || paragraph.level !== 0 || token.children?.length !== 1 ||
