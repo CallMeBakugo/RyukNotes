@@ -1415,11 +1415,16 @@ fn update_wikilinks_after_rename(
             // 1. Short title ref: [[Old Title]] → [[New Title]]
             result = result.replace(&format!("[[{}]]", old_title), &format!("[[{}]]", new_title));
 
-            // 2. Short title with alias: [[Old Title|display]] → [[New Title|display]]
-            result = result.replace(&format!("[[{}|", old_title), &format!("[[{}|", new_title));
+            // 2. A link to the renamed note that displays its old title follows the new one:
+            //    [[Old Title|Old Title]] → [[New Title|New Title]]. Only links to this note: an
+            //    alias on a link to another note ([[Index|Old Title]]) is that note's wording.
+            result = result.replace(
+                &format!("[[{old_title}|{old_title}]]"),
+                &format!("[[{new_title}|{new_title}]]"),
+            );
 
-            // 3. Short title as alias display: [[ref|Old Title]] → [[ref|New Title]]
-            result = result.replace(&format!("|{}]]", old_title), &format!("|{}]]", new_title));
+            // 3. Short title with any other alias: [[Old Title|display]] → [[New Title|display]]
+            result = result.replace(&format!("[[{}|", old_title), &format!("[[{}|", new_title));
         }
 
         // Path-based rules are always safe (paths are unique).
@@ -1447,7 +1452,14 @@ fn update_wikilinks_after_rename(
         }
 
         if result != content {
-            let _ = fs::write(path, &result);
+            // Replace the file in one step: a plain write truncates first, so a crash or a full
+            // disk here could leave a note that merely links to the renamed one empty.
+            if let Err(error) = replace_file_atomically(path, result.as_bytes()) {
+                log::error!(
+                    "Could not update links in {} after a rename: {error}",
+                    path.display()
+                );
+            }
         }
     }
 }
@@ -2477,6 +2489,54 @@ pub fn sanitize_filename(name: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod rename_link_tests {
+    use super::*;
+
+    #[test]
+    fn a_rename_updates_links_to_the_note_and_leaves_other_aliases_alone() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().to_str().unwrap();
+        let linking = vault.path().join("Linking.md");
+        fs::write(
+            &linking,
+            "See [[Home]], [[Home|the start page]] and [[Home|Home]].\nAlso [[Index|Home]] and [[Notes/Home|Home]].\n",
+        )
+        .unwrap();
+        let untouched = vault.path().join("Untouched.md");
+        fs::write(&untouched, "No links here.\n").unwrap();
+        let before = fs::metadata(&untouched).unwrap().modified().unwrap();
+        let new_path = vault.path().join("Start.md");
+        fs::write(&new_path, "# Start\n").unwrap();
+
+        update_wikilinks_after_rename(
+            root,
+            vault.path().join("Home.md").to_str().unwrap(),
+            new_path.to_str().unwrap(),
+            "Home",
+            "Start",
+        );
+
+        assert_eq!(
+            fs::read_to_string(&linking).unwrap(),
+            // The alias on the link to Index, and on the link to another note called Home in a
+            // folder, is not this note's title and stays.
+            "See [[Start]], [[Start|the start page]] and [[Start|Start]].\nAlso [[Index|Home]] and [[Notes/Home|Home]].\n"
+        );
+        assert_eq!(
+            fs::metadata(&untouched).unwrap().modified().unwrap(),
+            before
+        );
+        // Nothing is left behind by the one-step replacement.
+        let names: Vec<_> = fs::read_dir(vault.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+    }
 }
 
 #[cfg(test)]
