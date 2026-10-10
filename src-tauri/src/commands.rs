@@ -3560,10 +3560,34 @@ mod external_access_tests {
     }
 }
 
+/// File types that are handed to the system's default application. Opening a file takes one click
+/// on a link in a note, and notes and attachments arrive through sync, import and shared vaults.
+/// Anything the system might run rather than display (scripts, executables, shortcuts, installers,
+/// HTML, files without an extension) is shown in the file manager instead, under its real name.
+const OPENABLE_EXTENSIONS: &[&str] = &[
+    "txt", "md", "markdown", "log", "csv", "tsv", "json", "xml", "yaml", "yml", "toml", "pdf",
+    "rtf", "doc", "docx", "odt", "xls", "xlsx", "ods", "ppt", "pptx", "odp", "epub", "png", "jpg",
+    "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif", "avif", "ico", "mp3", "wav",
+    "flac", "ogg", "oga", "opus", "m4a", "aac", "mp4", "m4v", "mkv", "mov", "webm", "avi", "zip",
+    "7z", "tar", "gz", "tgz", "bz2", "xz", "rar", "ics", "vcf",
+];
+
+fn opens_with_default_application(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            OPENABLE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+        })
+}
+
 #[tauri::command]
 pub fn open_file(app: AppHandle, path: String) -> Result<(), String> {
     ensure_readable_path(&app, Path::new(&path))?;
-    open_path_with_system(Path::new(&path))
+    if opens_with_default_application(Path::new(&path)) {
+        open_path_with_system(Path::new(&path))
+    } else {
+        tauri_plugin_opener::reveal_item_in_dir(path).map_err(|error| error.to_string())
+    }
 }
 
 #[tauri::command]
@@ -4386,6 +4410,58 @@ pub fn get_install_type() -> String {
         "appimage".to_string()
     } else {
         "native".to_string()
+    }
+}
+
+#[cfg(test)]
+mod open_file_tests {
+    use super::opens_with_default_application;
+    use std::path::Path;
+
+    #[test]
+    fn only_document_and_media_types_go_to_the_default_application() {
+        for name in [
+            "report.pdf",
+            "Photo.JPG",
+            "notes.md",
+            "data.csv",
+            "clip.mp4",
+            "archive.tar.gz",
+            "a b/c d.docx",
+        ] {
+            assert!(opens_with_default_application(Path::new(name)), "{name}");
+        }
+        // Anything the system could run, and anything unknown, is revealed in the file manager.
+        for name in [
+            "report.cmd",
+            "report.bat",
+            "setup.exe",
+            "run.ps1",
+            "x.vbs",
+            "x.js",
+            "x.lnk",
+            "x.url",
+            "x.msi",
+            "x.scr",
+            "x.hta",
+            "x.jar",
+            "run.sh",
+            "app.desktop",
+            "x.AppImage",
+            "x.command",
+            "x.app",
+            "x.pkg",
+            "page.html",
+            "drawing.svg",
+            "macro.docm",
+            "noextension",
+            "report.pdf.",
+            "report.pdf.exe",
+            ".hidden",
+            "weird.xyz",
+        ] {
+            assert!(!opens_with_default_application(Path::new(name)), "{name}");
+        }
     }
 }
 
