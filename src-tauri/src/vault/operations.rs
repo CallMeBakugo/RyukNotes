@@ -1258,6 +1258,23 @@ pub struct RenamedNote {
     pub new_raw: String,
     pub old_title: String,
     pub new_title: String,
+    pub links: LinkRewrite,
+}
+
+/// A note whose links were updated because the note they point to was renamed.
+pub struct RewrittenNote {
+    pub path: String,
+    pub old_raw: String,
+    pub new_raw: String,
+}
+
+/// What a rename changed in the notes that link to the renamed one.
+pub struct LinkRewrite {
+    pub old_ref: String,
+    pub new_ref: String,
+    /// Whether links written with the note's title were updated too.
+    pub title_rules: bool,
+    pub notes: Vec<RewrittenNote>,
 }
 
 pub fn rename_note(path: &str, new_title: &str, vault_path: &str) -> Result<RenamedNote, String> {
@@ -1316,7 +1333,7 @@ pub fn rename_note(path: &str, new_title: &str, vault_path: &str) -> Result<Rena
     let new_path_str = new_path.to_string_lossy().to_string();
 
     // Update wikilinks in other notes that reference this note
-    update_wikilinks_after_rename(
+    let links = update_wikilinks_after_rename(
         vault_path,
         &old_path_str,
         &new_path_str,
@@ -1330,6 +1347,7 @@ pub fn rename_note(path: &str, new_title: &str, vault_path: &str) -> Result<Rena
         new_raw: updated,
         old_title,
         new_title: meta.title,
+        links,
     })
 }
 
@@ -1341,7 +1359,7 @@ fn update_wikilinks_after_rename(
     new_path: &str,
     old_title: &str,
     new_title: &str,
-) {
+) -> LinkRewrite {
     let vault = Path::new(vault_path);
     let hn_dir = helixnotes_dir(vault_path);
 
@@ -1382,6 +1400,8 @@ fn update_wikilinks_after_rename(
                 .map(|s| s.eq_ignore_ascii_case(old_title))
                 .unwrap_or(false)
         });
+    let title_rules = old_title != new_title && title_is_unique;
+    let mut notes = Vec::new();
 
     for entry in WalkDir::new(vault)
         .into_iter()
@@ -1415,7 +1435,7 @@ fn update_wikilinks_after_rename(
 
         // Title-based rules only apply when the old title is unique in the vault.
         // If another note shares the same title, these would be ambiguous.
-        if old_title != new_title && title_is_unique {
+        if title_rules {
             // 1. Short title ref: [[Old Title]] → [[New Title]]
             result = result.replace(&format!("[[{}]]", old_title), &format!("[[{}]]", new_title));
 
@@ -1458,13 +1478,24 @@ fn update_wikilinks_after_rename(
         if result != content {
             // Replace the file in one step: a plain write truncates first, so a crash or a full
             // disk here could leave a note that merely links to the renamed one empty.
-            if let Err(error) = replace_file_atomically(path, result.as_bytes()) {
-                log::error!(
+            match replace_file_atomically(path, result.as_bytes()) {
+                Ok(()) => notes.push(RewrittenNote {
+                    path: path_str.into_owned(),
+                    old_raw: content,
+                    new_raw: result,
+                }),
+                Err(error) => log::error!(
                     "Could not update links in {} after a rename: {error}",
                     path.display()
-                );
+                ),
             }
         }
+    }
+    LinkRewrite {
+        old_ref: old_rel_ref,
+        new_ref: new_rel_ref,
+        title_rules,
+        notes,
     }
 }
 
@@ -2562,12 +2593,26 @@ mod rename_link_tests {
         let new_path = vault.path().join("Start.md");
         fs::write(&new_path, "# Start\n").unwrap();
 
-        update_wikilinks_after_rename(
+        let original = fs::read_to_string(&linking).unwrap();
+        let rewrite = update_wikilinks_after_rename(
             root,
             vault.path().join("Home.md").to_str().unwrap(),
             new_path.to_str().unwrap(),
             "Home",
             "Start",
+        );
+        // Only the note that changed is reported, with what it held before and after.
+        assert_eq!(rewrite.notes.len(), 1);
+        assert_eq!(rewrite.notes[0].path, linking.to_str().unwrap());
+        assert_eq!(rewrite.notes[0].old_raw, original);
+        assert_eq!(
+            rewrite.notes[0].new_raw,
+            fs::read_to_string(&linking).unwrap()
+        );
+        assert!(rewrite.title_rules);
+        assert_eq!(
+            (rewrite.old_ref.as_str(), rewrite.new_ref.as_str()),
+            ("Home", "Start")
         );
 
         assert_eq!(

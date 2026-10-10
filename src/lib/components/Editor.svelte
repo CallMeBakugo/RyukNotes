@@ -68,6 +68,7 @@
 	import { externalNoteReferences } from '$lib/editor/externalNote';
 	import { tagIterationKey } from '$lib/utils/tag-styles';
 	import { replaceWithWikiLink } from '$lib/editor/wikiLinks';
+	import { renamedLink, renamedLinkChanges, type LinkRename } from '$lib/editor/renamedLinks';
 	import { assetSourceToMarkdown, assetUrlToLocalPath, encodeMarkdownPath, resolveFileReference, noteAssetRoot, isTrashedNote } from '$lib/utils/paths';
 	import GraphView from './GraphView.svelte';
 	import TagSuggestInput from './TagSuggestInput.svelte';
@@ -7191,6 +7192,69 @@
 		else unlistenPathMoved = fn;
 	}).catch(error => console.error('Failed to listen for relocated notes:', error));
 
+	/** Bring the wiki links of the open note in line with a rename of the note they point to. */
+	function applyRenamedLinks(rename: LinkRename) {
+		if ($sourceMode) {
+			const view = source.view;
+			if (!view) return;
+			const changes = renamedLinkChanges(view.state.doc.toString(), rename);
+			if (changes.length) view.dispatch({ changes });
+			return;
+		}
+		if (!editor) return;
+		const { schema, doc } = editor.state;
+		const wikiLink = schema.marks.wikiLink;
+		const edits: { from: number; to: number; node: any }[] = [];
+		doc.descendants((node: any, pos: number) => {
+			if (!node.isText) return;
+			const text = node.text as string;
+			const mark = wikiLink ? node.marks.find((m: any) => m.type === wikiLink) : null;
+			if (mark) {
+				const ref = (mark.attrs.title as string | null) || text;
+				const next = renamedLink(ref, ref === text ? null : text, rename);
+				if (!next) return;
+				const path = String(mark.attrs.path ?? '').replace(/\\/g, '/');
+				const attrs = { ...mark.attrs, title: next.ref,
+					path: path === `${rename.old_ref}.md` ? `${rename.new_ref}.md` : mark.attrs.path };
+				const marks = node.marks.map((m: any) => m === mark ? wikiLink.create(attrs) : m);
+				edits.push({ from: pos, to: pos + node.nodeSize, node: schema.text(next.display ?? next.ref, marks) });
+			} else if (!wikiLink && !node.marks.some((m: any) => m.type.name === 'code')) {
+				// With wiki links switched off they are ordinary text in the note.
+				for (const change of renamedLinkChanges(text, rename)) {
+					edits.push({ from: pos + change.from, to: pos + change.to, node: schema.text(change.insert, node.marks) });
+				}
+			}
+		});
+		if (!edits.length) return;
+		const tr = editor.state.tr.setMeta('addToHistory', false);
+		for (const edit of edits.reverse()) tr.replaceWith(edit.from, edit.to, edit.node);
+		editor.view.dispatch(tr);
+	}
+
+	type LinksRewrittenEvent = LinkRename & { vault_path: string; path: string; old_raw: string; new_raw: string };
+	let unlistenLinksRewritten: (() => void) | null = null;
+	listen<LinksRewrittenEvent>('vault-links-rewritten', ({ payload }) => {
+		if (editorDisposed || payload.vault_path !== $appConfig?.active_vault
+			|| payload.path !== $activeNotePath || payload.path !== loadedPath) return;
+		// Without unsaved edits the note is simply reloaded when the file change is noticed.
+		if (!$editorDirty) return;
+		const session = saves.capture();
+		void (async () => {
+			await saves.idle();
+			if (editorDisposed || !saves.isCurrentSession(session) || $activeNotePath !== payload.path) return;
+			// The rename rewrote the version this draft is based on: take over the same link changes
+			// and continue from the rewritten file, so the draft saves instead of conflicting.
+			if (!saves.adoptMovedRaw(payload.old_raw, payload.new_raw)) {
+				if (saves.raw !== payload.new_raw) flagExternalConflict();
+				return;
+			}
+			applyRenamedLinks(payload);
+		})();
+	}).then(fn => {
+		if (editorDisposed) fn();
+		else unlistenLinksRewritten = fn;
+	}).catch(error => console.error('Failed to listen for updated links:', error));
+
 	let unlistenToolbarLayout: (() => void) | null = null;
 	listen<ToolbarLayout | null>('toolbar-layout-changed', (event) => {
 		const preference = JSON.stringify(event.payload);
@@ -7226,6 +7290,7 @@
 		destroyEditor();
 		unlistenFileChange?.();
 		unlistenPathMoved?.();
+		unlistenLinksRewritten?.();
 		unlistenToolbarLayout?.();
 		if (infoPathCopyTimer) clearTimeout(infoPathCopyTimer);
 	});

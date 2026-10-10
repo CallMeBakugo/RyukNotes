@@ -66,6 +66,56 @@ fn emit_path_move<R: Runtime>(
     }
 }
 
+#[derive(Clone, serde::Serialize)]
+struct LinksRewrittenEvent<'a> {
+    vault_path: &'a str,
+    path: &'a str,
+    old_raw: &'a str,
+    new_raw: &'a str,
+    old_ref: &'a str,
+    new_ref: &'a str,
+    old_title: &'a str,
+    new_title: &'a str,
+    title_rules: bool,
+}
+
+// A rename also rewrites the notes that link to the renamed one. Keep their previous state in
+// version history, and tell open editors so unsaved edits in such a note are not refused as a
+// conflict with the disk.
+fn announce_rewritten_links<R: Runtime>(
+    app: &AppHandle<R>,
+    vault: &str,
+    renamed: &operations::RenamedNote,
+    max_versions: u32,
+) {
+    for note in &renamed.links.notes {
+        let filename = Path::new(&note.path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let (meta, _) = crate::vault::frontmatter::parse_note(&note.old_raw, &filename);
+        if !meta.id.is_empty() {
+            crate::history::maybe_snapshot(vault, &meta.id, &note.old_raw, max_versions);
+        }
+        if let Err(error) = app.emit(
+            "vault-links-rewritten",
+            LinksRewrittenEvent {
+                vault_path: vault,
+                path: &note.path,
+                old_raw: &note.old_raw,
+                new_raw: &note.new_raw,
+                old_ref: &renamed.links.old_ref,
+                new_ref: &renamed.links.new_ref,
+                old_title: &renamed.old_title,
+                new_title: &renamed.new_title,
+                title_rules: renamed.links.title_rules,
+            },
+        ) {
+            log::error!("Could not notify note windows about updated links: {error}");
+        }
+    }
+}
+
 // ── Vault Management ──
 
 #[cfg(target_os = "ios")]
@@ -948,9 +998,15 @@ pub async fn rename_note<R: Runtime>(
     new_title: String,
 ) -> Result<String, String> {
     let search = state.vault_snapshot(&vault_path)?;
+    let max_versions = state
+        .config
+        .lock()
+        .map_err(|error| error.to_string())?
+        .max_versions_per_note;
     let _write_guard = state.note_save.lock().await;
     let renamed = operations::rename_note(&path, &new_title, &vault_path)?;
     emit_path_move(&app, &vault_path, &path, &renamed.path, Some(&renamed));
+    announce_rewritten_links(&app, &vault_path, &renamed, max_versions);
     if let Some(search) = search {
         if let Err(error) = search.queue_vault_refresh(&vault_path) {
             log::error!("Failed to queue renamed note search refresh: {error}");
