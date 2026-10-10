@@ -4204,14 +4204,31 @@
 		return hasImage && !hasOther;
 	}
 
+	// Saving used to serialize every block of the note each time. Document nodes are immutable and
+	// an edit replaces only the blocks it touches, so the Markdown of each top-level block is kept
+	// and a save re-serializes just what changed. The cache is dropped when the note or vault
+	// changes, since image paths are written relative to them.
+	let serializedBlocks = new WeakMap<object, MarkdownBlock>();
+	let serializedBlocksFor = '';
+
 	function prosemirrorToMarkdown(doc: any): string {
+		const owner = `${$appConfig?.active_vault ?? ''}\n${$activeNotePath}`;
+		if (owner !== serializedBlocksFor) {
+			serializedBlocks = new WeakMap();
+			serializedBlocksFor = owner;
+		}
 		const blocks: MarkdownBlock[] = [];
 		doc.forEach((node: any) => {
-			// Preserve every empty paragraph so markdown round-trip keeps the user's vertical
-			// spacing exactly. The parser converts the marker (or a blank line before an image)
-			// back to <p></p> on load.
-			const isEmpty = node.type.name === 'paragraph' && node.childCount === 0;
-			blocks.push({ text: isEmpty ? '' : serializeNode(node), isImage: !isEmpty && isImageNode(node), isEmpty });
+			let block = serializedBlocks.get(node);
+			if (!block) {
+				// Preserve every empty paragraph so markdown round-trip keeps the user's vertical
+				// spacing exactly. The parser converts the marker (or a blank line before an image)
+				// back to <p></p> on load.
+				const isEmpty = node.type.name === 'paragraph' && node.childCount === 0;
+				block = { text: isEmpty ? '' : serializeNode(node), isImage: !isEmpty && isImageNode(node), isEmpty };
+				serializedBlocks.set(node, block);
+			}
+			blocks.push(block);
 		});
 		return joinMarkdownBlocks(blocks);
 	}
