@@ -82,7 +82,9 @@ export function joinListItemBlocks(blocks: readonly ListItemBlock[]): string {
   const parts: string[] = [];
   blocks.forEach((block, index) => {
     if (block.isList) {
-      parts.push(block.text.replace(/\n$/, '').split('\n').map((line) => '    ' + line).join('\n'));
+      // A serialized list ends with a blank line; left in, it became an indented blank line here
+      // and an extra empty line after the outer list.
+      parts.push(block.text.replace(/\n+$/, '').split('\n').map((line) => (line ? '    ' + line : line)).join('\n'));
     } else if (index === 0) {
       parts.push(block.text);
     } else {

@@ -521,6 +521,10 @@ const item = (text, isList = false) => ({ text, isList });
 
 test('blocks after a list item\'s first paragraph stay inside the item, separated by a blank line', () => {
   assert.equal(joinListItemBlocks([item('only')]), 'only\n');
+  // A nested list arrives ending in a blank line; it must not leave an indented blank line behind (issue #277).
+  const list = (text) => ({ text, isList: true });
+  assert.equal(joinListItemBlocks([item('parent'), list('- a\n- b\n\n')]), 'parent\n    - a\n    - b\n');
+  assert.equal(joinListItemBlocks([item('parent'), list('- a\n    - deep\n\n')]), 'parent\n    - a\n        - deep\n');
   assert.equal(joinListItemBlocks([item('first'), item('second\n')]), 'first\n\n    second\n');
   assert.equal(
     joinListItemBlocks([item('step'), item('```sh\nrun\n\n\nagain\n```\n'), item('after\n')]),
