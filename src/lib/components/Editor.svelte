@@ -78,9 +78,11 @@
 
 	const componentId = $props.id();
 	const outlinePanelId = `${componentId}-outline`;
-	let { onMoveToTrash, onOutlineChange }: {
+	let { onMoveToTrash, onOutlineChange, onShowTag }: {
 		onMoveToTrash?: (path: string) => Promise<boolean>;
 		onOutlineChange?: (open: boolean, panelId: string) => void;
+		/** Shows the notes carrying a tag. Without it (a detached note window) the tags open the tag editor. */
+		onShowTag?: (tag: string) => void;
 	} = $props();
 
 	const modKey = navigator.platform.startsWith('Mac') ? '⌘' : 'Ctrl';
@@ -7804,13 +7806,22 @@
 				{/if}
 			</span>
 			<span class="meta-divider">·</span>
-			<button class="note-tags-trigger" class:search-target-meta={searchTagsReveal} onclick={toggleTagMenu} title="Edit tags">
-				{#if $activeNote.meta.tags?.length > 0}
-					{#each $activeNote.meta.tags as tag, i (tagIterationKey(tag, i))}<TagLabel name={tag} size={11} tone="muted" />{/each}
-				{:else}
-					<span class="note-tags-add">+ Tags</span>
-				{/if}
-			</button>
+			{#if onShowTag && $activeNote.meta.tags?.length > 0}
+				<!-- Each tag leads to its notes; the tag button in the header edits them. -->
+				<span class="note-tags-trigger" class:search-target-meta={searchTagsReveal}>
+					{#each $activeNote.meta.tags as tag, i (tagIterationKey(tag, i))}
+						<button type="button" class="note-tag-link" onclick={() => onShowTag(tag)} title={`Show notes tagged ${tag}`}><TagLabel name={tag} size={11} tone="muted" /></button>
+					{/each}
+				</span>
+			{:else}
+				<button class="note-tags-trigger" class:search-target-meta={searchTagsReveal} onclick={toggleTagMenu} title="Edit tags">
+					{#if $activeNote.meta.tags?.length > 0}
+						{#each $activeNote.meta.tags as tag, i (tagIterationKey(tag, i))}<TagLabel name={tag} size={11} tone="muted" />{/each}
+					{:else}
+						<span class="note-tags-add">+ Tags</span>
+					{/if}
+				</button>
+			{/if}
 		</div>
 		{/if}
 
@@ -9227,6 +9238,22 @@
 		font: inherit;
 		color: inherit;
 		cursor: pointer;
+	}
+
+	.note-tag-link {
+		display: inline-flex;
+		border: none;
+		background: none;
+		padding: 0;
+		margin: 0;
+		font: inherit;
+		color: inherit;
+		cursor: pointer;
+		border-radius: 4px;
+	}
+
+	.note-tag-link:hover {
+		color: var(--accent);
 	}
 
 	.note-tags-add {
