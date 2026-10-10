@@ -80,8 +80,9 @@ export async function importCustomThemes(path: string): Promise<CustomTheme[]> {
   return invoke("import_custom_themes", { path });
 }
 
-export async function setFontSize(size: number): Promise<void> {
-  return invoke("set_font_size", { size });
+/** `preferred` marks a choice made in Appearance, which is what resetting the zoom returns to. */
+export async function setFontSize(size: number, preferred = false): Promise<void> {
+  return invoke("set_font_size", { size, preferred });
 }
 
 export async function setScrollToChangeFontSize(enabled: boolean): Promise<void> {

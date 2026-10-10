@@ -1099,8 +1099,11 @@
 	function selectFontSize(size: number) {
 		activeFontSize = size;
 		applyFontSize(size);
-		if ($appConfig) $appConfig.font_size = size;
-		setFontSize(size).catch((e) => console.error('Failed to save font size:', e));
+		if ($appConfig) {
+			$appConfig.font_size = size;
+			$appConfig.preferred_font_size = size;
+		}
+		setFontSize(size, true).catch((e) => console.error('Failed to save font size:', e));
 	}
 
 	function toggleScrollToChangeFontSize() {

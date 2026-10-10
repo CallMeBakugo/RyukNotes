@@ -119,7 +119,8 @@
 			} else if (event.key === '0') {
 				event.preventDefault();
 				event.stopPropagation();
-				setEditorFontSize(defaultEditorFontSize);
+				// Back to the size chosen in Appearance, not the built-in default.
+				setEditorFontSize($appConfig?.preferred_font_size ?? defaultEditorFontSize);
 			}
 		};
 

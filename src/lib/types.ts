@@ -113,6 +113,7 @@ export interface AppConfig {
   system_dark_theme: string;
   accent_color: string | null;
   font_size: number | null;
+  preferred_font_size?: number | null;
   scroll_to_change_font_size: boolean;
   toolbar_layout: ToolbarLayout | null;
   font_family: string | null;

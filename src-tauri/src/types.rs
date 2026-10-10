@@ -163,6 +163,10 @@ pub struct AppConfig {
     pub accent_color: Option<String>,
     #[serde(default)]
     pub font_size: Option<u32>,
+    /// The size chosen in Appearance. Zooming changes `font_size` only, and resetting the zoom
+    /// returns to this.
+    #[serde(default)]
+    pub preferred_font_size: Option<u32>,
     #[serde(default = "default_true")]
     pub scroll_to_change_font_size: bool,
     #[serde(default)]
@@ -337,6 +341,7 @@ impl Default for AppConfig {
             system_dark_theme: default_system_dark_theme(),
             accent_color: None,
             font_size: None,
+            preferred_font_size: None,
             scroll_to_change_font_size: true,
             toolbar_layout: None,
             font_family: None,

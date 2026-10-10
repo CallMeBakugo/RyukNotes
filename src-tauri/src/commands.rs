@@ -569,9 +569,18 @@ pub fn import_custom_themes(
 }
 
 #[tauri::command]
-pub fn set_font_size(app: AppHandle, state: State<'_, AppState>, size: u32) -> Result<(), String> {
+pub fn set_font_size(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    size: u32,
+    preferred: Option<bool>,
+) -> Result<(), String> {
     let mut config = state.config.lock().map_err(|e| e.to_string())?;
     config.font_size = Some(size);
+    // Only a choice made in Appearance becomes the size that resetting the zoom returns to.
+    if preferred == Some(true) {
+        config.preferred_font_size = Some(size);
+    }
     save_app_config(&config)?;
     drop(config);
 
@@ -4222,10 +4231,22 @@ pub fn load_app_config() -> AppConfig {
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    if migrate_global_sync_to_vault(&mut config) {
+    let migrated_sync = migrate_global_sync_to_vault(&mut config);
+    let migrated_font = adopt_font_size_as_preference(&mut config);
+    if migrated_sync || migrated_font {
         let _ = save_app_config(&config);
     }
     config
+}
+
+// One-time migration: the size in use when the preference was introduced becomes the preference,
+// so resetting the zoom does not fall back to the built-in default for existing users.
+fn adopt_font_size_as_preference(config: &mut AppConfig) -> bool {
+    if config.preferred_font_size.is_some() || config.font_size.is_none() {
+        return false;
+    }
+    config.preferred_font_size = config.font_size;
+    true
 }
 
 // One-time migration: WebDAV sync moved from global AppConfig to per-vault VaultConfig.
@@ -4365,6 +4386,32 @@ pub fn get_install_type() -> String {
         "appimage".to_string()
     } else {
         "native".to_string()
+    }
+}
+
+#[cfg(test)]
+mod font_size_preference_tests {
+    use super::*;
+
+    #[test]
+    fn current_size_becomes_the_preference_once() {
+        let mut config = AppConfig {
+            font_size: Some(18),
+            ..AppConfig::default()
+        };
+        assert!(adopt_font_size_as_preference(&mut config));
+        assert_eq!(config.preferred_font_size, Some(18));
+        // A later zoom changes only the size in use.
+        config.font_size = Some(22);
+        assert!(!adopt_font_size_as_preference(&mut config));
+        assert_eq!(config.preferred_font_size, Some(18));
+    }
+
+    #[test]
+    fn nothing_is_adopted_without_a_saved_size() {
+        let mut config = AppConfig::default();
+        assert!(!adopt_font_size_as_preference(&mut config));
+        assert_eq!(config.preferred_font_size, None);
     }
 }
 
