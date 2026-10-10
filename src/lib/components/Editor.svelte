@@ -4164,6 +4164,27 @@
 		return restoreTitleHeading(md, hiddenTitleHeading);
 	}
 
+	/**
+	 * With the title heading shown in the body, the heading and the title field are the same text.
+	 * When the field changes, the leading heading that still reads as the old title follows it;
+	 * left behind, it was saved under a second heading carrying the new title.
+	 */
+	function syncVisibleTitleHeading(previous: string, next: string) {
+		if (hiddenTitleHeading || !next.trim()) return;
+		const same = (text: string) => text.trim().toLowerCase() === previous.trim().toLowerCase();
+		if ($sourceMode) {
+			const text = source.state.doc.toString();
+			const heading = /^(\s*# )([^\n]*)/.exec(text);
+			if (heading && same(heading[2])) source.replace(next.trim(), heading[1].length, heading[0].length);
+			return;
+		}
+		if (!editor) return;
+		finishProgressiveLoad();
+		const first = editor.state.doc.firstChild;
+		if (first?.type.name !== 'heading' || first.attrs.level !== 1 || !same(first.textContent)) return;
+		editor.view.dispatch(editor.state.tr.insertText(next.trim(), 1, 1 + first.content.size));
+	}
+
 	function editorToMarkdown(): string {
 		if (!editor) return '';
 		finishProgressiveLoad();
@@ -7541,6 +7562,7 @@
 						if (!$activeNote) return;
 						const title = e.currentTarget.value;
 						if ($activeNote.meta.title === title) return;
+						syncVisibleTitleHeading($activeNote.meta.title, title);
 						$activeNote.meta.title = title;
 						if (hiddenTitleHeading) hiddenTitleHeading = { ...hiddenTitleHeading, title };
 						markEdited();
@@ -7563,6 +7585,7 @@
 							if (!newTitle) return;
 							const oldPath = $activeNotePath;
 							if ($activeNote.meta.title !== newTitle) {
+								syncVisibleTitleHeading($activeNote.meta.title, newTitle);
 								$activeNote.meta.title = newTitle;
 								if (hiddenTitleHeading) hiddenTitleHeading = { ...hiddenTitleHeading, title: newTitle };
 								markEdited();

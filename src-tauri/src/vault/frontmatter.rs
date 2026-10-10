@@ -184,18 +184,15 @@ pub fn parse_note(raw: &str, filename: &str) -> (NoteMeta, String) {
     (meta, content)
 }
 
-/// Ensure the body starts with `# Title` heading for external app compatibility.
-/// If the body already starts with `# Title`, leave it as-is.
+/// Ensure the body starts with a top-level heading for external app compatibility, adding
+/// `# Title` when it has none. A body that already opens with a top-level heading is left alone
+/// even when that heading differs from the title: adding another one above it stacked a new
+/// heading on every title change (`# New`, `# Old`, ...).
 fn ensure_title_heading(body: &str, title: &str) -> String {
     let trimmed = body.trim_start();
 
-    // Check if body already starts with `# Title`
-    if let Some(rest) = trimmed.strip_prefix("# ") {
-        let first_line_end = rest.find('\n').unwrap_or(rest.len());
-        let heading_text = rest[..first_line_end].trim();
-        if heading_text.eq_ignore_ascii_case(title.trim()) {
-            return body.to_string();
-        }
+    if trimmed.starts_with("# ") {
+        return body.to_string();
     }
 
     // Don't add heading to empty notes (new/blank notes)
@@ -685,5 +682,50 @@ mod tests {
             assert_eq!(back.created.timestamp(), meta.created.timestamp());
             assert!(content.ends_with("body"));
         }
+    }
+
+    #[test]
+    fn a_title_heading_is_added_only_when_the_body_has_no_top_level_heading() {
+        let meta = |title: &str| NoteMeta {
+            id: "id".into(),
+            title: title.into(),
+            tags: vec![],
+            pinned: false,
+            created: Utc::now(),
+            modified: Utc::now(),
+        };
+        let body_of = |raw: String| parse_note(&raw, "x.md").1;
+        // No heading yet: the title becomes one.
+        assert_eq!(
+            body_of(update_note_raw(&meta("New"), "Text.\n")),
+            "# New\n\nText."
+        );
+        // A heading that differs from the title is not buried under a second one.
+        assert_eq!(
+            body_of(update_note_raw(&meta("New"), "# Old\n\nText.\n")),
+            "# Old\n\nText."
+        );
+        let original = "---\nid: id\ntitle: Old\n---\n# Old\n\nText.\n";
+        assert_eq!(
+            body_of(merge_frontmatter(
+                original,
+                &meta("New"),
+                "# Old\n\nText.\n"
+            )),
+            "# Old\n\nText."
+        );
+        // Saving again and again never grows the note.
+        let once = merge_frontmatter(original, &meta("New"), "# Old\n\nText.\n");
+        let (_, body) = parse_note(&once, "x.md");
+        assert_eq!(
+            body_of(merge_frontmatter(&once, &meta("Newer"), &body)),
+            "# Old\n\nText."
+        );
+        // Lower-level headings and empty notes behave as before.
+        assert_eq!(
+            body_of(update_note_raw(&meta("New"), "## Section\n")),
+            "# New\n\n## Section"
+        );
+        assert!(update_note_raw(&meta("New"), "\n").ends_with("---\n\n"));
     }
 }

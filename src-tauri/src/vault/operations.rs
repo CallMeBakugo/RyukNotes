@@ -840,7 +840,9 @@ pub fn save_note(
     }
 
     updated_meta.modified = Utc::now();
-    let raw = frontmatter::merge_frontmatter(&existing.raw, &updated_meta, body);
+    // The heading that carried the old title follows the title.
+    let body = retitle_leading_heading(body, &existing.meta.title, &updated_meta.title);
+    let raw = frontmatter::merge_frontmatter(&existing.raw, &updated_meta, &body);
     replace_file_atomically(&target, raw.as_bytes())?;
 
     Ok(Some(SavedNote {
@@ -1279,6 +1281,8 @@ pub fn rename_note(path: &str, new_title: &str, vault_path: &str) -> Result<Rena
     if meta.id.is_empty() {
         meta.id = Uuid::new_v4().to_string();
     }
+    // The heading that carried the old title follows the rename.
+    let content = retitle_leading_heading(&content, &old_title, new_title);
     let updated = frontmatter::merge_frontmatter(&raw, &meta, &content);
 
     // Rename file
@@ -2494,6 +2498,53 @@ pub fn sanitize_filename(name: &str) -> String {
 #[cfg(test)]
 mod rename_link_tests {
     use super::*;
+
+    #[test]
+    fn renaming_and_retitling_keep_a_single_title_heading() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().to_str().unwrap();
+        let note = vault.path().join("Alpha.md");
+        fs::write(
+            &note,
+            "---\nid: the-id\ntitle: Alpha\n---\n# Alpha\n\nText.\n",
+        )
+        .unwrap();
+
+        // Renamed twice from the sidebar: the heading follows, nothing stacks.
+        let renamed = rename_note(note.to_str().unwrap(), "Beta", root).unwrap();
+        let renamed = rename_note(&renamed.path, "Gamma", root).unwrap();
+        let raw = fs::read_to_string(&renamed.path).unwrap();
+        assert!(raw.trim_end().ends_with("---\n# Gamma\n\nText."), "{raw}");
+        assert_eq!(raw.matches("\n# ").count(), 1, "{raw}");
+
+        // A heading the user worded differently is theirs and stays.
+        let other = vault.path().join("Other.md");
+        fs::write(
+            &other,
+            "---\nid: other\ntitle: Other\n---\n# My own heading\n\nText.\n",
+        )
+        .unwrap();
+        let renamed = rename_note(other.to_str().unwrap(), "Renamed", root).unwrap();
+        let raw = fs::read_to_string(&renamed.path).unwrap();
+        assert!(
+            raw.trim_end().ends_with("---\n# My own heading\n\nText."),
+            "{raw}"
+        );
+
+        // The save path: a body still carrying the old title's heading is retitled with the title.
+        assert_eq!(
+            retitle_leading_heading("# Gamma\n\nText.\n", "Gamma", "Delta"),
+            "# Delta\n\nText.\n"
+        );
+        assert_eq!(
+            retitle_leading_heading("# Gamma\n\nText.\n", "Gamma", "Gamma"),
+            "# Gamma\n\nText.\n"
+        );
+        assert_eq!(
+            retitle_leading_heading("# Mine\n\nText.\n", "Gamma", "Delta"),
+            "# Mine\n\nText.\n"
+        );
+    }
 
     #[test]
     fn a_rename_updates_links_to_the_note_and_leaves_other_aliases_alone() {
