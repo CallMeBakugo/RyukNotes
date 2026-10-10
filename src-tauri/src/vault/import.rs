@@ -3,8 +3,8 @@ use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::vault::frontmatter::BoundedYaml;
 use chrono::Utc;
-use gray_matter::engine::YAML;
 use gray_matter::Matter;
 use regex::Regex;
 use uuid::Uuid;
@@ -259,7 +259,7 @@ fn build_file_index(vault: &Path) -> Result<HashMap<String, String>, String> {
 }
 
 fn rename_deprecated_properties(raw: &str) -> String {
-    let matter = Matter::<YAML>::new();
+    let matter = Matter::<BoundedYaml>::new();
     let result = matter.parse(raw);
 
     if result.matter.trim().is_empty() {
@@ -298,7 +298,7 @@ fn rename_deprecated_properties(raw: &str) -> String {
 }
 
 fn normalize_frontmatter(raw: &str, path: &Path) -> (NoteMeta, String) {
-    let matter = Matter::<YAML>::new();
+    let matter = Matter::<BoundedYaml>::new();
     let result = matter.parse(raw);
     let yaml_str = result.matter.trim();
 

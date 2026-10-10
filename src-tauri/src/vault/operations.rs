@@ -3171,7 +3171,8 @@ mod tests {
         assert_eq!(saved.meta.id, first.id);
         assert_eq!(saved.meta.created, meta.created);
         assert!(saved.content.contains("Second change."));
-        let parsed = gray_matter::Matter::<gray_matter::engine::YAML>::new().parse(&saved.raw);
+        let parsed =
+            gray_matter::Matter::<crate::vault::frontmatter::BoundedYaml>::new().parse(&saved.raw);
         let fields: serde_yaml::Value = parsed.data.unwrap().deserialize().unwrap();
         assert_eq!(fields["aliases"][0].as_str(), Some("Legacy"));
     }

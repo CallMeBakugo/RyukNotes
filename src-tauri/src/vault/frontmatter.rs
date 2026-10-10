@@ -1,8 +1,69 @@
 use crate::types::NoteMeta;
 use chrono::{NaiveDate, NaiveDateTime, Utc};
-use gray_matter::engine::YAML;
-use gray_matter::Matter;
+use gray_matter::engine::{Engine, YAML as UnboundedYaml};
+use gray_matter::{Matter, Pod};
 use serde::{Deserialize, Serialize};
+
+const MAX_FRONTMATTER_BYTES: usize = 64 * 1024;
+const MAX_FRONTMATTER_ALIASES: usize = 16;
+const MAX_FRONTMATTER_INDENT: usize = 200;
+const MAX_FRONTMATTER_INDICATORS: usize = 32;
+
+/// YAML frontmatter engine for notes, which are untrusted input (sync, import, shared vaults).
+/// The underlying loader expands every alias by copying and recurses once per nesting level, so a
+/// note of a few hundred bytes could take gigabytes or overflow the stack and take the app down
+/// at every start. Frontmatter outside these bounds is treated as carrying no metadata.
+pub struct BoundedYaml;
+
+impl Engine for BoundedYaml {
+    fn parse(content: &str) -> Pod {
+        if frontmatter_within_bounds(content) {
+            UnboundedYaml::parse(content)
+        } else {
+            Pod::Null
+        }
+    }
+}
+
+fn frontmatter_within_bounds(content: &str) -> bool {
+    if content.len() > MAX_FRONTMATTER_BYTES {
+        return false;
+    }
+    // Aliases multiply: with few of them the expansion stays small whatever they point at.
+    let bytes = content.as_bytes();
+    let aliases = bytes
+        .iter()
+        .enumerate()
+        .filter(|&(index, &byte)| {
+            byte == b'*'
+                && (index == 0
+                    || matches!(
+                        bytes[index - 1],
+                        b' ' | b'\t' | b'\n' | b'[' | b',' | b':' | b'-' | b'{'
+                    ))
+                && bytes
+                    .get(index + 1)
+                    .is_some_and(|next| next.is_ascii_alphanumeric() || matches!(next, b'_' | b'-'))
+        })
+        .count();
+    if aliases > MAX_FRONTMATTER_ALIASES {
+        return false;
+    }
+    // Block nesting deepens by indentation, or by indicators chained on one line (`- - - x`).
+    content.lines().all(|line| {
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let mut rest = &line.as_bytes()[indent..];
+        let mut indicators = 0;
+        while let [b'-' | b'?' | b':', b' ' | b'\t', tail @ ..] = rest {
+            indicators += 1;
+            rest = tail;
+            while let [b' ' | b'\t', tail @ ..] = rest {
+                rest = tail;
+            }
+        }
+        indent <= MAX_FRONTMATTER_INDENT && indicators <= MAX_FRONTMATTER_INDICATORS
+    })
+}
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct RawFrontmatter {
@@ -41,7 +102,7 @@ pub fn parse_date_flexible(s: &str) -> Option<chrono::DateTime<Utc>> {
 }
 
 pub fn parse_note(raw: &str, filename: &str) -> (NoteMeta, String) {
-    let matter = Matter::<YAML>::new();
+    let matter = Matter::<BoundedYaml>::new();
     let result = matter.parse(raw);
 
     let fm: RawFrontmatter = result
@@ -134,7 +195,7 @@ pub fn update_note_raw(meta: &NoteMeta, body: &str) -> String {
 /// Merge NoteMeta fields into existing frontmatter, preserving unknown YAML keys.
 /// Falls back to serialize_frontmatter() if the original has no frontmatter.
 pub fn merge_frontmatter(original_raw: &str, meta: &NoteMeta, body: &str) -> String {
-    let matter = Matter::<YAML>::new();
+    let matter = Matter::<BoundedYaml>::new();
     let parsed = matter.parse(original_raw);
 
     // If original had no frontmatter, use the simple serializer
@@ -214,7 +275,7 @@ pub fn filename_to_title(filename: &str) -> String {
 
 /// Quick title extraction from raw note content (frontmatter only, no full parse)
 pub fn extract_title(raw: &str) -> Option<String> {
-    let matter = Matter::<YAML>::new();
+    let matter = Matter::<BoundedYaml>::new();
     let result = matter.parse(raw);
     let fm: RawFrontmatter = result
         .data
@@ -421,5 +482,97 @@ mod tests {
         let stripped = strip_html_and_markdown(input);
         eprintln!("Stripped: {:?}", stripped);
         assert!(stripped.contains("Telefoonnummer"));
+    }
+    fn alias_bomb(levels: usize, width: usize) -> String {
+        let mut note = format!(
+            "---\ntitle: Bomb\na0: &a0 [{}]\n",
+            vec!["1"; width].join(",")
+        );
+        for level in 1..levels {
+            let alias = format!("*a{}", level - 1);
+            note.push_str(&format!(
+                "a{level}: &a{level} [{}]\n",
+                vec![alias.as_str(); width].join(",")
+            ));
+        }
+        note.push_str("---\nbody\n");
+        note
+    }
+
+    /// Runs on a stack the size of the app's worker threads, where the unbounded loader overflowed.
+    fn on_worker_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(work)
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn hostile_frontmatter_is_read_as_a_note_without_metadata() {
+        let nested_on_one_line = format!("---\nt: {}x\n---\nbody\n", "- ".repeat(2400));
+        let mut nested_by_indent = String::from("---\nt:\n");
+        for depth in 0..400 {
+            note_line(&mut nested_by_indent, depth);
+        }
+        nested_by_indent.push_str("---\nbody\n");
+        let oversized = format!(
+            "---\ntitle: Big\nfiller: \"{}\"\n---\nbody\n",
+            "x".repeat(MAX_FRONTMATTER_BYTES)
+        );
+        for note in [
+            alias_bomb(10, 8),
+            alias_bomb(40, 2),
+            nested_on_one_line,
+            nested_by_indent,
+            oversized,
+        ] {
+            let started = std::time::Instant::now();
+            let (title, content, extracted, merged) = on_worker_stack(move || {
+                let (meta, content) = parse_note(&note, "Fallback Name.md");
+                let merged = merge_frontmatter(&note, &meta, &content);
+                (meta.title, content, extract_title(&note), merged)
+            });
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            // No metadata is taken from it, and the body is still split off as usual.
+            assert_eq!(title, "Fallback Name");
+            assert_eq!(content, "body");
+            assert_eq!(extracted, None);
+            assert!(
+                merged.ends_with("body"),
+                "{}",
+                &merged[merged.len().saturating_sub(40)..]
+            );
+        }
+    }
+
+    fn note_line(note: &mut String, depth: usize) {
+        note.push_str(&" ".repeat(depth));
+        note.push_str("-\n");
+    }
+
+    #[test]
+    fn ordinary_frontmatter_is_unaffected_by_the_bounds() {
+        let (meta, content) = parse_note(
+            "---\nid: abc\ntitle: \"*Starred* title: 5*3\"\ntags:\n  - one\n  - two\npinned: true\n---\n# Body\n",
+            "x.md",
+        );
+        assert_eq!(meta.id, "abc");
+        assert_eq!(meta.title, "*Starred* title: 5*3");
+        assert_eq!(meta.tags, vec!["one", "two"]);
+        assert!(meta.pinned);
+        assert_eq!(content, "# Body");
+        // A few aliases and modest nesting are ordinary YAML.
+        let (meta, _) = parse_note(
+            "---\ntitle: Shared\nbase: &base [a, b]\ntags: *base\nextra:\n  - - nested\n    - list\n---\nbody\n",
+            "x.md",
+        );
+        assert_eq!(meta.title, "Shared");
+        assert_eq!(meta.tags, vec!["a", "b"]);
+        assert!(frontmatter_within_bounds(&format!(
+            "title: {}",
+            "x".repeat(MAX_FRONTMATTER_BYTES - 16)
+        )));
     }
 }
