@@ -1481,6 +1481,43 @@
 		},
 	});
 
+	/**
+	 * The body of a collapsible section is isolating, so Backspace at its start did nothing and the
+	 * caret could never leave it: a section could not be removed from inside, least of all when
+	 * nothing sits above it. Backspace there now steps back into the summary, where the stock
+	 * handler deletes text and then unwraps the section; a section with nothing in it is removed.
+	 */
+	const DetailsWithBodyBackspace = Details.extend({
+		addKeyboardShortcuts() {
+			const parent = this.parent?.() ?? {};
+			return {
+				...parent,
+				Backspace: (props) => {
+					const { state, view } = this.editor;
+					const { empty, $anchor: anchor } = state.selection;
+					const depth = anchor.depth - 1;
+					if (empty && anchor.parentOffset === 0 && depth >= 1 && anchor.node(depth).type.name === 'detailsContent' && anchor.index(depth) === 0) {
+						const content = anchor.node(depth);
+						const details = anchor.node(depth - 1);
+						const detailsPos = anchor.before(depth - 1);
+						const summary = details.firstChild;
+						if (summary?.type.name === 'detailsSummary') {
+							const bodyEmpty = content.childCount === 1 && content.firstChild!.isTextblock && content.firstChild!.content.size === 0;
+							if (summary.content.size === 0 && bodyEmpty) {
+								const tr = state.tr.replaceWith(detailsPos, detailsPos + details.nodeSize, state.schema.nodes.paragraph.create());
+								view.dispatch(tr.setSelection(TextSelection.create(tr.doc, detailsPos + 1)).scrollIntoView());
+							} else {
+								view.dispatch(state.tr.setSelection(TextSelection.create(state.doc, detailsPos + summary.nodeSize)).scrollIntoView());
+							}
+							return true;
+						}
+					}
+					return parent.Backspace?.(props) ?? false;
+				},
+			};
+		},
+	});
+
 	const HeadingShortcuts = Extension.create({
 		name: 'headingShortcuts',
 		addKeyboardShortcuts() {
@@ -5248,7 +5285,7 @@
 				Callout,
 				CalloutTyping,
 				ImageGrid.configure({ onUngroup: ungroupImageGridAt, onMoveImage: moveGridImageByIndex }),
-				Details.configure({ persist: true, HTMLAttributes: { class: 'editor-details' } }),
+				DetailsWithBodyBackspace.configure({ persist: true, HTMLAttributes: { class: 'editor-details' } }),
 				DetailsSummary,
 				DetailsContent,
 				Extension.create({
