@@ -4252,8 +4252,7 @@ fn app_config_path() -> Result<std::path::PathBuf, String> {
 pub fn load_app_config() -> AppConfig {
     let mut config: AppConfig = app_config_path()
         .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .map(|path| read_app_config(&path))
         .unwrap_or_default();
     let migrated_sync = migrate_global_sync_to_vault(&mut config);
     let migrated_font = adopt_font_size_as_preference(&mut config);
@@ -4261,6 +4260,54 @@ pub fn load_app_config() -> AppConfig {
         let _ = save_app_config(&config);
     }
     config
+}
+
+/// Reads the configuration, falling back to the defaults when there is none. A file that exists but
+/// cannot be parsed is first copied aside: the defaults are saved over it on the next change, and
+/// it holds the vault list, sync credentials, API keys and custom themes.
+fn read_app_config(path: &Path) -> AppConfig {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return AppConfig::default();
+    };
+    match serde_json::from_str(&text) {
+        Ok(config) => config,
+        Err(error) => {
+            if !text.trim().is_empty() {
+                keep_unreadable_config(path, &text, &error.to_string());
+            }
+            AppConfig::default()
+        }
+    }
+}
+
+fn keep_unreadable_config(path: &Path, text: &str, reason: &str) {
+    let Some(folder) = path.parent() else { return };
+    // One copy per distinct content: loading again before anything is saved must not pile them up.
+    let already_kept = std::fs::read_dir(folder).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("config.unreadable-")
+                && std::fs::read_to_string(entry.path()).is_ok_and(|kept| kept == text)
+        })
+    });
+    if already_kept {
+        return;
+    }
+    let copy = folder.join(format!(
+        "config.unreadable-{}.json",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    ));
+    match write_private_file(&copy, text.as_bytes()) {
+        Ok(()) => eprintln!(
+            "Configuration could not be read ({reason}); a copy was kept at {}",
+            copy.display()
+        ),
+        Err(error) => eprintln!(
+            "Configuration could not be read ({reason}), and no copy could be kept: {error}"
+        ),
+    }
 }
 
 // One-time migration: the size in use when the preference was introduced becomes the preference,
@@ -4274,7 +4321,9 @@ fn adopt_font_size_as_preference(config: &mut AppConfig) -> bool {
 }
 
 // One-time migration: WebDAV sync moved from global AppConfig to per-vault VaultConfig.
-// Copy the old global settings into the active vault's config if it has none yet. Idempotent.
+// The old global settings go to the active vault if it has none yet, and are then cleared. Left in
+// place, they were copied again at every start into whichever vault was active and had sync
+// disabled, undoing "Disabled" and pointing a second vault at the first one's remote folder.
 fn migrate_global_sync_to_vault(config: &mut AppConfig) -> bool {
     if config.sync_provider.is_none() && config.webdav_url.is_none() {
         return false;
@@ -4282,48 +4331,58 @@ fn migrate_global_sync_to_vault(config: &mut AppConfig) -> bool {
     let Ok(active_index) = active_vault_index(config) else {
         return false;
     };
-    let g_provider = config.sync_provider.clone();
-    let g_url = config.webdav_url.clone();
-    let g_user = config.webdav_username.clone();
-    let g_pass = config.webdav_password.clone();
-    let g_on_open = config.sync_on_open;
-    let g_on_change = config.sync_on_change;
-    let g_interval = config.sync_interval_minutes;
-    let g_last = config.last_sync_time.clone();
+    let g_provider = config.sync_provider.take();
+    let g_url = config.webdav_url.take();
+    let g_user = config.webdav_username.take();
+    let g_pass = config.webdav_password.take();
+    let g_on_open = std::mem::take(&mut config.sync_on_open);
+    let g_on_change = std::mem::take(&mut config.sync_on_change);
+    let g_interval = std::mem::take(&mut config.sync_interval_minutes);
+    let g_last = config.last_sync_time.take();
     let v = &mut config.vaults[active_index];
-    if v.sync_provider.is_some() || v.webdav_url.is_some() {
-        return false; // already migrated / has its own config
+    if v.sync_provider.is_none() && v.webdav_url.is_none() {
+        v.sync_provider = g_provider;
+        v.webdav_url = g_url;
+        v.webdav_username = g_user;
+        v.webdav_password = g_pass;
+        v.sync_on_open = g_on_open;
+        v.sync_on_change = g_on_change;
+        v.sync_interval_minutes = g_interval;
+        v.last_sync_time = g_last;
     }
-    v.sync_provider = g_provider;
-    v.webdav_url = g_url;
-    v.webdav_username = g_user;
-    v.webdav_password = g_pass;
-    v.sync_on_open = g_on_open;
-    v.sync_on_change = g_on_change;
-    v.sync_interval_minutes = g_interval;
-    v.last_sync_time = g_last;
     true
 }
 
+/// Writes an owner-only file by replacing it in one step: the data goes to a temporary file in the
+/// same folder, is flushed to disk and then renamed over the target. A crash or a full disk during
+/// the write leaves the previous file intact instead of an empty or half-written one.
 fn write_private_file(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
     use std::io::Write;
 
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-
-    let mut file = options.open(path).map_err(|error| error.to_string())?;
+    let folder = path.parent().ok_or("File has no parent directory")?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".helixnotes-config-")
+        .tempfile_in(folder)
+        .map_err(|error| error.to_string())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|error| error.to_string())?;
     }
-    file.write_all(data).map_err(|error| error.to_string())
+    temporary
+        .write_all(data)
+        .map_err(|error| error.to_string())?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error.to_string())
 }
 
 #[cfg(all(test, unix))]
@@ -4410,6 +4469,142 @@ pub fn get_install_type() -> String {
         "appimage".to_string()
     } else {
         "native".to_string()
+    }
+}
+
+#[cfg(test)]
+mod config_resilience_tests {
+    use super::*;
+
+    fn config_from(json: &str) -> (tempfile::TempDir, AppConfig) {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("config.json");
+        std::fs::write(&path, json).unwrap();
+        let config = read_app_config(&path);
+        (folder, config)
+    }
+
+    fn kept_copies(folder: &Path) -> Vec<String> {
+        std::fs::read_dir(folder)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with("config.unreadable-"))
+            .collect()
+    }
+
+    #[test]
+    fn missing_keys_and_damaged_entries_do_not_blank_the_configuration() {
+        // No `theme`, a custom theme without its colors, a vault without a path, a toolbar of the wrong shape.
+        let (folder, config) = config_from(
+            r##"{"vaults":[{"path":"/notes","name":"Notes","webdav_url":"https://dav.example/x"},{"name":"broken"}],
+                "active_vault":"/notes","font_size":18,"toolbar_layout":"oops",
+                "custom_themes":[{"id":"a","name":"A","is_dark":true},
+                  {"id":"b","name":"B","is_dark":false,"colors":{"bg_primary":"#fff","bg_secondary":"#fff","bg_tertiary":"#fff","bg_hover":"#fff","bg_active":"#fff","bg_editor":"#fff","text_primary":"#000","text_secondary":"#000","border_color":"#000"}}]}"##,
+        );
+        assert_eq!(config.vaults.len(), 1);
+        assert_eq!(
+            config.vaults[0].webdav_url.as_deref(),
+            Some("https://dav.example/x")
+        );
+        assert_eq!(config.active_vault.as_deref(), Some("/notes"));
+        assert_eq!(config.font_size, Some(18));
+        assert_eq!(config.theme, AppConfig::default().theme);
+        assert!(config.toolbar_layout.is_none());
+        assert_eq!(config.custom_themes.len(), 1);
+        assert_eq!(config.custom_themes[0].id, "b");
+        assert!(kept_copies(folder.path()).is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_configuration_is_kept_aside_once() {
+        let (folder, config) =
+            config_from(r#"{"vaults":[{"path":"/notes","name":"Notes"}],"active_va"#);
+        assert!(config.vaults.is_empty());
+        let copies = kept_copies(folder.path());
+        assert_eq!(copies.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(folder.path().join(&copies[0])).unwrap(),
+            r#"{"vaults":[{"path":"/notes","name":"Notes"}],"active_va"#
+        );
+        // Loading again before anything is saved keeps no second copy.
+        read_app_config(&folder.path().join("config.json"));
+        assert_eq!(kept_copies(folder.path()).len(), 1);
+        // No file and an empty file are a fresh start, not damage.
+        assert!(read_app_config(&folder.path().join("absent.json"))
+            .vaults
+            .is_empty());
+        let (empty, _) = config_from("");
+        assert!(kept_copies(empty.path()).is_empty());
+    }
+
+    #[test]
+    fn saving_replaces_the_file_in_one_step_and_leaves_nothing_behind() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("config.json");
+        std::fs::write(&path, "previous").unwrap();
+        save_app_config_to(&AppConfig::default(), &path).unwrap();
+        assert!(read_app_config(&path).vaults.is_empty());
+        let names: Vec<_> = std::fs::read_dir(folder.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("config.json")]);
+    }
+
+    fn vault(path: &str) -> crate::types::VaultConfig {
+        serde_json::from_value(serde_json::json!({ "path": path, "name": path })).unwrap()
+    }
+
+    #[test]
+    fn global_sync_settings_move_to_the_active_vault_once() {
+        let mut config = AppConfig {
+            vaults: vec![vault("/a"), vault("/b")],
+            active_vault: Some("/a".into()),
+            sync_provider: Some("webdav".into()),
+            webdav_url: Some("https://dav.example/a".into()),
+            webdav_username: Some("me".into()),
+            webdav_password: Some("secret".into()),
+            sync_on_open: true,
+            ..AppConfig::default()
+        };
+        assert!(migrate_global_sync_to_vault(&mut config));
+        assert_eq!(
+            config.vaults[0].webdav_url.as_deref(),
+            Some("https://dav.example/a")
+        );
+        assert!(config.vaults[0].sync_on_open);
+        // The global copy is gone, so nothing is left to hand out again.
+        assert!(config.sync_provider.is_none() && config.webdav_url.is_none());
+        assert!(config.webdav_username.is_none() && config.webdav_password.is_none());
+        assert!(!config.sync_on_open);
+
+        // Disabling sync on that vault stays disabled, and another vault inherits nothing.
+        config.vaults[0].sync_provider = None;
+        config.vaults[0].webdav_url = None;
+        config.active_vault = Some("/b".into());
+        assert!(!migrate_global_sync_to_vault(&mut config));
+        assert!(config.vaults[0].webdav_url.is_none());
+        assert!(config.vaults[1].webdav_url.is_none());
+    }
+
+    #[test]
+    fn a_vault_with_its_own_sync_settings_keeps_them_and_the_global_copy_is_cleared() {
+        let mut own = vault("/a");
+        own.webdav_url = Some("https://dav.example/own".into());
+        let mut config = AppConfig {
+            vaults: vec![own],
+            active_vault: Some("/a".into()),
+            webdav_url: Some("https://dav.example/old".into()),
+            ..AppConfig::default()
+        };
+        assert!(migrate_global_sync_to_vault(&mut config));
+        assert_eq!(
+            config.vaults[0].webdav_url.as_deref(),
+            Some("https://dav.example/own")
+        );
+        assert!(config.webdav_url.is_none());
     }
 }
 

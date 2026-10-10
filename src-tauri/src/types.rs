@@ -146,8 +146,36 @@ pub struct ToolbarLayout {
     pub more: Vec<String>,
 }
 
+/// Keeps the entries of a list that still parse and drops the rest, so one damaged entry (a custom
+/// theme missing a color, say) does not make the whole configuration unreadable.
+fn lenient_list<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let values = Vec::<serde_json::Value>::deserialize(deserializer).unwrap_or_default();
+    Ok(values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect())
+}
+
+/// An optional setting that no longer parses is treated as not set.
+fn lenient_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer).unwrap_or(serde_json::Value::Null);
+    Ok(serde_json::from_value(value).ok())
+}
+
+// Missing keys take their default: a configuration written by an older version, or edited by
+// hand, must still load instead of being replaced by a blank one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
+    #[serde(deserialize_with = "lenient_list")]
     pub vaults: Vec<VaultConfig>,
     pub active_vault: Option<String>,
     #[serde(default)]
@@ -169,7 +197,7 @@ pub struct AppConfig {
     pub preferred_font_size: Option<u32>,
     #[serde(default = "default_true")]
     pub scroll_to_change_font_size: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_option")]
     pub toolbar_layout: Option<ToolbarLayout>,
     #[serde(default)]
     pub font_family: Option<String>,
@@ -278,7 +306,7 @@ pub struct AppConfig {
     pub sync_interval_minutes: u32,
     #[serde(default)]
     pub last_sync_time: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_list")]
     pub custom_themes: Vec<CustomTheme>,
 }
 
