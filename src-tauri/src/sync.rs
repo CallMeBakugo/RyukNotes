@@ -74,6 +74,51 @@ fn webdav_error(operation: &str, relpath: &str, error: impl std::fmt::Display) -
     format!("WebDAV error: cannot {operation} \"{relpath}\": {error}")
 }
 
+/// The only relative paths sync will touch: plain file and folder names separated by `/`.
+/// A remote listing is untrusted input, and so is a stored manifest: a `..` segment, an absolute
+/// or drive-prefixed path, or a backslash must never be joined to the vault folder.
+fn validate_relpath(rel: &str) -> Result<(), String> {
+    validate_relpath_for(rel, cfg!(windows))
+}
+
+fn validate_relpath_for(rel: &str, windows: bool) -> Result<(), String> {
+    let reject = |reason: &str| {
+        Err(format!(
+            "Sync stopped: \"{}\" is not a valid file path ({reason}). No file was written for it.",
+            rel.escape_debug()
+        ))
+    };
+    if rel.is_empty() {
+        return reject("empty path");
+    }
+    for segment in rel.split('/') {
+        if segment.is_empty() {
+            return reject("empty path segment");
+        }
+        if segment == "." || segment == ".." {
+            return reject("relative path segment");
+        }
+        if segment.contains('\\') {
+            return reject("backslash");
+        }
+        if segment.chars().any(char::is_control) {
+            return reject("control character");
+        }
+        // Windows reads `D:x` as a drive path and `x:y` as a file stream, and drops trailing dots
+        // and spaces, which can turn a segment into `..`.
+        if windows && (segment.contains(':') || segment.ends_with('.') || segment.ends_with(' ')) {
+            return reject("not a valid Windows file name");
+        }
+    }
+    Ok(())
+}
+
+/// The local file for a synced path. Every join of a sync key to the vault goes through here.
+fn local_path(vault: &Path, relpath: &str) -> Result<PathBuf, String> {
+    validate_relpath(relpath)?;
+    Ok(vault.join(relpath))
+}
+
 fn load_manifest(vault: &str) -> Result<SyncManifest, String> {
     match fs::read(manifest_path(vault)) {
         Ok(bytes) => serde_json::from_slice(&bytes)
@@ -165,7 +210,7 @@ fn write_local(
     bytes: &[u8],
     changes: &mut HashMap<PathBuf, &'static str>,
 ) -> Result<(), String> {
-    let target = vault.join(relpath);
+    let target = local_path(vault, relpath)?;
     if fs::read(&target).is_ok_and(|current| current == bytes) {
         return Ok(());
     }
@@ -215,7 +260,7 @@ fn write_local_if_unchanged(
     changes: &mut HashMap<PathBuf, &'static str>,
 ) -> Result<(), String> {
     let _guard = write_guard.blocking_lock();
-    require_unchanged_local(&vault.join(relpath), expected_hash)?;
+    require_unchanged_local(&local_path(vault, relpath)?, expected_hash)?;
     write_local(vault, relpath, bytes, changes)
 }
 
@@ -228,6 +273,14 @@ struct LocalFile {
 /// `.helixnotes/attachments/`, plus notebook icon and tag style mappings. Applied to BOTH local
 /// and remote so pointing at a folder with unrelated files never imports them.
 fn is_synced_relpath(rel: &str) -> bool {
+    // On a case-insensitive disk `.HelixNotes/history/x.md` lands in the app's own folder, so any
+    // other spelling of it is never synced, whatever lies below.
+    let first = rel.split('/').next().unwrap_or_default();
+    if first != ".helixnotes"
+        && (first.to_lowercase() == ".helixnotes" || first.to_uppercase() == ".HELIXNOTES")
+    {
+        return false;
+    }
     if rel.starts_with(".helixnotes/") {
         rel.starts_with(".helixnotes/attachments/")
             || rel == ".helixnotes/notebook_icons.json"
@@ -586,8 +639,11 @@ fn href_to_relpath(href: &str, base_path: &str) -> Result<Option<String>, String
         .map_err(|e| format!("bad percent-encoding in WebDAV base path '{base_path}': {e}"))?
         .into_owned();
     let rest = match path.strip_prefix(&base) {
-        Some(r) => r.trim_start_matches('/'),
-        None => {
+        // `/dav-other/x` is not inside `/dav`: the folder must end at a path boundary.
+        Some(r) if r.is_empty() || r.starts_with('/') || base.is_empty() => {
+            r.trim_start_matches('/')
+        }
+        _ => {
             return Err(format!(
                 "remote path '{path}' is not under the configured WebDAV folder '{base}'. \
                  Aborting before deleting anything locally - please report this URL."
@@ -597,6 +653,7 @@ fn href_to_relpath(href: &str, base_path: &str) -> Result<Option<String>, String
     if rest.is_empty() {
         return Ok(None); // the base collection itself
     }
+    validate_relpath(rest)?;
     Ok(Some(rest.to_string()))
 }
 
@@ -813,7 +870,7 @@ fn apply_changes(
                         let ckey = conflict_relpath(key, &stamp);
                         let lbytes = {
                             let _guard = write_guard.blocking_lock();
-                            require_unchanged_local(&vault_path.join(&ckey), None)?;
+                            require_unchanged_local(&local_path(vault_path, &ckey)?, None)?;
                             let lbytes = read_scanned_local(lf)?;
                             write_local(vault_path, &ckey, &lbytes, changes)?;
                             write_local(vault_path, key, &bytes, changes)?;
@@ -1380,6 +1437,118 @@ mod tests {
         let event = changed_entry(path, "modify", vault.path());
         assert_eq!(event.note.unwrap().preview, "remote content");
     }
+    #[test]
+    fn remote_paths_cannot_leave_the_vault() {
+        // Literal and percent-encoded traversal, as a hostile server could list it.
+        for href in [
+            "/dav/.helixnotes/attachments/..%2F..%2F..%2Fescaped.md",
+            "/dav/.helixnotes/attachments/../../../escaped.md",
+            "/dav/..%2Fescaped.md",
+            "/dav/Notes/./x.md",
+            "/dav/Notes//x.md",
+            "/dav/Notes%5C..%5Cx.md",
+            "/dav/Notes/x%00.md",
+        ] {
+            let error = href_to_relpath(href, "/dav").unwrap_err();
+            assert!(error.starts_with("Sync stopped: "), "{href}: {error}");
+        }
+        // The folder must end at a path boundary.
+        assert!(href_to_relpath("/dav-other/x.md", "/dav").is_err());
+        assert_eq!(
+            href_to_relpath("/dav/Notes/x.md", "/dav")
+                .unwrap()
+                .as_deref(),
+            Some("Notes/x.md")
+        );
+        assert_eq!(
+            href_to_relpath("/x.md", "/").unwrap().as_deref(),
+            Some("x.md")
+        );
+        // Ordinary names stay valid, including ones only some platforms dislike.
+        for rel in [
+            "Notes/a b.md",
+            "Notes/é ü.md",
+            "Notes/A: B.md",
+            "Notes/v1.2.md",
+            ".helixnotes/attachments/x.png",
+        ] {
+            assert!(validate_relpath_for(rel, false).is_ok(), "{rel}");
+        }
+        // Windows: drive prefixes, streams and names it would silently rewrite.
+        for rel in [
+            "D:x.md",
+            "D: draft.md",
+            "Notes/x.md:stream",
+            "Notes/.. /x.md",
+            "Notes/x.md.",
+        ] {
+            assert!(validate_relpath_for(rel, true).is_err(), "{rel}");
+        }
+        assert!(validate_relpath_for("Notes/a b.md", true).is_ok());
+
+        // Even a key that slipped past the listing never reaches the disk.
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().join("vault");
+        fs::create_dir_all(&root).unwrap();
+        let mut changes = HashMap::new();
+        for rel in [
+            "../escaped.md",
+            ".helixnotes/attachments/../../../escaped.md",
+            "/abs.md",
+        ] {
+            assert!(
+                write_local(&root, rel, b"x", &mut changes).is_err(),
+                "{rel}"
+            );
+            assert!(write_local_if_unchanged(
+                &tokio::sync::Mutex::new(()),
+                &root,
+                rel,
+                b"x",
+                None,
+                &mut changes
+            )
+            .is_err());
+        }
+        assert!(changes.is_empty());
+        assert!(!vault.path().join("escaped.md").exists());
+    }
+
+    #[test]
+    fn a_listing_with_a_path_outside_the_folder_stops_the_sync() {
+        let listing = |href: &str| {
+            format!(
+                r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><d:response><d:href>/dav/ok.md</d:href><d:propstat><d:prop><d:getetag>"a"</d:getetag></d:prop></d:propstat></d:response><d:response><d:href>{href}</d:href><d:propstat><d:prop><d:getetag>"b"</d:getetag></d:prop></d:propstat></d:response></d:multistatus>"#
+            )
+        };
+        // One hostile entry fails the whole listing, so nothing from it is acted on.
+        for href in [
+            "/dav/.helixnotes/attachments/..%2F..%2F..%2FLibrary%2Fx.plist",
+            "/dav/../x.md",
+            "/elsewhere/x.md",
+        ] {
+            assert!(parse_multistatus(&listing(href), "/dav").is_err(), "{href}");
+        }
+        let entries = parse_multistatus(&listing("/dav/Notes/fine.md"), "/dav").unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn other_spellings_of_the_internal_folder_are_never_synced() {
+        for rel in [
+            ".HelixNotes/history/id/zz-00.md",
+            ".HELIXNOTES/trash/x.md",
+            ".helixNotes/attachments/x.png",
+            ".helixnote\u{17f}/history/x.md",
+        ] {
+            assert!(!is_synced_relpath(rel), "{rel}");
+        }
+        assert!(is_synced_relpath(".helixnotes/attachments/x.png"));
+        assert!(!is_synced_relpath(".helixnotes/history/id/x.md"));
+        assert!(is_synced_relpath("Notes/.HelixNotes.md"));
+        assert!(is_synced_relpath("Sub/.HelixNotes/x.md"));
+    }
+
     fn webdav_test_client(
         responses: Vec<(&'static str, &'static str)>,
     ) -> (WebdavClient, std::thread::JoinHandle<Vec<String>>) {
