@@ -19,11 +19,15 @@ export interface ActionDef {
 
 // Every customizable action and its factory-default binding. These mirror the
 // handlers in AppLayout.handleKeydown and the rows in InfoPanel's Shortcuts tab.
+const isMac = typeof navigator !== "undefined" && navigator.platform.startsWith("Mac");
+
 export const ACTIONS: ActionDef[] = [
   { id: "new-note", label: "New note", group: "General", default: { mod: true, code: "KeyN" } },
   { id: "save", label: "Save", group: "General", default: { mod: true, code: "KeyS" } },
   { id: "quick-open", label: "Quick open", group: "General", default: { mod: true, code: "KeyP" } },
   { id: "find-in-note", label: "Find in note", group: "General", default: { mod: true, code: "KeyF" } },
+  // Cmd+H hides the application on macOS.
+  { id: "replace-in-note", label: "Replace in note", group: "General", default: isMac ? { mod: true, alt: true, code: "KeyF" } : { mod: true, code: "KeyH" } },
   { id: "search-vault", label: "Search vault", group: "General", default: { mod: true, shift: true, code: "KeyF" } },
   { id: "open-new-window", label: "Open note in new window", group: "General", default: { mod: true, shift: true, code: "KeyW" } },
 
@@ -122,8 +126,6 @@ export function bindingFromEvent(e: KeyboardEvent): Binding | null {
 export function bindingsEqual(a: Binding, b: Binding): boolean {
   return !!a.mod === !!b.mod && !!a.shift === !!b.shift && !!a.alt === !!b.alt && a.code === b.code;
 }
-
-const isMac = typeof navigator !== "undefined" && navigator.platform.startsWith("Mac");
 
 const CODE_LABELS: Record<string, string> = {
   Backslash: "\\",

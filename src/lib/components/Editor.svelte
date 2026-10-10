@@ -54,7 +54,8 @@
 	import { calloutGroup, calloutIcon, calloutLabel, CALLOUT_MENU, transformCalloutBlockquotes, serializeCallout } from '$lib/editor/callouts';
 	import SourceEditor from './SourceEditor.svelte';
 	import { SourceController } from '$lib/editor/source/controller';
-	import { findDocumentMatches, findSourceMatches, closestSearchMatch, type NoteSearchMatch } from '$lib/editor/search';
+	import { findDocumentMatches, findSourceMatches, closestSearchMatch, type NoteSearchMatch, replaceableMatches } from '$lib/editor/search';
+	import { keybindings, bindingToKeys } from '$lib/keybindings';
 	import { resolveSearchTarget, visibleSearchTarget } from '$lib/editor/search-target';
 	import { convertListNode, type MixedListName } from '$lib/editor/mixedLists';
 	import { clearFormatting } from '$lib/editor/clearFormatting';
@@ -650,6 +651,9 @@
 	let noteSearchWholeWord = $state(false);
 	let noteSearchPending = $state(false);
 	let noteSearchInput = $state<HTMLInputElement>(null!);
+	let noteReplaceOpen = $state(false);
+	let noteReplaceValue = $state('');
+	let noteReplaceInput = $state<HTMLInputElement>(null!);
 	const noteSearchPluginKey = new PluginKey('noteSearch');
 
 	// Slash commands
@@ -5017,19 +5021,102 @@
 	function noteSearchNext() { navigateNoteSearch(1); }
 	function noteSearchPrev() { navigateNoteSearch(-1); }
 
-	export function openNoteSearch() {
+	export function openNoteSearch(replace = false) {
 		++targetRevealRequest;
 		clearTargetReveal();
+		// Asking for replace while find is already showing moves on to the replace field.
+		const toReplace = replace && noteSearchOpen && !!noteSearchQuery;
 		noteSearchOpen = true;
+		if (replace) noteReplaceOpen = true;
 		tick().then(() => {
-			if (noteSearchOpen && !editorDisposed) noteSearchInput?.focus({ preventScroll: true });
+			if (!noteSearchOpen || editorDisposed) return;
+			if (toReplace) noteReplaceInput?.focus({ preventScroll: true });
+			else noteSearchInput?.focus({ preventScroll: true });
 		});
+	}
+
+	function canReplaceInNote(): boolean {
+		if ($readOnly || $viewerNote || trashPreview || showHistory || externalOperationBusy) return false;
+		return $sourceMode ? !!source.view : !!editor?.isEditable;
+	}
+
+	// Replacing text shown by a wiki link changes what the link says, not where it points:
+	// [[Home]] becomes [[Home|House]]. Otherwise it would count as retitling the linked note.
+	function keepWikiLinkTarget(tr: any, from: number) {
+		const wikiLink = tr.doc.type.schema.marks.wikiLink;
+		if (!wikiLink) return;
+		const resolved = tr.doc.resolve(from);
+		const parent = resolved.parent;
+		const index = resolved.index();
+		const mark = parent.maybeChild(index)?.marks.find((m: any) => m.type === wikiLink);
+		if (!mark || mark.attrs.aliased) return;
+		let first = index;
+		let last = index;
+		const linked = (i: number) => !!parent.maybeChild(i)?.marks.some((m: any) => m.eq(mark));
+		while (first > 0 && linked(first - 1)) first--;
+		while (linked(last + 1)) last++;
+		let start = resolved.start();
+		for (let i = 0; i < first; i++) start += parent.child(i).nodeSize;
+		let end = start;
+		let shown = '';
+		for (let i = first; i <= last; i++) { end += parent.child(i).nodeSize; shown += parent.child(i).text ?? ''; }
+		// The mark does not exclude itself, so the old one has to go first.
+		tr.removeMark(start, end, mark);
+		tr.addMark(start, end, wikiLink.create({ ...mark.attrs, title: mark.attrs.title || shown, aliased: true }));
+	}
+
+	function replaceNoteMatches(matches: NoteSearchMatch[]) {
+		const insert = noteReplaceValue;
+		if ($sourceMode) {
+			source.dispatch({ changes: matches.map(({ from, to }) => ({ from, to, insert })), userEvent: 'input.replace' });
+			return;
+		}
+		if (!editor) return;
+		const tr = editor.state.tr;
+		// Last to first, so earlier positions stay valid. One transaction is one undo step.
+		for (let i = matches.length - 1; i >= 0; i--) {
+			keepWikiLinkTarget(tr, matches[i].from);
+			tr.insertText(insert, matches[i].from, matches[i].to);
+		}
+		editor.view.dispatch(tr);
+	}
+
+	function replaceNoteMatch() {
+		if (!noteSearchOpen || !canReplaceInNote()) return;
+		if (noteSearchPending) { cancelNoteSearchWork(); scanNoteSearch(); }
+		const match = noteSearchResults[noteSearchIndex];
+		if (!match) return;
+		replaceNoteMatches([match]);
+		// Continue behind the inserted text, so a replacement that contains the query is not found again.
+		cancelNoteSearchWork();
+		noteSearchAnchor = match.from + noteReplaceValue.length;
+		scanNoteSearch();
+		if (noteSearchResults.length && noteSearchResults[noteSearchIndex].from < noteSearchAnchor) {
+			noteSearchIndex = 0;
+			noteSearchAnchor = noteSearchResults[0].from;
+			if (!$sourceMode) applySearchDecorations();
+		}
+		if (noteSearchResults.length) revealNoteSearchMatch();
+		else source.highlight(null);
+	}
+
+	function replaceAllNoteMatches() {
+		if (!noteSearchOpen || !canReplaceInNote()) return;
+		if (noteSearchPending) { cancelNoteSearchWork(); scanNoteSearch(); }
+		const matches = replaceableMatches(noteSearchResults);
+		if (!matches.length) return;
+		replaceNoteMatches(matches);
+		cancelNoteSearchWork();
+		scanNoteSearch();
+		source.highlight(null);
 	}
 
 	function closeNoteSearch(restoreFocus = true) {
 		cancelNoteSearchWork();
 		noteSearchOpen = false;
 		noteSearchQuery = '';
+		noteReplaceOpen = false;
+		noteReplaceValue = '';
 		noteSearchResults = [];
 		noteSearchIndex = 0;
 		noteSearchSourceHighlighted = false;
@@ -7971,7 +8058,9 @@
 		<div class="editor-body-wrapper">
 			{#if noteSearchOpen}
 				<div class="note-search-bar">
-					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.5;flex-shrink:0"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+					<button type="button" class="note-search-btn note-replace-toggle" class:open={noteReplaceOpen} aria-label="Replace" aria-expanded={noteReplaceOpen} title={`Replace (${bindingToKeys($keybindings['replace-in-note']).join('+')})`} onmousedown={(e) => e.preventDefault()} onclick={() => { noteReplaceOpen = !noteReplaceOpen; }}>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"/></svg>
+					</button>
 					<input
 						bind:this={noteSearchInput}
 						type="text"
@@ -8006,6 +8095,27 @@
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 					</button>
 				</div>
+				{#if noteReplaceOpen}
+					{@const replaceDisabled = (!noteSearchPending && !noteSearchResults.length) || $readOnly || !!$viewerNote || trashPreview || showHistory}
+					<div class="note-search-bar note-replace-bar">
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.5;flex-shrink:0"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+						<input
+							bind:this={noteReplaceInput}
+							type="text"
+							class="note-search-input"
+							placeholder="Replace with..."
+							aria-label="Replace with"
+							bind:value={noteReplaceValue}
+							onkeydown={(e) => {
+								if (e.isComposing) return;
+								if (e.key === 'Enter') { e.preventDefault(); (e.ctrlKey || e.metaKey) ? replaceAllNoteMatches() : replaceNoteMatch(); }
+								if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeNoteSearch(); }
+							}}
+						/>
+						<button type="button" class="note-search-btn note-replace-btn" onclick={replaceNoteMatch} onmousedown={(e) => e.preventDefault()} disabled={replaceDisabled} title="Replace (Enter)">Replace</button>
+						<button type="button" class="note-search-btn note-replace-btn" onclick={replaceAllNoteMatches} onmousedown={(e) => e.preventDefault()} disabled={replaceDisabled} title={`Replace all (${modKey}+Enter)`}>All</button>
+					</div>
+				{/if}
 			{/if}
 			<div class="editor-body-row" class:reviewing-history={showHistory}>
 			<div class="editor-body" class:source-body={$sourceMode} class:history-hidden={showHistory} onscroll={scheduleOutlineActive}>
@@ -10026,6 +10136,9 @@
 	}
 	.note-search-btn:disabled { opacity: 0.4; cursor: default; }
 	.note-search-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+	.note-replace-toggle svg { transition: transform 0.12s ease; }
+	.note-replace-toggle.open svg { transform: rotate(90deg); }
+	.note-replace-btn { font-size: 12px; height: 24px; padding: 0 8px; }
 	.note-search-option { min-width: 24px; justify-content: center; font-size: 12px; height: 24px; }
 	.note-search-option[aria-pressed="true"] { background: var(--accent); color: var(--bg-primary); }
 	.note-search-option.whole-word { text-decoration: underline; text-underline-offset: 3px; }

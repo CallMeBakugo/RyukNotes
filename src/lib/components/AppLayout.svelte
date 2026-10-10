@@ -788,6 +788,9 @@
 						$showSearch = true;
 					}
 					return;
+				case 'replace-in-note':
+					if ($activeNotePath) editor?.openNoteSearch(true);
+					return;
 				case 'quick-open':
 					$showCommandPalette = true;
 					return;

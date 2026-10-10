@@ -64,6 +64,18 @@ export function findDocumentMatches(doc: ProseMirrorNode, query: string, options
 	return results;
 }
 
+/** Matches may overlap ("aa" in "aaa"); replacing all of them takes each stretch of text once. */
+export function replaceableMatches(results: NoteSearchMatch[]): NoteSearchMatch[] {
+	const picked: NoteSearchMatch[] = [];
+	let end = -1;
+	for (const match of results) {
+		if (match.from < end) continue;
+		picked.push(match);
+		end = match.to;
+	}
+	return picked;
+}
+
 export function closestSearchMatch(results: NoteSearchMatch[], anchor: number): number {
 	if (!results.length) return 0;
 	let lo = 0;

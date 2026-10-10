@@ -75,3 +75,11 @@ test('rescanning edited documents adds and removes occurrences without changing 
   assert.equal(after.textContent, 'word WORD word');
 });
 
+
+test('replace all takes each stretch of text once when matches overlap', async () => {
+  const { replaceableMatches } = await import('../src/lib/editor/search.ts');
+  const overlapping = findSourceMatches('aaaa b aa', 'aa', options);
+  assert.deepEqual(overlapping.map(({ from }) => from), [0, 1, 2, 7]);
+  assert.deepEqual(replaceableMatches(overlapping), [{ from: 0, to: 2 }, { from: 2, to: 4 }, { from: 7, to: 9 }]);
+  assert.deepEqual(replaceableMatches([]), []);
+});
