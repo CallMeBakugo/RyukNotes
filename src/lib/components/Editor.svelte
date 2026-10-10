@@ -189,6 +189,8 @@
 	let searchTitleReveal = $state(false);
 	let searchTagsReveal = $state(false);
 	let searchRevealNotice = $state('');
+	/** Path of a note the rich editor could not display; see failNoteLoad. */
+	let loadFailure = $state<string | null>(null);
 	type TaskRevealTarget = { sourceOrdinal: number; richOrdinal: number | null };
 	const TASK_LINE_RE = /^\s*[-*]\s\[[ xX]\]\s+.+?\s*$/;
 	const RICH_TASK_LINE_RE = /^\s*-\s\[(?:x| )\]\s+.+?\s*$/;
@@ -1219,6 +1221,15 @@
 		dom.append(header, body);
 	}
 
+	/** Percent-decoding of an attribute from note content: a stray `%` must not abort loading the note. */
+	function decodeNoteAttribute(value: string): string {
+		try {
+			return decodeURIComponent(value);
+		} catch {
+			return value;
+		}
+	}
+
 	function decodeSecretPayload(value: string): string {
 		try {
 			return decodeURIComponent(value);
@@ -1279,7 +1290,7 @@
 		parseHTML() {
 			return [{
 				tag: 'div[data-math-block]',
-				getAttrs: (el: HTMLElement) => ({ tex: decodeURIComponent(el.getAttribute('data-math-block') || '') }),
+				getAttrs: (el: HTMLElement) => ({ tex: decodeNoteAttribute(el.getAttribute('data-math-block') || '') }),
 			}];
 		},
 		renderHTML({ HTMLAttributes }) {
@@ -1315,7 +1326,7 @@
 		parseHTML() {
 			return [{
 				tag: 'span[data-math-inline]',
-				getAttrs: (el: HTMLElement) => ({ tex: decodeURIComponent(el.getAttribute('data-math-inline') || '') }),
+				getAttrs: (el: HTMLElement) => ({ tex: decodeNoteAttribute(el.getAttribute('data-math-inline') || '') }),
 			}];
 		},
 		renderHTML({ HTMLAttributes }) {
@@ -2867,6 +2878,7 @@
 					);
 					ignoreNextUpdate = true;
 					editor.view.dispatch(tr);
+					ignoreNextUpdate = false;
 				}
 				refreshWikiLinkTitles();
 			} catch (e) {
@@ -3923,7 +3935,29 @@
 		requestAnimationFrame(apply);
 	}
 
+	/**
+	 * Converting or showing a note failed, so the editor still holds the previous note while every
+	 * other piece of state already points at this one. Nothing may be saved from it: forget the
+	 * loaded path (saving and inserting both require it), empty the view and lock it.
+	 */
+	function failNoteLoad(path: string, error: unknown) {
+		console.error('Failed to open note in the editor:', error);
+		loadedPath = '';
+		$editorDirty = false;
+		saves.cancelScheduled();
+		isLoadingNote = false;
+		if (editor) {
+			ignoreNextUpdate = true;
+			try { editor.commands.clearContent(); } catch { /* Saving is already blocked. */ }
+			ignoreNextUpdate = false;
+			clearEditorHistory();
+			editor.setEditable(false);
+		}
+		loadFailure = path;
+	}
+
 	export function loadNote(path: string, content: string, taskTarget?: TaskRecord) {
+		loadFailure = null;
 		cancelProgressiveLoad();
 		endToolbarCustomization();
 		clearOutline();
@@ -3980,44 +4014,52 @@
 			updateCounts();
 		} else if (editorElement && editor) {
 			// Editor already exists, just swap content
-			const html = markdownToHtml(content);
-			// Retire the outgoing native selection before its DOM is replaced, or the webview can keep
-			// painting the old caret. Selections in other controls are left alone.
-			const editorDom = editor.view.dom;
-			const domSelection = editorDom.ownerDocument.getSelection();
-			if (domSelection && (editorDom.contains(domSelection.anchorNode) || editorDom.contains(domSelection.focusNode))) {
-				domSelection.removeAllRanges();
-			}
-			const settle = () => {
-				updateCounts();
-				// Restore scroll and reset the cursor after all ProseMirror/Svelte DOM updates settle.
-				tick().then(() => {
-					if (!saves.isCurrentSession(loadSnapshot) || path !== loadedPath) return;
-					if (editorBody) restoreNoteScroll(editorBody, scrollPosition?.rich ?? 0, path);
-					// Explicitly reset ProseMirror selection to start so TipTap's focus()
-					// (triggered by checkbox clicks etc.) doesn't scroll to the old note's cursor position.
-					if (editor) {
-						const tr = editor.state.tr.setSelection(TextSelection.atStart(editor.state.doc));
-						// No tr.scrollIntoView() - must not trigger any scroll
-						editor.view.dispatch(tr);
-					}
-					isLoadingNote = false;
-				});
-			};
-			if (content.length > LARGE_DOC_CHARS) {
-				// Very large note: show the start at once and build the rest in slices.
-				loadDocumentProgressively(html, () => {
-					settle();
-					if (showOutline) updateOutline();
-					scheduleTaskReveal(path, revealTarget, revealRequest);
-				});
+			try {
+				const html = markdownToHtml(content);
+				// Retire the outgoing native selection before its DOM is replaced, or the webview can keep
+				// painting the old caret. Selections in other controls are left alone.
+				const editorDom = editor.view.dom;
+				const domSelection = editorDom.ownerDocument.getSelection();
+				if (domSelection && (editorDom.contains(domSelection.anchorNode) || editorDom.contains(domSelection.focusNode))) {
+					domSelection.removeAllRanges();
+				}
+				const settle = () => {
+					updateCounts();
+					// Restore scroll and reset the cursor after all ProseMirror/Svelte DOM updates settle.
+					tick().then(() => {
+						if (!saves.isCurrentSession(loadSnapshot) || path !== loadedPath) return;
+						if (editorBody) restoreNoteScroll(editorBody, scrollPosition?.rich ?? 0, path);
+						// Explicitly reset ProseMirror selection to start so TipTap's focus()
+						// (triggered by checkbox clicks etc.) doesn't scroll to the old note's cursor position.
+						if (editor) {
+							const tr = editor.state.tr.setSelection(TextSelection.atStart(editor.state.doc));
+							// No tr.scrollIntoView() - must not trigger any scroll
+							editor.view.dispatch(tr);
+						}
+						isLoadingNote = false;
+					});
+				};
+				if (content.length > LARGE_DOC_CHARS) {
+					// Very large note: show the start at once and build the rest in slices.
+					loadDocumentProgressively(html, () => {
+						settle();
+						if (showOutline) updateOutline();
+						scheduleTaskReveal(path, revealTarget, revealRequest);
+					});
+					return;
+				}
+				// An identical document emits no update, so the flag is cleared here, not by the update
+				// handler: left set, it would swallow the user's next edit.
+				ignoreNextUpdate = true;
+				editor.commands.setContent(html);
+				ignoreNextUpdate = false;
+				// Clear undo/redo history so it doesn't bleed across notes
+				clearEditorHistory();
+				settle();
+			} catch (error) {
+				failNoteLoad(path, error);
 				return;
 			}
-			ignoreNextUpdate = true;
-			editor.commands.setContent(html);
-			// Clear undo/redo history so it doesn't bleed across notes
-			clearEditorHistory();
-			settle();
 		} else {
 			// Editor element not in DOM yet (first note load).
 			// Store content and let the $effect on editorElement handle init.
@@ -6892,6 +6934,7 @@
 			// Resolving an image changes its representation, not the user's revision.
 			ignoreNextUpdate = true;
 			editor.view.dispatch(tr);
+			ignoreNextUpdate = false;
 		}
 	}
 
@@ -6899,8 +6942,9 @@
 	// Source mode toggle - only react to explicit user toggle, not note switches
 	$effect(() => {
 		const isSource = $sourceMode;
-		// Only act if we have a loaded note
-		if (!loadedPath) return;
+		// Only act if we have a loaded note, or one the rich editor could not display
+		const failedLoad = loadFailure !== null && loadFailure === $activeNotePath;
+		if (!loadedPath && !failedLoad) return;
 		const origin = captureOrigin();
 		const isCurrent = () => !editorDisposed && origin.path === loadedPath
 			&& origin.path === $activeNotePath && origin.vault === $appConfig?.active_vault
@@ -6915,8 +6959,13 @@
 			const anchorNonWs = visibleBefore(selection?.anchor ?? 0);
 			const headNonWs = selection?.head === selection?.anchor ? anchorNonWs : visibleBefore(selection?.head ?? 0);
 			const docNonWs = docNonWhitespace();
-			const text = stripTitleH1(editor ? editorToMarkdown() : ($activeNote?.content ?? ''));
+			const text = stripTitleH1(editor && !failedLoad ? editorToMarkdown() : ($activeNote?.content ?? ''));
 			source.load(text);
+			if (failedLoad) {
+				// The source view holds the real content, so the note counts as loaded again.
+				loadedPath = $activeNotePath ?? '';
+				loadFailure = null;
+			}
 			lastSourceMode = true;
 			if (showOutline) updateOutline();
 			const anchor = scanAlign(text, docNonWs, { stopAtNw: anchorNonWs }).srcOffset;
@@ -6951,6 +7000,7 @@
 				if (editor) {
 					ignoreNextUpdate = true;
 					editor.commands.setContent(markdownToHtml(restoreTitleH1(srcText)));
+					ignoreNextUpdate = false;
 				} else {
 					createEditor(restoreTitleH1(srcText));
 				}
@@ -7730,6 +7780,11 @@
 						{retryingSave ? 'Saving…' : 'Retry'}
 					</button>
 				{/if}
+			</div>
+		{/if}
+		{#if loadFailure && loadFailure === $activeNotePath && !$sourceMode}
+			<div class="save-error" role="alert">
+				<span><strong>This note could not be opened in the editor.</strong> It is shown empty and nothing will be saved from here; the file on disk is unchanged. Switch to source mode to view or edit it.</span>
 			</div>
 		{/if}
 		{#if searchRevealNotice}
