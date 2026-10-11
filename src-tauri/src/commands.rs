@@ -372,23 +372,36 @@ fn remove_vault_path<R: Runtime>(
     bookmark_id: Option<String>,
     config_path: &Path,
 ) -> Result<(), String> {
+    let find = |config: &AppConfig| {
+        config
+            .vaults
+            .iter()
+            .find(|vault| match bookmark_id.as_deref() {
+                Some(bookmark_id) => vault.bookmark_id.as_deref() == Some(bookmark_id),
+                None => vault.bookmark_id.is_none() && vault.path == path,
+            })
+            .cloned()
+    };
+    // Asking a window for its address waits for the main thread, and the main thread may be
+    // waiting for the locks taken below. Check the windows before holding any of them.
+    #[cfg(desktop)]
+    {
+        // Only a bookmarked vault needs the list to learn its path.
+        let listed = match bookmark_id {
+            Some(_) => find(&*state.config.lock().map_err(|error| error.to_string())?)
+                .map(|vault| vault.path),
+            None => Some(path.clone()),
+        };
+        if let Some(vault_path) = listed {
+            AppState::ensure_no_detached_windows(app, &vault_path)?;
+        }
+    }
     let mut search_slot = state
         .search_index
         .lock()
         .map_err(|error| error.to_string())?;
     let mut config = state.config.lock().map_err(|error| error.to_string())?;
-    let target = if let Some(bookmark_id) = bookmark_id.as_deref() {
-        config
-            .vaults
-            .iter()
-            .find(|vault| vault.bookmark_id.as_deref() == Some(bookmark_id))
-    } else {
-        config
-            .vaults
-            .iter()
-            .find(|vault| vault.bookmark_id.is_none() && vault.path == path)
-    }
-    .map(|vault| {
+    let target = find(&config).map(|vault| {
         let is_active = if let Some(bookmark_id) = vault.bookmark_id.as_deref() {
             config.active_bookmark_id.as_deref() == Some(bookmark_id)
         } else {
@@ -401,9 +414,6 @@ fn remove_vault_path<R: Runtime>(
     let Some((target_path, target_bookmark, is_active)) = target else {
         return Ok(());
     };
-    #[cfg(desktop)]
-    AppState::ensure_no_detached_windows(app, &target_path)?;
-
     let old = config.clone();
     let mut next = old.clone();
     if let Some(id) = target_bookmark.as_deref() {
