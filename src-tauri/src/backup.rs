@@ -195,9 +195,8 @@ pub fn create_backup(
         Ok(())
     })();
     result?;
-    // persist_noclobber does not replace an existing backup even on UUID collision.
-    temporary
-        .persist_noclobber(&backup_path)
+    // Never replaces an existing backup, even on UUID collision.
+    crate::vault::operations::persist_without_replacing(temporary, &backup_path)
         .map_err(|e| format!("Failed to publish backup: {}", e.error))?;
     let meta = fs::metadata(&backup_path).map_err(|e| e.to_string())?;
     Ok(BackupEntry {

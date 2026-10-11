@@ -77,7 +77,7 @@ fn snapshot_path(dir: &Path, raw_content: &str) -> Result<(), String> {
         // allowing multiple versions within one second.
         let timestamp = instant.format("%Y-%m-%dT%H-%M-%S%.3f");
         let path = dir.join(format!("{timestamp}.md"));
-        match temporary.persist_noclobber(&path) {
+        match crate::vault::operations::persist_without_replacing(temporary, &path) {
             Ok(_) => return Ok(()),
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
                 temporary = error.file;

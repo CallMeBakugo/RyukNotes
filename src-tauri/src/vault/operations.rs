@@ -121,7 +121,7 @@ fn safe_child_name(name: &str) -> Result<&str, String> {
 // A normal rename can replace an existing file (or an empty directory).
 // Use the OS's exclusive rename primitive instead; checking exists first is racy.
 #[cfg(target_os = "linux")]
-fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
+fn rename_exclusive_native(src: &Path, dest: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     unsafe extern "C" {
@@ -146,7 +146,7 @@ fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "android")]
-fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
+fn rename_exclusive_native(src: &Path, dest: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let old = CString::new(src.as_os_str().as_bytes())
@@ -174,7 +174,7 @@ fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
+fn rename_exclusive_native(src: &Path, dest: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     unsafe extern "C" {
@@ -199,7 +199,7 @@ fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
+fn rename_exclusive_native(src: &Path, dest: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "Kernel32")]
     unsafe extern "system" {
@@ -211,6 +211,58 @@ fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
+    }
+}
+
+// exFAT on macOS and some FUSE mounts have no exclusive rename and reject the request outright.
+// Without a fallback, trash, move, attachments, history and backups all fail on such a volume.
+fn exclusive_rename_unsupported(error: &std::io::Error) -> bool {
+    // EINVAL, ENOSYS, ENOTSUP and EOPNOTSUPP. Rust reports some of them as "uncategorized".
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    const UNSUPPORTED: [i32; 4] = [22, 78, 45, 102];
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    const UNSUPPORTED: [i32; 3] = [22, 38, 95];
+    cfg!(unix)
+        && error
+            .raw_os_error()
+            .is_some_and(|code| UNSUPPORTED.contains(&code))
+}
+
+// The best such a volume allows: refuse an existing target, then rename. The check and the
+// rename are two steps, which is why this is only used where the single step does not exist.
+fn rename_after_checking(src: &Path, dest: &Path) -> std::io::Result<()> {
+    if dest.symlink_metadata().is_ok() {
+        return Err(std::io::ErrorKind::AlreadyExists.into());
+    }
+    fs::rename(src, dest)
+}
+
+fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
+    match rename_exclusive_native(src, dest) {
+        Err(error) if exclusive_rename_unsupported(&error) => rename_after_checking(src, dest),
+        result => result,
+    }
+}
+
+/// Publish a temporary file under a name that must not exist yet, also on volumes without an
+/// exclusive rename.
+pub(crate) fn persist_without_replacing(
+    temporary: tempfile::NamedTempFile,
+    dest: impl AsRef<Path>,
+) -> Result<(), tempfile::PersistError> {
+    let dest = dest.as_ref();
+    match temporary.persist_noclobber(dest) {
+        Ok(_) => Ok(()),
+        Err(error) if exclusive_rename_unsupported(&error.error) => {
+            if dest.symlink_metadata().is_ok() {
+                return Err(tempfile::PersistError {
+                    error: std::io::ErrorKind::AlreadyExists.into(),
+                    file: error.file,
+                });
+            }
+            error.file.persist(dest).map(|_| ())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1812,7 +1864,7 @@ pub fn save_attachment(vault_path: &str, name: &str, data: &[u8]) -> Result<Stri
         .map_err(|error| error.to_string())?;
     loop {
         let filename = format!("{}_{}", Uuid::new_v4(), safe_name);
-        match temporary.persist_noclobber(attachments_dir.join(&filename)) {
+        match persist_without_replacing(temporary, attachments_dir.join(&filename)) {
             Ok(_) => return Ok(format!(".helixnotes/attachments/{filename}")),
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
                 temporary = error.file;
@@ -1971,7 +2023,7 @@ pub fn import_note(
                 let filename = loop {
                     let filename = format!("{}_{}", Uuid::new_v4(), name);
                     let destination = attachments.join(&filename);
-                    match temporary.persist_noclobber(&destination) {
+                    match persist_without_replacing(temporary, &destination) {
                         Ok(_) => {
                             created.push(destination);
                             break filename;
@@ -2023,7 +2075,7 @@ pub fn import_note(
         let mut destination = directory.join(filename);
         let mut suffix = 2;
         loop {
-            match temporary.persist_noclobber(&destination) {
+            match persist_without_replacing(temporary, &destination) {
                 Ok(_) => break,
                 Err(error)
                     if error.error.kind() == std::io::ErrorKind::AlreadyExists && suffix <= 100 =>
@@ -2632,6 +2684,84 @@ mod rename_link_tests {
             .map(|entry| entry.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(names.len(), 3, "{names:?}");
+    }
+}
+
+#[cfg(test)]
+mod exclusive_rename_fallback_tests {
+    use super::{
+        exclusive_rename_unsupported, persist_without_replacing, rename_after_checking,
+        rename_exclusive,
+    };
+    use std::fs;
+    use std::io::{Error, ErrorKind, Write};
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_missing_exclusive_rename_counts_as_unsupported() {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let (unsupported, exists) = (45, 17);
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let (unsupported, exists) = (95, 17);
+        assert!(exclusive_rename_unsupported(&Error::from_raw_os_error(
+            unsupported
+        )));
+        assert!(exclusive_rename_unsupported(&Error::from_raw_os_error(22)));
+        assert!(!exclusive_rename_unsupported(&Error::from_raw_os_error(
+            exists
+        )));
+        assert!(!exclusive_rename_unsupported(&Error::from_raw_os_error(13)));
+        // An error that did not come from the system, such as a path with a NUL byte.
+        assert!(!exclusive_rename_unsupported(&Error::from(
+            ErrorKind::InvalidInput
+        )));
+    }
+
+    #[test]
+    fn the_fallback_moves_a_file_but_never_onto_an_existing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, c) = (
+            dir.path().join("a"),
+            dir.path().join("b"),
+            dir.path().join("c"),
+        );
+        fs::write(&a, "a").unwrap();
+        fs::write(&b, "b").unwrap();
+        let refused = rename_after_checking(&a, &b).unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&b).unwrap(), "b");
+        rename_after_checking(&a, &c).unwrap();
+        assert!(!a.exists());
+        assert_eq!(fs::read_to_string(&c).unwrap(), "a");
+        // A folder moves the same way.
+        let (folder, moved) = (dir.path().join("folder"), dir.path().join("moved"));
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("note.md"), "x").unwrap();
+        rename_after_checking(&folder, &moved).unwrap();
+        assert_eq!(fs::read_to_string(moved.join("note.md")).unwrap(), "x");
+    }
+
+    #[test]
+    fn publishing_and_renaming_still_refuse_an_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("kept.md");
+        fs::write(&target, "kept").unwrap();
+        let mut temporary = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        temporary.write_all(b"new").unwrap();
+        let error = persist_without_replacing(temporary, &target).unwrap_err();
+        assert_eq!(error.error.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "kept");
+        persist_without_replacing(error.file, dir.path().join("new.md")).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("new.md")).unwrap(),
+            "new"
+        );
+
+        let source = dir.path().join("source.md");
+        fs::write(&source, "source").unwrap();
+        let refused = rename_exclusive(&source, &target).unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "kept");
     }
 }
 
