@@ -340,6 +340,49 @@ function imageGrid(state: StateBlock, startLine: number, endLine: number, silent
   return true;
 }
 
+// Elements a note may hold as HTML. Anything else written in angle brackets is the user's text,
+// such as `List<String>`, and a browser would drop it without a trace.
+const HTML_ELEMENTS = new Set((
+  'a abbr address area article aside audio b base bdi bdo big blockquote body br button canvas caption center cite code '
+  + 'col colgroup data datalist dd del details dfn dialog dir div dl dt em embed fieldset figcaption figure font footer '
+  + 'form frame frameset h1 h2 h3 h4 h5 h6 head header hgroup hr html i iframe img input ins kbd label legend li link '
+  + 'main map mark menu meta meter nav nobr noscript object ol optgroup option output p param picture pre progress q rp '
+  + 'rt ruby s samp script search section select slot small source span strike strong style sub summary sup svg math '
+  + 'table tbody td template textarea tfoot th thead time title tr track tt u ul var video wbr'
+).split(' '));
+const HTML_PIECE = /<!--[\s\S]*?-->|<\/?([A-Za-z][A-Za-z0-9-]*)(?:\s[^<>]*)?\/?>/g;
+
+/** Whether a tag or comment is shown as the text it is instead of being handed to the browser. */
+function isLiteralHtml(piece: string, tagName: string | undefined): boolean {
+  // A comment would vanish on the first save; the empty one is the editor's own blank-line marker.
+  if (piece.startsWith('<!--')) return piece.replace(/\s/g, '') !== '<!---->';
+  return !!tagName && !HTML_ELEMENTS.has(tagName.toLowerCase());
+}
+
+function literalHtml(state: { tokens: Token[]; md: MarkdownIt }): void {
+  for (const token of state.tokens) {
+    if (token.type === 'inline') {
+      for (const child of token.children ?? []) {
+        if (child.type !== 'html_inline') continue;
+        HTML_PIECE.lastIndex = 0;
+        const match = HTML_PIECE.exec(child.content);
+        if (match && match[0] === child.content && isLiteralHtml(match[0], match[1])) child.type = 'text';
+      }
+    } else if (token.type === 'html_block') {
+      let literal = false;
+      const content = token.content.replace(HTML_PIECE, (piece, tagName) => {
+        if (!isLiteralHtml(piece, tagName)) return piece;
+        literal = true;
+        return state.md.utils.escapeHtml(piece);
+      });
+      if (!literal) continue;
+      // Text without an element around it becomes a paragraph that keeps its lines.
+      token.content = content.startsWith('&lt;')
+        ? `<p>${content.trim().split('\n').map((line) => line.trimEnd()).join('<br>')}</p>\n` : content;
+    }
+  }
+}
+
 export function createEditorMarkdownParser(): MarkdownIt {
   const md = MarkdownIt({ html: true, linkify: false, breaks: false })
     .use(markdownItMark).use(markdownItSup).use(markdownItSub);
@@ -355,6 +398,8 @@ export function createEditorMarkdownParser(): MarkdownIt {
   md.renderer.rules.helix_wiki = (tokens, index, _options, _env, renderer) =>
     `<span${renderer.renderAttrs(tokens[index])}>${md.utils.escapeHtml(tokens[index].content)}</span>`;
   md.core.ruler.before('block', 'helix_wiki_index', state => { delete state.env[wikiIndexKey]; });
+
+  md.core.ruler.after('inline', 'helix_literal_html', literalHtml);
 
   md.core.ruler.before('inline', 'helix_tasks', state => {
     const lists: { open: Token; firstItem: boolean; item: Token | null; firstParagraph: boolean }[] = [];

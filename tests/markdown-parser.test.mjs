@@ -253,3 +253,24 @@ test('a line with thousands of unclosed link starts is parsed in linear time', (
   assert.match(parser.render(noise + '[doc](my file.md) and ![pic](photo one.png "Caption")'), /href="my%20file.md".*src="photo%20one.png"/s);
   assert.match(parser.render(noise + '\n[doc](my file.md)'), /href="my%20file.md"/);
 });
+
+test('angle-bracket text that is not HTML stays text', () => {
+  assert.equal(parser.render('returns List<String> or Map<K,V> here'), '<p>returns List&lt;String&gt; or Map&lt;K,V&gt; here</p>\n');
+  assert.equal(parser.render('Run `x` as <username> then <my-tag a="1">'), '<p data-helix-code="">Run <code style="white-space: pre-wrap">x</code> as &lt;username&gt; then &lt;my-tag a=&quot;1&quot;&gt;</p>\n');
+  // A placeholder alone on a line would otherwise be an HTML block.
+  assert.equal(parser.render('<GroupName>\n\nafter'), '<p>&lt;GroupName&gt;</p>\n<p>after</p>\n');
+  assert.equal(parser.render('<Foo>\ntext  \n</Foo>'), '<p>&lt;Foo&gt;<br>text<br>&lt;/Foo&gt;</p>\n');
+});
+
+test('real HTML elements are still HTML', () => {
+  assert.equal(parser.render('a <b>bold</b> and <br> and <kbd>K</kbd>'), '<p>a <b>bold</b> and <br> and <kbd>K</kbd></p>\n');
+  assert.equal(parser.render('<div class="x">there</div>'), '<div class="x">there</div>');
+  assert.equal(parser.render('<details><summary>S</summary>\n\nbody\n\n</details>'), '<details><summary>S</summary>\n<p>body</p>\n</details>');
+});
+
+test('HTML comments are kept as text, the blank-line marker is not', () => {
+  assert.equal(parser.render('a <!-- note to self --> b'), '<p>a &lt;!-- note to self --&gt; b</p>\n');
+  assert.equal(parser.render('before\n\n<!--\nline one\nline two\n-->\n\nafter'), '<p>before</p>\n<p>&lt;!--<br>line one<br>line two<br>--&gt;</p>\n<p>after</p>\n');
+  assert.equal(parser.render('one\n\n<!-- -->\n\ntwo'), '<p>one</p>\n<p></p>\n<p>two</p>\n');
+  assert.equal(parser.render('x <!-- --> y'), '<p>x <!-- --> y</p>\n');
+});

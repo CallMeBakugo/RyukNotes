@@ -4339,7 +4339,7 @@
 			}
 			case 'orderedList': {
 				const items: string[] = [];
-				let i = node.attrs.start || 1;
+				let i = node.attrs.start ?? 1;
 				node.forEach((child: any) => { items.push(`${i++}. ` + serializeListItem(child)); });
 				return items.join('') + '\n';
 			}
