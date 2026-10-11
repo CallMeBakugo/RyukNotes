@@ -117,9 +117,23 @@ export const resolvedTheme = derived(
 
 // Sync (WebDAV) - global status so the top-bar button reflects any sync,
 // whoever triggered it (manual button, settings, interval, on-change).
-export const syncState = writable<{ running: boolean; error: string | null }>({
+export interface SyncSummary {
+  uploaded?: number;
+  downloaded?: number;
+  deleted_local?: number;
+  deleted_remote?: number;
+  conflicts?: number;
+}
+// `result` is what the last finished sync did, so Settings reports the same outcome for every
+// way a sync can start.
+export const syncState = writable<{
+  running: boolean;
+  error: string | null;
+  result: { vault: string; summary: SyncSummary } | null;
+}>({
   running: false,
   error: null,
+  result: null,
 });
 
 // Update state

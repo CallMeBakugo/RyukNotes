@@ -56,6 +56,7 @@
 		notebookOrder,
 		noteOrder,
 		syncState,
+		type SyncSummary,
 		platformIsMobile,
 		activeVaultConfig,
 		activateVaultData,
@@ -1070,12 +1071,13 @@
 
 		// ── WebDAV sync: global status + auto-sync triggers ──
 		unlistenSync.push(await listen<{ vault_path: string }>('sync-progress', ({ payload }) => {
-			if (ownerIsCurrent() && payload.vault_path === ownerVault) syncState.set({ running: true, error: null });
+			if (ownerIsCurrent() && payload.vault_path === ownerVault) syncState.set({ running: true, error: null, result: null });
 		}));
 		if (!ownerIsCurrent()) { unlistenSync.pop()?.(); return; }
-		unlistenSync.push(await listen<{ vault_path: string; bookmark_id?: string | null; success: boolean; last_sync_time?: string | null }>('sync-done', ({ payload }) => {
+		unlistenSync.push(await listen<{ vault_path: string; bookmark_id?: string | null; success: boolean; summary?: SyncSummary; last_sync_time?: string | null }>('sync-done', ({ payload }) => {
 			if (!ownerIsCurrent() || payload.vault_path !== ownerVault) return;
-			syncState.set({ running: false, error: null });
+			syncState.set({ running: false, error: null,
+				result: payload.success ? { vault: payload.vault_path, summary: payload.summary ?? {} } : null });
 			if (!payload.success || !payload.last_sync_time) return;
 			const current = get(appConfig);
 			const active = activeVaultConfig(current);
@@ -1086,7 +1088,7 @@
 		}));
 		if (!ownerIsCurrent()) { unlistenSync.pop()?.(); return; }
 		unlistenSync.push(await listen<{ vault_path: string; error?: string }>('sync-error', ({ payload }) => {
-			if (ownerIsCurrent() && payload.vault_path === ownerVault) syncState.set({ running: false, error: payload.error ?? 'Sync failed' });
+			if (ownerIsCurrent() && payload.vault_path === ownerVault) syncState.set({ running: false, error: payload.error ?? 'Sync failed', result: null });
 		}));
 		if (!ownerIsCurrent()) { unlistenSync.pop()?.(); return; }
 

@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { showSettings, theme, resolvedTheme, appConfig, platformIsMobile, activeVaultConfig, updateAvailable as globalUpdateAvailable, updateObj as globalUpdateObj, installType, settingsTab, vaultReady, androidApkUrl, checkForUpdateMobile, notebookSortMode, isManagedInstall, customThemes } from '$lib/stores/app';
+	import { untrack } from 'svelte';
+	import { showSettings, syncState, theme, resolvedTheme, appConfig, platformIsMobile, activeVaultConfig, updateAvailable as globalUpdateAvailable, updateObj as globalUpdateObj, installType, settingsTab, vaultReady, androidApkUrl, checkForUpdateMobile, notebookSortMode, isManagedInstall, customThemes } from '$lib/stores/app';
 	import { setTheme, setSystemThemes, setAccentColor, setFontSize, setScrollToChangeFontSize, setFontFamily, setLineHeight, setUiScale, setContentWidth, setGeneralSettings, importObsidian, createBackup, listBackups, restoreBackup, deleteBackup, setBackupSettings, setAiSettings, testAiConnection, setSyncSettings, testSyncConnection, syncNow, saveCustomTheme, deleteCustomTheme, exportCustomTheme, importCustomThemes, getVaultStats, findOrphanedAttachments, trashOrphanedAttachments } from '$lib/api';
 	import { darkThemes, isMobile, isAndroid } from '$lib/platform';
 	import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
@@ -467,7 +468,8 @@
 	let syncShowPassword = $state(false);
 	let syncTestLoading = $state(false);
 	let syncTestMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
-	let syncRunning = $state(false);
+	let syncStarting = $state(false);
+	const syncRunning = $derived(syncStarting || $syncState.running);
 	let syncMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
 	let syncOnOpen = $state(activeVaultConfig($appConfig)?.sync_on_open ?? false);
 	let syncOnChange = $state(activeVaultConfig($appConfig)?.sync_on_change ?? false);
@@ -537,47 +539,37 @@
 		}
 	}
 
-	async function handleSyncNow() {
+	// The outcome of the last sync, whether it was started here, from the title bar or automatically.
+	$effect(() => {
+		const state = $syncState;
 		const vault = maintenanceVault;
-		if (!vault || syncRunning) return;
-		syncRunning = true;
-		syncMessage = null;
-		const unlisteners: Array<() => void> = [];
-		const cleanup = () => { unlisteners.forEach((u) => u()); };
-		unlisteners.push(await listen<{ vault_path: string; success: boolean; summary?: { uploaded?: number; downloaded?: number; deleted_local?: number; deleted_remote?: number; conflicts?: number }; last_sync_time?: string }>('sync-done', (event) => {
-			if (event.payload.vault_path !== vault) return;
-			if (!$showSettings || maintenanceVault !== vault) { cleanup(); return; }
-			const s = event.payload.summary ?? {};
-			const parts: string[] = [];
-			if (s.uploaded) parts.push(`${s.uploaded} uploaded`);
-			if (s.downloaded) parts.push(`${s.downloaded} downloaded`);
-			const deleted = (s.deleted_local ?? 0) + (s.deleted_remote ?? 0);
-			if (deleted) parts.push(`${deleted} deleted`);
-			if (s.conflicts) parts.push(`${s.conflicts} conflict copies`);
-			syncMessage = { type: 'success', text: parts.length ? `Synced: ${parts.join(', ')}.` : 'Already up to date.' };
-			syncRunning = false;
-			const timestamp = event.payload.last_sync_time;
-			const currentVault = activeVaultConfig($appConfig);
-			if (timestamp && currentVault && $appConfig) {
-				$appConfig = { ...$appConfig, vaults: $appConfig.vaults.map(item =>
-					item === currentVault ? { ...item, last_sync_time: timestamp } : item) };
+		untrack(() => {
+			if (state.running) syncMessage = null;
+			else if (state.error) syncMessage = { type: 'error', text: state.error };
+			else if (state.result && state.result.vault === vault) {
+				const s = state.result.summary;
+				const parts: string[] = [];
+				if (s.uploaded) parts.push(`${s.uploaded} uploaded`);
+				if (s.downloaded) parts.push(`${s.downloaded} downloaded`);
+				const deleted = (s.deleted_local ?? 0) + (s.deleted_remote ?? 0);
+				if (deleted) parts.push(`${deleted} deleted`);
+				if (s.conflicts) parts.push(`${s.conflicts} conflict ${s.conflicts === 1 ? 'copy' : 'copies'}`);
+				syncMessage = { type: 'success', text: parts.length ? `Synced: ${parts.join(', ')}.` : 'Already up to date.' };
 			}
-			cleanup();
-		}));
-		unlisteners.push(await listen<{ vault_path: string; error?: string }>('sync-error', (event) => {
-			if (event.payload.vault_path !== vault) return;
-			if (!$showSettings || maintenanceVault !== vault) { cleanup(); return; }
-			syncMessage = { type: 'error', text: event.payload.error ?? 'Sync failed' };
-			syncRunning = false;
-			cleanup();
-		}));
+		});
+	});
+
+	async function handleSyncNow() {
+		if (!maintenanceVault || syncRunning) return;
+		syncStarting = true;
+		syncMessage = null;
 		try {
 			await saveSyncSettings();
 			await syncNow();
 		} catch (e) {
 			syncMessage = { type: 'error', text: String(e) };
-			syncRunning = false;
-			cleanup();
+		} finally {
+			syncStarting = false;
 		}
 	}
 
