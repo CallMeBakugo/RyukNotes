@@ -1029,7 +1029,7 @@ pub fn duplicate_note(path: &str, vault_path: &str) -> Result<NoteEntry, String>
     read_note_entry(&copy_path, Path::new(vault_path))
 }
 
-fn retitle_leading_heading(body: &str, old_title: &str, new_title: &str) -> String {
+pub(crate) fn retitle_leading_heading(body: &str, old_title: &str, new_title: &str) -> String {
     let trimmed = body.trim_start();
     let leading_len = body.len() - trimmed.len();
     let first_line_end = trimmed.find('\n').unwrap_or(trimmed.len());

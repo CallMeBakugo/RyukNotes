@@ -217,6 +217,28 @@ fn conflict_relpath(relpath: &str, stamp: &str) -> String {
     format!("{}{} (conflict {}){}", dir, stem, stamp, ext)
 }
 
+// The note list, search and quick open all go by a note's title, so a conflict copy that only
+// differs in its file name looks identical to the original. Give the copy the same suffix in its
+// title. A note without a title of its own already takes it from the file name.
+fn conflict_copy(relpath: &str, bytes: Vec<u8>, stamp: &str) -> Vec<u8> {
+    use crate::vault::{frontmatter, operations};
+    if !relpath.ends_with(".md") {
+        return bytes;
+    }
+    let Ok(raw) = std::str::from_utf8(&bytes) else {
+        return bytes;
+    };
+    if frontmatter::extract_title(raw).is_none() {
+        return bytes;
+    }
+    let filename = relpath.rsplit('/').next().unwrap_or(relpath);
+    let (mut meta, body) = frontmatter::parse_note(raw, filename);
+    let title = format!("{} (conflict {stamp})", meta.title);
+    let body = operations::retitle_leading_heading(&body, &meta.title, &title);
+    meta.title = title;
+    frontmatter::merge_frontmatter(raw, &meta, &body).into_bytes()
+}
+
 fn write_local(
     vault: &Path,
     relpath: &str,
@@ -884,7 +906,7 @@ fn apply_changes(
                         let lbytes = {
                             let _guard = write_guard.blocking_lock();
                             require_unchanged_local(&local_path(vault_path, &ckey)?, None)?;
-                            let lbytes = read_scanned_local(lf)?;
+                            let lbytes = conflict_copy(&ckey, read_scanned_local(lf)?, &stamp);
                             write_local(vault_path, &ckey, &lbytes, changes)?;
                             write_local(vault_path, key, &bytes, changes)?;
                             lbytes
@@ -1076,6 +1098,47 @@ pub fn run_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_conflict_copy_says_so_in_its_title() {
+        let raw =
+            "---\nid: abc\ntitle: Plan\ntags:\n- work\ncustom: kept\n---\n# Plan\n\nLocal text.\n";
+        let copy = conflict_copy(
+            "Work/Plan (conflict 2026-10-11 10-00-00).md",
+            raw.as_bytes().to_vec(),
+            "2026-10-11 10-00-00",
+        );
+        let copy = String::from_utf8(copy).unwrap();
+        assert!(
+            copy.contains("title: Plan (conflict 2026-10-11 10-00-00)\n"),
+            "{copy}"
+        );
+        assert!(
+            copy.contains("# Plan (conflict 2026-10-11 10-00-00)\n\nLocal text."),
+            "{copy}"
+        );
+        assert!(
+            copy.contains("custom: kept") && copy.contains("- work") && copy.contains("id: abc"),
+            "{copy}"
+        );
+
+        // No title of its own: the file name already names the copy. Other files are untouched.
+        let untitled = b"Just text.\n".to_vec();
+        assert_eq!(
+            conflict_copy("Note (conflict x).md", untitled.clone(), "x"),
+            untitled
+        );
+        let image = vec![0xff, 0xd8, 0x00];
+        assert_eq!(
+            conflict_copy("a (conflict x).jpg", image.clone(), "x"),
+            image
+        );
+        let binary_md = vec![0xff, 0xfe];
+        assert_eq!(
+            conflict_copy("b (conflict x).md", binary_md.clone(), "x"),
+            binary_md
+        );
+    }
 
     #[test]
     fn synced_metadata_waits_for_local_patches_and_never_overwrites_a_newer_style() {
