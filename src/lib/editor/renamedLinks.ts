@@ -40,10 +40,11 @@ export interface TextChange {
 /** The edits that bring the wiki links in Markdown text in line with the rename. */
 export function renamedLinkChanges(text: string, rename: LinkRename): TextChange[] {
 	const changes: TextChange[] = [];
-	for (const match of text.matchAll(/\[\[([^\[\]|]+)(?:\|([^\[\]]*))?\]\]/g)) {
-		const next = renamedLink(match[1], match[2] ?? null, rename);
+	// In a table cell the alias separator is written `\\|`, since a bare `|` ends the cell.
+	for (const match of text.matchAll(/\[\[([^\[\]|]+?)(?:(\\?\|)([^\[\]]*))?\]\]/g)) {
+		const next = renamedLink(match[1], match[3] ?? null, rename);
 		if (!next) continue;
-		const insert = next.display === null ? `[[${next.ref}]]` : `[[${next.ref}|${next.display}]]`;
+		const insert = next.display === null ? `[[${next.ref}]]` : `[[${next.ref}${match[2]}${next.display}]]`;
 		changes.push({ from: match.index, to: match.index + match[0].length, insert });
 	}
 	return changes;

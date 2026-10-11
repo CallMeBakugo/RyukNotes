@@ -41,3 +41,11 @@ test('nothing changes when no link points at the renamed note', () => {
   const rename = { old_ref: 'Home', new_ref: 'Start', old_title: 'Home', new_title: 'Start', title_rules: true };
   assert.deepEqual(renamedLinkChanges('Home is [[Elsewhere]] and `code`.', rename), []);
 });
+
+test('aliased links in a table cell follow a rename', () => {
+  const rename = { old_ref: 'Home', new_ref: 'Start', old_title: 'Home', new_title: 'Start', title_rules: true };
+  assert.equal(
+    apply('| [[Home\\|Home]] | [[Home\\|start]] and [[Index\\|Home]] |', rename),
+    '| [[Start\\|Start]] | [[Start\\|start]] and [[Index\\|Home]] |'
+  );
+});

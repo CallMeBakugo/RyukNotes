@@ -1494,13 +1494,19 @@ fn update_wikilinks_after_rename(
             // 2. A link to the renamed note that displays its old title follows the new one:
             //    [[Old Title|Old Title]] → [[New Title|New Title]]. Only links to this note: an
             //    alias on a link to another note ([[Index|Old Title]]) is that note's wording.
-            result = result.replace(
-                &format!("[[{old_title}|{old_title}]]"),
-                &format!("[[{new_title}|{new_title}]]"),
-            );
+            //    In a table cell the separator is written `\|`, since a bare `|` ends the cell.
+            for bar in ["|", "\\|"] {
+                result = result.replace(
+                    &format!("[[{old_title}{bar}{old_title}]]"),
+                    &format!("[[{new_title}{bar}{new_title}]]"),
+                );
 
-            // 3. Short title with any other alias: [[Old Title|display]] → [[New Title|display]]
-            result = result.replace(&format!("[[{}|", old_title), &format!("[[{}|", new_title));
+                // 3. Short title with any other alias: [[Old Title|display]] → [[New Title|display]]
+                result = result.replace(
+                    &format!("[[{old_title}{bar}"),
+                    &format!("[[{new_title}{bar}"),
+                );
+            }
         }
 
         // Path-based rules are always safe (paths are unique).
@@ -1514,17 +1520,19 @@ fn update_wikilinks_after_rename(
             // 5. Path-based ref with alias: [[folder/Old Name|display]] → [[folder/New Name|display]]
             //    Also update the alias if it matches the old title.
             //    e.g. [[folder/Old Name|Old Title]] → [[folder/New Name|New Title]]
-            if old_title != new_title {
+            for bar in ["|", "\\|"] {
+                if old_title != new_title {
+                    result = result.replace(
+                        &format!("[[{old_rel_ref}{bar}{old_title}]]"),
+                        &format!("[[{new_rel_ref}{bar}{new_title}]]"),
+                    );
+                }
+                // For aliases that DON'T match the old title, just update the ref part
                 result = result.replace(
-                    &format!("[[{}|{}]]", old_rel_ref, old_title),
-                    &format!("[[{}|{}]]", new_rel_ref, new_title),
+                    &format!("[[{old_rel_ref}{bar}"),
+                    &format!("[[{new_rel_ref}{bar}"),
                 );
             }
-            // For aliases that DON'T match the old title, just update the ref part
-            result = result.replace(
-                &format!("[[{}|", old_rel_ref),
-                &format!("[[{}|", new_rel_ref),
-            );
         }
 
         if result != content {
@@ -2636,7 +2644,7 @@ mod rename_link_tests {
         let linking = vault.path().join("Linking.md");
         fs::write(
             &linking,
-            "See [[Home]], [[Home|the start page]] and [[Home|Home]].\nAlso [[Index|Home]] and [[Notes/Home|Home]].\n",
+            "See [[Home]], [[Home|the start page]] and [[Home|Home]].\nAlso [[Index|Home]] and [[Notes/Home|Home]].\n\n| a | b |\n| --- | --- |\n| [[Home\\|Home]] | [[Home\\|start]] and [[Index\\|Home]] |\n",
         )
         .unwrap();
         let untouched = vault.path().join("Untouched.md");
@@ -2671,7 +2679,7 @@ mod rename_link_tests {
             fs::read_to_string(&linking).unwrap(),
             // The alias on the link to Index, and on the link to another note called Home in a
             // folder, is not this note's title and stays.
-            "See [[Start]], [[Start|the start page]] and [[Start|Start]].\nAlso [[Index|Home]] and [[Notes/Home|Home]].\n"
+            "See [[Start]], [[Start|the start page]] and [[Start|Start]].\nAlso [[Index|Home]] and [[Notes/Home|Home]].\n\n| a | b |\n| --- | --- |\n| [[Start\\|Start]] | [[Start\\|start]] and [[Index\\|Home]] |\n"
         );
         assert_eq!(
             fs::metadata(&untouched).unwrap().modified().unwrap(),

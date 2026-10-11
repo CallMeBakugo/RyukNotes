@@ -1188,6 +1188,8 @@ fn extract_wiki_links(body: &str) -> Vec<String> {
             if i + 1 < len {
                 let link_raw = &body[start..i];
                 let link = link_raw.split('|').next().unwrap_or(link_raw);
+                // In a table cell the alias separator is written `\|`.
+                let link = link.strip_suffix('\\').unwrap_or(link);
                 let link = link.split('#').next().unwrap_or(link);
                 let link = link.split('^').next().unwrap_or(link);
                 links.push(link.trim().to_lowercase());
@@ -1198,6 +1200,19 @@ fn extract_wiki_links(body: &str) -> Vec<String> {
         }
     }
     links
+}
+
+#[cfg(test)]
+mod graph_link_tests {
+    use super::extract_wiki_links;
+
+    #[test]
+    fn aliased_links_in_a_table_cell_are_found() {
+        let body =
+            "| a |\n| --- |\n| [[Home\\|start]] and [[Other]] and [[Deep/Note#part\\|x]] |\n";
+        assert_eq!(extract_wiki_links(body), ["home", "other", "deep/note"]);
+        assert_eq!(extract_wiki_links("[[Home|start]]"), ["home"]);
+    }
 }
 
 fn scan_graph_data(vault_path: &str) -> Result<crate::types::GraphData, String> {
