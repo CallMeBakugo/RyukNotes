@@ -225,8 +225,10 @@ fn notes_tag(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String>
 
 fn notes_search(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String> {
     let query = positional(tail, &[]).first().cloned().ok_or("notes search <query>")?;
+    // FTS5 raw queries break on '/' and other syntax; wrap as a quoted phrase.
+    let quoted = format!("\"{}\"", query.replace('"', "\"\""));
     let db = open_vault(vault_flag.as_deref())?;
-    for note in db.search(&query)? {
+    for note in db.search(&quoted)? {
         println!("{}  {}", note.id, note.title);
     }
     Ok(())
