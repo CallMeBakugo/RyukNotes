@@ -71,7 +71,6 @@
 	import { replaceWithWikiLink } from '$lib/editor/wikiLinks';
 	import { renamedLink, renamedLinkChanges, type LinkRename } from '$lib/editor/renamedLinks';
 	import { assetSourceToMarkdown, assetUrlToLocalPath, encodeMarkdownPath, resolveFileReference, noteAssetRoot, isTrashedNote } from '$lib/utils/paths';
-	import GraphView from './GraphView.svelte';
 	import TagSuggestInput from './TagSuggestInput.svelte';
 	import TagLabel from './TagLabel.svelte';
 	import ImageViewer from './ImageViewer.svelte';
@@ -614,7 +613,6 @@
 
 	// Version history
 	let showHistory = $state(false);
-	let showGraph = $state(false);
 	let tagMenu = $state<{ x: number; y: number } | null>(null);
 	let historyVersions = $state<VersionEntry[]>([]);
 	let historyPreview = $state<string | null>(null);
@@ -5799,10 +5797,6 @@
 		openAiMenu();
 	}
 
-	export function toggleGraphView() {
-		showGraph = !showGraph;
-	}
-
 	export function addLinkFromToolbar() {
 		if (!editor) return;
 		const { from, to } = editor.state.selection;
@@ -7960,19 +7954,6 @@
 						<line x1="12" y1="12" x2="12" y2="16"/>
 					</svg>
 				</button>
-				{#if $appConfig?.enable_wiki_links}
-				<button
-					class="icon-btn"
-					class:active={showGraph}
-					onclick={() => showGraph = !showGraph}
-					title="Graph View"
-				>
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-						<circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="18" r="3"/>
-						<line x1="8.5" y1="7.5" x2="15.5" y2="16.5"/><line x1="15.5" y1="7.5" x2="8.5" y2="16.5"/>
-					</svg>
-				</button>
-				{/if}
 				{#if $appConfig?.ai_provider}
 				<button
 					class="icon-btn"
@@ -9328,10 +9309,6 @@
 			</div>
 		</div>
 	</div>
-{/if}
-
-{#if showGraph}
-	<GraphView onclose={() => showGraph = false} onnavigate={(path, title) => { showGraph = false; navigateToWikiLink(path, title); }} />
 {/if}
 
 <style>
