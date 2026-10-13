@@ -4322,7 +4322,7 @@ pub fn db_list_versions(
 /// app config the same way `open_vault` does for directory vaults. No search
 /// index and no filesystem watcher — the DB is the source of truth.
 #[tauri::command]
-pub async fn db_open_vault(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<(), String> {
+pub async fn db_open_vault(state: State<'_, AppState>, path: String) -> Result<(), String> {
     let _transition = state.vault_transition.lock().await;
     if !path.ends_with(".rn") {
         return Err(format!("'{path}' is not a RyukNotes database (expected a .rn file)"));

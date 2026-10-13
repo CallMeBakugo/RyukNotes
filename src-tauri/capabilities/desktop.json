@@ -5,7 +5,6 @@
   "platforms": ["linux", "macOS", "windows"],
   "windows": ["main"],
   "permissions": [
-    "updater:default",
     "window-state:default",
     "core:webview:allow-set-webview-zoom"
   ]

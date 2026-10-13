@@ -335,7 +335,8 @@ pub fn run() {
             }
         }));
 
-        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+        // Updater plugin removed with the upstream endpoint config (Canari fork:
+        // the fork must never update itself from HelixNotes releases).
         let window_state_builder = tauri_plugin_window_state::Builder::default();
         #[cfg(target_os = "linux")]
         let window_state_builder = window_state_builder.with_state_flags(
