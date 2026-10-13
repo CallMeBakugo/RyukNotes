@@ -4170,6 +4170,128 @@ pub fn ai_ask(
     Ok(())
 }
 
+// ── SQLite vault (DB-backed) commands ──
+//
+// The DB command surface mirrors the .md filesystem surface one-to-one so the
+// frontend can switch vaults a feature at a time. State holds one open
+// VaultDb per running app; operations are short and run inline (WAL mode).
+
+#[tauri::command]
+pub fn db_open(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let db = crate::vault::db::VaultDb::open(std::path::Path::new(&path))?;
+    let mut slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+    *slot = Some(db);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn db_close(state: State<'_, AppState>) -> Result<(), String> {
+    let mut slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+    *slot = None;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn db_is_open(state: State<'_, AppState>) -> Result<bool, String> {
+    let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+    Ok(slot.is_some())
+}
+
+fn with_db<T>(state: &State<'_, AppState>, f: impl FnOnce(&crate::vault::db::VaultDb) -> Result<T, String>) -> Result<T, String> {
+    let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+    let db = slot.as_ref().ok_or("No vault database is open")?;
+    f(db)
+}
+
+#[tauri::command]
+pub fn db_list_notes(state: State<'_, AppState>, include_trashed: bool) -> Result<Vec<crate::vault::db::NoteSummary>, String> {
+    with_db(&state, |db| db.list_notes(include_trashed))
+}
+
+#[tauri::command]
+pub fn db_get_note(state: State<'_, AppState>, id: String) -> Result<Option<String>, String> {
+    with_db(&state, |db| db.get_note_content(&id))
+}
+
+#[tauri::command]
+pub fn db_save_note(
+    state: State<'_, AppState>,
+    id: String,
+    title: String,
+    content: String,
+    pinned: bool,
+    tags: Vec<String>,
+) -> Result<(), String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    with_db(&state, |db| {
+        let created = db
+            .get_note_created(&id)?
+            .unwrap_or_else(|| now.clone());
+        db.upsert_note(&crate::vault::db::NewNote {
+            id,
+            title,
+            content,
+            pinned,
+            tags,
+            created,
+            modified: now,
+        })
+    })
+}
+
+#[tauri::command]
+pub fn db_search_notes(state: State<'_, AppState>, query: String) -> Result<Vec<crate::vault::db::NoteSummary>, String> {
+    with_db(&state, |db| db.search(&query))
+}
+
+#[tauri::command]
+pub fn db_add_attachment(
+    state: State<'_, AppState>,
+    note_id: String,
+    filename: String,
+    mime_type: String,
+    data: Vec<u8>,
+) -> Result<crate::vault::db::AttachmentMeta, String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    with_db(&state, |db| db.add_attachment(&note_id, &filename, &mime_type, &data, &now))
+}
+
+#[tauri::command]
+pub fn db_get_attachment(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Option<serde_json::Value>, String> {
+    with_db(&state, |db| {
+        match db.get_attachment_data(&id)? {
+            Some((meta, data)) => Ok(Some(serde_json::json!({
+                "id": meta.id,
+                "noteId": meta.note_id,
+                "filename": meta.filename,
+                "mimeType": meta.mime_type,
+                "size": meta.size,
+                "sha256": meta.sha256,
+                "data": data,
+            }))),
+            None => Ok(None),
+        }
+    })
+}
+
+#[tauri::command]
+pub fn db_trash_note(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    with_db(&state, |db| db.set_note_trashed(&id, true))
+}
+
+#[tauri::command]
+pub fn db_restore_note(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    with_db(&state, |db| db.set_note_trashed(&id, false))
+}
+
+#[tauri::command]
+pub fn db_delete_note(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    with_db(&state, |db| db.delete_note(&id))
+}
+
 // ── Helpers ──
 
 // On mobile (Android + iOS) the OS config dir is injected at startup via the Tauri
@@ -5201,5 +5323,105 @@ mod mutation_order_tests {
         let raw = std::fs::read_to_string(&trash.notes[0].path).unwrap();
         let (_, content) = crate::vault::frontmatter::parse_note(&raw, "Note.md");
         assert_eq!(content, "# Note\n\nLatest text before trash");
+    }
+}
+
+#[cfg(test)]
+mod db_command_tests {
+    use super::*;
+    use crate::types::AppConfig;
+    use tauri::Manager;
+
+    fn app_with_state() -> tauri::App<tauri::test::MockRuntime> {
+        tauri::test::mock_builder()
+            .manage(AppState::new(AppConfig::default()))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap()
+    }
+
+    #[test]
+    fn db_commands_round_trip() {
+        let app = app_with_state();
+        let state: tauri::State<AppState> = app.state();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vault.rn");
+
+        assert!(!db_is_open(state.clone()).unwrap());
+        db_open(state.clone(), db_path.to_string_lossy().into_owned()).unwrap();
+        assert!(db_is_open(state.clone()).unwrap());
+
+        // Saving before opening fails cleanly.
+        db_close(state.clone()).unwrap();
+        assert!(db_save_note(state.clone(), "x".into(), "T".into(), "c".into(), false, vec![]).is_err());
+
+        db_open(state.clone(), db_path.to_string_lossy().into_owned()).unwrap();
+        db_save_note(
+            state.clone(),
+            "note-1".into(),
+            "Deltaferon notes".into(),
+            "Cytokine signaling study".into(),
+            true,
+            vec!["immunology".into(), "research".into()],
+        )
+        .unwrap();
+
+        let notes = db_list_notes(state.clone(), false).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, "note-1");
+        assert!(notes[0].pinned);
+        assert_eq!(notes[0].tags.len(), 2);
+
+        assert_eq!(
+            db_get_note(state.clone(), "note-1".into()).unwrap().unwrap(),
+            "Cytokine signaling study"
+        );
+
+        let hits = db_search_notes(state.clone(), "cytokine".into()).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "note-1");
+
+        // Trash hides from the default list, restore brings it back, delete removes it.
+        db_trash_note(state.clone(), "note-1".into()).unwrap();
+        assert!(db_list_notes(state.clone(), false).unwrap().is_empty());
+        assert_eq!(db_list_notes(state.clone(), true).unwrap().len(), 1);
+        db_restore_note(state.clone(), "note-1".into()).unwrap();
+        assert_eq!(db_list_notes(state.clone(), false).unwrap().len(), 1);
+        db_delete_note(state.clone(), "note-1".into()).unwrap();
+        assert!(db_list_notes(state.clone(), true).unwrap().is_empty());
+        assert!(db_get_note(state.clone(), "note-1".into()).unwrap().is_none());
+    }
+
+    #[test]
+    fn db_attachment_commands_round_trip() {
+        let app = app_with_state();
+        let state: tauri::State<AppState> = app.state();
+        let dir = tempfile::tempdir().unwrap();
+        db_open(state.clone(), dir.path().join("v.rn").to_string_lossy().into_owned()).unwrap();
+        db_save_note(state.clone(), "n1".into(), "Receipts".into(), "body".into(), false, vec![]).unwrap();
+
+        let meta = db_add_attachment(
+            state.clone(),
+            "n1".into(),
+            "proton-recovery.txt".into(),
+            "text/plain".into(),
+            b"recovery codes".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(meta.size, 14);
+
+        let fetched = db_get_attachment(state.clone(), meta.id.clone()).unwrap().unwrap();
+        assert_eq!(fetched["filename"], "proton-recovery.txt");
+        assert_eq!(fetched["data"], serde_json::json!(b"recovery codes".to_vec()));
+
+        // Attachment for a missing note leaves the note foreign-key intact? No:
+        // attachments require an existing note (FK enforced).
+        assert!(db_add_attachment(
+            state.clone(),
+            "missing".into(),
+            "x.png".into(),
+            "image/png".into(),
+            vec![1, 2, 3]
+        )
+        .is_err());
     }
 }

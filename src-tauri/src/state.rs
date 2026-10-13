@@ -1,5 +1,6 @@
 use crate::search::{SearchIndex, SearchIndexShutdown};
 use crate::types::AppConfig;
+use crate::vault::db::VaultDb;
 use crate::vault::watcher::VaultWatcher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicBool;
@@ -43,6 +44,8 @@ pub struct AppState {
     pub vault_maintenance: Arc<tokio::sync::Mutex<()>>,
     pub note_save: Arc<tokio::sync::Mutex<()>>,
     pub importing: AtomicBool,
+    /// The SQLite vault database, when the active vault is DB-backed.
+    pub vault_db: Mutex<Option<VaultDb>>,
     #[cfg(desktop)]
     pub quitting: AtomicBool,
     pending_open_files: Mutex<PendingOpenFiles>,
@@ -237,6 +240,7 @@ impl AppState {
             vault_maintenance: Arc::new(tokio::sync::Mutex::new(())),
             note_save: Arc::new(tokio::sync::Mutex::new(())),
             importing: AtomicBool::new(false),
+            vault_db: Mutex::new(None),
             #[cfg(desktop)]
             quitting: AtomicBool::new(false),
             pending_open_files: Mutex::new(PendingOpenFiles::default()),

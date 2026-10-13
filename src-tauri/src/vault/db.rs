@@ -91,6 +91,8 @@ pub struct NewNote {
     pub modified: String,
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NoteSummary {
     pub id: String,
     pub title: String,
@@ -101,7 +103,8 @@ pub struct NoteSummary {
     pub tags: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AttachmentMeta {
     pub id: String,
     pub note_id: String,
@@ -195,6 +198,48 @@ impl VaultDb {
         )
         .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn get_note_created(&self, id: &str) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT created FROM notes WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn set_note_trashed(&self, id: &str, trashed: bool) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE notes SET trashed = ?1 WHERE id = ?2",
+                params![trashed as i64, id],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err(format!("No note with id {id}"));
+        }
+        Ok(())
+    }
+
+    pub fn delete_note(&self, id: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM notes_fts WHERE rowid = (SELECT rowid FROM notes WHERE id = ?1)",
+                params![id],
+            )
+            .map_err(|e| e.to_string())?;
+        let changed = self
+            .conn
+            .execute("DELETE FROM notes WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err(format!("No note with id {id}"));
+        }
+        Ok(())
     }
 
     pub fn get_note_content(&self, id: &str) -> Result<Option<String>, String> {
