@@ -102,6 +102,17 @@
 		}
 	}
 
+	async function pickDatabase() {
+		const selected = await open({
+			multiple: false,
+			title: 'Open RyukNotes Database',
+			filters: [{ name: 'RyukNotes Database', extensions: ['rn'] }],
+		});
+		if (selected) {
+			await openSelectedVault(selected as string);
+		}
+	}
+
 	async function openSelectedVault(path: string) {
 		loading = true;
 		error = '';
@@ -276,6 +287,12 @@
 				Open Notes Folder
 			{/if}
 		</button>
+
+		{#if !isIOS && !isMobile}
+			<button class="btn-back" onclick={pickDatabase} disabled={loading}>
+				Open Database (.rn)
+			</button>
+		{/if}
 
 		{#if isIOS}
 			<button class="btn-back" onclick={pickExternalFolder} disabled={loading}>

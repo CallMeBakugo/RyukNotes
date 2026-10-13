@@ -249,6 +249,7 @@ pub fn run() {
             commands::test_ai_connection,
             commands::ai_ask,
             commands::db_open,
+            commands::db_open_vault,
             commands::db_close,
             commands::db_is_open,
             commands::db_list_notes,

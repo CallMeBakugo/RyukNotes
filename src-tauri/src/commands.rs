@@ -4209,8 +4209,8 @@ pub fn db_list_notes(state: State<'_, AppState>, include_trashed: bool) -> Resul
 }
 
 #[tauri::command]
-pub fn db_get_note(state: State<'_, AppState>, id: String) -> Result<Option<String>, String> {
-    with_db(&state, |db| db.get_note_content(&id))
+pub fn db_get_note(state: State<'_, AppState>, id: String) -> Result<Option<serde_json::Value>, String> {
+    with_db(&state, |db| db.get_note_full(&id))
 }
 
 #[tauri::command]
@@ -4316,6 +4316,45 @@ pub fn db_list_versions(
             })
             .collect())
     })
+}
+
+/// Opens a `.rn` SQLite vault: opens the DB and registers the vault in the
+/// app config the same way `open_vault` does for directory vaults. No search
+/// index and no filesystem watcher — the DB is the source of truth.
+#[tauri::command]
+pub async fn db_open_vault(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let _transition = state.vault_transition.lock().await;
+    if !path.ends_with(".rn") {
+        return Err(format!("'{path}' is not a RyukNotes database (expected a .rn file)"));
+    }
+    if !std::path::Path::new(&path).is_file() {
+        return Err(format!("'{path}' does not exist"));
+    }
+    let db = crate::vault::db::VaultDb::open(std::path::Path::new(&path))?;
+    {
+        let mut slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+        *slot = Some(db);
+    }
+    // Register in config (same semantics as open_vault_path's directory case).
+    let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    let mut next = config.clone();
+    if !next.vaults.iter().any(|vault| vault.path == path) {
+        let name = std::path::Path::new(&path)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        next.vaults.push(crate::types::VaultConfig {
+            path: path.clone(),
+            name,
+            ..Default::default()
+        });
+    }
+    next.active_vault = Some(path);
+    save_app_config(&next)?;
+    *config = next;
+    drop(config);
+    Ok(())
 }
 
 // ── Helpers ──
@@ -5397,10 +5436,10 @@ mod db_command_tests {
         assert!(notes[0].pinned);
         assert_eq!(notes[0].tags.len(), 2);
 
-        assert_eq!(
-            db_get_note(state.clone(), "note-1".into()).unwrap().unwrap(),
-            "Cytokine signaling study"
-        );
+        let note_json = db_get_note(state.clone(), "note-1".into()).unwrap().unwrap();
+        assert_eq!(note_json["content"], "Cytokine signaling study");
+        assert_eq!(note_json["title"], "Deltaferon notes");
+        assert_eq!(note_json["tags"], serde_json::json!(["immunology", "research"]));
 
         let hits = db_search_notes(state.clone(), "cytokine".into()).unwrap();
         assert_eq!(hits.len(), 1);

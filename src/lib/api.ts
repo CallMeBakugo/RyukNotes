@@ -1,4 +1,22 @@
 import { invoke } from "@tauri-apps/api/core";
+import {
+  isDbVault,
+  looksLikeDbVault,
+  dbOpenVault,
+  dbGetNotes,
+  dbReadNote,
+  dbSaveNote,
+  dbCreateNote,
+  dbCreateDailyNote,
+  dbRenameNote,
+  dbDuplicateNote,
+  dbSearchNotes,
+  dbGetAllTags,
+  dbGetAllNoteTitles,
+  dbGetTrash,
+  dbLoadVaultState,
+  dbSaveVaultState,
+} from "./api-db";
 import type { ExternalNoteReference } from "./editor/externalNote";
 import type {
   AppConfig,
@@ -25,6 +43,7 @@ import type {
 } from "./types";
 
 export async function openVault(path: string): Promise<void> {
+  if (looksLikeDbVault(path)) return dbOpenVault(path);
   return invoke("open_vault", { path });
 }
 
@@ -110,10 +129,12 @@ export async function setContentWidth(width: number | null): Promise<void> {
 }
 
 export async function getNotebooks(): Promise<NotebookEntry[]> {
+  if (isDbVault()) return [];
   return invoke("get_notebooks");
 }
 
 export async function countRootNotes(): Promise<number> {
+  if (isDbVault()) return (await dbGetNotes(null)).length;
   return invoke("count_root_notes");
 }
 
@@ -148,10 +169,12 @@ export async function moveNotebook(
 export async function getNotes(
   notebookPath: string | null,
 ): Promise<NoteEntry[]> {
+  if (isDbVault()) return dbGetNotes(notebookPath);
   return invoke("get_notes", { notebookPath });
 }
 
 export async function readNote(vaultPath: string, path: string): Promise<NoteContent> {
+  if (isDbVault()) return dbReadNote(path);
   return invoke("read_note", { vaultPath, path });
 }
 
@@ -162,6 +185,7 @@ export async function saveNote(
   body: string,
   expectedRaw: string,
 ): Promise<NoteContent> {
+  if (isDbVault()) return dbSaveNote(path, meta, body);
   return invoke("save_note", { vaultPath, path, meta, body, expectedRaw });
 }
 
@@ -180,14 +204,17 @@ export async function createNote(
   notebookRelative: string | null,
   title: string,
 ): Promise<NoteEntry> {
+  if (isDbVault()) return dbCreateNote(title);
   return invoke("create_note", { vaultPath, notebookRelative, title });
 }
 
 export async function duplicateNote(vaultPath: string, path: string): Promise<NoteEntry> {
+  if (isDbVault()) return dbDuplicateNote(path);
   return invoke("duplicate_note", { vaultPath, path });
 }
 
 export async function createDailyNote(vaultPath: string, date?: string): Promise<NoteEntry> {
+  if (isDbVault()) return dbCreateDailyNote(date);
   return invoke("create_daily_note", { vaultPath, date: date ?? null });
 }
 
@@ -196,10 +223,12 @@ export async function renameNote(
   path: string,
   newTitle: string,
 ): Promise<string> {
+  if (isDbVault()) return dbRenameNote(path, newTitle);
   return invoke("rename_note", { vaultPath, path, newTitle });
 }
 
 export async function deleteNote(vaultPath: string, path: string): Promise<void> {
+  if (isDbVault()) return invoke("db_trash_note", { id: path });
   return invoke("delete_note", { vaultPath, path });
 }
 
@@ -212,10 +241,12 @@ export async function moveNote(
 }
 
 export async function getAllTags(): Promise<[string, number][]> {
+  if (isDbVault()) return dbGetAllTags();
   return invoke("get_all_tags");
 }
 
 export async function getAllNoteTitles(vaultPath: string): Promise<NoteTitleEntry[]> {
+  if (isDbVault()) return dbGetAllNoteTitles();
   return invoke("get_all_note_titles", { vaultPath });
 }
 
@@ -234,6 +265,7 @@ export async function searchNotes(
   limit?: number,
   offset?: number,
 ): Promise<SearchPage> {
+  if (isDbVault()) return dbSearchNotes(query);
   return invoke("search_notes", { query, limit, offset });
 }
 
@@ -242,6 +274,7 @@ export async function reindex(): Promise<void> {
 }
 
 export async function getTrash(): Promise<TrashContents> {
+  if (isDbVault()) return dbGetTrash();
   return invoke("get_trash");
 }
 
@@ -250,6 +283,10 @@ export async function restoreNote(
   trashPath: string,
   destNotebook: string | null,
 ): Promise<string> {
+  if (isDbVault()) {
+    await invoke("db_restore_note", { id: trashPath });
+    return trashPath;
+  }
   return invoke("restore_note", { vaultPath, trashPath, destNotebook });
 }
 
@@ -258,6 +295,7 @@ export async function restoreNotebook(vaultPath: string, trashPath: string): Pro
 }
 
 export async function permanentDelete(vaultPath: string, path: string): Promise<void> {
+  if (isDbVault()) return invoke("db_delete_note", { id: path });
   return invoke("permanent_delete", { vaultPath, path });
 }
 
@@ -266,10 +304,12 @@ export async function emptyTrash(vaultPath: string): Promise<void> {
 }
 
 export async function loadVaultState(vaultPath: string): Promise<VaultState> {
+  if (isDbVault()) return dbLoadVaultState();
   return invoke("load_vault_state", { vaultPath });
 }
 
 export async function saveVaultState(vaultPath: string, vaultState: VaultState): Promise<void> {
+  if (isDbVault()) return dbSaveVaultState(vaultState);
   return invoke("save_vault_state", { vaultPath, vaultState });
 }
 

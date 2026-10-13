@@ -101,6 +101,7 @@ pub struct NoteSummary {
     pub created: String,
     pub modified: String,
     pub tags: Vec<String>,
+    pub preview: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -275,6 +276,49 @@ impl VaultDb {
         Ok(())
     }
 
+    /// Full note (meta + tags + content) for the frontend adapter.
+    pub fn get_note_full(
+        &self,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, title, content, pinned, trashed, created, modified,
+                        (SELECT group_concat(t.tag, char(31)) FROM note_tags t WHERE t.note_id = n.id)
+                 FROM notes n WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(row.map(|(id, title, content, pinned, trashed, created, modified, tags)| {
+            serde_json::json!({
+                "id": id,
+                "title": title,
+                "content": content,
+                "pinned": pinned != 0,
+                "trashed": trashed != 0,
+                "created": created,
+                "modified": modified,
+                "tags": tags
+                    .map(|b| b.split('\u{1f}').map(str::to_string).collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            })
+        }))
+    }
+
     pub fn get_note_content(&self, id: &str) -> Result<Option<String>, String> {
         self.conn
             .query_row(
@@ -291,7 +335,8 @@ impl VaultDb {
             .conn
             .prepare(
                 "SELECT n.id, n.title, n.pinned, n.trashed, n.created, n.modified,
-                        (SELECT group_concat(t.tag, char(31)) FROM note_tags t WHERE t.note_id = n.id)
+                        (SELECT group_concat(t.tag, char(31)) FROM note_tags t WHERE t.note_id = n.id),
+                        substr(replace(replace(n.content, char(10), ' '), '#', ''), 1, 120)
                  FROM notes n
                  WHERE n.trashed = ?1 OR ?2
                  ORDER BY n.pinned DESC, n.modified DESC",
@@ -310,6 +355,7 @@ impl VaultDb {
                     tags: tags_blob
                         .map(|b| b.split('\u{1f}').map(str::to_string).collect())
                         .unwrap_or_default(),
+                    preview: row.get(7)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -321,7 +367,8 @@ impl VaultDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT n.id, n.title, n.pinned, n.trashed, n.created, n.modified
+                "SELECT n.id, n.title, n.pinned, n.trashed, n.created, n.modified,
+                        substr(replace(replace(n.content, char(10), ' '), '#', ''), 1, 120)
                  FROM notes_fts f JOIN notes n ON n.rowid = f.rowid
                  WHERE notes_fts MATCH ?1 AND n.trashed = 0
                  ORDER BY rank",
@@ -337,6 +384,7 @@ impl VaultDb {
                     created: row.get(4)?,
                     modified: row.get(5)?,
                     tags: Vec::new(),
+                    preview: row.get(6)?,
                 })
             })
             .map_err(|e| e.to_string())?;

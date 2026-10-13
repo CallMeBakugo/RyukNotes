@@ -246,7 +246,17 @@ mod real_vault_tests {
     #[ignore]
     fn real_vault_dry_run() {
         let vault = std::env::var("RYUK_REAL_VAULT").expect("set RYUK_REAL_VAULT");
-        let db = VaultDb::open_in_memory().unwrap();
+        // RYUK_REAL_DB_OUT (optional): also materialize the vault as a .rn file.
+        let db = match std::env::var("RYUK_REAL_DB_OUT") {
+            Ok(out) => {
+                let path = std::path::PathBuf::from(&out);
+                if path.exists() {
+                    std::fs::remove_file(&path).unwrap();
+                }
+                VaultDb::open(&path).unwrap()
+            }
+            Err(_) => VaultDb::open_in_memory().unwrap(),
+        };
         let report = import_md_vault(std::path::Path::new(&vault), &db).unwrap();
         let total = db.list_notes(true).unwrap().len();
         let live = db.list_notes(false).unwrap().len();
