@@ -264,7 +264,8 @@ export type ViewMode =
   | "search"
   | "quickaccess"
   | "daily"
-  | "tasks";
+  | "tasks"
+  | "hermes";
 
 export interface TaskItem {
   note_path: string;

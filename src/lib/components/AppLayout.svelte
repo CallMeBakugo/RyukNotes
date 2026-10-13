@@ -1097,7 +1097,7 @@
 					{#if $mobileView === 'sidebar'}
 						RyukNotes
 					{:else}
-						{#if $viewMode === 'notebook'}{$activeNotebook?.name ?? 'Notebook'}{:else if $viewMode === 'tag' && $activeTag}<TagLabel name={$activeTag} size={16} />{:else if $viewMode === 'quickaccess'}Quick Access{:else if $viewMode === 'daily'}Daily Notes{:else if $viewMode === 'tasks'}Tasks{:else if $viewMode === 'trash'}Trash{:else}All Notes{/if}
+						{#if $viewMode === 'notebook'}{$activeNotebook?.name ?? 'Notebook'}{:else if $viewMode === 'tag' && $activeTag}<TagLabel name={$activeTag} size={16} />{:else if $viewMode === 'quickaccess'}Quick Access{:else if $viewMode === 'daily'}Daily Notes{:else if $viewMode === 'tasks'}Tasks{:else if $viewMode === 'hermes'}Hermes{:else if $viewMode === 'trash'}Trash{:else}All Notes{/if}
 					{/if}
 				</span>
 				{#if $globalUpdateAvailable && $mobileView === 'sidebar'}

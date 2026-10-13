@@ -278,6 +278,13 @@
 		onViewChanged();
 	}
 
+	function selectHermes() {
+		$viewMode = 'hermes';
+		$activeNotebook = null;
+		$activeTag = null;
+		onViewChanged();
+	}
+
 	function selectTrash() {
 		$viewMode = 'trash';
 		$activeNotebook = null;
@@ -863,7 +870,7 @@
 				class="nav-item"
 				class:active={$viewMode === 'daily'}
 				onclick={selectDaily}
-			>
+				>
 				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
 					<line x1="16" y1="2" x2="16" y2="6" />
@@ -873,6 +880,20 @@
 				<span>Daily Notes</span>
 			</button>
 			{/if}
+
+			<button
+				class="nav-item"
+				class:active={$viewMode === 'hermes'}
+				onclick={selectHermes}
+				>
+				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<path d="M12 2c2.5 2.5 3 5 3 7s-1 3-3 3-3-1-3-3 .5-4.5 3-7z"/>
+					<path d="M5 14c4 2 10 2 14 0"/>
+					<path d="M8 19c1.5-2 4.5-2 8 0"/>
+					<path d="M12 12v10"/>
+				</svg>
+				<span>Hermes</span>
+			</button>
 
 			{#if $appConfig?.show_trash !== false}
 			<button

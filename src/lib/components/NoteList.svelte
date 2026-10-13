@@ -461,6 +461,7 @@
 		if ($viewMode === 'quickaccess') return 'Quick Access';
 		if ($viewMode === 'daily') return 'Daily Notes';
 		if ($viewMode === 'tasks') return 'Tasks';
+		if ($viewMode === 'hermes') return 'Hermes';
 		if ($viewMode === 'trash') return 'Trash';
 		return 'Notes';
 	});
@@ -494,6 +495,7 @@
 		if ($viewMode === 'trash') return 'trash';
 		if ($viewMode === 'daily') return 'daily';
 		if ($viewMode === 'quickaccess') return 'quickaccess';
+		if ($viewMode === 'hermes') return 'hermes';
 		if ($viewMode === 'tag' && $activeTag) return `tag:${$activeTag}`;
 		if ($viewMode === 'notebook' && $activeNotebook) return `nb:${$activeNotebook.path}`;
 		return 'all';
@@ -530,6 +532,9 @@
 				list = vault ? await getNotes(`${vault}/Daily`) : [];
 			} else if (mode === 'quickaccess') {
 				list = await getQuickAccess(ownerVault!);
+			} else if (mode === 'hermes') {
+				allNotes = noteCache.get('all') ?? await getNotes(null);
+				list = allNotes.filter((note) => note.meta.tags.includes('hermes/session'));
 			} else if (mode === 'tag' && tag) {
 				allNotes = noteCache.get('all') ?? await getNotes(null);
 				list = allNotes.filter((note) => note.meta.tags.includes(tag));
