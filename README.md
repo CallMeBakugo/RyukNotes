@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/icon.png" width="256" alt="Ryuk's Notebook — the Shinigami's notebook" />
+</p>
+
 # Ryuk's Notebook
 
 A local-first notes app with the agent built in.
