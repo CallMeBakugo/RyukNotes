@@ -16,6 +16,19 @@ import {
   dbGetTrash,
   dbLoadVaultState,
   dbSaveVaultState,
+  dbGetQuickAccess,
+  dbAddQuickAccess,
+  dbRemoveQuickAccess,
+  dbReorderQuickAccess,
+  dbGetVaultStats,
+  dbEmptyTrash,
+  dbGetTasks,
+  dbCreateBackup,
+  dbRestoreBackup,
+  dbExportMd,
+  dbSetTaskDone,
+  dbSetTaskPriority,
+  dbSetTaskDue,
 } from "./api-db";
 import type { ExternalNoteReference } from "./editor/externalNote";
 import type {
@@ -300,6 +313,7 @@ export async function permanentDelete(vaultPath: string, path: string): Promise<
 }
 
 export async function emptyTrash(vaultPath: string): Promise<void> {
+  if (isDbVault()) { await dbEmptyTrash(); return; }
   return invoke("empty_trash", { vaultPath });
 }
 
@@ -447,22 +461,27 @@ export async function setGeneralSettings(
 }
 
 export async function getQuickAccess(vaultPath: string): Promise<NoteEntry[]> {
+  if (isDbVault()) return dbGetQuickAccess();
   return invoke("get_quick_access", { vaultPath });
 }
 
 export async function addQuickAccess(vaultPath: string, noteRelative: string): Promise<void> {
+  if (isDbVault()) return dbAddQuickAccess(noteRelative);
   return invoke("add_quick_access", { vaultPath, noteRelative });
 }
 
 export async function removeQuickAccess(vaultPath: string, noteRelative: string): Promise<void> {
+  if (isDbVault()) return dbRemoveQuickAccess(noteRelative);
   return invoke("remove_quick_access", { vaultPath, noteRelative });
 }
 
 export async function reorderQuickAccess(paths: string[]): Promise<void> {
+  if (isDbVault()) return dbReorderQuickAccess(paths);
   return invoke("reorder_quick_access", { paths });
 }
 
 export async function getVaultStats(): Promise<VaultStats> {
+  if (isDbVault()) return dbGetVaultStats();
   return invoke("get_vault_stats");
 }
 
@@ -481,6 +500,16 @@ export async function trashOrphanedAttachments(vaultPath: string, names: string[
 
 export async function importObsidian(): Promise<void> {
   return invoke("import_obsidian");
+}
+
+/** DB mode: import a folder of .md files into the open vault. */
+export async function importMdFolderIntoDb(folder: string): Promise<{ notesImported: number; notesTrashed: number; versionsImported: number; filesSkipped: number }> {
+  return invoke("db_import_md_vault", { mdVaultPath: folder });
+}
+
+/** DB mode: export the vault as a folder of .md files. */
+export async function exportDbToMd(outDir: string): Promise<number> {
+  return dbExportMd(outDir);
 }
 
 export async function openFile(path: string): Promise<void> {
@@ -520,18 +549,22 @@ export async function copyPngToClipboard(data: Uint8Array): Promise<void> {
 // ── Backup ──
 
 export async function createBackup(vaultPath: string): Promise<void> {
+  if (isDbVault()) { await dbCreateBackup(); return; }
   return invoke("create_backup", { vaultPath });
 }
 
 export async function listBackups(vaultPath: string): Promise<BackupEntry[]> {
+  if (isDbVault()) return invoke("db_list_backups");
   return invoke("list_backups", { vaultPath });
 }
 
 export async function restoreBackup(vaultPath: string, backupPath: string): Promise<void> {
+  if (isDbVault()) return dbRestoreBackup(backupPath, vaultPath);
   return invoke("restore_backup", { vaultPath, backupPath });
 }
 
 export async function deleteBackup(vaultPath: string, backupPath: string): Promise<void> {
+  if (isDbVault()) return invoke("db_delete_backup", { backupPath });
   return invoke("delete_backup", { vaultPath, backupPath });
 }
 
@@ -554,6 +587,7 @@ export async function setBackupSettings(
 // ── Tasks ──
 
 export async function getTasks(notePath?: string): Promise<TaskItem[]> {
+  if (isDbVault()) return dbGetTasks(notePath);
   return invoke("get_tasks", { notePath: notePath ?? null });
 }
 
@@ -564,6 +598,7 @@ export async function setTaskDone(
   rawLine: string,
   done: boolean,
 ): Promise<void> {
+  if (isDbVault()) return dbSetTaskDone(notePath, line, rawLine, done);
   return invoke("set_task_done", { vaultPath, notePath, line, rawLine, done });
 }
 
@@ -574,6 +609,7 @@ export async function setTaskPriority(
   rawLine: string,
   priority: string | null,
 ): Promise<void> {
+  if (isDbVault()) return dbSetTaskPriority(notePath, line, rawLine, priority);
   return invoke("set_task_priority", { vaultPath, notePath, line, rawLine, priority });
 }
 
@@ -584,6 +620,7 @@ export async function setTaskDue(
   rawLine: string,
   due: string | null,
 ): Promise<void> {
+  if (isDbVault()) return dbSetTaskDue(notePath, line, rawLine, due);
   return invoke("set_task_due", { vaultPath, notePath, line, rawLine, due });
 }
 

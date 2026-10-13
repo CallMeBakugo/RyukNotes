@@ -4391,6 +4391,279 @@ pub fn spawn_ryuk_terminal(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// DB-vault stats: counts from SQL instead of a filesystem walk.
+#[tauri::command]
+pub fn db_vault_stats(state: State<'_, AppState>) -> Result<crate::types::VaultStats, String> {
+    with_db(&state, |db| {
+        let total_notes: u64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM notes WHERE trashed = 0", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        let total_attachments: u64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        let notes_size: u64 = db
+            .conn
+            .query_row("SELECT COALESCE(SUM(LENGTH(content)), 0) FROM notes WHERE trashed = 0", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        let attachments_size: u64 = db
+            .conn
+            .query_row("SELECT COALESCE(SUM(size), 0) FROM attachments", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        let total_size = notes_size + attachments_size;
+        Ok(crate::types::VaultStats {
+            total_notes,
+            total_attachments,
+            notes_size,
+            attachments_size,
+            total_size,
+        })
+    })
+}
+
+/// DB-mode empty trash: permanently delete every trashed note.
+#[tauri::command]
+pub fn db_empty_trash(state: State<'_, AppState>) -> Result<u32, String> {
+    with_db(&state, |db| {
+        let ids: Vec<String> = {
+            let mut stmt = db
+                .conn
+                .prepare("SELECT id FROM notes WHERE trashed = 1")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get(0))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        };
+        let mut deleted = 0;
+        for id in &ids {
+            if db.delete_note(id).is_ok() {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    })
+}
+
+/// DB-mode task extraction: checkbox items parsed straight from note bodies.
+#[tauri::command]
+pub fn db_get_tasks(state: State<'_, AppState>, note_id: Option<String>) -> Result<Vec<crate::types::TaskItem>, String> {
+    with_db(&state, |db| {
+        let notes = if let Some(id) = note_id {
+            let Some(note) = db.get_note_full(&id)? else {
+                return Ok(Vec::new());
+            };
+            vec![(String::from(note["id"].as_str().unwrap_or("")), String::from(note["title"].as_str().unwrap_or("")), String::from(note["content"].as_str().unwrap_or("")))]
+        } else {
+            let mut stmt = db
+                .conn
+                .prepare("SELECT id, title, content FROM notes WHERE trashed = 0")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        };
+        let mut tasks = Vec::new();
+        for (id, title, content) in notes {
+            tasks.extend(parse_note_tasks(&id, &title, &content));
+        }
+        Ok(tasks)
+    })
+}
+
+/// Generic key-value state inside the vault (Quick Access paths etc.),
+/// replacing the .helixnotes/state.json file in DB mode.
+#[tauri::command]
+pub fn db_get_state(state: State<'_, AppState>, key: String) -> Result<Option<serde_json::Value>, String> {
+    with_db(&state, |db| db.get_state(&key))
+}
+
+#[tauri::command]
+pub fn db_set_state(state: State<'_, AppState>, key: String, value: serde_json::Value) -> Result<(), String> {
+    with_db(&state, |db| db.set_state(&key, &value))
+}
+
+/// DB-mode backup: a clean snapshot via VACUUM INTO, safe while the app runs.
+#[tauri::command]
+pub fn db_create_backup(app: AppHandle, state: State<'_, AppState>) -> Result<crate::types::BackupEntry, String> {
+    let vault_path = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.active_vault.clone().ok_or("No active vault")?
+    };
+    let backup_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        crate::backup::get_backup_dir(&config.backup_location)?
+    };
+    std::fs::create_dir_all(&backup_dir).map_err(|e| e.to_string())?;
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let stem = std::path::Path::new(&vault_path)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let filename = format!("{stem}-db-backup-{stamp}.rn");
+    let backup_path = backup_dir.join(&filename);
+    with_db(&state, |db| {
+        db.conn
+            .pragma_update(None, "wal_checkpoint", "TRUNCATE")
+            .map_err(|e| e.to_string())?;
+        db.conn
+            .execute(
+                "VACUUM INTO ?1",
+                rusqlite::params![backup_path.to_string_lossy().as_ref()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })?;
+    let size = std::fs::metadata(&backup_path).map(|m| m.len()).unwrap_or(0);
+    let _ = app;
+    Ok(crate::types::BackupEntry {
+        filename,
+        path: backup_path.to_string_lossy().into_owned(),
+        size,
+        created: chrono::Utc::now().to_rfc3339(),
+        other_vault: false,
+    })
+}
+
+/// DB-mode restore: close the DB, copy the backup over the vault, reopen.
+/// The frontend must refresh all lists afterward.
+#[tauri::command]
+pub fn db_restore_backup(state: State<'_, AppState>, backup_path: String, vault_path: String) -> Result<(), String> {
+    // Close the DB so we are not copying over an open handle.
+    {
+        let mut slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+        *slot = None;
+    }
+    let temp = std::path::Path::new(&vault_path).with_extension("rn.restoring");
+    std::fs::copy(&backup_path, &temp).map_err(|e| e.to_string())?;
+    std::fs::rename(&temp, &vault_path).map_err(|e| e.to_string())?;
+    let db = crate::vault::db::VaultDb::open(std::path::Path::new(&vault_path))?;
+    let mut slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+    *slot = Some(db);
+    Ok(())
+}
+
+/// Export the DB vault to a folder of .md files — the inverse of the
+/// importer, and the user's lock-in escape hatch. Frontmatter is written in
+/// the same shape the importer reads, so export -> import round-trips.
+#[tauri::command]
+pub fn db_export_md(state: State<'_, AppState>, out_dir: String) -> Result<u32, String> {
+    let dir = std::path::PathBuf::from(&out_dir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    with_db(&state, |db| {
+        let notes = db.list_notes(true)?;
+        let mut written = 0;
+        for summary in &notes {
+            let Some(full) = db.get_note_full(&summary.id)? else { continue };
+            let meta = crate::types::NoteMeta {
+                id: summary.id.clone(),
+                title: String::from(full["title"].as_str().unwrap_or("")),
+                tags: full["tags"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default(),
+                pinned: summary.pinned,
+                created: crate::vault::frontmatter::parse_date_flexible(
+                    full["created"].as_str().unwrap_or(""),
+                )
+                .unwrap_or_else(chrono::Utc::now),
+                modified: crate::vault::frontmatter::parse_date_flexible(
+                    full["modified"].as_str().unwrap_or(""),
+                )
+                .unwrap_or_else(chrono::Utc::now),
+            };
+            let body = String::from(full["content"].as_str().unwrap_or(""));
+            let raw = crate::vault::frontmatter::serialize_frontmatter(&meta) + &body;
+            let mut filename = format!("{}.md", sanitize_filename(&meta.title));
+            let mut candidate = dir.join(&filename);
+            let mut n = 1;
+            while candidate.exists() {
+                n += 1;
+                filename = format!("{} ({}).md", meta.title, n);
+                candidate = dir.join(&filename);
+            }
+            std::fs::write(&candidate, raw).map_err(|e| e.to_string())?;
+            written += 1;
+        }
+        Ok(written)
+    })
+}
+
+/// List DB-mode backups (*.rn snapshots) in the backup dir.
+#[tauri::command]
+pub fn db_list_backups(state: State<'_, AppState>) -> Result<Vec<crate::types::BackupEntry>, String> {
+    let (backup_dir, vault_path) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        (
+            crate::backup::get_backup_dir(&config.backup_location)?,
+            config.active_vault.clone().unwrap_or_default(),
+        )
+    };
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&backup_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rn") {
+                continue;
+            }
+            let filename = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            if !filename.contains("-db-backup-") {
+                continue;
+            }
+            let meta = std::fs::metadata(&path).ok();
+            let created = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|t| {
+                    chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
+                })
+                .unwrap_or_default();
+            let stem = std::path::Path::new(&vault_path)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let other_vault = !filename.starts_with(stem.as_str());
+            out.push(crate::types::BackupEntry {
+                filename,
+                path: path.to_string_lossy().into_owned(),
+                size: meta.map(|m| m.len()).unwrap_or(0),
+                created,
+                other_vault,
+            });
+        }
+    }
+    out.sort_by(|a, b| b.filename.cmp(&a.filename));
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn db_delete_backup(backup_path: String) -> Result<(), String> {
+    std::fs::remove_file(&backup_path).map_err(|e| e.to_string())
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '-',
+            _ => c,
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_end_matches('.');
+    if trimmed.is_empty() {
+        "Untitled".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 // ── Helpers ──
 
 // On mobile (Android + iOS) the OS config dir is injected at startup via the Tauri

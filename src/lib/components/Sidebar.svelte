@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onDestroy, tick } from 'svelte';
 	import { get } from 'svelte/store';
+	import { isDbVault } from '$lib/api-db';
 	import {
 		notebooks,
 		notes,
@@ -912,6 +913,7 @@
 		{/if}
 
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		{#if !isDbVault()}
 		<div class="section" ondblclick={startNewNotebookFromSidebar}>
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<div
@@ -1010,6 +1012,7 @@
 				</div>
 			{/if}
 		</div>
+		{/if}
 
 		{#if !isMobile && $tags.length > 0}
 			<div class="tags-section">

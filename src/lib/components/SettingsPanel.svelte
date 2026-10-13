@@ -2,6 +2,8 @@
 	import { showSettings, theme, resolvedTheme, appConfig, platformIsMobile, activeVaultConfig, updateAvailable as globalUpdateAvailable, updateObj as globalUpdateObj, installType, settingsTab, vaultReady, notebookSortMode, isManagedInstall, customThemes } from '$lib/stores/app';
 	import { setTheme, setSystemThemes, setAccentColor, setFontSize, setScrollToChangeFontSize, setFontFamily, setLineHeight, setUiScale, setContentWidth, setGeneralSettings, importObsidian, createBackup, listBackups, restoreBackup, deleteBackup, setBackupSettings, setAiSettings, testAiConnection, saveCustomTheme, deleteCustomTheme, exportCustomTheme, importCustomThemes, getVaultStats, findOrphanedAttachments, trashOrphanedAttachments } from '$lib/api';
 	import { darkThemes, isMobile, isAndroid } from '$lib/platform';
+	import { isDbVault } from '$lib/api-db';
+	import { importMdFolderIntoDb, exportDbToMd } from '$lib/api';
 	import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { listen } from '@tauri-apps/api/event';
 	import { getVersion } from '@tauri-apps/api/app';
@@ -832,6 +834,44 @@
 		{ label: 'Full', value: 1000 },
 	];
 
+	// DB-mode import/export state
+	let mdImportLoading = $state(false);
+	let mdImportResult = $state<string | null>(null);
+	let mdImportError = $state<string | null>(null);
+	let mdExportLoading = $state(false);
+	let mdExportResult = $state<string | null>(null);
+
+	async function handleImportMdFolder() {
+		mdImportLoading = true;
+		mdImportResult = null;
+		mdImportError = null;
+		try {
+			const folder = await openDialog({ directory: true, multiple: false, title: 'Choose a folder of .md notes' });
+			if (!folder) return;
+			const report = await importMdFolderIntoDb(folder as string);
+			mdImportResult = `Imported ${report.notesImported} notes (${report.notesTrashed} trashed, ${report.versionsImported} history versions).`;
+		} catch (e) {
+			mdImportError = String(e);
+		} finally {
+			mdImportLoading = false;
+		}
+	}
+
+	async function handleExportMd() {
+		mdExportLoading = true;
+		mdExportResult = null;
+		try {
+			const folder = await openDialog({ directory: true, multiple: false, title: 'Choose an export folder' });
+			if (!folder) return;
+			const count = await exportDbToMd(folder as string);
+			mdExportResult = `Exported ${count} notes as .md files.`;
+		} catch (e) {
+			mdExportResult = `Export failed: ${e}`;
+		} finally {
+			mdExportLoading = false;
+		}
+	}
+
 	// Import state
 	let importLoading = $state(false);
 	let importResult = $state<ImportResult | null>(null);
@@ -1446,6 +1486,7 @@
 								{/if}
 							</div>
 
+							{#if !isDbVault()}
 							<div class="settings-section">
 								<h3>Orphaned Attachments</h3>
 								<div class="vault-maintenance">
@@ -1484,6 +1525,7 @@
 									{/if}
 								</div>
 							</div>
+							{/if}
 						</div>
 					{:else if activeTab === 'editor'}
 						<div class="tab-content">
@@ -1987,7 +2029,17 @@
 						</div>
 					{:else if activeTab === 'backup'}
 						<div class="tab-content">
-							<div class="settings-section">
+						{#if isDbVault()}
+						<div class="settings-section">
+								<h3>Export to Markdown</h3>
+								<p class="import-desc">Write every note in this vault to a folder of plain .md files — the escape hatch back to any other notes app.</p>
+								<button class="import-btn" onclick={handleExportMd} disabled={mdExportLoading}>
+									{#if mdExportLoading}Exporting...{:else}Choose Folder & Export{/if}
+								</button>
+								{#if mdExportResult}<p class="import-result success">{mdExportResult}</p>{/if}
+							</div>
+						{/if}
+						<div class="settings-section">
 								<h3>Automatic Backup</h3>
 
 								<label class="setting-toggle">
@@ -2127,7 +2179,23 @@
 
 					{:else if activeTab === 'import'}
 						<div class="tab-content">
-							<div class="settings-section">
+						{#if isDbVault()}
+						<div class="settings-section">
+								<h3>Import .md Folder</h3>
+								<p class="import-desc">Choose a folder of markdown notes and import them into this database vault. Frontmatter (tags, ids, dates) is preserved; re-importing updates rather than duplicates.</p>
+								<button class="import-btn" onclick={handleImportMdFolder} disabled={mdImportLoading}>
+									{#if mdImportLoading}
+										<svg class="spinner-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" opacity="0.25" /><path d="M12 2a10 10 0 019.95 9" /></svg>
+										Importing...
+									{:else}
+									Import Folder
+									{/if}
+								</button>
+								{#if mdImportResult}<p class="import-result success">{mdImportResult}</p>{/if}
+								{#if mdImportError}<p class="import-result error">{mdImportError}</p>{/if}
+							</div>
+						{:else}
+						<div class="settings-section">
 								<h3>Import from Obsidian</h3>
 								<p class="import-desc">Fully converts an Obsidian vault to RyukNotes format: normalizes frontmatter (tags, IDs, dates, title headings), converts <code>[[wiki-links]]</code> to standard markdown links, converts <code>==highlights==</code> and <code>%%comments%%</code>, and relocates attachments to <code>.helixnotes/attachments/</code>. Open the Obsidian vault directory as your RyukNotes vault first.</p>
 								<div class="import-warn">
@@ -2170,6 +2238,7 @@
 									</div>
 								{/if}
 							</div>
+						{/if}
 						</div>
 
 					{:else if activeTab === 'ai'}

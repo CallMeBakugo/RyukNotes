@@ -12,15 +12,26 @@ const source = await readFile(
 const ast = parse(source, { modern: true });
 
 function elementWithClass(nodes, className) {
-  return nodes.find((node) => node.attributes?.some((attribute) =>
-    attribute.name === 'class' && attribute.value[0]?.data === className
-  ));
+  // Depth-first: descend into control-flow blocks ({#if}/{#each} consequents)
+  // so structural guards (e.g. the DB-mode notebook-section hide) don't hide
+  // the elements this suite asserts on.
+  for (const node of nodes) {
+    if (node.attributes?.some((attribute) =>
+      attribute.name === 'class' && attribute.value[0]?.data === className
+    )) {
+      return node;
+    }
+    const children = node.consequent?.nodes ?? node.body?.nodes ?? [];
+    const found = elementWithClass(children, className);
+    if (found) return found;
+  }
+  return undefined;
 }
 
 const aside = elementWithClass(ast.fragment.nodes, 'sidebar');
 const blocks = aside.fragment.nodes.filter((node) => node.type === 'IfBlock');
 const content = blocks.find((node) => elementWithClass(node.consequent.nodes, 'section'));
-const header = blocks.find((node) => elementWithClass(node.consequent.nodes, 'sidebar-header'));
+const header = blocks.find((node) => node !== content && elementWithClass(node.consequent.nodes, 'sidebar-header'));
 const toggle = elementWithClass(
   elementWithClass(header.consequent.nodes, 'sidebar-header').fragment.nodes,
   'collapse-btn'

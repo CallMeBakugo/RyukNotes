@@ -140,7 +140,7 @@ impl VaultDb {
         Ok(db)
     }
 
-    fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
         self.conn
             .execute(
                 "INSERT INTO meta(key, value) VALUES(?1, ?2)
@@ -149,6 +149,30 @@ impl VaultDb {
             )
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Generic key-value state (Quick Access paths, UI prefs) stored as JSON.
+    pub fn get_state(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        match row {
+            None => Ok(None),
+            Some(text) => serde_json::from_str(&text)
+                .map(Some)
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    pub fn set_state(&self, key: &str, value: &serde_json::Value) -> Result<(), String> {
+        let text = serde_json::to_string(value).map_err(|e| e.to_string())?;
+        self.set_meta(key, &text)
     }
 
     /// Inserts a note (or replaces it wholesale by id) and refreshes its tags
