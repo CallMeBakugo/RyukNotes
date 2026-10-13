@@ -263,6 +263,7 @@ pub fn run() {
             commands::db_delete_note,
             commands::db_import_md_vault,
             commands::db_list_versions,
+            commands::spawn_ryuk_terminal,
             commands::get_install_type,
             commands::is_mobile_platform,
             commands::get_pending_open_file,

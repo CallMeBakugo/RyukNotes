@@ -35,7 +35,7 @@
 	import { openFile, openUrl, copyFileTo, copyImageToClipboard as copyImageToClipboardCmd, writeBytesTo, copyPngToClipboard, copyTextToClipboard } from '$lib/api';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { activeNote, activeNotePath, appConfig, editorDirty, sourceMode, focusMode, readOnly, quickAccessPaths, notes, navHistory, canGoBack, canGoForward, viewerNote, viewMode, notebooks, outlineWidth } from '$lib/stores/app';
-	import { saveNote, importNote, createNote, saveImage, saveAttachment, readClipboardImage, readClipboardContents, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout } from '$lib/api';
+	import { saveNote, importNote, createNote, saveImage, saveAttachment, readClipboardImage, readClipboardContents, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout, spawnRyukTerminal } from '$lib/api';
 	import type { NoteContent, VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord, FileEvent, SearchTarget, ToolbarLayout } from '$lib/types';
 	import { listen } from '@tauri-apps/api/event';
 	import { debounce } from '$lib/utils/debounce';
@@ -159,6 +159,27 @@
 	});
 	let editorReady = $state(false);
 	const trashPreview = $derived(isTrashedNote($activeNotePath, $appConfig?.active_vault));
+
+	// Hermes integration: summary notes carry the hermes/session tag and a
+	// hermes-session-<id> note id; the restore button resurrects that session
+	// in a fresh terminal. Any other note in a DB vault can seed a new session.
+	const isSessionSummary = $derived($activeNote?.meta.tags.includes('hermes/session') ?? false);
+	const sessionId = $derived(
+		isSessionSummary && $activeNotePath?.startsWith('hermes-session-')
+			? $activeNotePath.replace('hermes-session-', '')
+			: null,
+	);
+	const canGenerateSession = $derived(!isSessionSummary && !!$appConfig?.active_vault?.endsWith('.rn'));
+	async function restoreSession() {
+		if (!sessionId) return;
+		try { await spawnRyukTerminal(['session', 'restore', sessionId]); }
+		catch (e) { console.error('restore failed', e); }
+	}
+	async function generateSession() {
+		if (!$activeNotePath) return;
+		try { await spawnRyukTerminal(['session', 'start', '--notes', $activeNotePath]); }
+		catch (e) { console.error('session start failed', e); }
+	}
 	// CM retains an immutable document; edits never bind a full source string to Svelte.
 	const source = new SourceController((changes, edited) => {
 		noteSearchAnchor = changes.mapPos(Math.min(noteSearchAnchor, changes.length));
@@ -7954,6 +7975,30 @@
 						<line x1="12" y1="12" x2="12" y2="16"/>
 					</svg>
 				</button>
+				{#if isSessionSummary && sessionId}
+				<button
+					class="icon-btn"
+					onclick={restoreSession}
+					title="Restore this Hermes session in a terminal"
+					>
+					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+						<path d="M12 2c2.5 2.5 3 5 3 7s-1 3-3 3-3-1-3-3 .5-4.5 3-7z"/>
+						<path d="M5 14c4 2 10 2 14 0"/>
+						<path d="M12 12v10"/>
+					</svg>
+				</button>
+				{/if}
+				{#if canGenerateSession}
+				<button
+					class="icon-btn"
+					onclick={generateSession}
+					title="Start a Hermes session grounded in this note"
+					>
+					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+						<path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/>
+					</svg>
+				</button>
+				{/if}
 				{#if $appConfig?.ai_provider}
 				<button
 					class="icon-btn"

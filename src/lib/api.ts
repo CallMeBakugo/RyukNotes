@@ -495,6 +495,10 @@ export async function openUrl(url: string): Promise<void> {
   return invoke("open_url", { url });
 }
 
+export async function spawnRyukTerminal(args: string[]): Promise<void> {
+  return invoke("spawn_ryuk_terminal", { args });
+}
+
 export async function copyFileTo(
   source: string,
   destination: string,

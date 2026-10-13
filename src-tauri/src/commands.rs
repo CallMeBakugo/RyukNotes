@@ -4357,6 +4357,40 @@ pub async fn db_open_vault(state: State<'_, AppState>, path: String) -> Result<(
     Ok(())
 }
 
+/// Spawns a terminal emulator running `ryuk <args>`, detached. The Hermes
+/// session actions (restore / start) exec `hermes`, a TUI that cannot live in
+/// the app window, so they get their own terminal. Terminal selection:
+/// $RYUK_TERMINAL, then the first of ghostty/alacritty/foot/kitty/konsole on
+/// PATH.
+#[tauri::command]
+pub fn spawn_ryuk_terminal(args: Vec<String>) -> Result<(), String> {
+    fn on_path(program: &str) -> bool {
+        std::env::var_os("PATH")
+            .map(|paths| {
+                std::env::split_paths(&paths).any(|dir| {
+                    dir.join(program).is_file()
+                        || dir.join(format!("{program}.sh")).is_file()
+                })
+            })
+            .unwrap_or(false)
+    }
+    let terminal = std::env::var("RYUK_TERMINAL").ok().filter(|t| on_path(t));
+    let terminal = terminal.unwrap_or_else(|| {
+        ["ghostty", "alacritty", "foot", "kitty", "konsole"]
+            .iter()
+            .find(|t| on_path(t))
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "xterm".to_string())
+    });
+    std::process::Command::new(&terminal)
+        .arg("-e")
+        .arg("ryuk")
+        .args(&args)
+        .spawn()
+        .map_err(|e| format!("spawning {terminal}: {e}"))?;
+    Ok(())
+}
+
 // ── Helpers ──
 
 // On mobile (Android + iOS) the OS config dir is injected at startup via the Tauri
