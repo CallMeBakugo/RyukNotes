@@ -1,7 +1,6 @@
 <script lang="ts">
 	import { getCurrentWindow } from '@tauri-apps/api/window';
-	import { vaultReady, focusMode, readOnly, updateAvailable, showSettings, settingsTab, appConfig, activeNotePath, activeVaultConfig, syncState } from '$lib/stores/app';
-	import { syncNow } from '$lib/api';
+	import { vaultReady, focusMode, readOnly, updateAvailable, showSettings, settingsTab, appConfig, activeNotePath, activeVaultConfig } from '$lib/stores/app';
 	import NoteSwitcher from './NoteSwitcher.svelte';
 	import { isTrashedNote } from '$lib/utils/paths';
 
@@ -126,13 +125,6 @@
 				<line x1="3" y1="10" x2="21" y2="10" />
 			</svg>
 		</button>
-		{#if activeVaultConfig($appConfig)?.sync_provider === 'webdav'}
-		<button class="switch-vault-btn" class:active={$syncState.running} onclick={() => { if (!$syncState.running) syncNow().catch(() => {}); }} disabled={$syncState.running} title={$syncState.error ? `Sync error: ${$syncState.error}` : ($syncState.running ? 'Syncing vault...' : 'Sync vault now')}>
-			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class:sync-spin={$syncState.running}>
-				<path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0115-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 01-15 6.7L3 16"/>
-			</svg>
-		</button>
-		{/if}
 		<button class="new-note-btn" onclick={onNewNote} title={`New Note (${modKey}+N)`}>
 			<svg width="14" height="14" viewBox="0 0 14 14" fill="none">
 				<path d="M7 1v12M1 7h12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />

@@ -6,7 +6,6 @@ mod history;
 mod image_proxy;
 mod search;
 mod state;
-mod sync;
 mod types;
 mod vault;
 
@@ -249,9 +248,6 @@ pub fn run() {
             commands::set_ai_settings,
             commands::test_ai_connection,
             commands::ai_ask,
-            commands::set_sync_settings,
-            commands::test_sync_connection,
-            commands::sync_now,
             commands::get_install_type,
             commands::is_mobile_platform,
             commands::get_pending_open_file,

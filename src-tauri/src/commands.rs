@@ -2910,8 +2910,8 @@ pub async fn trash_orphaned_attachments(
 
 fn ensure_cleanup_idle(state: &AppState) -> Result<(), String> {
     use std::sync::atomic::Ordering;
-    if state.importing.load(Ordering::Acquire) || state.syncing.load(Ordering::Acquire) {
-        Err("Attachment cleanup is unavailable while import or sync is running".to_string())
+    if state.importing.load(Ordering::Acquire) {
+        Err("Attachment cleanup is unavailable while import is running".to_string())
     } else {
         Ok(())
     }
@@ -3808,9 +3808,7 @@ pub fn restore_backup(
         let result = {
             let _writes = state.note_save.blocking_lock();
             state.importing.store(true, Ordering::Release);
-            let result = crate::backup::restore_backup(&vault_path, &backup_dir, &backup_path)
-                // Still under the maintenance lock, so no sync can run in between.
-                .and_then(|()| crate::sync::forget_baseline(&vault_path));
+            let result = crate::backup::restore_backup(&vault_path, &backup_dir, &backup_path);
             state.importing.store(false, Ordering::Release);
             result
         };
@@ -4091,141 +4089,6 @@ mod vault_identity_tests {
     }
 }
 
-fn sync_config_from(config: &AppConfig) -> Result<crate::sync::WebdavConfig, String> {
-    let v = active_vault_config(config)?;
-    if v.sync_provider.as_deref() != Some("webdav") {
-        return Err("Sync is not configured".to_string());
-    }
-    let url = v
-        .webdav_url
-        .clone()
-        .filter(|u| !u.trim().is_empty())
-        .ok_or("WebDAV URL is not set")?;
-    Ok(crate::sync::WebdavConfig {
-        url,
-        username: v.webdav_username.clone().unwrap_or_default(),
-        password: v.webdav_password.clone().unwrap_or_default(),
-    })
-}
-
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-pub fn set_sync_settings(
-    state: State<'_, AppState>,
-    provider: Option<String>,
-    url: Option<String>,
-    username: Option<String>,
-    password: Option<String>,
-    sync_on_open: bool,
-    sync_on_change: bool,
-    sync_interval_minutes: u32,
-) -> Result<(), String> {
-    let mut config = state.config.lock().map_err(|e| e.to_string())?;
-    let active_index = active_vault_index(&config)?;
-    let v = &mut config.vaults[active_index];
-    v.sync_provider = provider.filter(|p| !p.is_empty());
-    v.webdav_url = url.filter(|u| !u.trim().is_empty());
-    v.webdav_username = username.filter(|u| !u.is_empty());
-    v.webdav_password = password.filter(|p| !p.is_empty());
-    v.sync_on_open = sync_on_open;
-    v.sync_on_change = sync_on_change;
-    v.sync_interval_minutes = sync_interval_minutes;
-    save_app_config(&config)?;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn test_sync_connection(app: AppHandle) -> Result<(), String> {
-    let cfg = {
-        let state = app.state::<AppState>();
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        sync_config_from(&config)?
-    };
-    std::thread::spawn(move || {
-        use tauri::Emitter;
-        match crate::sync::test_connection(cfg) {
-            Ok(msg) => {
-                let _ = app.emit(
-                    "sync-test-result",
-                    serde_json::json!({ "success": true, "message": msg }),
-                );
-            }
-            Err(e) => {
-                let _ = app.emit(
-                    "sync-test-result",
-                    serde_json::json!({ "success": false, "error": e }),
-                );
-            }
-        }
-    });
-    Ok(())
-}
-
-#[tauri::command]
-pub fn sync_now(app: AppHandle) -> Result<(), String> {
-    use std::sync::atomic::Ordering;
-    // Guard against overlapping syncs (manual button + interval + on-change can collide).
-    if app.state::<AppState>().syncing.swap(true, Ordering::SeqCst) {
-        return Ok(()); // a sync is already running
-    }
-    let (vault, bookmark_id, cfg) = {
-        let state = app.state::<AppState>();
-        let config = match state.config.lock() {
-            Ok(c) => c,
-            Err(e) => {
-                state.syncing.store(false, Ordering::SeqCst);
-                return Err(e.to_string());
-            }
-        };
-        let gathered = config
-            .active_vault
-            .clone()
-            .ok_or_else(|| "No active vault".to_string())
-            .and_then(|vault| {
-                sync_config_from(&config).map(|cfg| (vault, config.active_bookmark_id.clone(), cfg))
-            });
-        match gathered {
-            Ok(vault_config) => vault_config,
-            Err(e) => {
-                drop(config);
-                state.syncing.store(false, Ordering::SeqCst);
-                return Err(e);
-            }
-        }
-    };
-    std::thread::spawn(move || {
-        use tauri::Emitter;
-        let result = crate::sync::run_sync(app.clone(), vault.clone(), cfg);
-        app.state::<AppState>()
-            .syncing
-            .store(false, Ordering::SeqCst);
-        match result {
-            Ok(summary) => {
-                let ts = chrono::Utc::now().to_rfc3339();
-                if let Ok(mut config) = app.state::<AppState>().config.lock() {
-                    if let Some(vault_config) = config.vaults.iter_mut().find(|candidate| {
-                        vault_matches_identity(candidate, &vault, bookmark_id.as_deref())
-                    }) {
-                        vault_config.last_sync_time = Some(ts.clone());
-                    }
-                    let _ = save_app_config(&config);
-                }
-                let _ = app.emit(
-                    "sync-done",
-                    serde_json::json!({ "vault_path": vault, "bookmark_id": bookmark_id, "success": true, "summary": summary, "last_sync_time": ts }),
-                );
-            }
-            Err(e) => {
-                let _ = app.emit(
-                    "sync-error",
-                    serde_json::json!({ "vault_path": vault, "success": false, "error": e }),
-                );
-            }
-        }
-    });
-    Ok(())
-}
-
 #[tauri::command]
 pub fn ai_ask(
     app: AppHandle,
@@ -4337,9 +4200,8 @@ pub fn load_app_config() -> AppConfig {
         .ok()
         .map(|path| read_app_config(&path))
         .unwrap_or_default();
-    let migrated_sync = migrate_global_sync_to_vault(&mut config);
     let migrated_font = adopt_font_size_as_preference(&mut config);
-    if migrated_sync || migrated_font {
+    if migrated_font {
         let _ = save_app_config(&config);
     }
     config
@@ -4403,38 +4265,8 @@ fn adopt_font_size_as_preference(config: &mut AppConfig) -> bool {
     true
 }
 
-// One-time migration: WebDAV sync moved from global AppConfig to per-vault VaultConfig.
-// The old global settings go to the active vault if it has none yet, and are then cleared. Left in
-// place, they were copied again at every start into whichever vault was active and had sync
-// disabled, undoing "Disabled" and pointing a second vault at the first one's remote folder.
-fn migrate_global_sync_to_vault(config: &mut AppConfig) -> bool {
-    if config.sync_provider.is_none() && config.webdav_url.is_none() {
-        return false;
-    }
-    let Ok(active_index) = active_vault_index(config) else {
-        return false;
-    };
-    let g_provider = config.sync_provider.take();
-    let g_url = config.webdav_url.take();
-    let g_user = config.webdav_username.take();
-    let g_pass = config.webdav_password.take();
-    let g_on_open = std::mem::take(&mut config.sync_on_open);
-    let g_on_change = std::mem::take(&mut config.sync_on_change);
-    let g_interval = std::mem::take(&mut config.sync_interval_minutes);
-    let g_last = config.last_sync_time.take();
-    let v = &mut config.vaults[active_index];
-    if v.sync_provider.is_none() && v.webdav_url.is_none() {
-        v.sync_provider = g_provider;
-        v.webdav_url = g_url;
-        v.webdav_username = g_user;
-        v.webdav_password = g_pass;
-        v.sync_on_open = g_on_open;
-        v.sync_on_change = g_on_change;
-        v.sync_interval_minutes = g_interval;
-        v.last_sync_time = g_last;
-    }
-    true
-}
+// One-time migration: WebDAV sync fields were removed from config in the Canari
+// fork; nothing to migrate anymore.
 
 /// Writes an owner-only file by replacing it in one step: the data goes to a temporary file in the
 /// same folder, is flushed to disk and then renamed over the target. A crash or a full disk during
@@ -4580,16 +4412,12 @@ mod config_resilience_tests {
     fn missing_keys_and_damaged_entries_do_not_blank_the_configuration() {
         // No `theme`, a custom theme without its colors, a vault without a path, a toolbar of the wrong shape.
         let (folder, config) = config_from(
-            r##"{"vaults":[{"path":"/notes","name":"Notes","webdav_url":"https://dav.example/x"},{"name":"broken"}],
+            r##"{"vaults":[{"path":"/notes","name":"Notes"},{"name":"broken"}],
                 "active_vault":"/notes","font_size":18,"toolbar_layout":"oops",
                 "custom_themes":[{"id":"a","name":"A","is_dark":true},
                   {"id":"b","name":"B","is_dark":false,"colors":{"bg_primary":"#fff","bg_secondary":"#fff","bg_tertiary":"#fff","bg_hover":"#fff","bg_active":"#fff","bg_editor":"#fff","text_primary":"#000","text_secondary":"#000","border_color":"#000"}}]}"##,
         );
         assert_eq!(config.vaults.len(), 1);
-        assert_eq!(
-            config.vaults[0].webdav_url.as_deref(),
-            Some("https://dav.example/x")
-        );
         assert_eq!(config.active_vault.as_deref(), Some("/notes"));
         assert_eq!(config.font_size, Some(18));
         assert_eq!(config.theme, AppConfig::default().theme);
@@ -4638,56 +4466,6 @@ mod config_resilience_tests {
 
     fn vault(path: &str) -> crate::types::VaultConfig {
         serde_json::from_value(serde_json::json!({ "path": path, "name": path })).unwrap()
-    }
-
-    #[test]
-    fn global_sync_settings_move_to_the_active_vault_once() {
-        let mut config = AppConfig {
-            vaults: vec![vault("/a"), vault("/b")],
-            active_vault: Some("/a".into()),
-            sync_provider: Some("webdav".into()),
-            webdav_url: Some("https://dav.example/a".into()),
-            webdav_username: Some("me".into()),
-            webdav_password: Some("secret".into()),
-            sync_on_open: true,
-            ..AppConfig::default()
-        };
-        assert!(migrate_global_sync_to_vault(&mut config));
-        assert_eq!(
-            config.vaults[0].webdav_url.as_deref(),
-            Some("https://dav.example/a")
-        );
-        assert!(config.vaults[0].sync_on_open);
-        // The global copy is gone, so nothing is left to hand out again.
-        assert!(config.sync_provider.is_none() && config.webdav_url.is_none());
-        assert!(config.webdav_username.is_none() && config.webdav_password.is_none());
-        assert!(!config.sync_on_open);
-
-        // Disabling sync on that vault stays disabled, and another vault inherits nothing.
-        config.vaults[0].sync_provider = None;
-        config.vaults[0].webdav_url = None;
-        config.active_vault = Some("/b".into());
-        assert!(!migrate_global_sync_to_vault(&mut config));
-        assert!(config.vaults[0].webdav_url.is_none());
-        assert!(config.vaults[1].webdav_url.is_none());
-    }
-
-    #[test]
-    fn a_vault_with_its_own_sync_settings_keeps_them_and_the_global_copy_is_cleared() {
-        let mut own = vault("/a");
-        own.webdav_url = Some("https://dav.example/own".into());
-        let mut config = AppConfig {
-            vaults: vec![own],
-            active_vault: Some("/a".into()),
-            webdav_url: Some("https://dav.example/old".into()),
-            ..AppConfig::default()
-        };
-        assert!(migrate_global_sync_to_vault(&mut config));
-        assert_eq!(
-            config.vaults[0].webdav_url.as_deref(),
-            Some("https://dav.example/own")
-        );
-        assert!(config.webdav_url.is_none());
     }
 }
 
@@ -5329,19 +5107,6 @@ mod mutation_order_tests {
                 .unwrap(),
             0
         );
-
-        state
-            .syncing
-            .store(true, std::sync::atomic::Ordering::Release);
-        assert!(find_orphaned_attachments(app.state(), path.clone())
-            .await
-            .is_err());
-        assert!(trash_orphaned_attachments(app.state(), path, Vec::new())
-            .await
-            .is_err());
-        state
-            .syncing
-            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     #[tokio::test]

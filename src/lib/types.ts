@@ -55,15 +55,6 @@ export interface VaultConfig {
   path: string;
   name: string;
   bookmark_id?: string | null;
-  // Per-vault WebDAV sync (moved off the global AppConfig).
-  sync_provider?: string | null;
-  webdav_url?: string | null;
-  webdav_username?: string | null;
-  webdav_password?: string | null;
-  sync_on_open?: boolean;
-  sync_on_change?: boolean;
-  sync_interval_minutes?: number;
-  last_sync_time?: string | null;
   last_backup_time?: string | null;
 }
 
@@ -161,14 +152,6 @@ export interface AppConfig {
   enable_wiki_links: boolean;
   startup_view: StartupView;
   restore_last_session: boolean;
-  sync_provider: string | null;
-  webdav_url: string | null;
-  webdav_username: string | null;
-  webdav_password: string | null;
-  sync_on_open: boolean;
-  sync_on_change: boolean;
-  sync_interval_minutes: number;
-  last_sync_time: string | null;
   custom_themes: CustomTheme[];
 }
 

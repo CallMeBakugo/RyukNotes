@@ -43,7 +43,6 @@ pub struct AppState {
     pub vault_maintenance: Arc<tokio::sync::Mutex<()>>,
     pub note_save: Arc<tokio::sync::Mutex<()>>,
     pub importing: AtomicBool,
-    pub syncing: AtomicBool,
     #[cfg(desktop)]
     pub quitting: AtomicBool,
     pending_open_files: Mutex<PendingOpenFiles>,
@@ -238,7 +237,6 @@ impl AppState {
             vault_maintenance: Arc::new(tokio::sync::Mutex::new(())),
             note_save: Arc::new(tokio::sync::Mutex::new(())),
             importing: AtomicBool::new(false),
-            syncing: AtomicBool::new(false),
             #[cfg(desktop)]
             quitting: AtomicBool::new(false),
             pending_open_files: Mutex::new(PendingOpenFiles::default()),

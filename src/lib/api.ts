@@ -543,28 +543,6 @@ export async function setTaskDue(
   return invoke("set_task_due", { vaultPath, notePath, line, rawLine, due });
 }
 
-// ── Sync (WebDAV) ──
-
-export async function setSyncSettings(
-  provider: string | null,
-  url: string | null,
-  username: string | null,
-  password: string | null,
-  syncOnOpen: boolean,
-  syncOnChange: boolean,
-  syncIntervalMinutes: number,
-): Promise<void> {
-  return invoke("set_sync_settings", { provider, url, username, password, syncOnOpen, syncOnChange, syncIntervalMinutes });
-}
-
-export async function testSyncConnection(): Promise<void> {
-  return invoke("test_sync_connection");
-}
-
-export async function syncNow(): Promise<void> {
-  return invoke("sync_now");
-}
-
 // ── Version History ──
 
 export async function getNoteVersions(vaultPath: string, noteId: string): Promise<VersionEntry[]> {

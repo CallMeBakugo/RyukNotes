@@ -87,23 +87,6 @@ pub struct VaultConfig {
     pub name: String,
     #[serde(default)]
     pub bookmark_id: Option<String>,
-    // Per-vault WebDAV sync (was previously global on AppConfig; those fields are kept deprecated for migration).
-    #[serde(default)]
-    pub sync_provider: Option<String>,
-    #[serde(default)]
-    pub webdav_url: Option<String>,
-    #[serde(default)]
-    pub webdav_username: Option<String>,
-    #[serde(default)]
-    pub webdav_password: Option<String>,
-    #[serde(default)]
-    pub sync_on_open: bool,
-    #[serde(default)]
-    pub sync_on_change: bool,
-    #[serde(default)]
-    pub sync_interval_minutes: u32,
-    #[serde(default)]
-    pub last_sync_time: Option<String>,
     #[serde(default)]
     pub last_backup_time: Option<String>,
 }
@@ -289,23 +272,6 @@ pub struct AppConfig {
     pub startup_view: StartupView,
     #[serde(default)]
     pub restore_last_session: bool,
-    // DEPRECATED: WebDAV sync moved to per-vault VaultConfig. Kept for one release to migrate old configs.
-    #[serde(default)]
-    pub sync_provider: Option<String>,
-    #[serde(default)]
-    pub webdav_url: Option<String>,
-    #[serde(default)]
-    pub webdav_username: Option<String>,
-    #[serde(default)]
-    pub webdav_password: Option<String>,
-    #[serde(default)]
-    pub sync_on_open: bool,
-    #[serde(default)]
-    pub sync_on_change: bool,
-    #[serde(default)]
-    pub sync_interval_minutes: u32,
-    #[serde(default)]
-    pub last_sync_time: Option<String>,
     #[serde(default, deserialize_with = "lenient_list")]
     pub custom_themes: Vec<CustomTheme>,
 }
@@ -417,14 +383,6 @@ impl Default for AppConfig {
             enable_wiki_links: true,
             startup_view: StartupView::All,
             restore_last_session: false,
-            sync_provider: None,
-            webdav_url: None,
-            webdav_username: None,
-            webdav_password: None,
-            sync_on_open: false,
-            sync_on_change: false,
-            sync_interval_minutes: 0,
-            last_sync_time: None,
             custom_themes: Vec::new(),
         }
     }
