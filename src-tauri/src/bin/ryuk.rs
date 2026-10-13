@@ -54,7 +54,9 @@ USAGE:
   ryuk [--vault PATH] notes trash <id> | restore <id>
   ryuk [--vault PATH] session import --file <summary.json>
   ryuk [--vault PATH] session restore <session-id>
-  ryuk [--vault PATH] session start --notes <id> [<id> ...] [--prompt <text>]
+  ryuk [--vault PATH] session start --notes <id> [--prompt <text>]   (resumes linked session if any)
+  ryuk [--vault PATH] session resume-for-note <note-id>
+  ryuk [--vault PATH] session list-links
 
 Vault resolution: --vault, then RYUK_VAULT, then ~/Notes/ryuknotes.rn."
     );
@@ -97,6 +99,8 @@ fn main() {
         ("session", Some("import")) => session_import(&vault_flag, tail),
         ("session", Some("restore")) => session_restore(&vault_flag, tail),
         ("session", Some("start")) => session_start(&vault_flag, tail),
+        ("session", Some("resume-for-note")) => session_resume_for_note(&vault_flag, tail),
+        ("session", Some("list-links")) => session_list_links(&vault_flag),
         _ => usage(),
     };
     if let Err(e) = result {
@@ -327,36 +331,116 @@ fn session_start(vault_flag: &Option<String>, tail: &[String]) -> Result<(), Str
     if ids.is_empty() {
         return Err("session start --notes <id> [<id> ...]".into());
     }
-    let db = open_vault(vault_flag.as_deref())?;
-    let mut context = String::new();
-    for id in &ids {
-        let Some(note) = db.get_note_full(id)? else {
-            return Err(format!("no note with id {id}"));
-        };
-        context.push_str(&format!(
-            "# {}\n\n{}\n\n---\n\n",
-            note["title"].as_str().unwrap_or(""),
-            note["content"].as_str().unwrap_or("")
-        ));
+    if ids.len() > 1 {
+        return Err("session start takes one note; the note is the session's home".into());
     }
-    let context_dir = std::env::temp_dir().join("ryuk-sessions");
+    let note_id = ids[0].clone();
+    let db = open_vault(vault_flag.as_deref())?;
+
+    // Linked session? Resume it — the note IS the session's home.
+    if let Some(session_id) = db.get_session_link(&note_id)? {
+        println!("resuming linked session {session_id}");
+        let status = Command::new("hermes")
+            .arg("--resume")
+            .arg(&session_id)
+            .status()
+            .map_err(|e| format!("launching hermes: {e}"))?;
+        std::process::exit(status.code().unwrap_or(0));
+    }
+
+    // New session: hermes runs inside a per-note workspace so the session can
+    // be found again by workspace (hermes --pass-session-id puts the id in
+    // the agent's prompt; sessions list --workspace finds it regardless).
+    let Some(note) = db.get_note_full(&note_id)? else {
+        return Err(format!("no note with id {note_id}"));
+    };
+    let title = String::from(note["title"].as_str().unwrap_or(""));
+    let content = String::from(note["content"].as_str().unwrap_or(""));
+    let context_dir = std::env::temp_dir().join("ryuk-sessions").join(&note_id);
     std::fs::create_dir_all(&context_dir).map_err(|e| e.to_string())?;
-    let context_file = context_dir.join(format!("{}.md", uuid::Uuid::new_v4()));
-    std::fs::write(&context_file, &context).map_err(|e| e.to_string())?;
+    let context_file = context_dir.join("context.md");
+    std::fs::write(
+        &context_file,
+        format!("# {title}\n\n{content}\n\n---\n\n*(This file grounds the session in a Ryuk's Notebook note titled \"{title}\". The note id is {note_id}.)*\n"),
+    )
+    .map_err(|e| e.to_string())?;
     println!("context: {}", context_file.display());
 
+    let before = newest_session_in_workspace(&note_id);
     let mut cmd = Command::new("hermes");
     cmd.arg("--in").arg(context_dir.to_string_lossy().as_ref());
+    cmd.arg("--pass-session-id");
     if let Some(p) = prompt {
         cmd.arg("-z").arg(p);
     } else {
         cmd.arg("chat");
     }
     let status = cmd
+        .env("HERMES_CONTEXT_NOTE", &note_id)
+        .env("HERMES_CONTEXT_NOTE_TITLE", &title)
         .status()
         .map_err(|e| format!("launching hermes: {e}"))?;
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+    let exit = status.code().unwrap_or(1);
+
+    // Record the linkage: the newest session in this note's workspace that
+    // did not exist before we launched (before=None means a brand-new home).
+    if let Some(after) = newest_session_in_workspace(&note_id) {
+        if Some(&after) != before.as_ref() {
+            db.set_session_link(&note_id, &after)?;
+            println!("session linked: {note_id} -> {after}");
+        }
+    }
+    std::process::exit(exit);
+}
+
+/// Newest hermes session id for a workspace needle, via `hermes sessions
+/// list --workspace <needle> --limit 1`. None when the listing is empty or
+/// the command fails (record-link then simply doesn't happen).
+fn newest_session_in_workspace(needle: &str) -> Option<String> {
+    let out = Command::new("hermes")
+        .args(["sessions", "list", "--workspace", needle, "--limit", "1"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let line = text.lines().rev().find(|l| {
+        // session ids look like 20261013_185649_b600fe
+        l.contains('_') && l.split_whitespace().last().map(|w| w.chars().filter(|c| *c == '_').count() == 2).unwrap_or(false)
+    })?;
+    line.split_whitespace().last().map(String::from)
+}
+
+fn session_resume_for_note(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String> {
+    let note_id = positional(tail, &[]).first().cloned().ok_or("session resume-for-note <note-id>")?;
+    let db = open_vault(vault_flag.as_deref())?;
+    let session_id = db
+        .get_session_link(&note_id)?
+        .ok_or_else(|| format!("note {note_id} has no linked session yet"))?;
+    let status = Command::new("hermes")
+        .arg("--resume")
+        .arg(&session_id)
+        .status()
+        .map_err(|e| format!("launching hermes: {e}"))?;
+    std::process::exit(status.code().unwrap_or(0));
+}
+
+fn session_list_links(vault_flag: &Option<String>) -> Result<(), String> {
+    let db = open_vault(vault_flag.as_deref())?;
+    let mut stmt = db
+        .conn
+        .prepare("SELECT l.note_id, n.title, l.session_id FROM session_links l JOIN notes n ON n.id = l.note_id ORDER BY l.created")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let (note_id, title, session_id) = row.map_err(|e| e.to_string())?;
+        println!("{note_id}  {title}  ->  {session_id}");
     }
     Ok(())
 }

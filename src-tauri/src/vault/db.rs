@@ -74,6 +74,13 @@ CREATE INDEX IF NOT EXISTS idx_versions_note ON versions(note_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
     title, content, content='', contentless_delete=1, tokenize='unicode61'
 );
+
+CREATE TABLE IF NOT EXISTS session_links (
+    note_id    TEXT PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    created    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_links_session ON session_links(session_id);
 "#;
 
 pub struct VaultDb {
@@ -173,6 +180,30 @@ impl VaultDb {
     pub fn set_state(&self, key: &str, value: &serde_json::Value) -> Result<(), String> {
         let text = serde_json::to_string(value).map_err(|e| e.to_string())?;
         self.set_meta(key, &text)
+    }
+
+    /// Note -> hermes session linkage ("the session symlink"). One live
+    /// session per note; starting over replaces the link.
+    pub fn get_session_link(&self, note_id: &str) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT session_id FROM session_links WHERE note_id = ?1",
+                params![note_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn set_session_link(&self, note_id: &str, session_id: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO session_links(note_id, session_id, created) VALUES(?1, ?2, ?3)
+                 ON CONFLICT(note_id) DO UPDATE SET session_id = excluded.session_id, created = excluded.created",
+                params![note_id, session_id, chrono::Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// Inserts a note (or replaces it wholesale by id) and refreshes its tags
