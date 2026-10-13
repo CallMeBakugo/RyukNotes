@@ -529,13 +529,9 @@
 		{ name: 'System', value: 'system', stack: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif' },
 		{ name: 'Inter', value: 'inter', stack: '"Inter", -apple-system, BlinkMacSystemFont, sans-serif' },
 		{ name: 'Georgia', value: 'georgia', stack: 'Georgia, "Times New Roman", serif' },
-		{ name: 'Merriweather', value: 'merriweather', stack: '"Merriweather", Georgia, serif' },
-		{ name: 'Lora', value: 'lora', stack: '"Lora", Georgia, serif' },
 		{ name: 'Open Sans', value: 'opensans', stack: '"Open Sans", -apple-system, sans-serif' },
 		{ name: 'Literata', value: 'literata', stack: '"Literata", Georgia, serif' },
 		{ name: 'Mono', value: 'mono', stack: '"JetBrains Mono", "Fira Code", "Cascadia Code", monospace' },
-		{ name: 'Ubuntu', value: 'ubuntu', stack: '"Ubuntu", -apple-system, sans-serif' },
-		{ name: 'Ubuntu Mono', value: 'ubuntu-mono', stack: '"Ubuntu Mono", monospace' },
 	];
 
 	const lineHeightPresets = [
