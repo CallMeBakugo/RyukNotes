@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import '../app.css';
-	import { resolvedTheme, appConfig, activeNotePath, installType, platformIsMobile, checkForUpdate, checkForUpdateMobile, isManagedInstall, customThemes } from '$lib/stores/app';
+	import { resolvedTheme, appConfig, activeNotePath, installType, platformIsMobile, checkForUpdate, isManagedInstall, customThemes } from '$lib/stores/app';
 	import { openFile, openUrl, getInstallType, isMobilePlatform } from '$lib/api';
 	import { get } from 'svelte/store';
 	import { darkThemes, isMobile, isAndroid } from '$lib/platform';

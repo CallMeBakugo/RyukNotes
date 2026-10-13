@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { showSettings, theme, resolvedTheme, appConfig, platformIsMobile, activeVaultConfig, updateAvailable as globalUpdateAvailable, updateObj as globalUpdateObj, installType, settingsTab, vaultReady, androidApkUrl, checkForUpdateMobile, notebookSortMode, isManagedInstall, customThemes } from '$lib/stores/app';
+	import { showSettings, theme, resolvedTheme, appConfig, platformIsMobile, activeVaultConfig, updateAvailable as globalUpdateAvailable, updateObj as globalUpdateObj, installType, settingsTab, vaultReady, notebookSortMode, isManagedInstall, customThemes } from '$lib/stores/app';
 	import { setTheme, setSystemThemes, setAccentColor, setFontSize, setScrollToChangeFontSize, setFontFamily, setLineHeight, setUiScale, setContentWidth, setGeneralSettings, importObsidian, createBackup, listBackups, restoreBackup, deleteBackup, setBackupSettings, setAiSettings, testAiConnection, saveCustomTheme, deleteCustomTheme, exportCustomTheme, importCustomThemes, getVaultStats, findOrphanedAttachments, trashOrphanedAttachments } from '$lib/api';
 	import { darkThemes, isMobile, isAndroid } from '$lib/platform';
 	import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
@@ -58,37 +58,26 @@
 	});
 
 	async function handleCheckUpdate() {
-		updateChecking = true;
-		updateMessage = null;
-		updateAvailable = null;
-		try {
-			if (isMobile) {
-				await checkForUpdateMobile();
-				const global = $globalUpdateAvailable;
-				if (global) {
-					updateAvailable = { version: global.version, body: global.body };
-					updateMessage = { type: 'info', text: `Version ${global.version} is available!` };
-				} else {
-					updateMessage = { type: 'success', text: 'You are on the latest version.' };
-				}
-			} else {
-				const { check: checkUpdate } = await import('@tauri-apps/plugin-updater');
-				const update = await checkUpdate();
-				if (update) {
-					updateObj = update;
-					$globalUpdateObj = update;
-					updateAvailable = { version: update.version, body: update.body, date: update.date };
-					globalUpdateAvailable.set({ version: update.version, body: update.body });
-					updateMessage = { type: 'info', text: `Version ${update.version} is available!` };
-				} else {
-					updateMessage = { type: 'success', text: 'You are on the latest version.' };
-				}
-			}
-		} catch (e) {
-			updateMessage = { type: 'error', text: `Failed to check: ${e}` };
-		} finally {
-			updateChecking = false;
+	updateChecking = true;
+	updateMessage = null;
+	updateAvailable = null;
+	try {
+		const { check: checkUpdate } = await import('@tauri-apps/plugin-updater');
+		const update = await checkUpdate();
+		if (update) {
+			updateObj = update;
+			$globalUpdateObj = update;
+			updateAvailable = { version: update.version, body: update.body, date: update.date };
+			globalUpdateAvailable.set({ version: update.version, body: update.body });
+			updateMessage = { type: 'info', text: `Version ${update.version} is available!` };
+		} else {
+			updateMessage = { type: 'success', text: 'You are on the latest version.' };
 		}
+	} catch (e) {
+		updateMessage = { type: 'error', text: `Failed to check: ${e}` };
+	} finally {
+		updateChecking = false;
+	}
 	}
 
 	async function handleDownloadAndInstall() {

@@ -1,8 +1,0 @@
-<resources xmlns:tools="http://schemas.android.com/tools">
-    <!-- Base application theme (dark mode). -->
-    <style name="Theme.helixnotes" parent="Theme.MaterialComponents.DayNight.NoActionBar">
-        <item name="android:windowBackground">#1a1b26</item>
-        <item name="android:navigationBarColor">#1a1b26</item>
-        <item name="android:statusBarColor">#1a1b26</item>
-    </style>
-</resources>
