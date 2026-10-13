@@ -143,7 +143,7 @@
 							<line x1="29" y1="18" x2="19" y2="30" stroke="white" stroke-width="2" stroke-linecap="round" opacity="0.7" />
 						</svg>
 					</div>
-					<h3 class="app-name">RyukNotes</h3>
+					<h3 class="app-name">Ryuk's Notebook</h3>
 					<p class="app-version">v{appVersion}</p>
 					<p class="app-description">A local markdown note-taking app.</p>
 

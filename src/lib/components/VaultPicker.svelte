@@ -222,7 +222,7 @@
 				<line x1="29" y1="18" x2="19" y2="30" stroke="white" stroke-width="2" stroke-linecap="round" opacity="0.7" />
 			</svg>
 		</div>
-		<h1>RyukNotes</h1>
+		<h1>Ryuk's Notebook</h1>
 		<p class="subtitle">Local markdown notes</p>
 		{#if isMobile}
 			{#if isIOS}

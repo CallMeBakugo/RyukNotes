@@ -81,7 +81,7 @@
 			<line x1="19" y1="18" x2="29" y2="30" stroke="white" stroke-width="2" stroke-linecap="round" opacity="0.7" />
 			<line x1="29" y1="18" x2="19" y2="30" stroke="white" stroke-width="2" stroke-linecap="round" opacity="0.7" />
 		</svg>
-		<span class="titlebar-title">RyukNotes</span>
+		<span class="titlebar-title">Ryuk's Notebook</span>
 		{#if $updateAvailable}
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 		<button class="update-badge" onmousedown={(e) => e.stopPropagation()} onclick={() => { $settingsTab = 'updates'; $showSettings = true; }}>

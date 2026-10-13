@@ -1,10 +1,10 @@
-# RyukNotes
+# Ryuk's Notebook
 
 A local-first notes app with the agent built in.
 
-RyukNotes is a fork of [HelixNotes](https://gitlab.com/ArkHost/HelixNotes)
-(AGPL-3.0), rebuilt around a single SQLite vault and a companion CLI for
-AI-agent workflows.
+Ryuk's Notebook (the app, binary, and repo are named RyukNotes) is a fork of
+[HelixNotes](https://gitlab.com/ArkHost/HelixNotes) (AGPL-3.0), rebuilt around
+a single SQLite vault and a companion CLI for AI-agent workflows.
 
 **Status: this is a new project.** It works, but expect rough edges —
 bugs are being worked out over the next few weeks.
