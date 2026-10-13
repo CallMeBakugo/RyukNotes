@@ -247,10 +247,13 @@ mod real_vault_tests {
     fn real_vault_dry_run() {
         let vault = std::env::var("RYUK_REAL_VAULT").expect("set RYUK_REAL_VAULT");
         // RYUK_REAL_DB_OUT (optional): also materialize the vault as a .rn file.
+        // RYUK_REAL_DB_UPSERT=1 with an existing OUT file imports INTO it
+        // (upserts) instead of rebuilding — preserves DB-only notes.
         let db = match std::env::var("RYUK_REAL_DB_OUT") {
             Ok(out) => {
                 let path = std::path::PathBuf::from(&out);
-                if path.exists() {
+                let upsert = std::env::var("RYUK_REAL_DB_UPSERT").as_deref() == Ok("1");
+                if path.exists() && !upsert {
                     std::fs::remove_file(&path).unwrap();
                 }
                 VaultDb::open(&path).unwrap()
