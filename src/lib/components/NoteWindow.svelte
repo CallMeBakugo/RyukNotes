@@ -51,7 +51,7 @@
 	});
 	$effect(() => {
 		const title = $activeNote?.meta.title;
-		if (title && !disposed) void appWindow.setTitle(`${title} - HelixNotes`);
+		if (title && !disposed) void appWindow.setTitle(`${title} - RyukNotes`);
 	});
 
 

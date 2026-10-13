@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn rejects_history_path_traversal() {
         let vault =
-            std::env::temp_dir().join(format!("helixnotes-history-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("ryuknotes-history-test-{}", Uuid::new_v4()));
         let metadata = vault.join(".helixnotes");
         let escaped_history = metadata.join("escaped");
         fs::create_dir_all(&escaped_history).unwrap();

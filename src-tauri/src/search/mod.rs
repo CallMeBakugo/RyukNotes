@@ -1,6 +1,6 @@
 use crate::types::{SearchMatch, SearchPage, SearchResult, SearchTarget, SearchTargetField};
 use crate::vault::frontmatter;
-use crate::vault::operations::helixnotes_dir;
+use crate::vault::operations::ryuknotes_dir;
 use parking_lot::{Condvar, Mutex};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -41,7 +41,7 @@ fn vault_index_base(vault_path: &str) -> Option<std::path::PathBuf> {
         .iter()
         .map(|b| format!("{:02x}", b))
         .collect();
-    dirs::data_local_dir().map(|d| d.join("helixnotes").join("search").join(key))
+    dirs::data_local_dir().map(|d| d.join("ryuknotes").join("search").join(key))
 }
 
 /// True for characters in the CJK / Japanese / Korean blocks, which are written
@@ -448,12 +448,12 @@ impl SearchIndex {
         #[cfg(desktop)]
         let index = {
             let base = vault_index_base(vault_path)
-                .unwrap_or_else(|| helixnotes_dir(vault_path).join("search_index"));
+                .unwrap_or_else(|| ryuknotes_dir(vault_path).join("search_index"));
             let index_dir = base.join("index");
             let version_path = base.join("version");
 
             // Remove the old in-vault index so it stops syncing.
-            let hn = helixnotes_dir(vault_path);
+            let hn = ryuknotes_dir(vault_path);
             let _ = fs::remove_dir_all(hn.join("search_index"));
             let _ = fs::remove_file(hn.join("search_index.version"));
 
@@ -989,7 +989,7 @@ mod tests {
     impl TestVault {
         fn new() -> Self {
             let path =
-                std::env::temp_dir().join(format!("helixnotes-search-{}", uuid::Uuid::new_v4()));
+                std::env::temp_dir().join(format!("ryuknotes-search-{}", uuid::Uuid::new_v4()));
             fs::create_dir_all(&path).unwrap();
             Self(path)
         }

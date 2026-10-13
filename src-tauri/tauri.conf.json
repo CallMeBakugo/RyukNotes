@@ -1,8 +1,8 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "HelixNotes",
+  "productName": "RyukNotes",
   "version": "1.3.6",
-  "identifier": "com.helixnotes.app",
+  "identifier": "com.callmebakugo.ryuknotes",
   "build": {
     "frontendDist": "../build",
     "devUrl": "http://localhost:5173",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "HelixNotes",
+        "title": "RyukNotes",
         "label": "main",
         "width": 1200,
         "height": 800,
@@ -35,12 +35,7 @@
       }
     }
   },
-  "plugins": {
-    "updater": {
-      "endpoints": ["https://helixnotes.com/latest.json"],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFEODY0N0JDRjFEOTVGQTEKUldTaFg5bnh2RWVHclFEcW4wdjB2cWg0TWZNRkRxZThMYnZEV0pKV09YK1ZxcHBYOUJwT1pGT3UK"
-    }
-  },
+  "plugins": {},
   "bundle": {
     "active": true,
     "targets": "all",

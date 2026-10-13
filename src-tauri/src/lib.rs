@@ -390,17 +390,17 @@ pub fn run() {
 
 #[cfg(desktop)]
 fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let show = MenuItemBuilder::with_id("show", "Show HelixNotes").build(app)?;
+    let show = MenuItemBuilder::with_id("show", "Show RyukNotes").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
     let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
 
-    let _tray = TrayIconBuilder::with_id("helixnotes")
+    let _tray = TrayIconBuilder::with_id("ryuknotes")
         .icon(
             Image::from_path("icons/32x32.png")
                 .unwrap_or_else(|_| app.default_window_icon().cloned().unwrap()),
         )
         .menu(&menu)
-        .tooltip("HelixNotes")
+        .tooltip("RyukNotes")
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => {
                 if let Some(window) = app.get_webview_window("main") {

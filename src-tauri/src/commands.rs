@@ -491,7 +491,7 @@ pub fn complete_window_close<R: Runtime>(
 ) -> Result<(), String> {
     if state.should_hide_to_tray(
         window.label(),
-        window.app_handle().tray_by_id("helixnotes").is_some(),
+        window.app_handle().tray_by_id("ryuknotes").is_some(),
     )? {
         return window.hide().map_err(|error| error.to_string());
     }
@@ -1095,7 +1095,7 @@ fn scan_all_note_titles(vault_path: &str) -> Result<Vec<NoteTitleEntry>, String>
     use rayon::prelude::*;
 
     let vault = std::path::Path::new(vault_path);
-    let hn_dir = operations::helixnotes_dir(vault_path);
+    let hn_dir = operations::ryuknotes_dir(vault_path);
 
     let paths: Vec<PathBuf> = walkdir::WalkDir::new(vault)
         .into_iter()
@@ -1220,7 +1220,7 @@ fn scan_graph_data(vault_path: &str) -> Result<crate::types::GraphData, String> 
     use std::collections::{HashMap, HashSet};
 
     let vault = std::path::Path::new(vault_path);
-    let hn_dir = operations::helixnotes_dir(vault_path);
+    let hn_dir = operations::ryuknotes_dir(vault_path);
 
     // Collect every note path first. Cross-platform exclusion (string "/.helixnotes/" checks miss
     // Windows backslash paths; is_hidden also covers .stversions/.stfolder/.trash/.git).
@@ -1425,7 +1425,7 @@ fn scan_tasks(vault_path: &str, note_path: Option<&str>) -> Result<Vec<TaskItem>
     }
 
     let vault = Path::new(vault_path);
-    let hn_dir = operations::helixnotes_dir(vault_path);
+    let hn_dir = operations::ryuknotes_dir(vault_path);
     let paths: Vec<PathBuf> = walkdir::WalkDir::new(vault)
         .into_iter()
         .filter_entry(|entry| {
@@ -2795,7 +2795,7 @@ pub struct OrphanAttachment {
 // in each source, first raw and then decoded in place (including URL-encoded paths).
 // When in doubt a file is KEPT: a leftover orphan is harmless, a wrong deletion is not.
 fn scan_orphaned_attachments(vault: &str) -> Result<Vec<(String, u64)>, String> {
-    let attachments_dir = operations::helixnotes_dir(vault).join("attachments");
+    let attachments_dir = operations::ryuknotes_dir(vault).join("attachments");
     let entries = match std::fs::read_dir(&attachments_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -2847,7 +2847,7 @@ fn scan_orphaned_attachments(vault: &str) -> Result<Vec<(String, u64)>, String> 
     }
     // Folder and tag icons live in attachments but are referenced here, not in notes. (#157)
     for mapping in ["notebook_icons.json", "tag_styles.json"] {
-        let mapping_path = operations::helixnotes_dir(vault).join(mapping);
+        let mapping_path = operations::ryuknotes_dir(vault).join(mapping);
         match std::fs::read_to_string(&mapping_path) {
             Ok(content) => {
                 let references = operations::attachment_metadata_references(mapping, &content)
@@ -2924,8 +2924,8 @@ fn trash_orphaned_files(vault: &str, names: &[String]) -> Result<u32, String> {
         .into_iter()
         .map(|(n, _)| n)
         .collect();
-    let attachments_dir = operations::helixnotes_dir(vault).join("attachments");
-    let trash_dir = operations::helixnotes_dir(vault).join("trash");
+    let attachments_dir = operations::ryuknotes_dir(vault).join("attachments");
+    let trash_dir = operations::ryuknotes_dir(vault).join("trash");
     std::fs::create_dir_all(&trash_dir).map_err(|e| e.to_string())?;
     let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S%3f").to_string();
     let mut moved = 0u32;
@@ -2974,7 +2974,7 @@ mod orphan_attachment_tests {
             let root = tempfile::tempdir().unwrap();
             let vault = root.path().to_str().unwrap();
             operations::ensure_vault_structure(vault).unwrap();
-            let storage = operations::helixnotes_dir(vault);
+            let storage = operations::ryuknotes_dir(vault);
             let attachment = storage.join("attachments/keep.png");
             std::fs::write(&attachment, b"preserved").unwrap();
             std::fs::write(storage.join(mapping), content).unwrap();
@@ -2992,7 +2992,7 @@ mod orphan_attachment_tests {
         let root = tempfile::tempdir().unwrap();
         let vault = root.path().to_str().unwrap();
         operations::ensure_vault_structure(vault).unwrap();
-        let storage = operations::helixnotes_dir(vault);
+        let storage = operations::ryuknotes_dir(vault);
         std::fs::write(storage.join("attachments/猫.png"), b"notebook").unwrap();
         std::fs::write(storage.join("attachments/é.png"), b"tag").unwrap();
         std::fs::write(
@@ -3024,7 +3024,7 @@ mod orphan_attachment_tests {
         let root = tempfile::tempdir().unwrap();
         let vault = root.path().to_str().unwrap();
         operations::ensure_vault_structure(vault).unwrap();
-        let attachments = operations::helixnotes_dir(vault).join("attachments");
+        let attachments = operations::ryuknotes_dir(vault).join("attachments");
         for name in [
             "plain.txt",
             "icon.png",
@@ -3053,7 +3053,7 @@ mod orphan_attachment_tests {
         let root = tempfile::tempdir().unwrap();
         let vault = root.path().to_str().unwrap();
         operations::ensure_vault_structure(vault).unwrap();
-        let storage = operations::helixnotes_dir(vault);
+        let storage = operations::ryuknotes_dir(vault);
         let attachments = storage.join("attachments");
         for name in [
             "raw 猫.png",
@@ -3107,7 +3107,7 @@ mod orphan_attachment_tests {
         let root = tempfile::tempdir().unwrap();
         let vault = root.path().to_str().unwrap();
         operations::ensure_vault_structure(vault).unwrap();
-        let storage = operations::helixnotes_dir(vault);
+        let storage = operations::ryuknotes_dir(vault);
         let attachment = storage.join("attachments/keep.png");
         std::fs::write(&attachment, b"image").unwrap();
         std::fs::write(root.path().join("Note.md"), "keep.png").unwrap();
@@ -3122,7 +3122,7 @@ mod orphan_attachment_tests {
         let root = tempfile::tempdir().unwrap();
         let vault = root.path().to_str().unwrap();
         operations::ensure_vault_structure(vault).unwrap();
-        let storage = operations::helixnotes_dir(vault);
+        let storage = operations::ryuknotes_dir(vault);
         let attachments = storage.join("attachments");
         for name in [
             "late.png",
@@ -3185,7 +3185,7 @@ mod orphan_attachment_tests {
         let root = tempfile::tempdir().unwrap();
         let vault = root.path().to_str().unwrap();
         operations::ensure_vault_structure(vault).unwrap();
-        let storage = operations::helixnotes_dir(vault);
+        let storage = operations::ryuknotes_dir(vault);
         let attachment = storage.join("attachments/keep.png");
         std::fs::write(&attachment, b"image").unwrap();
         let note = root.path().join("Unreadable.md");
@@ -3607,7 +3607,7 @@ mod external_access_tests {
     #[test]
     fn file_access_requires_the_active_vault_or_an_explicit_user_scope() {
         let root = std::env::temp_dir().join(format!(
-            "helixnotes-external-access-{}",
+            "ryuknotes-external-access-{}",
             uuid::Uuid::new_v4()
         ));
         let vault = root.join("vault");
@@ -4122,7 +4122,7 @@ pub fn ai_ask(
         (provider, key, model, style, base_url)
     };
 
-    let mut system_prompt = "You are a helpful writing assistant inside a note-taking app called HelixNotes. \
+    let mut system_prompt = "You are a helpful writing assistant inside a note-taking app called RyukNotes. \
         You help users improve, rewrite, summarize, and transform their text. \
         Return ONLY the resulting text - no explanations, no markdown code fences, no preamble. \
         Preserve the original language of the text unless specifically asked to translate. \
@@ -4185,9 +4185,9 @@ fn app_config_path() -> Result<std::path::PathBuf, String> {
     // Prefer the injected mobile dir when present (set only on mobile); fall back to
     // the platform config dir on desktop.
     let app_dir = if let Some(mobile_dir) = MOBILE_CONFIG_DIR.get() {
-        mobile_dir.join("helixnotes")
+        mobile_dir.join("ryuknotes")
     } else if let Some(config_dir) = dirs::config_dir() {
-        config_dir.join("helixnotes")
+        config_dir.join("ryuknotes")
     } else {
         return Err("Config directory not available yet".to_string());
     };
@@ -4308,7 +4308,7 @@ mod config_permission_tests {
     #[test]
     fn config_files_are_owner_only() {
         let path = std::env::temp_dir().join(format!(
-            "helixnotes-config-permissions-{}.json",
+            "ryuknotes-config-permissions-{}.json",
             uuid::Uuid::new_v4()
         ));
         std::fs::write(&path, "old").unwrap();
@@ -4348,8 +4348,8 @@ pub fn is_mobile_platform() -> bool {
 #[tauri::command]
 pub fn get_install_type() -> String {
     // Build-time override for distro packagers (e.g. Solus): build with
-    // HELIXNOTES_INSTALL_TYPE=solus to report that type and suppress the in-app updater.
-    if let Some(forced) = option_env!("HELIXNOTES_INSTALL_TYPE") {
+    // RYUKNOTES_INSTALL_TYPE=solus to report that type and suppress the in-app updater.
+    if let Some(forced) = option_env!("RYUKNOTES_INSTALL_TYPE") {
         if !forced.is_empty() {
             return forced.to_string();
         }
@@ -4366,10 +4366,10 @@ pub fn get_install_type() -> String {
         "macos".to_string()
     } else if cfg!(target_os = "windows") {
         "windows".to_string()
-    } else if std::path::Path::new("/var/lib/dpkg/info/helix-notes.list").exists() {
+    } else if std::path::Path::new("/var/lib/dpkg/info/ryuk-notes.list").exists() {
         "deb".to_string()
     } else if std::path::Path::new("/var/lib/pacman/local").exists()
-        && ["helixnotes", "helixnotes-bin", "helixnotes-appimage-bin"]
+        && ["ryuknotes", "ryuknotes-bin", "ryuknotes-appimage-bin"]
             .iter()
             .any(|pkg| {
                 std::process::Command::new("pacman")

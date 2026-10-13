@@ -1383,7 +1383,7 @@
 								<label class="setting-toggle">
 									<span class="setting-label">
 										<span class="setting-name">Start at system startup</span>
-										<span class="setting-desc">Launch HelixNotes when your computer starts</span>
+										<span class="setting-desc">Launch RyukNotes when your computer starts</span>
 									</span>
 									<button class="toggle-switch" class:on={autostart} role="switch" aria-checked={autostart} aria-label="Start at system startup" onclick={() => { autostart = !autostart; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
@@ -2129,7 +2129,7 @@
 						<div class="tab-content">
 							<div class="settings-section">
 								<h3>Import from Obsidian</h3>
-								<p class="import-desc">Fully converts an Obsidian vault to HelixNotes format: normalizes frontmatter (tags, IDs, dates, title headings), converts <code>[[wiki-links]]</code> to standard markdown links, converts <code>==highlights==</code> and <code>%%comments%%</code>, and relocates attachments to <code>.helixnotes/attachments/</code>. Open the Obsidian vault directory as your HelixNotes vault first.</p>
+								<p class="import-desc">Fully converts an Obsidian vault to RyukNotes format: normalizes frontmatter (tags, IDs, dates, title headings), converts <code>[[wiki-links]]</code> to standard markdown links, converts <code>==highlights==</code> and <code>%%comments%%</code>, and relocates attachments to <code>.helixnotes/attachments/</code>. Open the Obsidian vault directory as your RyukNotes vault first.</p>
 								<div class="import-warn">
 									<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" /><line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
 									<span>This modifies files in place. Make a backup before running!</span>
@@ -2368,13 +2368,13 @@
 						<div class="tab-content">
 							<div class="settings-section">
 								<h3>Current Version</h3>
-								<p class="update-version">HelixNotes <strong>v{appVersion}</strong></p>
+								<p class="update-version">RyukNotes <strong>v{appVersion}</strong></p>
 							</div>
 
 							{#if isManagedInstall($installType)}
 							<div class="settings-section">
 								<h3>Updates</h3>
-								<p class="setting-hint">HelixNotes was installed through your system package manager, which delivers updates. The app does not check for or install updates on its own.</p>
+								<p class="setting-hint">RyukNotes was installed through your system package manager, which delivers updates. The app does not check for or install updates on its own.</p>
 							</div>
 							{:else}
 							<div class="settings-section">
@@ -2425,12 +2425,12 @@
 								{:else if $installType === 'deb'}
 									<div class="update-apt-info">
 										<p>Update via your package manager:</p>
-										<code>sudo apt update && sudo apt upgrade helix-notes</code>
+										<code>sudo apt update && sudo apt upgrade ryuk-notes</code>
 									</div>
 								{:else if $installType === 'aur'}
 									<div class="update-apt-info">
 										<p>Update via your AUR helper:</p>
-										<code>yay -Syu helixnotes</code>
+										<code>yay -Syu ryuknotes</code>
 									</div>
 								{:else if $installType === 'android'}
 									<button class="update-install-btn" onclick={() => { openUrl('https://helixnotes.com/#download').catch(() => {}); }}>
@@ -2440,7 +2440,7 @@
 										Download from Website
 									</button>
 								{:else}
-									<a class="update-install-btn" href="https://gitlab.com/ArkHost/HelixNotes/-/releases" target="_blank" rel="noopener">
+									<a class="update-install-btn" href="https://gitlab.com/ArkHost/RyukNotes/-/releases" target="_blank" rel="noopener">
 										<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 											<path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
 										</svg>

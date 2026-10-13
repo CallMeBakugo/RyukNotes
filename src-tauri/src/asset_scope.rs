@@ -95,7 +95,7 @@ mod tests {
     use std::fs;
 
     fn test_directory(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("helixnotes-{name}-{}", uuid::Uuid::new_v4()))
+        std::env::temp_dir().join(format!("ryuknotes-{name}-{}", uuid::Uuid::new_v4()))
     }
 
     #[test]

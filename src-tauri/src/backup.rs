@@ -46,7 +46,7 @@ fn options() -> SimpleFileOptions {
 fn is_published_backup(path: &Path) -> bool {
     path.file_name().is_some_and(|name| {
         let name = name.to_string_lossy();
-        name.starts_with("helixnotes-backup-") && name.ends_with(".zip")
+        name.starts_with("ryuknotes-backup-") && name.ends_with(".zip")
     })
 }
 
@@ -82,10 +82,10 @@ fn excluded_path(path: &Path, vault: &Path, backup_dir: &Path, attachments: bool
     })
 }
 
-/// Returns the default backup directory (~/.config/helixnotes/backups/)
+/// Returns the default backup directory (~/.config/ryuknotes/backups/)
 pub fn default_backup_dir() -> Result<PathBuf, String> {
     let config_dir = dirs::config_dir().ok_or("Cannot find config directory")?;
-    let dir = config_dir.join("helixnotes").join("backups");
+    let dir = config_dir.join("ryuknotes").join("backups");
     if !dir.exists() {
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     }
@@ -124,7 +124,7 @@ pub fn create_backup(
     let id = vault_id(&vault)?;
     let now = Utc::now();
     let timestamp = now.format("%Y-%m-%dT%H-%M-%S").to_string();
-    let filename = format!("helixnotes-backup-{timestamp}-{id}-{}.zip", Uuid::new_v4());
+    let filename = format!("ryuknotes-backup-{timestamp}-{id}-{}.zip", Uuid::new_v4());
     let backup_path = output.join(&filename);
     let temporary = Builder::new()
         .prefix(".helixnotes-backup-")
@@ -210,7 +210,7 @@ pub fn create_backup(
 
 fn archive_name(filename: &str, id: &str) -> Option<(String, bool)> {
     let stem = filename
-        .strip_prefix("helixnotes-backup-")?
+        .strip_prefix("ryuknotes-backup-")?
         .strip_suffix(".zip")?;
     let timestamp = stem.get(..19)?;
     let suffix = stem.get(19..)?;
@@ -246,7 +246,7 @@ fn list_owned_backups(
         let filename = entry.file_name().to_string_lossy().to_string();
         if let Some((created, owned)) = archive_name(&filename, &id) {
             // Archives from before vault identities carry none, so they cannot be told apart.
-            let names_a_vault = filename.len() > "helixnotes-backup-0000-00-00T00-00-00.zip".len();
+            let names_a_vault = filename.len() > "ryuknotes-backup-0000-00-00T00-00-00.zip".len();
             entries.push((
                 BackupEntry {
                     filename,
@@ -790,7 +790,7 @@ mod tests {
 
     #[test]
     fn delete_backup_rejects_files_outside_backup_directory() {
-        let root = std::env::temp_dir().join(format!("helixnotes-backup-test-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("ryuknotes-backup-test-{}", Uuid::new_v4()));
         let backup_dir = root.join("backups");
         let outside = root.join("outside.zip");
         fs::create_dir_all(&backup_dir).unwrap();
@@ -853,7 +853,7 @@ mod tests {
         fs::create_dir_all(vault.join(".private/notes")).unwrap();
         fs::create_dir_all(vault.join("former-archives")).unwrap();
         fs::write(
-            vault.join("former-archives/helixnotes-backup-2026-01-02T03-04-05.zip"),
+            vault.join("former-archives/ryuknotes-backup-2026-01-02T03-04-05.zip"),
             "former",
         )
         .unwrap();
@@ -865,7 +865,7 @@ mod tests {
         assert!(zip.by_name("note.md").is_ok());
         assert!(zip.by_name("archives/old.zip").is_err());
         assert!(zip
-            .by_name("former-archives/helixnotes-backup-2026-01-02T03-04-05.zip")
+            .by_name("former-archives/ryuknotes-backup-2026-01-02T03-04-05.zip")
             .is_err());
         assert!(zip.by_name(".private/notes/secret.md").is_err());
         drop(zip);
@@ -878,7 +878,7 @@ mod tests {
         assert_eq!(fs::read_to_string(output.join("old.zip")).unwrap(), "old");
         assert_eq!(
             fs::read_to_string(
-                vault.join("former-archives/helixnotes-backup-2026-01-02T03-04-05.zip")
+                vault.join("former-archives/ryuknotes-backup-2026-01-02T03-04-05.zip")
             )
             .unwrap(),
             "former"
@@ -1145,7 +1145,7 @@ mod tests {
         fs::write(vault.join("note.md"), "keep me").unwrap();
         // What the old exclusion produced: nothing but the manifest.
         let empty = output.join(format!(
-            "helixnotes-backup-2026-01-01T00-00-00-{}-{}.zip",
+            "ryuknotes-backup-2026-01-01T00-00-00-{}-{}.zip",
             "a".repeat(64),
             Uuid::new_v4()
         ));
@@ -1187,7 +1187,7 @@ mod tests {
         // An archive from before vault identities: it cannot be attributed, so it is not flagged.
         fs::copy(
             &own.path,
-            output.join("helixnotes-backup-2020-01-01T00-00-00.zip"),
+            output.join("ryuknotes-backup-2020-01-01T00-00-00.zip"),
         )
         .unwrap();
         assert!(!own.other_vault);

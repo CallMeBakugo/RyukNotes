@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-pub fn helixnotes_dir(vault_path: &str) -> PathBuf {
+pub fn ryuknotes_dir(vault_path: &str) -> PathBuf {
     Path::new(vault_path).join(".helixnotes")
 }
 
@@ -87,7 +87,7 @@ fn ensure_notebook_path(vault_path: &str, requested_path: &Path) -> Result<PathB
 }
 
 fn ensure_trash_entry(vault_path: &str, requested_path: &Path) -> Result<PathBuf, String> {
-    let trash = canonicalize_path(&helixnotes_dir(vault_path).join("trash"), "trash path")?;
+    let trash = canonicalize_path(&ryuknotes_dir(vault_path).join("trash"), "trash path")?;
     let requested = canonicalize_path(requested_path, "trash item path")?;
     if requested == trash || !requested.starts_with(&trash) {
         return Err("Path must be an item inside the active vault trash".to_string());
@@ -333,7 +333,7 @@ fn original_trash_name(name: &str) -> &str {
 }
 
 pub fn ensure_vault_structure(vault_path: &str) -> Result<(), String> {
-    let hn_dir = helixnotes_dir(vault_path);
+    let hn_dir = ryuknotes_dir(vault_path);
     fs::create_dir_all(hn_dir.join("trash")).map_err(|e| e.to_string())?;
     fs::create_dir_all(hn_dir.join("attachments")).map_err(|e| e.to_string())?;
 
@@ -597,7 +597,7 @@ pub fn scan_notes(vault_path: &str, notebook_path: Option<&str>) -> Result<Vec<N
                 Err(_) => Vec::new(),
             }
         } else {
-            let hn_dir = helixnotes_dir(vault_path);
+            let hn_dir = ryuknotes_dir(vault_path);
             WalkDir::new(root)
                 .into_iter()
                 // filter_entry skips descending into hidden dirs (unlike filter)
@@ -635,7 +635,7 @@ pub fn scan_notes(vault_path: &str, notebook_path: Option<&str>) -> Result<Vec<N
                 .filter_entry(|e| {
                     e.depth() == 0
                         || (!is_hidden(e.path())
-                            && !e.path().starts_with(helixnotes_dir(vault_path)))
+                            && !e.path().starts_with(ryuknotes_dir(vault_path)))
                 })
                 .filter_map(|e| e.ok())
                 .map(|e| e.path().to_path_buf())
@@ -1234,7 +1234,7 @@ pub fn delete_note(vault_path: &str, note_path: &str) -> Result<(), String> {
     let validated = ensure_note_path(vault_path, Path::new(note_path))?;
     let src = validated.as_path();
 
-    let trash_dir = helixnotes_dir(vault_path).join("trash");
+    let trash_dir = ryuknotes_dir(vault_path).join("trash");
     fs::create_dir_all(&trash_dir).map_err(|e| e.to_string())?;
 
     let filename = src
@@ -1258,7 +1258,7 @@ pub fn delete_notebook(vault_path: &str, notebook_path: &str) -> Result<(), Stri
     let validated = ensure_notebook_path(vault_path, Path::new(notebook_path))?;
     let src = validated.as_path();
 
-    let trash_dir = helixnotes_dir(vault_path).join("trash");
+    let trash_dir = ryuknotes_dir(vault_path).join("trash");
     fs::create_dir_all(&trash_dir).map_err(|e| e.to_string())?;
 
     let dirname = src
@@ -1413,7 +1413,7 @@ fn update_wikilinks_after_rename(
     new_title: &str,
 ) -> LinkRewrite {
     let vault = Path::new(vault_path);
-    let hn_dir = helixnotes_dir(vault_path);
+    let hn_dir = ryuknotes_dir(vault_path);
 
     // Vault-relative path ref (without .md), normalized to forward slashes so it
     // matches [[folder/note]] wikilinks on Windows (OS paths use backslashes there).
@@ -1624,7 +1624,7 @@ pub fn move_notebook(
 
 /// Remove a directory inside trash if it's empty (after restoring/deleting its last note).
 fn cleanup_empty_trash_dir(vault_path: &str, dir: Option<&Path>) {
-    let trash_dir = helixnotes_dir(vault_path).join("trash");
+    let trash_dir = ryuknotes_dir(vault_path).join("trash");
     if let Some(d) = dir {
         if d != trash_dir && d.starts_with(&trash_dir) {
             if let Ok(mut entries) = fs::read_dir(d) {
@@ -1637,7 +1637,7 @@ fn cleanup_empty_trash_dir(vault_path: &str, dir: Option<&Path>) {
 }
 
 pub fn get_trash_contents(vault_path: &str) -> Result<TrashContents, String> {
-    let trash_dir = helixnotes_dir(vault_path).join("trash");
+    let trash_dir = ryuknotes_dir(vault_path).join("trash");
     if !trash_dir.exists() {
         return Ok(TrashContents {
             notes: Vec::new(),
@@ -1789,7 +1789,7 @@ pub fn permanent_delete(vault_path: &str, path: &str) -> Result<(), String> {
 }
 
 pub fn empty_trash(vault_path: &str) -> Result<(), String> {
-    let trash_dir = helixnotes_dir(vault_path).join("trash");
+    let trash_dir = ryuknotes_dir(vault_path).join("trash");
     if trash_dir.exists() {
         fs::remove_dir_all(&trash_dir).map_err(|e| e.to_string())?;
         fs::create_dir_all(&trash_dir).map_err(|e| e.to_string())?;
@@ -1798,7 +1798,7 @@ pub fn empty_trash(vault_path: &str) -> Result<(), String> {
 }
 
 pub fn load_vault_state(vault_path: &str) -> Result<VaultState, String> {
-    let state_path = helixnotes_dir(vault_path).join("state.json");
+    let state_path = ryuknotes_dir(vault_path).join("state.json");
     if state_path.exists() {
         let data = fs::read_to_string(&state_path).map_err(|e| e.to_string())?;
         serde_json::from_str(&data).map_err(|e| e.to_string())
@@ -1808,13 +1808,13 @@ pub fn load_vault_state(vault_path: &str) -> Result<VaultState, String> {
 }
 
 pub fn save_vault_state(vault_path: &str, state: &VaultState) -> Result<(), String> {
-    let state_path = helixnotes_dir(vault_path).join("state.json");
+    let state_path = ryuknotes_dir(vault_path).join("state.json");
     let data = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
     replace_file_atomically(&state_path, data.as_bytes())
 }
 
 pub fn get_all_tags(vault_path: &str) -> Result<Vec<(String, usize)>, String> {
-    let hn_dir = helixnotes_dir(vault_path);
+    let hn_dir = ryuknotes_dir(vault_path);
     let md_files: Vec<PathBuf> = WalkDir::new(vault_path)
         .into_iter()
         .filter_entry(|entry| entry.depth() == 0 || entry.path() != hn_dir.as_path())
@@ -1854,7 +1854,7 @@ pub fn save_image(vault_path: &str, name: &str, data: &[u8]) -> Result<String, S
 }
 
 pub fn save_attachment(vault_path: &str, name: &str, data: &[u8]) -> Result<String, String> {
-    let attachments_dir = helixnotes_dir(vault_path).join("attachments");
+    let attachments_dir = ryuknotes_dir(vault_path).join("attachments");
     fs::create_dir_all(&attachments_dir).map_err(|e| e.to_string())?;
 
     let safe_name = sanitize_filename(name);
@@ -1924,7 +1924,7 @@ pub fn import_note(
     if canonical_directory != vault.join(relative.unwrap_or(Path::new(""))) {
         return Err("Import destination must not use symbolic links".into());
     }
-    let attachments = helixnotes_dir(vault_path).join("attachments");
+    let attachments = ryuknotes_dir(vault_path).join("attachments");
     references.sort_by_key(|reference| reference.from);
     let mut previous = 0;
     let mut targets = Vec::new();
@@ -2139,7 +2139,7 @@ pub(crate) fn normalize_notebook_icon_key(path: &str) -> String {
 pub fn load_notebook_icons(
     vault_path: &str,
 ) -> Result<std::collections::HashMap<String, String>, String> {
-    let icons_path = helixnotes_dir(vault_path).join("notebook_icons.json");
+    let icons_path = ryuknotes_dir(vault_path).join("notebook_icons.json");
     let data = match fs::read_to_string(&icons_path) {
         Ok(data) => data,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2177,7 +2177,7 @@ fn save_notebook_icons(
     vault_path: &str,
     icons: &std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
-    let dir = helixnotes_dir(vault_path);
+    let dir = ryuknotes_dir(vault_path);
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let data = serde_json::to_vec_pretty(icons).map_err(|error| error.to_string())?;
     replace_file_atomically(&dir.join("notebook_icons.json"), &data)
@@ -2286,7 +2286,7 @@ pub fn import_tag_icon(
 }
 
 fn tag_styles_path(vault_path: &str) -> PathBuf {
-    helixnotes_dir(vault_path).join("tag_styles.json")
+    ryuknotes_dir(vault_path).join("tag_styles.json")
 }
 
 fn normalize_tag_style_key(tag: &str) -> String {
@@ -2374,7 +2374,7 @@ pub fn patch_tag_style(
         styles.insert(stored_key, style.clone());
     }
 
-    let dir = helixnotes_dir(vault_path);
+    let dir = ryuknotes_dir(vault_path);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let data = serde_json::to_string_pretty(&styles).map_err(|e| e.to_string())?;
     replace_file_atomically(&tag_styles_path(vault_path), data.as_bytes())?;
@@ -2474,7 +2474,7 @@ fn move_note_with_quick_access(
 }
 
 pub fn load_quick_access(vault_path: &str) -> Result<Vec<String>, String> {
-    let qa_path = helixnotes_dir(vault_path).join("quick_access.json");
+    let qa_path = ryuknotes_dir(vault_path).join("quick_access.json");
     if qa_path.exists() {
         let data = fs::read_to_string(&qa_path).map_err(|e| e.to_string())?;
         serde_json::from_str(&data).map_err(|e| e.to_string())
@@ -2484,7 +2484,7 @@ pub fn load_quick_access(vault_path: &str) -> Result<Vec<String>, String> {
 }
 
 pub fn save_quick_access(vault_path: &str, paths: &[String]) -> Result<(), String> {
-    let qa_path = helixnotes_dir(vault_path).join("quick_access.json");
+    let qa_path = ryuknotes_dir(vault_path).join("quick_access.json");
     let data = serde_json::to_string_pretty(paths).map_err(|e| e.to_string())?;
     replace_file_atomically(&qa_path, data.as_bytes())
 }
@@ -2777,7 +2777,7 @@ mod exclusive_rename_fallback_tests {
 mod tests {
     use super::{
         compare_natural_names, create_notebook, duplicate_note, get_note_switcher_titles,
-        helixnotes_dir, load_notebook_icons, load_tag_styles, patch_tag_style, permanent_delete,
+        ryuknotes_dir, load_notebook_icons, load_tag_styles, patch_tag_style, permanent_delete,
         read_note, replace_file_atomically, restore_notebook, save_note, scan_notebooks,
         set_notebook_icon,
     };
@@ -2884,8 +2884,8 @@ mod tests {
         super::ensure_vault_structure(path).unwrap();
         set_notebook_icon(path, "Book", Some("builtin:folder")).unwrap();
         patch_tag_style(path, "Work", TagStyleChange::Color(Some("#123456".into()))).unwrap();
-        let icons_path = helixnotes_dir(path).join("notebook_icons.json");
-        let styles_path = helixnotes_dir(path).join("tag_styles.json");
+        let icons_path = ryuknotes_dir(path).join("notebook_icons.json");
+        let styles_path = ryuknotes_dir(path).join("tag_styles.json");
         let icons_before = fs::read(&icons_path).unwrap();
         let styles_before = fs::read(&styles_path).unwrap();
         let mut icons_reader = fs::File::open(&icons_path).unwrap();
@@ -2920,7 +2920,7 @@ mod tests {
             let path = vault.path().to_str().unwrap();
             super::ensure_vault_structure(path).unwrap();
             let original = super::save_attachment(path, "same.png", b"keep").unwrap();
-            fs::write(helixnotes_dir(path).join(mapping), b"{broken").unwrap();
+            fs::write(ryuknotes_dir(path).join(mapping), b"{broken").unwrap();
             let result = if mapping == "notebook_icons.json" {
                 super::import_notebook_icon(path, "Book", "same.png", b"reject")
             } else {
@@ -2929,13 +2929,13 @@ mod tests {
             };
             assert!(result.is_err());
             assert_eq!(fs::read(vault.path().join(&original)).unwrap(), b"keep");
-            let remaining: Vec<_> = fs::read_dir(helixnotes_dir(path).join("attachments"))
+            let remaining: Vec<_> = fs::read_dir(ryuknotes_dir(path).join("attachments"))
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .collect();
             assert_eq!(remaining, vec![vault.path().join(original)]);
             assert_eq!(
-                fs::read(helixnotes_dir(path).join(mapping)).unwrap(),
+                fs::read(ryuknotes_dir(path).join(mapping)).unwrap(),
                 b"{broken"
             );
         }
@@ -2950,7 +2950,7 @@ mod tests {
         let note = super::create_note(path, Some("Book"), "Keep").unwrap();
         let before = fs::read(&note.path).unwrap();
         let destination = create_notebook(path, None, "Archive").unwrap();
-        fs::write(helixnotes_dir(path).join("notebook_icons.json"), b"{broken").unwrap();
+        fs::write(ryuknotes_dir(path).join("notebook_icons.json"), b"{broken").unwrap();
         assert!(super::rename_notebook(path, &notebook.path, "Renamed").is_err());
         assert!(super::move_notebook(path, &notebook.path, &destination.path).is_err());
         assert_eq!(fs::read(&note.path).unwrap(), before);
@@ -2967,7 +2967,7 @@ mod tests {
         super::ensure_vault_structure(path).unwrap();
         let notebook = create_notebook(path, None, "Book").unwrap();
         set_notebook_icon(path, "Book", Some("builtin:folder")).unwrap();
-        let mapping = helixnotes_dir(path).join("notebook_icons.json");
+        let mapping = ryuknotes_dir(path).join("notebook_icons.json");
         let before = fs::read(&mapping).unwrap();
         fs::set_permissions(&mapping, fs::Permissions::from_mode(0o440)).unwrap();
         assert!(set_notebook_icon(path, "Book", Some("builtin:star")).is_err());
@@ -2992,7 +2992,7 @@ mod tests {
     #[test]
     fn sorts_notebooks_with_numeric_names_naturally() {
         let vault =
-            std::env::temp_dir().join(format!("helixnotes-natural-sort-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("ryuknotes-natural-sort-test-{}", Uuid::new_v4()));
         let nested = vault.join("Classes");
         fs::create_dir_all(&nested).unwrap();
         let expected = ["5g", "6g", "7g", "8g", "9g", "10g", "11g", "12g"];
@@ -3024,13 +3024,13 @@ mod tests {
     #[test]
     fn persists_and_removes_builtin_notebook_icons() {
         let vault =
-            std::env::temp_dir().join(format!("helixnotes-notebook-icon-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("ryuknotes-notebook-icon-test-{}", Uuid::new_v4()));
         let vault_path = vault.to_string_lossy();
-        fs::create_dir_all(helixnotes_dir(&vault_path)).unwrap();
+        fs::create_dir_all(ryuknotes_dir(&vault_path)).unwrap();
 
         set_notebook_icon(&vault_path, r"Projects\Client", Some("builtin:briefcase")).unwrap();
         let stored: std::collections::HashMap<String, String> = serde_json::from_str(
-            &fs::read_to_string(helixnotes_dir(&vault_path).join("notebook_icons.json")).unwrap(),
+            &fs::read_to_string(ryuknotes_dir(&vault_path).join("notebook_icons.json")).unwrap(),
         )
         .unwrap();
         assert!(stored.contains_key("Projects/Client"));
@@ -3051,10 +3051,10 @@ mod tests {
     #[test]
     fn normalizes_legacy_notebook_icon_keys_when_loading() {
         let vault =
-            std::env::temp_dir().join(format!("helixnotes-notebook-icon-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("ryuknotes-notebook-icon-test-{}", Uuid::new_v4()));
         let vault_path = vault.to_string_lossy();
-        let icons_path = helixnotes_dir(&vault_path).join("notebook_icons.json");
-        fs::create_dir_all(helixnotes_dir(&vault_path)).unwrap();
+        let icons_path = ryuknotes_dir(&vault_path).join("notebook_icons.json");
+        fs::create_dir_all(ryuknotes_dir(&vault_path)).unwrap();
         fs::write(&icons_path, r#"{"Projects\\Client":"builtin:folder"}"#).unwrap();
 
         let icons = load_notebook_icons(&vault_path).unwrap();
@@ -3069,7 +3069,7 @@ mod tests {
     #[test]
     fn persists_and_removes_tag_styles() {
         let vault =
-            std::env::temp_dir().join(format!("helixnotes-tag-style-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("ryuknotes-tag-style-test-{}", Uuid::new_v4()));
         let vault_path = vault.to_string_lossy();
 
         patch_tag_style(
@@ -3086,7 +3086,7 @@ mod tests {
         .unwrap();
 
         let stored: std::collections::HashMap<String, TagStyle> = serde_json::from_str(
-            &fs::read_to_string(helixnotes_dir(&vault_path).join("tag_styles.json")).unwrap(),
+            &fs::read_to_string(ryuknotes_dir(&vault_path).join("tag_styles.json")).unwrap(),
         )
         .unwrap();
         assert!(stored.contains_key("Work"));
@@ -3106,7 +3106,7 @@ mod tests {
     #[test]
     fn resetting_tag_style_is_case_insensitive() {
         let vault =
-            std::env::temp_dir().join(format!("helixnotes-tag-style-case-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("ryuknotes-tag-style-case-test-{}", Uuid::new_v4()));
         let vault_path = vault.to_string_lossy();
 
         patch_tag_style(
@@ -3125,7 +3125,7 @@ mod tests {
         patch_tag_style(&vault_path, "work", TagStyleChange::Reset).unwrap();
 
         let stored: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(helixnotes_dir(&vault_path).join("tag_styles.json")).unwrap(),
+            &fs::read_to_string(ryuknotes_dir(&vault_path).join("tag_styles.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(stored, serde_json::json!({}));
@@ -3137,13 +3137,13 @@ mod tests {
     #[test]
     fn load_collapses_case_variant_tag_style_keys() {
         let vault = std::env::temp_dir().join(format!(
-            "helixnotes-tag-style-collapse-test-{}",
+            "ryuknotes-tag-style-collapse-test-{}",
             Uuid::new_v4()
         ));
         let vault_path = vault.to_string_lossy();
-        fs::create_dir_all(helixnotes_dir(&vault_path)).unwrap();
+        fs::create_dir_all(ryuknotes_dir(&vault_path)).unwrap();
         fs::write(
-            helixnotes_dir(&vault_path).join("tag_styles.json"),
+            ryuknotes_dir(&vault_path).join("tag_styles.json"),
             r##"{"Work":{"icon":"builtin:briefcase"},"work":{"color":"#e11d48"}}"##,
         )
         .unwrap();
@@ -3160,7 +3160,7 @@ mod tests {
     #[test]
     fn rejects_invalid_tag_color() {
         let vault = std::env::temp_dir().join(format!(
-            "helixnotes-tag-style-color-test-{}",
+            "ryuknotes-tag-style-color-test-{}",
             Uuid::new_v4()
         ));
         let vault_path = vault.to_string_lossy();
@@ -3179,7 +3179,7 @@ mod tests {
     #[test]
     fn clearing_empty_tag_style_removes_entry() {
         let vault = std::env::temp_dir().join(format!(
-            "helixnotes-tag-style-clear-test-{}",
+            "ryuknotes-tag-style-clear-test-{}",
             Uuid::new_v4()
         ));
         let vault_path = vault.to_string_lossy();
@@ -3199,7 +3199,7 @@ mod tests {
     #[test]
     fn loads_only_requested_note_switcher_titles() {
         let vault =
-            std::env::temp_dir().join(format!("helixnotes-note-switcher-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("ryuknotes-note-switcher-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&vault).unwrap();
 
         let mut note_paths = Vec::new();
@@ -3219,7 +3219,7 @@ mod tests {
         .unwrap();
 
         let outside =
-            std::env::temp_dir().join(format!("helixnotes-outside-note-{}.md", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("ryuknotes-outside-note-{}.md", Uuid::new_v4()));
         fs::write(&outside, "---\ntitle: Outside\n---\n").unwrap();
 
         let requested = vec![
@@ -3263,9 +3263,9 @@ mod tests {
     #[test]
     fn reads_markdown_notes_from_trash_without_allowing_external_files() {
         let test_root =
-            std::env::temp_dir().join(format!("helixnotes-path-security-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("ryuknotes-path-security-test-{}", Uuid::new_v4()));
         let vault = test_root.join("vault");
-        let trash = helixnotes_dir(&vault.to_string_lossy()).join("trash");
+        let trash = ryuknotes_dir(&vault.to_string_lossy()).join("trash");
         let trashed_note = trash.join("20240101000000000_Note.md");
         let outside = test_root.join("outside.md");
         fs::create_dir_all(&trash).unwrap();
@@ -3281,10 +3281,10 @@ mod tests {
     #[test]
     fn rejects_permanent_deletion_outside_trash() {
         let test_root =
-            std::env::temp_dir().join(format!("helixnotes-path-security-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("ryuknotes-path-security-test-{}", Uuid::new_v4()));
         let vault = test_root.join("vault");
         let outside = test_root.join("outside.md");
-        fs::create_dir_all(helixnotes_dir(&vault.to_string_lossy()).join("trash")).unwrap();
+        fs::create_dir_all(ryuknotes_dir(&vault.to_string_lossy()).join("trash")).unwrap();
         fs::write(&outside, "must survive").unwrap();
 
         let result = permanent_delete(&vault.to_string_lossy(), &outside.to_string_lossy());
@@ -3297,7 +3297,7 @@ mod tests {
     #[test]
     fn rejects_notebook_creation_outside_vault() {
         let test_root =
-            std::env::temp_dir().join(format!("helixnotes-path-security-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("ryuknotes-path-security-test-{}", Uuid::new_v4()));
         let vault = test_root.join("vault");
         fs::create_dir_all(&vault).unwrap();
 
@@ -3311,9 +3311,9 @@ mod tests {
     #[test]
     fn rejects_traversal_in_restored_notebook_metadata() {
         let test_root =
-            std::env::temp_dir().join(format!("helixnotes-path-security-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("ryuknotes-path-security-test-{}", Uuid::new_v4()));
         let vault = test_root.join("vault");
-        let trash = helixnotes_dir(&vault.to_string_lossy()).join("trash");
+        let trash = ryuknotes_dir(&vault.to_string_lossy()).join("trash");
         let trashed_notebook = trash.join("20240101000000000_Notebook");
         fs::create_dir_all(&trashed_notebook).unwrap();
         fs::write(trash.join("20240101000000000_Notebook.meta"), "../escaped").unwrap();
@@ -3332,7 +3332,7 @@ mod tests {
     #[test]
     fn duplicates_note_content_and_assigns_unique_identity_and_name() {
         let vault =
-            std::env::temp_dir().join(format!("helixnotes-duplicate-note-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("ryuknotes-duplicate-note-test-{}", Uuid::new_v4()));
         let notebook = vault.join("Projects");
         fs::create_dir_all(&notebook).unwrap();
         let source_path = notebook.join("Project.md");
@@ -3667,7 +3667,7 @@ mod tests {
         let original = "---\ntitle: Note\n---\noriginal";
         fs::write(&note, original).unwrap();
         super::save_quick_access(vault_path, &["Book/Note.md".into()]).unwrap();
-        let favorites = helixnotes_dir(vault_path).join("quick_access.json");
+        let favorites = ryuknotes_dir(vault_path).join("quick_access.json");
         let before = fs::read(&favorites).unwrap();
         fs::set_permissions(&favorites, fs::Permissions::from_mode(0o440)).unwrap();
 
@@ -3835,7 +3835,7 @@ mod tests {
         let vault = tempfile::tempdir().unwrap();
         let vault_path = vault.path().to_str().unwrap();
         super::ensure_vault_structure(vault_path).unwrap();
-        let trash = helixnotes_dir(vault_path).join("trash");
+        let trash = ryuknotes_dir(vault_path).join("trash");
         let old_note = trash.join("20260101000000_Old.md");
         fs::write(&old_note, "---\ntitle: Old\n---\nlegacy note").unwrap();
         let restored_note =
@@ -3884,7 +3884,7 @@ mod tests {
             "outside"
         );
 
-        let trash = helixnotes_dir(vault_path).join("trash");
+        let trash = ryuknotes_dir(vault_path).join("trash");
         let notebook = trash.join("20260101000000000_Stashed");
         fs::create_dir(&notebook).unwrap();
         fs::write(notebook.join("Keep.md"), "safe").unwrap();
@@ -4012,7 +4012,7 @@ mod tests {
         let vault = tempfile::tempdir().unwrap();
         let vault_path = vault.path().to_str().unwrap();
         super::ensure_vault_structure(vault_path).unwrap();
-        let state = helixnotes_dir(vault_path).join("state.json");
+        let state = ryuknotes_dir(vault_path).join("state.json");
         fs::write(&state, b"old vault state").unwrap();
         let mut reader = fs::File::open(&state).unwrap();
         let new_state = crate::types::VaultState {

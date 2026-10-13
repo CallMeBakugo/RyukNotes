@@ -95,7 +95,7 @@
 			const absPath = resolveFileReference(href, note, root).path;
 			// Internal .md note link - navigate within the app
 			if (absPath.endsWith('.md')) {
-				window.dispatchEvent(new CustomEvent('helixnotes-open-note', { detail: absPath }));
+				window.dispatchEvent(new CustomEvent('ryuknotes-open-note', { detail: absPath }));
 			} else {
 				openLocalFile(absPath);
 			}
@@ -211,7 +211,7 @@
 <svelte:document oncontextmenu={(e) => { if (!isMobile) e.preventDefault(); }} />
 
 <svelte:head>
-	<title>HelixNotes</title>
+	<title>RyukNotes</title>
 </svelte:head>
 
 {@render children()}

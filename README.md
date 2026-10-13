@@ -1,7 +1,7 @@
-# HelixNotes
+# RyukNotes
 
-[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](https://gitlab.com/ArkHost/HelixNotes/-/blob/main/LICENSE)
-[![Latest Release](https://img.shields.io/badge/release-v1.3.6-green)](https://gitlab.com/ArkHost/HelixNotes/-/releases/v1.3.6)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](https://gitlab.com/ArkHost/RyukNotes/-/blob/main/LICENSE)
+[![Latest Release](https://img.shields.io/badge/release-v1.3.6-green)](https://gitlab.com/ArkHost/RyukNotes/-/releases/v1.3.6)
 [![Website](https://img.shields.io/badge/web-helixnotes.com-purple)](https://helixnotes.com)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS%20%7C%20Android-lightgrey)]()
 
@@ -18,7 +18,7 @@ No cloud, no lock-in.
 
 The AppImage works only on Fedora 43+, Arch Linux, and openSUSE Tumbleweed (x86_64).
 
-[Download AppImage](https://download.helixnotes.com/releases/v1.3.6/HelixNotes_1.3.6_amd64.AppImage)
+[Download AppImage](https://download.helixnotes.com/releases/v1.3.6/RyukNotes_1.3.6_amd64.AppImage)
 
 #### Distro-specific packages
 
@@ -26,26 +26,26 @@ The AppImage works only on Fedora 43+, Arch Linux, and openSUSE Tumbleweed (x86_
 
 ```bash
 sudo dnf config-manager addrepo \
-  --from-repofile=https://repo.arkhost.com/helixnotes.repo
-sudo dnf install helix-notes
+  --from-repofile=https://repo.arkhost.com/ryuknotes.repo
+sudo dnf install ryuk-notes
 ```
 
 ##### Debian / Ubuntu / Mint (APT)
 
 ```bash
-curl -fsSL https://repo.arkhost.com/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/arkhost.gpg && echo "deb [signed-by=/usr/share/keyrings/arkhost.gpg arch=amd64] https://repo.arkhost.com stable main" | sudo tee /etc/apt/sources.list.d/helixnotes.list && sudo apt update && sudo apt install helix-notes
+curl -fsSL https://repo.arkhost.com/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/arkhost.gpg && echo "deb [signed-by=/usr/share/keyrings/arkhost.gpg arch=amd64] https://repo.arkhost.com stable main" | sudo tee /etc/apt/sources.list.d/ryuknotes.list && sudo apt update && sudo apt install ryuk-notes
 ```
 
 ##### Arch / Manjaro (AUR)
 
 ```bash
-yay -S helixnotes-appimage-bin
+yay -S ryuknotes-appimage-bin
 ```
 
 ##### Solus (EOPKG)
 
 ```bash
-sudo eopkg it helixnotes
+sudo eopkg it ryuknotes
 ```
 
 ##### NixOS
@@ -57,15 +57,15 @@ sudo eopkg it helixnotes
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    helix-notes = {
-      url = "git+https://gitlab.com/ArkHost/HelixNotes";
+    ryuk-notes = {
+      url = "git+https://gitlab.com/ArkHost/RyukNotes";
       # inputs.nixpkgs.follows = "nixpkgs";
     }
   };
 
   outputs = {
     nixpkgs,
-    helix-notes,
+    ryuk-notes,
     ...
   }: let
     system = "x86_64-linux";
@@ -73,7 +73,7 @@ sudo eopkg it helixnotes
   in {
     nixosConfigurations.default = nixpkgs.lib.nixosSystem {
       system = system;
-      specialArgs = { inherit helix-notes; };
+      specialArgs = { inherit ryuk-notes; };
 
       modules = [
         /path/to/configuration.nix
@@ -93,13 +93,13 @@ sudo eopkg it helixnotes
   config,
   lib,
   pkgs,
-  helix-notes,
+  ryuk-notes,
   ...
 }:
 {
   users.users.<USERNAME> = {
     packages = with pkgs; [
-      (helix-notes.packages.${pkgs.stdenv.hostPlatform.system}.default)
+      (ryuk-notes.packages.${pkgs.stdenv.hostPlatform.system}.default)
     ];
   };
 }
@@ -108,32 +108,32 @@ sudo eopkg it helixnotes
 
 #### Manual package downloads
 
-- [.deb](https://download.helixnotes.com/releases/v1.3.6/HelixNotes_1.3.6_amd64.deb) (Ubuntu 22.04+)
-- [.rpm](https://download.helixnotes.com/releases/v1.3.6/HelixNotes-1.3.6-1.x86_64.rpm)
+- [.deb](https://download.helixnotes.com/releases/v1.3.6/RyukNotes_1.3.6_amd64.deb) (Ubuntu 22.04+)
+- [.rpm](https://download.helixnotes.com/releases/v1.3.6/RyukNotes-1.3.6-1.x86_64.rpm)
 
 ### Windows
 
-[Download Installer](https://download.helixnotes.com/releases/v1.3.6/HelixNotes_1.3.6_x64-setup.exe) (Windows 10/11)
+[Download Installer](https://download.helixnotes.com/releases/v1.3.6/RyukNotes_1.3.6_x64-setup.exe) (Windows 10/11)
 
 ### macOS
 
-[Download .dmg (Apple Silicon)](https://download.helixnotes.com/releases/v1.3.6/HelixNotes_1.3.6_aarch64.dmg) (M-series Macs)
+[Download .dmg (Apple Silicon)](https://download.helixnotes.com/releases/v1.3.6/RyukNotes_1.3.6_aarch64.dmg) (M-series Macs)
 
-[Download .dmg (Intel)](https://download.helixnotes.com/releases/v1.3.6/HelixNotes_1.3.6_x64.dmg)
+[Download .dmg (Intel)](https://download.helixnotes.com/releases/v1.3.6/RyukNotes_1.3.6_x64.dmg)
 
 The Apple Silicon build is signed and notarized by Apple. The Intel build may still trigger a Gatekeeper warning. If macOS reports that the Intel build is damaged, run this once after installing or updating it:
 
 ```bash
-xattr -cr /Applications/HelixNotes.app
+xattr -cr /Applications/RyukNotes.app
 ```
 
 ### Android
 
-[Download APK](https://download.helixnotes.com/releases/v1.3.6/HelixNotes_1.3.6_android.apk)
+[Download APK](https://download.helixnotes.com/releases/v1.3.6/RyukNotes_1.3.6_android.apk)
 
 ---
 
-All releases: [gitlab.com/ArkHost/HelixNotes/-/releases](https://gitlab.com/ArkHost/HelixNotes/-/releases)
+All releases: [gitlab.com/ArkHost/RyukNotes/-/releases](https://gitlab.com/ArkHost/RyukNotes/-/releases)
 
 ## Features
 
@@ -224,4 +224,4 @@ pnpm tauri build
 
 ## License
 
-[AGPL-3.0](https://gitlab.com/ArkHost/HelixNotes/-/blob/main/LICENSE)
+[AGPL-3.0](https://gitlab.com/ArkHost/RyukNotes/-/blob/main/LICENSE)

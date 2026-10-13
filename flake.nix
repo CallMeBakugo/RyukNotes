@@ -1,5 +1,5 @@
 {
-  description = "HelixNotes (local Markdown notes app) with Nix flake";
+  description = "RyukNotes (local Markdown notes app) with Nix flake";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -68,11 +68,11 @@
           '';
 
           meta = with pkgs.lib; {
-            description = "HelixNotes desktop application";
+            description = "RyukNotes desktop application";
             homepage = "https://helixnotes.com/";
             license = licenses.agpl3Plus;
             platforms = platforms.linux ++ platforms.darwin;
-            mainProgram = "helixnotes";
+            mainProgram = "ryuknotes";
           };
         };
 

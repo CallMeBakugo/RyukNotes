@@ -1717,7 +1717,7 @@
 	const MermaidRenderer = Extension.create({
 		name: 'mermaidRendererOptIn',
 		addProseMirrorPlugins() {
-			console.info('[HelixNotes] Mermaid renderer (opt-in) initialised');
+			console.info('[RyukNotes] Mermaid renderer (opt-in) initialised');
 
 			let mermaidPromise: Promise<any> | null = null;
 			const svgCache = new Map<string, string>();
@@ -7351,7 +7351,7 @@
 		const path = (event as CustomEvent<string>).detail;
 		if (typeof path === 'string' && path) void navigateToWikiLink(path, '');
 	}
-	window.addEventListener('helixnotes-open-note', handleOpenNote);
+	window.addEventListener('ryuknotes-open-note', handleOpenNote);
 
 	onDestroy(() => {
 		cancelProgressiveLoad();
@@ -7366,7 +7366,7 @@
 		cancelNoteSearchWork();
 		searchRevealedDetails.clear();
 		if (wikiTitleRefreshTimer !== null) clearTimeout(wikiTitleRefreshTimer);
-		window.removeEventListener('helixnotes-open-note', handleOpenNote);
+		window.removeEventListener('ryuknotes-open-note', handleOpenNote);
 		clearTargetReveal();
 		destroyEditor();
 		unlistenFileChange?.();
