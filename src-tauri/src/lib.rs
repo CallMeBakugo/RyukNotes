@@ -7,7 +7,7 @@ mod image_proxy;
 mod search;
 mod state;
 mod types;
-mod vault;
+pub mod vault;
 
 use state::AppState;
 #[allow(unused_imports)]
