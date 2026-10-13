@@ -260,6 +260,8 @@ pub fn run() {
             commands::db_trash_note,
             commands::db_restore_note,
             commands::db_delete_note,
+            commands::db_import_md_vault,
+            commands::db_list_versions,
             commands::get_install_type,
             commands::is_mobile_platform,
             commands::get_pending_open_file,

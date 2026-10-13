@@ -200,6 +200,39 @@ impl VaultDb {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    /// Stores a history snapshot. The version id is the SHA-256 of
+    /// (note id, content), so identical snapshots dedupe across re-imports.
+    pub fn add_version(&self, note_id: &str, content: &str, created: &str) -> Result<String, String> {
+        let digest = {
+            use sha2::Digest;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(note_id.as_bytes());
+            hasher.update(content.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+        self.conn
+            .execute(
+                "INSERT INTO versions(id, note_id, content, created) VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(id) DO NOTHING",
+                params![digest, note_id, content, created],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(digest)
+    }
+
+    pub fn list_versions(&self, note_id: &str) -> Result<Vec<(String, String, String)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, content, created FROM versions WHERE note_id = ?1 ORDER BY created")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![note_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
     pub fn get_note_created(&self, id: &str) -> Result<Option<String>, String> {
         self.conn
             .query_row(

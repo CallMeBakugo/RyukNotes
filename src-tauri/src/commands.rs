@@ -4292,6 +4292,32 @@ pub fn db_delete_note(state: State<'_, AppState>, id: String) -> Result<(), Stri
     with_db(&state, |db| db.delete_note(&id))
 }
 
+#[tauri::command]
+pub fn db_import_md_vault(
+    state: State<'_, AppState>,
+    md_vault_path: String,
+) -> Result<crate::vault::db_import::ImportReport, String> {
+    let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+    let db = slot.as_ref().ok_or("No vault database is open")?;
+    crate::vault::db_import::import_md_vault(std::path::Path::new(&md_vault_path), db)
+}
+
+#[tauri::command]
+pub fn db_list_versions(
+    state: State<'_, AppState>,
+    note_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    with_db(&state, |db| {
+        Ok(db
+            .list_versions(&note_id)?
+            .into_iter()
+            .map(|(id, content, created)| {
+                serde_json::json!({ "id": id, "content": content, "created": created })
+            })
+            .collect())
+    })
+}
+
 // ── Helpers ──
 
 // On mobile (Android + iOS) the OS config dir is injected at startup via the Tauri
