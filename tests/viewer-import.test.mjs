@@ -18,8 +18,8 @@ function fixture(path = '/external/External.md') {
   const original = { path, meta: { title: 'External' },
     content: '![Image](images/photo.png)', raw: '---\ncustom: keep\n---\n![Image](images/photo.png)' };
   const imported = { ...original, path: '/vault/External.md',
-    content: '![Image](.helixnotes/attachments/unique-photo.png)',
-    raw: '---\ncustom: keep\n---\n![Image](.helixnotes/attachments/unique-photo.png)' };
+    content: '![Image](.ryuknotes/attachments/unique-photo.png)',
+    raw: '---\ncustom: keep\n---\n![Image](.ryuknotes/attachments/unique-photo.png)' };
   let current = true;
   const calls = [];
   const loaded = [];

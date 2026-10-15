@@ -11,7 +11,7 @@
 // - attachments are BLOB rows capped by size (default 25 MiB) and deduplicated
 //   by content hash; the same screenshot referenced from several notes is
 //   stored once.
-// - versions stores full-content snapshots (the .helixnotes/history model).
+// - versions stores full-content snapshots (the .ryuknotes/history model).
 // - notes_fts is an FTS5 index over title + content for search.
 
 use rusqlite::{params, Connection, OptionalExtension};

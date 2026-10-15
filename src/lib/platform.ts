@@ -1,12 +1,12 @@
 // Platform is the compile-time build target, injected by the backend into
-// window.__HELIX_PLATFORM__ before app scripts run (see src-tauri/src/lib.rs). The UA is only a
+// window.__RYUK_PLATFORM__ before app scripts run (see src-tauri/src/lib.rs). The UA is only a
 // fallback when that global is absent (SSR/prerender, plain-browser dev): some desktop WebKitGTK
 // builds report a mobile-looking user-agent. (#63)
-type HelixPlatform = { mobile: boolean; android: boolean; ios: boolean };
+type RyukPlatform = { mobile: boolean; android: boolean; ios: boolean };
 
-const injected: HelixPlatform | undefined =
+const injected: RyukPlatform | undefined =
 	typeof window !== 'undefined'
-		? (window as unknown as { __HELIX_PLATFORM__?: HelixPlatform }).__HELIX_PLATFORM__
+		? (window as unknown as { __RYUK_PLATFORM__?: RyukPlatform }).__RYUK_PLATFORM__
 		: undefined;
 
 const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';

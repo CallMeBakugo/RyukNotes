@@ -135,7 +135,7 @@
 	const keepCodeWhitespace = {
 		parseHTML(this: any) {
 			return (this.parent?.() ?? []).flatMap((rule: any) => [
-				{ ...rule, tag: `${rule.tag}[data-helix-code]`, preserveWhitespace: 'full' as const },
+				{ ...rule, tag: `${rule.tag}[data-ryuk-code]`, preserveWhitespace: 'full' as const },
 				rule,
 			]);
 		},
@@ -151,7 +151,7 @@
 					return this.parent!({
 						...props,
 						HTMLAttributes: hasInlineCode(props.node)
-							? { ...props.HTMLAttributes, 'data-helix-code': '' } : props.HTMLAttributes,
+							? { ...props.HTMLAttributes, 'data-ryuk-code': '' } : props.HTMLAttributes,
 					});
 				},
 			}) : extension);
@@ -4405,7 +4405,7 @@
 			}
 			case 'secretBlock': {
 				const payload = (node.attrs.payload || '').trim();
-				return `\`\`\`helix-secret\n${payload}\n\`\`\`\n`;
+				return `\`\`\`ryuk-secret\n${payload}\n\`\`\`\n`;
 			}
 			case 'mathBlock': {
 				const tex = node.attrs.tex || '';
@@ -4449,14 +4449,14 @@
 
 	function inlineMathPayloads(markdown: string): string[] {
 		const children = mdit.parseInline(markdown, {})[0]?.children ?? [];
-		return children.filter(token => token.type === 'helix_math_inline').map(token => token.content);
+		return children.filter(token => token.type === 'ryuk_math_inline').map(token => token.content);
 	}
 
 	/** The text a line of inline Markdown shows when it is read back, without its formatting. */
 	function inlinePlainText(markdown: string): string {
 		let text = '';
 		for (const token of mdit.parseInline(markdown, {})[0]?.children ?? []) {
-			if (token.type === 'text' || token.type === 'code_inline' || token.type === 'helix_wiki') text += token.content;
+			if (token.type === 'text' || token.type === 'code_inline' || token.type === 'ryuk_wiki') text += token.content;
 		}
 		return text;
 	}
@@ -8911,7 +8911,7 @@
 				<div class="secret-modal-error">{secretModal.error}</div>
 			{/if}
 			<div class="math-modal-footer">
-				<span class="math-modal-hint">Stored as a portable helix-secret markdown block</span>
+				<span class="math-modal-hint">Stored as a portable ryuk-secret markdown block</span>
 				<div class="math-modal-actions">
 					<button type="button" onclick={cancelSecretModal} disabled={secretModal.busy}>Cancel</button>
 					<button type="button" class="primary" onclick={commitSecretModal} disabled={secretModal.busy || !secretModal.text || !secretModal.passphrase || !secretModal.confirmPassphrase}>

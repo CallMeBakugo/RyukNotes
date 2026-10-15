@@ -34,8 +34,8 @@ test('looks up tag styles with a case-insensitive fallback', () => {
 });
 
 test('treats non-builtin icons as custom image paths', () => {
-  const styles = { daily: { icon: '.helixnotes/attachments/tag.png' } };
-  assert.equal(tagCustomImagePath('daily', styles), '.helixnotes/attachments/tag.png');
+  const styles = { daily: { icon: '.ryuknotes/attachments/tag.png' } };
+  assert.equal(tagCustomImagePath('daily', styles), '.ryuknotes/attachments/tag.png');
   assert.equal(tagCustomImagePath('daily', { daily: { icon: 'builtin:calendar' } }), null);
 });
 

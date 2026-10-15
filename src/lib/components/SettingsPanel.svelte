@@ -2197,7 +2197,7 @@
 						{:else}
 						<div class="settings-section">
 								<h3>Import from Obsidian</h3>
-								<p class="import-desc">Fully converts an Obsidian vault to RyukNotes format: normalizes frontmatter (tags, IDs, dates, title headings), converts <code>[[wiki-links]]</code> to standard markdown links, converts <code>==highlights==</code> and <code>%%comments%%</code>, and relocates attachments to <code>.helixnotes/attachments/</code>. Open the Obsidian vault directory as your RyukNotes vault first.</p>
+								<p class="import-desc">Fully converts an Obsidian vault to RyukNotes format: normalizes frontmatter (tags, IDs, dates, title headings), converts <code>[[wiki-links]]</code> to standard markdown links, converts <code>==highlights==</code> and <code>%%comments%%</code>, and relocates attachments to <code>.ryuknotes/attachments/</code>. Open the Obsidian vault directory as your RyukNotes vault first.</p>
 								<div class="import-warn">
 									<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" /><line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
 									<span>This modifies files in place. Make a backup before running!</span>
@@ -2225,7 +2225,7 @@
 											{#if importResult.frontmatter_normalized}<li>Normalized frontmatter in {importResult.frontmatter_normalized} notes</li>{/if}
 											{#if importResult.links_converted}<li>Converted {importResult.links_converted} wiki-links to markdown</li>{/if}
 											{#if importResult.syntax_converted}<li>Converted Obsidian syntax (highlights, comments) in {importResult.syntax_converted} notes</li>{/if}
-											{#if importResult.attachments_moved}<li>Moved {importResult.attachments_moved} attachments to .helixnotes/attachments/</li>{/if}
+											{#if importResult.attachments_moved}<li>Moved {importResult.attachments_moved} attachments to .ryuknotes/attachments/</li>{/if}
 											{#if !importResult.frontmatter_normalized && !importResult.links_converted && !importResult.syntax_converted && !importResult.attachments_moved}<li>No changes needed</li>{/if}
 										</ul>
 									</div>
@@ -2502,7 +2502,7 @@
 										<code>yay -Syu ryuknotes</code>
 									</div>
 								{:else if $installType === 'android'}
-									<button class="update-install-btn" onclick={() => { openUrl('https://helixnotes.com/#download').catch(() => {}); }}>
+									<button class="update-install-btn" onclick={() => { openUrl('https://github.com/CallMeBakugo/RyukNotes/releases').catch(() => {}); }}>
 										<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 											<path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
 										</svg>

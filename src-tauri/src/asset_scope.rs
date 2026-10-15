@@ -35,7 +35,7 @@ pub fn external_note_root<R: Runtime>(
 }
 
 /// Grants asset-protocol access only to a vault selected by the user.
-/// `.helixnotes` is added explicitly because Unix glob matching excludes hidden paths.
+/// `.ryuknotes` is added explicitly because Unix glob matching excludes hidden paths.
 pub fn allow_vault_assets<R: Runtime>(app: &AppHandle<R>, vault_path: &Path) -> Result<(), String> {
     // Keep the canonical native path: Tauri's scope normalizes Unix paths plus
     // Windows drive, verbatim, and UNC prefixes when matching asset requests.
@@ -45,13 +45,29 @@ pub fn allow_vault_assets<R: Runtime>(app: &AppHandle<R>, vault_path: &Path) -> 
             vault_path.display()
         )
     })?;
+    // Migration: vaults created before the RyukNotes rebrand store attachments and
+    // history under `.helixnotes`. Rename it on first open; if the rename fails
+    // (read-only media, permissions) fall back to scoping both directories.
+    let legacy = vault.join(".helixnotes");
+    let current = vault.join(".ryuknotes");
+    if legacy.is_dir() && !current.exists() {
+        if let Err(error) = std::fs::rename(&legacy, &current) {
+            log::warn!("Could not migrate legacy .helixnotes directory: {error}");
+        }
+    }
     let scope = app.asset_protocol_scope();
     scope
         .allow_directory(&vault, true)
         .map_err(|error| error.to_string())?;
     scope
-        .allow_directory(vault.join(".helixnotes"), true)
-        .map_err(|error| error.to_string())
+        .allow_directory(vault.join(".ryuknotes"), true)
+        .map_err(|error| error.to_string())?;
+    if legacy.is_dir() {
+        scope
+            .allow_directory(&legacy, true)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 /// Grants access to relative assets next to a Markdown file explicitly opened by the user.
@@ -72,7 +88,7 @@ pub fn allow_external_note_assets<R: Runtime>(
         .allow_directory(parent, true)
         .map_err(|error| error.to_string())?;
     let root = external_note_root(app, &note)?;
-    let attachments = root.join(".helixnotes/attachments");
+    let attachments = root.join(".ryuknotes/attachments");
     // Never follow a hidden attachment-directory symlink when extending either scope.
     if std::fs::canonicalize(&attachments)
         .is_ok_and(|canonical| canonical == attachments && canonical.is_dir())
@@ -113,7 +129,7 @@ mod tests {
     fn runtime_scope_allows_only_the_selected_vault() {
         let root = test_directory("asset-scope");
         let vault = root.join("Vault [Cross Platform]");
-        let attachments = vault.join(".helixnotes").join("attachments");
+        let attachments = vault.join(".ryuknotes").join("attachments");
         fs::create_dir_all(&attachments).unwrap();
         let note_image = vault.join("images").join("note image.png");
         fs::create_dir_all(note_image.parent().unwrap()).unwrap();
@@ -139,13 +155,13 @@ mod tests {
         use tauri_plugin_fs::FsExt;
         let root = tempfile::tempdir().unwrap();
         let parent = root.path().join("external");
-        let attachments = parent.join(".helixnotes/attachments");
+        let attachments = parent.join(".ryuknotes/attachments");
         fs::create_dir_all(&attachments).unwrap();
-        fs::create_dir_all(parent.join(".helixnotes/history")).unwrap();
+        fs::create_dir_all(parent.join(".ryuknotes/history")).unwrap();
         fs::create_dir_all(parent.join(".ssh")).unwrap();
         let note = parent.join("Note.md");
         let image = attachments.join("image.png");
-        let history = parent.join(".helixnotes/history/snapshot.md");
+        let history = parent.join(".ryuknotes/history/snapshot.md");
         let private = parent.join(".ssh/private.bin");
         for file in [&note, &image, &history, &private] {
             fs::write(file, b"fixture").unwrap();
@@ -185,9 +201,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let vault = root.path().join("source");
         fs::create_dir_all(vault.join("Notebook")).unwrap();
-        fs::create_dir_all(vault.join(".helixnotes/attachments")).unwrap();
+        fs::create_dir_all(vault.join(".ryuknotes/attachments")).unwrap();
         let note = vault.join("Notebook/Note.md");
-        let image = vault.join(".helixnotes/attachments/image.png");
+        let image = vault.join(".ryuknotes/attachments/image.png");
         fs::write(&note, b"Note").unwrap();
         fs::write(&image, b"Image").unwrap();
         let app = tauri::test::mock_builder()
@@ -213,13 +229,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let parent = root.path().join("external");
         let private = root.path().join("private");
-        fs::create_dir_all(parent.join(".helixnotes")).unwrap();
+        fs::create_dir_all(parent.join(".ryuknotes")).unwrap();
         fs::create_dir(&private).unwrap();
         let note = parent.join("Note.md");
         let file = private.join("private.bin");
         fs::write(&note, b"Note").unwrap();
         fs::write(&file, b"private fixture").unwrap();
-        std::os::unix::fs::symlink(&private, parent.join(".helixnotes/attachments")).unwrap();
+        std::os::unix::fs::symlink(&private, parent.join(".ryuknotes/attachments")).unwrap();
         let app = tauri::test::mock_builder()
             .plugin(tauri_plugin_fs::init())
             .build(tauri::test::mock_context(tauri::test::noop_assets()))

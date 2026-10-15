@@ -260,7 +260,7 @@ mod tests {
     fn atomic_replace_emits_only_enriched_destination() {
         let vault = tempfile::tempdir().unwrap();
         let target = vault.path().join("Note.md");
-        let temporary = vault.path().join(".helixnotes-save-123");
+        let temporary = vault.path().join(".ryuknotes-save-123");
         std::fs::write(&target, "---\ntitle: New title\n---\nUpdated preview.").unwrap();
         let events = mapped_events(
             vec![
@@ -269,7 +269,7 @@ mod tests {
                     .add_path(target.clone()),
                 Event::new(EventKind::Remove(RemoveKind::File)).add_path(target.clone()),
                 Event::new(EventKind::Create(CreateKind::File))
-                    .add_path(vault.path().join(".helixnotes/history/snapshot.md")),
+                    .add_path(vault.path().join(".ryuknotes/history/snapshot.md")),
                 Event::new(EventKind::Create(CreateKind::File))
                     .add_path(vault.path().join(".hidden/secret.md")),
             ],

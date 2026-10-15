@@ -47,12 +47,12 @@ export const DEFAULT_BINDINGS: Record<string, Binding> = Object.fromEntries(
   ACTIONS.map((a) => [a.id, a.default]),
 );
 
-const STORAGE_KEY = "helix-keybindings";
+const STORAGE_KEY = "ryuk-keybindings";
 
 function loadBindings(): Record<string, Binding> {
   const merged: Record<string, Binding> = { ...DEFAULT_BINDINGS };
   try {
-    const raw = typeof localStorage !== "undefined" && localStorage.getItem(STORAGE_KEY);
+    const raw = typeof localStorage !== "undefined" && (localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem("helix-keybindings")); // legacy key fallback
     if (raw) {
       const stored = JSON.parse(raw) as Record<string, Binding>;
       for (const id of Object.keys(merged)) {

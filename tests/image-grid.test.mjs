@@ -29,9 +29,9 @@ function parseGrids(markdown) {
   const grids = [];
   let current = null;
   for (const token of parser.parse(markdown, {})) {
-    if (token.type === 'helix_img_grid_open') {
+    if (token.type === 'ryuk_img_grid_open') {
       current = { cols: Number(token.attrGet('data-cols')), layout: token.attrGet('data-layout'), images: [] };
-    } else if (token.type === 'helix_img_grid_close') {
+    } else if (token.type === 'ryuk_img_grid_close') {
       grids.push(current);
       current = null;
     } else if (current && token.type === 'inline') {

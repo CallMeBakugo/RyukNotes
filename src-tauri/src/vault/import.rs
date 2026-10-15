@@ -212,7 +212,7 @@ pub fn import(vault_path: &str) -> Result<ImportResult, String> {
     Ok(result)
 }
 
-/// Hidden files and folders are never imported, moved or cleaned up. The app's own `.helixnotes`
+/// Hidden files and folders are never imported, moved or cleaned up. The app's own `.ryuknotes`
 /// and Obsidian's `.obsidian` and `.trash` are among them, and so is `.git`: every file that is
 /// not a note becomes an attachment and its original is deleted, which took a repository apart.
 fn is_hidden_entry(path: &Path) -> bool {
@@ -628,7 +628,7 @@ fn ensure_attachment_parent(
 }
 
 fn move_attachments(vault: &Path) -> Result<HashMap<String, String>, String> {
-    let attachments_dir = vault.join(".helixnotes").join("attachments");
+    let attachments_dir = vault.join(".ryuknotes").join("attachments");
     let attachment_files: Vec<_> = scanned_files(vault)?
         .into_iter()
         .filter(|p| p.extension().and_then(|x| x.to_str()) != Some("md"))
@@ -954,13 +954,13 @@ mod tests {
         assert!(root.join(".gitignore").is_file());
         assert!(root.join(".stversions/old.png").is_file());
         // Nothing hidden was copied into the attachments either.
-        assert!(!root.join(".helixnotes/attachments/.git").exists());
-        assert!(!root.join(".helixnotes/attachments/.gitignore").exists());
+        assert!(!root.join(".ryuknotes/attachments/.git").exists());
+        assert!(!root.join(".ryuknotes/attachments/.gitignore").exists());
         // The folder the import emptied is gone; the one that was empty already is kept.
         assert!(!root.join("Pictures").exists());
         assert!(root.join("Empty notebook").is_dir());
         assert!(root
-            .join(".helixnotes/attachments/Pictures/photo.png")
+            .join(".ryuknotes/attachments/Pictures/photo.png")
             .is_file());
     }
 
@@ -994,19 +994,19 @@ mod tests {
         assert_eq!(result.attachments_moved, attachments.len() as u64);
         let note = std::fs::read_to_string(&note_path).unwrap();
         for reference in [
-            "![raw](../.helixnotes/attachments/笔记/café%20雪+.png)",
-            "[encoded](../.helixnotes/attachments/笔记/café%20雪+.png#preview)",
-            "![malformed](../.helixnotes/attachments/笔记/bad%GG.png)",
-            "![percent](../.helixnotes/attachments/笔记/tail%.png)",
-            "[short](../.helixnotes/attachments/笔记/tail%2.png)",
-            "[invalid UTF-8](../.helixnotes/attachments/笔记/bytes%FF%20.png)",
+            "![raw](../.ryuknotes/attachments/笔记/café%20雪+.png)",
+            "[encoded](../.ryuknotes/attachments/笔记/café%20雪+.png#preview)",
+            "![malformed](../.ryuknotes/attachments/笔记/bad%GG.png)",
+            "![percent](../.ryuknotes/attachments/笔记/tail%.png)",
+            "[short](../.ryuknotes/attachments/笔记/tail%2.png)",
+            "[invalid UTF-8](../.ryuknotes/attachments/笔记/bytes%FF%20.png)",
         ] {
             assert!(note.contains(reference), "missing {reference:?} in {note}");
         }
         for name in attachments {
             assert!(!note_dir.join(name).exists());
             assert_eq!(
-                std::fs::read(root.join(".helixnotes/attachments/笔记").join(name)).unwrap(),
+                std::fs::read(root.join(".ryuknotes/attachments/笔记").join(name)).unwrap(),
                 name.as_bytes()
             );
         }
@@ -1224,7 +1224,7 @@ mod tests {
         let vault = tempfile::tempdir().unwrap();
         let root = vault.path();
         let note_dir = root.join("Notes");
-        let stored = root.join(".helixnotes/attachments/Notes");
+        let stored = root.join(".ryuknotes/attachments/Notes");
         std::fs::create_dir_all(&note_dir).unwrap();
         std::fs::create_dir_all(&stored).unwrap();
         std::fs::write(note_dir.join("pic.png"), b"NEW").unwrap();
@@ -1244,15 +1244,15 @@ mod tests {
         assert_eq!(std::fs::read(stored.join("pic-2.png")).unwrap(), b"NEW");
         assert!(!note_dir.join("pic.png").exists());
         let note = std::fs::read_to_string(note_dir.join("Entry.md")).unwrap();
-        assert!(note.contains("![picture](../.helixnotes/attachments/Notes/pic-2.png)"));
-        assert!(note.contains("[picture](../.helixnotes/attachments/Notes/pic-2.png#preview)"));
+        assert!(note.contains("![picture](../.ryuknotes/attachments/Notes/pic-2.png)"));
+        assert!(note.contains("[picture](../.ryuknotes/attachments/Notes/pic-2.png#preview)"));
     }
 
     #[test]
     fn import_prunes_metadata_directories_at_every_depth() {
         let vault = tempfile::tempdir().unwrap();
         let root = vault.path();
-        for hidden in [".helixnotes", ".obsidian", ".trash", ".stfolder", ".claude"] {
+        for hidden in [".ryuknotes", ".obsidian", ".trash", ".stfolder", ".claude"] {
             for base in [root.to_path_buf(), root.join("Notebook")] {
                 let hidden_dir = base.join(hidden).join("history");
                 std::fs::create_dir_all(&hidden_dir).unwrap();
@@ -1273,11 +1273,11 @@ mod tests {
 
         assert_eq!(result.attachments_moved, 1);
         assert_eq!(
-            std::fs::read(root.join(".helixnotes/attachments/Notebook/stfolder-visible/asset.bin"))
+            std::fs::read(root.join(".ryuknotes/attachments/Notebook/stfolder-visible/asset.bin"))
                 .unwrap(),
             b"visible"
         );
-        for hidden in [".helixnotes", ".obsidian", ".trash", ".stfolder", ".claude"] {
+        for hidden in [".ryuknotes", ".obsidian", ".trash", ".stfolder", ".claude"] {
             for base in [root.to_path_buf(), root.join("Notebook")] {
                 let hidden_dir = base.join(hidden).join("history");
                 assert_eq!(
@@ -1296,14 +1296,14 @@ mod tests {
     fn destination_io_failure_leaves_original_attachment_in_place() {
         let vault = tempfile::tempdir().unwrap();
         let root = vault.path();
-        std::fs::create_dir(root.join(".helixnotes")).unwrap();
-        std::fs::write(root.join(".helixnotes/attachments"), b"existing metadata").unwrap();
+        std::fs::create_dir(root.join(".ryuknotes")).unwrap();
+        std::fs::write(root.join(".ryuknotes/attachments"), b"existing metadata").unwrap();
         std::fs::write(root.join("asset.bin"), b"original").unwrap();
 
         assert!(import(root.to_str().unwrap()).is_err());
         assert_eq!(std::fs::read(root.join("asset.bin")).unwrap(), b"original");
         assert_eq!(
-            std::fs::read(root.join(".helixnotes/attachments")).unwrap(),
+            std::fs::read(root.join(".ryuknotes/attachments")).unwrap(),
             b"existing metadata"
         );
     }
@@ -1335,8 +1335,8 @@ mod tests {
         let vault = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let root = vault.path();
-        std::fs::create_dir(root.join(".helixnotes")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.join(".helixnotes/attachments")).unwrap();
+        std::fs::create_dir(root.join(".ryuknotes")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join(".ryuknotes/attachments")).unwrap();
         std::fs::write(root.join("asset.bin"), b"original").unwrap();
 
         assert!(import(root.to_str().unwrap()).is_err());

@@ -1,16 +1,16 @@
 // .md vault -> SQLite importer.
 //
-// Walks an existing HelixNotes/RyukNotes filesystem vault (*.md files with
-// YAML frontmatter, `.helixnotes/` metadata) and pours it into a VaultDb:
+// Walks an existing RyukNotes/RyukNotes filesystem vault (*.md files with
+// YAML frontmatter, `.ryuknotes/` metadata) and pours it into a VaultDb:
 //
 // - note id, title, tags, pinned, created, modified come from frontmatter
 //   (falling back to filename/mtime when frontmatter is damaged)
-// - notes under `.helixnotes/trash` keep their trashed state
-// - history snapshots under `.helixnotes/history/<note id>/` are imported
+// - notes under `.ryuknotes/trash` keep their trashed state
+// - history snapshots under `.ryuknotes/history/<note id>/` are imported
 //   into the versions table
 // - the source vault is never modified; re-running is idempotent (upserts)
 //
-// Attachments (`.helixnotes/attachments/`) are not migrated in this pass:
+// Attachments (`.ryuknotes/attachments/`) are not migrated in this pass:
 // .md notes reference them by relative path, and rewiring those references
 // to attachment ids is part of the frontend switch.
 
@@ -36,14 +36,14 @@ fn rfc3339(dt: chrono::DateTime<Utc>) -> String {
 /// Imports every .md file in `vault_root` into `db`.
 pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, String> {
     let mut report = ImportReport::default();
-    let metadata_dir = vault_root.join(".helixnotes");
+    let metadata_dir = vault_root.join(".ryuknotes");
     let trash_dir = metadata_dir.join("trash");
     let history_dir = metadata_dir.join("history");
 
     let mut md_files: Vec<std::path::PathBuf> = Vec::new();
     collect_md_files(vault_root, &metadata_dir, &mut md_files)
         .map_err(|e| format!("walking vault: {e}"))?;
-    // Trashed notes live inside .helixnotes/trash; collect them too.
+    // Trashed notes live inside .ryuknotes/trash; collect them too.
     collect_md_files(&trash_dir, &metadata_dir, &mut md_files)
         .map_err(|e| format!("walking trash: {e}"))?;
 
@@ -86,7 +86,7 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
             report.notes_imported += 1;
         }
 
-        // History snapshots: .helixnotes/history/<note id>/*.md (raw bodies).
+        // History snapshots: .ryuknotes/history/<note id>/*.md (raw bodies).
         let note_history = history_dir.join(sanitize(&note_id));
         if let Ok(entries) = std::fs::read_dir(&note_history) {
             for entry in entries.flatten() {
@@ -171,7 +171,7 @@ mod tests {
         // Damaged frontmatter must not abort the import.
         std::fs::write(root.join("Broken.md"), "no frontmatter at all").unwrap();
 
-        let meta = root.join(".helixnotes");
+        let meta = root.join(".ryuknotes");
         std::fs::create_dir_all(meta.join("trash")).unwrap();
         std::fs::create_dir_all(meta.join("history/id-alpha")).unwrap();
         write_note(
@@ -225,7 +225,7 @@ mod tests {
         assert_eq!(db.list_notes(true).unwrap().len(), 1);
         // History dedupes by snapshot id (content-addressed below), so a
         // second import of the same snapshot must not duplicate it.
-        let history = vault.path().join(".helixnotes/history/id-only");
+        let history = vault.path().join(".ryuknotes/history/id-only");
         std::fs::create_dir_all(&history).unwrap();
         std::fs::write(history.join("snap.md"), "v1").unwrap();
         import_md_vault(vault.path(), &db).unwrap();

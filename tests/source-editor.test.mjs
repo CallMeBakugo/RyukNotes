@@ -94,9 +94,9 @@ test('asset representation updates do not clear edits or become their own undo s
   const editor = new SourceController((_, edited) => { if (edited) dirty++; });
   editor.load('![image](blob:image)');
   editor.replace(' user edit', editor.state.doc.length);
-  editor.replace('.helixnotes/attachments/image.png', 9, 19, true);
+  editor.replace('.ryuknotes/attachments/image.png', 9, 19, true);
   assert.equal(dirty, 1);
-  assert.equal(editor.state.doc.toString(), '![image](.helixnotes/attachments/image.png) user edit');
+  assert.equal(editor.state.doc.toString(), '![image](.ryuknotes/attachments/image.png) user edit');
   editor.undo();
-  assert.equal(editor.state.doc.toString(), '![image](.helixnotes/attachments/image.png)');
+  assert.equal(editor.state.doc.toString(), '![image](.ryuknotes/attachments/image.png)');
 });

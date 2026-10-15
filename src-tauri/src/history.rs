@@ -16,14 +16,14 @@ fn safe_path_component<'a>(value: &'a str, label: &str) -> Result<&'a str, Strin
     Ok(value)
 }
 
-/// Directory: .helixnotes/history/<note-id>/
+/// Directory: .ryuknotes/history/<note-id>/
 fn history_dir(vault_path: &str, note_id: &str) -> Result<PathBuf, String> {
     let mut dir = PathBuf::from(vault_path);
     // Each level must be a real folder. A link here (carried in by git, a file-sync tool or an
     // extracted archive) would send snapshots, and the pruning that deletes old ones, to whatever
     // folder it points at.
     for part in [
-        ".helixnotes",
+        ".ryuknotes",
         "history",
         safe_path_component(note_id, "note ID")?,
     ] {
@@ -61,7 +61,7 @@ fn is_snapshot_file(path: &Path) -> bool {
 fn snapshot_path(dir: &Path, raw_content: &str) -> Result<(), String> {
     use std::io::Write;
     let mut temporary = tempfile::Builder::new()
-        .prefix(".helixnotes-history-")
+        .prefix(".ryuknotes-history-")
         .tempfile_in(dir)
         .map_err(|error| error.to_string())?;
     temporary
@@ -268,7 +268,7 @@ mod tests {
     fn rejects_history_path_traversal() {
         let vault =
             std::env::temp_dir().join(format!("ryuknotes-history-test-{}", Uuid::new_v4()));
-        let metadata = vault.join(".helixnotes");
+        let metadata = vault.join(".ryuknotes");
         let escaped_history = metadata.join("escaped");
         fs::create_dir_all(&escaped_history).unwrap();
         fs::write(escaped_history.join("2026-01-01T00-00-00.md"), "escaped").unwrap();
@@ -310,7 +310,7 @@ mod tests {
     fn legacy_versions_remain_readable_and_recent_unique_versions_observe_cooldown() {
         let vault = tempfile::tempdir().unwrap();
         let root = vault.path().to_str().unwrap();
-        let history = vault.path().join(".helixnotes/history/note");
+        let history = vault.path().join(".ryuknotes/history/note");
         fs::create_dir_all(&history).unwrap();
         fs::write(history.join("2026-01-01T00-00-00.md"), "legacy").unwrap();
         fs::write(history.join("2026-01-01T1é-00-00.md"), "unusual filename").unwrap();
@@ -344,7 +344,7 @@ mod tests {
             )
             .unwrap();
         }
-        let history = vault.path().join(".helixnotes/history");
+        let history = vault.path().join(".ryuknotes/history");
         fs::create_dir_all(&history).unwrap();
         symlink(outside.path(), history.join("linked")).unwrap();
 
@@ -356,8 +356,8 @@ mod tests {
 
         // The same when a higher level is the link.
         let second = tempfile::tempdir().unwrap();
-        fs::create_dir_all(second.path().join(".helixnotes")).unwrap();
-        symlink(outside.path(), second.path().join(".helixnotes/history")).unwrap();
+        fs::create_dir_all(second.path().join(".ryuknotes")).unwrap();
+        symlink(outside.path(), second.path().join(".ryuknotes/history")).unwrap();
         assert!(super::force_snapshot(second.path().to_str().unwrap(), "note", "new", 20).is_err());
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 25);
     }
@@ -366,7 +366,7 @@ mod tests {
     fn pruning_and_listing_only_touch_snapshots() {
         let vault = tempfile::tempdir().unwrap();
         let root = vault.path().to_str().unwrap();
-        let history = vault.path().join(".helixnotes/history/note");
+        let history = vault.path().join(".ryuknotes/history/note");
         fs::create_dir_all(&history).unwrap();
         // Markdown files that are not snapshots, sorting before and after real ones.
         fs::write(history.join("README.md"), "keep").unwrap();

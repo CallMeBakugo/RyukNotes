@@ -19,7 +19,7 @@ const MAX_ENTRIES: usize = 1_000_000;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_NAME_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PATH_COMPONENTS: usize = 64;
-const MANIFEST: &str = ".helixnotes-backup.json";
+const MANIFEST: &str = ".ryuknotes-backup.json";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,7 +67,7 @@ fn excluded_path(path: &Path, vault: &Path, backup_dir: &Path, attachments: bool
     let relative = path.strip_prefix(vault).expect("walker stays in vault");
     let mut parts = relative.components();
     let first = parts.next().expect("non-root entry").as_os_str();
-    if first == ".helixnotes" {
+    if first == ".ryuknotes" {
         return match parts.next() {
             None => !attachments,
             Some(part) if part.as_os_str() == "attachments" && attachments => {
@@ -127,7 +127,7 @@ pub fn create_backup(
     let filename = format!("ryuknotes-backup-{timestamp}-{id}-{}.zip", Uuid::new_v4());
     let backup_path = output.join(&filename);
     let temporary = Builder::new()
-        .prefix(".helixnotes-backup-")
+        .prefix(".ryuknotes-backup-")
         .suffix(".tmp")
         .tempfile_in(&output)
         .map_err(|e| format!("Failed to create temporary backup: {e}"))?;
@@ -349,10 +349,10 @@ fn historical_backups(
         let hidden = relative
             .components()
             .any(|component| component.as_os_str().to_string_lossy().starts_with('.'));
-        if hidden && !(attachments && relative.starts_with(".helixnotes/attachments")) {
+        if hidden && !(attachments && relative.starts_with(".ryuknotes/attachments")) {
             if item.file_type().is_dir() {
-                // Continue into .helixnotes only to find historical attachment backups.
-                if attachments && relative == Path::new(".helixnotes") {
+                // Continue into .ryuknotes only to find historical attachment backups.
+                if attachments && relative == Path::new(".ryuknotes") {
                     continue;
                 }
                 walker.skip_current_dir();
@@ -393,7 +393,7 @@ fn install_staged(
     let mut held_output = false;
     let mut displaced = Vec::new();
     let mut installed = Vec::new();
-    let attachments_path = vault.join(".helixnotes/attachments");
+    let attachments_path = vault.join(".ryuknotes/attachments");
     let mut displaced_attachments = false;
     let mut installed_attachments = false;
     let operation = (|| -> io::Result<()> {
@@ -432,19 +432,19 @@ fn install_staged(
                 fs::rename(&attachments_path, &previous_attachments)?;
                 displaced_attachments = true;
             }
-            fs::create_dir_all(vault.join(".helixnotes"))?;
+            fs::create_dir_all(vault.join(".ryuknotes"))?;
         }
         for entry in fs::read_dir(contents)? {
             let entry = entry?;
             let name = entry.file_name();
-            if name == ".helixnotes" {
+            if name == ".ryuknotes" {
                 continue;
             }
             fs::rename(entry.path(), vault.join(&name))?;
             installed.push(name);
         }
         if attachments {
-            fs::rename(contents.join(".helixnotes/attachments"), &attachments_path)?;
+            fs::rename(contents.join(".ryuknotes/attachments"), &attachments_path)?;
             installed_attachments = true;
         }
         if let Some(relative) = nested {
@@ -571,7 +571,7 @@ pub fn restore_backup(
     let output = fs::canonicalize(backup_dir).map_err(|e| e.to_string())?;
     let backup = validated_backup_file(&output, backup_path)?;
     let stage = Builder::new()
-        .prefix(".helixnotes-restore-")
+        .prefix(".ryuknotes-restore-")
         .tempdir_in(vault.parent().ok_or("Vault has no parent")?)
         .map_err(|e| e.to_string())?;
     let contents = stage.path().join("contents");
@@ -611,6 +611,16 @@ pub fn restore_backup(
     for index in 0..archive.len() {
         let mut item = archive.by_index(index).map_err(|e| e.to_string())?;
         let name = item.name().to_string();
+        // Read-compat: backups written before the RyukNotes rebrand name the internal
+        // directory `.helixnotes` and the manifest `.helixnotes-backup.json`. Remap those
+        // entry names to the current ones before validation and extraction.
+        let name = if name == ".helixnotes-backup.json" {
+            MANIFEST.to_string()
+        } else if name.starts_with(".helixnotes/") || name == ".helixnotes" {
+            name.replacen(".helixnotes", ".ryuknotes", 1)
+        } else {
+            name
+        };
         let relative = checked_entry_name(&name)?;
         let directory = item.is_dir();
         if !directory && is_published_backup(&relative) {
@@ -627,7 +637,7 @@ pub fn restore_backup(
         }
         let mut parts = relative.components();
         let first = parts.next().expect("checked path");
-        let internal = first.as_os_str() == ".helixnotes";
+        let internal = first.as_os_str() == ".ryuknotes";
         if internal {
             match parts.next() {
                 None if directory => {}
@@ -730,13 +740,13 @@ pub fn restore_backup(
         legacy_attachments
     };
     if attachments {
-        fs::create_dir_all(contents.join(".helixnotes/attachments")).map_err(|e| e.to_string())?;
+        fs::create_dir_all(contents.join(".ryuknotes/attachments")).map_err(|e| e.to_string())?;
         if let Ok(relative) = output.strip_prefix(&vault) {
-            if relative.starts_with(".helixnotes/attachments") {
+            if relative.starts_with(".ryuknotes/attachments") {
                 return Err("Cannot replace attachments containing the backup output".to_string());
             }
         }
-        let internals = vault.join(".helixnotes");
+        let internals = vault.join(".ryuknotes");
         if fs::symlink_metadata(&internals).is_ok_and(|meta| !meta.file_type().is_dir()) {
             return Err("Vault app metadata directory is not a real directory".to_string());
         }
@@ -891,13 +901,13 @@ mod tests {
         let root = tempdir().unwrap();
         let vault = root.path().join("vault");
         let output = root.path().join("backups");
-        let attachments = vault.join(".helixnotes/attachments");
+        let attachments = vault.join(".ryuknotes/attachments");
         fs::create_dir_all(&attachments).unwrap();
         fs::write(vault.join("note.md"), "old").unwrap();
         fs::write(attachments.join("picture.png"), "original").unwrap();
         fs::create_dir_all(vault.join("attachments")).unwrap();
         fs::write(vault.join("attachments/notebook.md"), "top-level original").unwrap();
-        fs::write(vault.join(".helixnotes/settings.json"), "keep").unwrap();
+        fs::write(vault.join(".ryuknotes/settings.json"), "keep").unwrap();
 
         let omitted = create_backup(&vault_string(&vault), &output, false).unwrap();
         let mut omitted_zip = ZipArchive::new(File::open(&omitted.path).unwrap()).unwrap();
@@ -937,7 +947,7 @@ mod tests {
         );
         assert!(!attachments.join("extra.png").exists());
         assert_eq!(
-            fs::read_to_string(vault.join(".helixnotes/settings.json")).unwrap(),
+            fs::read_to_string(vault.join(".ryuknotes/settings.json")).unwrap(),
             "keep"
         );
     }
@@ -947,17 +957,17 @@ mod tests {
         let root = tempdir().unwrap();
         let vault = root.path().join("vault");
         let output = root.path().join("backups");
-        fs::create_dir_all(vault.join(".helixnotes/attachments")).unwrap();
+        fs::create_dir_all(vault.join(".ryuknotes/attachments")).unwrap();
         fs::create_dir_all(&output).unwrap();
         fs::write(vault.join("note.md"), "live-note").unwrap();
-        fs::write(vault.join(".helixnotes/attachments/photo"), "live-photo").unwrap();
+        fs::write(vault.join(".ryuknotes/attachments/photo"), "live-photo").unwrap();
         let archive_path = output.join("legacy.zip");
         let mut zip = ZipWriter::new(File::create(&archive_path).unwrap());
         let options =
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
         zip.start_file("note.md", options).unwrap();
         zip.write_all(b"archived-note").unwrap();
-        zip.start_file(".helixnotes/attachments/photo", options)
+        zip.start_file(".ryuknotes/attachments/photo", options)
             .unwrap();
         zip.write_all(b"archived-photo").unwrap();
         zip.finish().unwrap();
@@ -976,7 +986,7 @@ mod tests {
             "live-note"
         );
         assert_eq!(
-            fs::read_to_string(vault.join(".helixnotes/attachments/photo")).unwrap(),
+            fs::read_to_string(vault.join(".ryuknotes/attachments/photo")).unwrap(),
             "live-photo"
         );
     }
@@ -1023,10 +1033,10 @@ mod tests {
         let root = tempdir().unwrap();
         let vault = root.path().join("vault");
         let output = root.path().join("backups");
-        fs::create_dir_all(vault.join(".helixnotes/attachments")).unwrap();
+        fs::create_dir_all(vault.join(".ryuknotes/attachments")).unwrap();
         fs::create_dir_all(&output).unwrap();
         fs::write(vault.join("note.md"), "live").unwrap();
-        fs::write(vault.join(".helixnotes/attachments/photo"), "untouched").unwrap();
+        fs::write(vault.join(".ryuknotes/attachments/photo"), "untouched").unwrap();
         let archive_path = output.join("legacy.zip");
         let mut zip = ZipWriter::new(File::create(&archive_path).unwrap());
         zip.start_file("note.md", SimpleFileOptions::default())
@@ -1039,7 +1049,7 @@ mod tests {
             "restored"
         );
         assert_eq!(
-            fs::read_to_string(vault.join(".helixnotes/attachments/photo")).unwrap(),
+            fs::read_to_string(vault.join(".ryuknotes/attachments/photo")).unwrap(),
             "untouched"
         );
     }
@@ -1049,13 +1059,13 @@ mod tests {
         let root = tempdir().unwrap();
         let vault = root.path().join("vault");
         let output = root.path().join("backups");
-        fs::create_dir_all(vault.join(".helixnotes")).unwrap();
+        fs::create_dir_all(vault.join(".ryuknotes")).unwrap();
         fs::create_dir_all(&output).unwrap();
         fs::write(vault.join("note.md"), "original").unwrap();
-        fs::write(vault.join(".helixnotes/settings.json"), "settings").unwrap();
+        fs::write(vault.join(".ryuknotes/settings.json"), "settings").unwrap();
         for bad_name in [
             "../escape.md",
-            ".helixnotes/settings.json",
+            ".ryuknotes/settings.json",
             "dir/../../escape.md",
         ] {
             let archive_path = output.join("unsafe.zip");
@@ -1076,7 +1086,7 @@ mod tests {
                 "original"
             );
             assert_eq!(
-                fs::read_to_string(vault.join(".helixnotes/settings.json")).unwrap(),
+                fs::read_to_string(vault.join(".ryuknotes/settings.json")).unwrap(),
                 "settings"
             );
             assert!(!root.path().join("escape.md").exists());

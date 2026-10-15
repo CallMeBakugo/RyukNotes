@@ -69,7 +69,7 @@
 
           meta = with pkgs.lib; {
             description = "RyukNotes desktop application";
-            homepage = "https://helixnotes.com/";
+            homepage = "https://github.com/CallMeBakugo/RyukNotes/";
             license = licenses.agpl3Plus;
             platforms = platforms.linux ++ platforms.darwin;
             mainProgram = "ryuknotes";

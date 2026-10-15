@@ -1083,13 +1083,7 @@
 				</button>
 			{:else}
 				<div class="mobile-header-brand">
-					<svg width="22" height="22" viewBox="0 0 48 48" fill="none">
-						<rect width="48" height="48" rx="12" fill="var(--accent)" />
-						<circle cx="16" cy="16" r="3.5" fill="white" opacity="0.9" />
-						<circle cx="32" cy="16" r="3.5" fill="white" opacity="0.9" />
-						<circle cx="16" cy="32" r="3.5" fill="white" opacity="0.9" />
-						<circle cx="32" cy="32" r="3.5" fill="white" opacity="0.9" />
-					</svg>
+					<img src="/ryuk-logo.png" alt="Ryuk's Notebook" width="22" height="22" />
 				</div>
 			{/if}
 			{#if $mobileView !== 'editor'}

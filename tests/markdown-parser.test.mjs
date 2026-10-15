@@ -150,15 +150,15 @@ test('image-only gaps remain outside code and do not alter inline images', () =>
 });
 
 test('only actual closed secret fences become secret blocks, not literal examples', () => {
-  assert.match(parser.render('```helix-secret\nexample-payload\n```'), /data-secret-block="example-payload"/);
-  const literal = '```helix-secret\nexample-payload\n```';
+  assert.match(parser.render('```ryuk-secret\nexample-payload\n```'), /data-secret-block="example-payload"/);
+  const literal = '```ryuk-secret\nexample-payload\n```';
   assert.equal(unescape(escapedCode(parser.render('````text\n' + literal + '\n````'))), literal);
-  assert.doesNotMatch(parser.render('```helix-secret\nunclosed'), /data-secret-block/);
+  assert.doesNotMatch(parser.render('```ryuk-secret\nunclosed'), /data-secret-block/);
 });
 
 test('invalid final secret-fence markers remain literal code', () => {
   for (const closing of ['    ```', '\t```', '```\u00a0']) {
-    const html = parser.render('```helix-secret\nexample-payload\n' + closing);
+    const html = parser.render('```ryuk-secret\nexample-payload\n' + closing);
     assert.doesNotMatch(html, /data-secret-block/);
     assert.equal(unescape(escapedCode(html)), 'example-payload\n' + closing);
   }
@@ -166,8 +166,8 @@ test('invalid final secret-fence markers remain literal code', () => {
 
 test('code whitespace is marked for DOM import without changing soft or hard line-break semantics', () => {
   const html = parser.render('# `   `\n\nbefore `trailing `\nnext  \nlast');
-  assert.match(html, /<h1 data-helix-code="">/);
-  assert.match(html, /<p data-helix-code="">/);
+  assert.match(html, /<h1 data-ryuk-code="">/);
+  assert.match(html, /<p data-ryuk-code="">/);
   assert.match(html, /<\/code> next<br>last/);
 });
 
@@ -194,21 +194,21 @@ test('task markers only turn bullet-list items into tasks, never numbered items'
 });
 
 test('code spans mark simple list items and table cells so whitespace-only code survives DOM import', () => {
-  assert.match(parser.render('- a `  ` b\n- plain'), /<li data-helix-code="">a <code[^>]*>  <\/code> b<\/li>\s*<li>plain<\/li>/);
-  assert.match(parser.render('1. one `  ` two'), /<li data-helix-code="">one /);
-  assert.match(parser.render('- [ ] task `  ` x'), /<li data-type="taskItem" data-checked="false" data-helix-code="">/);
-  assert.match(parser.render('| a | b |\n| - | - |\n| `  ` | c |'), /<td data-helix-code=""><code[^>]*>  <\/code><\/td>\s*<td>c<\/td>/);
-  assert.match(parser.render('| `  ` | b |\n| - | - |\n| x | y |'), /<th data-helix-code="">/);
+  assert.match(parser.render('- a `  ` b\n- plain'), /<li data-ryuk-code="">a <code[^>]*>  <\/code> b<\/li>\s*<li>plain<\/li>/);
+  assert.match(parser.render('1. one `  ` two'), /<li data-ryuk-code="">one /);
+  assert.match(parser.render('- [ ] task `  ` x'), /<li data-type="taskItem" data-checked="false" data-ryuk-code="">/);
+  assert.match(parser.render('| a | b |\n| - | - |\n| `  ` | c |'), /<td data-ryuk-code=""><code[^>]*>  <\/code><\/td>\s*<td>c<\/td>/);
+  assert.match(parser.render('| `  ` | b |\n| - | - |\n| x | y |'), /<th data-ryuk-code="">/);
 });
 
 test('list items with nested blocks are not marked, so no stray whitespace text appears around them', () => {
   const nested = parser.render('- a `x`\n  - nested `y`');
   assert.match(nested, /<li>a <code/);
-  assert.match(nested, /<li data-helix-code="">nested /);
-  assert.doesNotMatch(parser.render('- item `x`\n\n  ```js\n  code\n  ```'), /<li data-helix-code/);
-  assert.doesNotMatch(parser.render('- no code here\n- still none'), /data-helix-code/);
+  assert.match(nested, /<li data-ryuk-code="">nested /);
+  assert.doesNotMatch(parser.render('- item `x`\n\n  ```js\n  code\n  ```'), /<li data-ryuk-code/);
+  assert.doesNotMatch(parser.render('- no code here\n- still none'), /data-ryuk-code/);
   // Loose lists keep their paragraph marker as before.
-  assert.match(parser.render('- loose `  ` x\n\n- second'), /<li>\s*<p data-helix-code="">loose /);
+  assert.match(parser.render('- loose `  ` x\n\n- second'), /<li>\s*<p data-ryuk-code="">loose /);
 });
 
 test('stripLinkTitle behaves exactly like the title expression it replaced, on every short combination', () => {
@@ -256,7 +256,7 @@ test('a line with thousands of unclosed link starts is parsed in linear time', (
 
 test('angle-bracket text that is not HTML stays text', () => {
   assert.equal(parser.render('returns List<String> or Map<K,V> here'), '<p>returns List&lt;String&gt; or Map&lt;K,V&gt; here</p>\n');
-  assert.equal(parser.render('Run `x` as <username> then <my-tag a="1">'), '<p data-helix-code="">Run <code style="white-space: pre-wrap">x</code> as &lt;username&gt; then &lt;my-tag a=&quot;1&quot;&gt;</p>\n');
+  assert.equal(parser.render('Run `x` as <username> then <my-tag a="1">'), '<p data-ryuk-code="">Run <code style="white-space: pre-wrap">x</code> as &lt;username&gt; then &lt;my-tag a=&quot;1&quot;&gt;</p>\n');
   // A placeholder alone on a line would otherwise be an HTML block.
   assert.equal(parser.render('<GroupName>\n\nafter'), '<p>&lt;GroupName&gt;</p>\n<p>after</p>\n');
   assert.equal(parser.render('<Foo>\ntext  \n</Foo>'), '<p>&lt;Foo&gt;<br>text<br>&lt;/Foo&gt;</p>\n');

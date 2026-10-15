@@ -72,15 +72,7 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div class="titlebar" class:macos={isMac} onmousedown={handleMouseDown}>
 	<div class="titlebar-brand">
-		<svg width="18" height="18" viewBox="0 0 48 48" fill="none">
-			<rect width="48" height="48" rx="12" fill="var(--accent)" />
-			<circle cx="16" cy="16" r="3.5" fill="white" opacity="0.9" />
-			<circle cx="32" cy="16" r="3.5" fill="white" opacity="0.9" />
-			<circle cx="16" cy="32" r="3.5" fill="white" opacity="0.9" />
-			<circle cx="32" cy="32" r="3.5" fill="white" opacity="0.9" />
-			<line x1="19" y1="18" x2="29" y2="30" stroke="white" stroke-width="2" stroke-linecap="round" opacity="0.7" />
-			<line x1="29" y1="18" x2="19" y2="30" stroke="white" stroke-width="2" stroke-linecap="round" opacity="0.7" />
-		</svg>
+		<img class="titlebar-logo" src="/ryuk-logo.png" alt="Ryuk's Notebook" width="18" height="18" />
 		<span class="titlebar-title">Ryuk's Notebook</span>
 		{#if $updateAvailable}
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -192,6 +184,11 @@
 		font-size: 12px;
 		font-weight: 500;
 		color: var(--text-tertiary);
+	}
+
+	.titlebar-logo {
+		border-radius: 4px;
+		flex-shrink: 0;
 	}
 
 	.update-badge {

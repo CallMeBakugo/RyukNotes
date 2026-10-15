@@ -7,7 +7,7 @@
 A local-first notes app with the agent built in.
 
 Ryuk's Notebook (the app, binary, and repo are named RyukNotes) is a fork of
-[HelixNotes](https://gitlab.com/ArkHost/HelixNotes) (AGPL-3.0), rebuilt around
+[RyukNotes](https://gitlab.com/ArkHost/RyukNotes) (AGPL-3.0), rebuilt around
 a single SQLite vault and a companion CLI for AI-agent workflows.
 
 **Status: this is a new project.** It works, but expect rough edges —
@@ -54,6 +54,6 @@ The `ryuk` CLI binary lands in `src-tauri/target/release/ryuk`.
 
 ## Credits and license
 
-Forked from HelixNotes by Yuri Karamian (ArkHost) — the editor, UI, and
+Forked from RyukNotes by Yuri Karamian (ArkHost) — the editor, UI, and
 original architecture are his work. Rebadged and reworked as RyukNotes
-under the same AGPL-3.0 license. Upstream: https://gitlab.com/ArkHost/HelixNotes
+under the same AGPL-3.0 license. Upstream: https://gitlab.com/ArkHost/RyukNotes

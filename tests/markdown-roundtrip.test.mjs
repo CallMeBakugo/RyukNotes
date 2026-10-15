@@ -175,7 +175,7 @@ test('joins contiguous code across formatting changes with code taking precedenc
     editorMarkdown.parseInline(serialized, {})[0].children.map((token) => [token.type, token.content]),
     [['code_inline', '`a``b`']]
   );
-  assert.equal(editorMarkdown.render(serialized), '<p data-helix-code=""><code style="white-space: pre-wrap">`a``b`</code></p>\n');
+  assert.equal(editorMarkdown.render(serialized), '<p data-ryuk-code=""><code style="white-space: pre-wrap">`a``b`</code></p>\n');
 });
 
 test('keeps link syntax outside code and joins code across formatting changes within links', () => {
@@ -189,7 +189,7 @@ test('keeps link syntax outside code and joins code across formatting changes wi
   assert.equal(serialized, 'before [`` `ab` ``](https://example.com) after');
   assert.equal(
     editorMarkdown.render(serialized),
-    '<p data-helix-code="">before <a href="https://example.com"><code style="white-space: pre-wrap">`ab`</code></a> after</p>\n'
+    '<p data-ryuk-code="">before <a href="https://example.com"><code style="white-space: pre-wrap">`ab`</code></a> after</p>\n'
   );
 });
 
@@ -236,7 +236,7 @@ test('drops formatting around a code span that a letter or digit touches', () =>
 
 // What the editor does when it saves a paragraph: escape only what would read back differently.
 const inlinePlainText = (markdown) => (editorMarkdown.parseInline(markdown, {})[0]?.children ?? [])
-  .map((token) => (token.type === 'text' || token.type === 'code_inline' || token.type === 'helix_wiki' ? token.content : '')).join('');
+  .map((token) => (token.type === 'text' || token.type === 'code_inline' || token.type === 'ryuk_wiki' ? token.content : '')).join('');
 const readsAsParagraph = (markdown) => {
   const tokens = editorMarkdown.parse(markdown, {});
   return tokens.length === 3 && tokens[0].type === 'paragraph_open';
@@ -289,7 +289,7 @@ test('text that looks like Markdown is saved so that it stays text', () => {
 test('text that reads as a link or an image is left to become one', () => {
   // Deliberate: images damaged by an old save bug (`<!-- -->![](a b.png)`) load as text and come
   // back as images this way. Brackets are never escaped.
-  for (const text of ['![](.helixnotes/attachments/a b.png)', '[docs](https://example.com)', '[[Other note]]']) {
+  for (const text of ['![](.ryuknotes/attachments/a b.png)', '[docs](https://example.com)', '[[Other note]]']) {
     assert.equal(saveParagraph([{ text, marks: [] }]), text);
   }
 });
@@ -342,7 +342,7 @@ test('preserves formatting on non-code parts of a link', () => {
   ]));
   assert.equal(
     editorMarkdown.render(serialized),
-    '<p data-helix-code=""><strong><a href="https://example.com">first</a></strong><a href="https://example.com"><code style="white-space: pre-wrap">code</code></a><strong><a href="https://example.com">last</a></strong></p>\n'
+    '<p data-ryuk-code=""><strong><a href="https://example.com">first</a></strong><a href="https://example.com"><code style="white-space: pre-wrap">code</code></a><strong><a href="https://example.com">last</a></strong></p>\n'
   );
 });
 
@@ -498,7 +498,7 @@ test('splits contiguous code at link boundaries without losing code text or link
   ]));
   assert.equal(
     editorMarkdown.render(serialized),
-    '<p data-helix-code=""><code style="white-space: pre-wrap">`first</code><a href="https://example.com"><code style="white-space: pre-wrap">second`</code></a><a href="https://other.example"><code style="white-space: pre-wrap">third</code></a><code style="white-space: pre-wrap">last</code></p>\n'
+    '<p data-ryuk-code=""><code style="white-space: pre-wrap">`first</code><a href="https://example.com"><code style="white-space: pre-wrap">second`</code></a><a href="https://other.example"><code style="white-space: pre-wrap">third</code></a><code style="white-space: pre-wrap">last</code></p>\n'
   );
 });
 
@@ -550,12 +550,12 @@ test('joining never collapses blank lines inside code blocks', () => {
 });
 
 const mathPayloads = (markdown) => (editorMarkdown.parseInline(markdown, {})[0]?.children ?? [])
-  .filter((token) => token.type === 'helix_math_inline').map((token) => token.content);
+  .filter((token) => token.type === 'ryuk_math_inline').map((token) => token.content);
 const keepDollars = (children) => serializeInlineMarkdownKeepingDollars(schema.node('paragraph', null, children), undefined, mathPayloads);
 const mathAtom = (tex) => schema.node('mathInline', { tex });
 // What a reader of the saved Markdown sees: plain text and formulas, in order.
 const readBack = (markdown) => (editorMarkdown.parseInline(markdown, {})[0]?.children ?? []).map((token) =>
-  token.type === 'helix_math_inline' ? `\u0000${token.content}\u0000` : token.type === 'text' ? token.content : '').join('');
+  token.type === 'ryuk_math_inline' ? `\u0000${token.content}\u0000` : token.type === 'text' ? token.content : '').join('');
 const authored = (children) => children.map((child) => child.type.name === 'mathInline' ? `\u0000${child.attrs.tex}\u0000` : child.text).join('');
 
 test('dollar signs that cannot form a formula are saved as typed', () => {

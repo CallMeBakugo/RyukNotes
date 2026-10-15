@@ -80,9 +80,9 @@ export function resolveVaultFilePath(
 	const root = vaultRoot?.replace(/\\/g, '/').replace(/\/$/, '') ?? '';
 	if (root) {
 		// Older imported managed links may still contain notebook-depth prefixes.
-		const managed = target.match(/^(?:\.{1,2}\/)*(\.helixnotes\/attachments\/.*)$/);
+		const managed = target.match(/^(?:\.{1,2}\/)*(\.ryuknotes\/attachments\/.*)$/);
 		if (managed) return resolvePathFromFile(`${root}/.vault-root`, managed[1]);
-		if (target.startsWith('.helixnotes/')) return resolvePathFromFile(`${root}/.vault-root`, target);
+		if (target.startsWith('.ryuknotes/')) return resolvePathFromFile(`${root}/.vault-root`, target);
 	}
 	if (notePath) return resolvePathFromFile(notePath, target);
 	if (root) return resolvePathFromFile(`${root}/.vault-root`, target);
@@ -110,7 +110,7 @@ export function assetSourceToMarkdown(
 	const normalizedRoot = vaultRoot?.replace(/\\/g, '/').replace(/\/$/, '');
 	if (!normalizedRoot || !isPathInDirectory(absolutePath, normalizedRoot)) return encodeMarkdownPath(absolutePath) + suffix;
 	const vaultRelative = absolutePath.substring(normalizedRoot.length + 1);
-	if (vaultRelative.startsWith('.helixnotes/') || !notePath) return encodeMarkdownPath(vaultRelative) + suffix;
+	if (vaultRelative.startsWith('.ryuknotes/') || !notePath) return encodeMarkdownPath(vaultRelative) + suffix;
 	const normalizedNotePath = notePath.replace(/\\/g, '/');
 	const noteDirectory = normalizedNotePath.substring(0, normalizedNotePath.lastIndexOf('/'));
 	return encodeMarkdownPath(relativePath(noteDirectory, absolutePath)) + suffix;
@@ -166,5 +166,5 @@ export function isPathInDirectory(path: string, directory: string | null): boole
 }
 
 export function isTrashedNote(path: string | null, vaultRoot: string | null | undefined): boolean {
-	return !!path && !!vaultRoot && isPathInDirectory(path, `${vaultRoot}/.helixnotes/trash`);
+	return !!path && !!vaultRoot && isPathInDirectory(path, `${vaultRoot}/.ryuknotes/trash`);
 }

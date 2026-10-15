@@ -24,7 +24,7 @@ function displayMath(state: StateBlock, startLine: number, endLine: number, sile
   }
   if (closing === endLine) return false;
   if (silent) return true;
-  const token = state.push('helix_math_block', 'div', 0);
+  const token = state.push('ryuk_math_block', 'div', 0);
   token.block = true;
   token.content = state.getLines(startLine + 1, closing, state.blkIndent, false).trim();
   token.map = [startLine, closing + 1];
@@ -49,7 +49,7 @@ function inlineMath(state: StateInline, silent: boolean): boolean {
   if (end >= state.posMax || end === start + 1 || /\s/u.test(state.src[end - 1]) ||
     state.src[end + 1] === '$' || /[0-9]/.test(state.src[end + 1] ?? '')) return false;
   if (!silent) {
-    const token = state.push('helix_math_inline', 'span', 0);
+    const token = state.push('ryuk_math_inline', 'span', 0);
     token.content = state.src.slice(start + 1, end).trim();
     token.meta = { from: start, to: end + 1 };
     token.attrSet('data-math-inline', encodeURIComponent(token.content));
@@ -82,11 +82,11 @@ function spaceCode(state: StateInline, silent: boolean): boolean {
 }
 
 function installMath(md: MarkdownIt) {
-  md.block.ruler.before('fence', 'helix_math_block', displayMath, { alt: ['paragraph', 'reference', 'blockquote', 'list'] });
-  md.inline.ruler.after('backticks', 'helix_math_inline', inlineMath);
-  md.renderer.rules.helix_math_block = (tokens, index, _options, _env, renderer) =>
+  md.block.ruler.before('fence', 'ryuk_math_block', displayMath, { alt: ['paragraph', 'reference', 'blockquote', 'list'] });
+  md.inline.ruler.after('backticks', 'ryuk_math_inline', inlineMath);
+  md.renderer.rules.ryuk_math_block = (tokens, index, _options, _env, renderer) =>
     `<div${renderer.renderAttrs(tokens[index])}></div>\n`;
-  md.renderer.rules.helix_math_inline = (tokens, index, _options, _env, renderer) =>
+  md.renderer.rules.ryuk_math_inline = (tokens, index, _options, _env, renderer) =>
     `<span${renderer.renderAttrs(tokens[index])}></span>`;
 }
 
@@ -118,7 +118,7 @@ function wikiLink(state: StateInline, silent: boolean): boolean {
     const basename = title.includes('/') ? title.slice(title.lastIndexOf('/') + 1) : title;
     const path = (title.includes('/') ? index.paths.get(title + '.md') : undefined)
       ?? index.titles.get(basename.toLowerCase())?.path ?? '';
-    const token = state.push('helix_wiki', 'span', 0);
+    const token = state.push('ryuk_wiki', 'span', 0);
     token.attrSet('data-wiki-link', '');
     token.attrSet('data-path', path);
     token.attrSet('data-title', reference);
@@ -279,7 +279,7 @@ function emptyParagraph(state: StateBlock, startLine: number, _endLine: number, 
   const from = state.bMarks[startLine] + state.tShift[startLine];
   if (state.src.slice(from, state.eMarks[startLine]).trim() !== '<!-- -->') return false;
   if (silent) return true;
-  const token = state.push('helix_empty', 'p', 0);
+  const token = state.push('ryuk_empty', 'p', 0);
   token.block = true;
   token.map = [startLine, startLine + 1];
   state.line = startLine + 1;
@@ -322,7 +322,7 @@ function imageGrid(state: StateBlock, startLine: number, endLine: number, silent
   }
   if (closing < 0 || images.length === 0) return false;
   if (silent) return true;
-  const open = state.push('helix_img_grid_open', 'div', 1);
+  const open = state.push('ryuk_img_grid_open', 'div', 1);
   open.block = true;
   open.map = [startLine, closing + 1];
   open.attrSet('data-img-grid', '');
@@ -335,7 +335,7 @@ function imageGrid(state: StateBlock, startLine: number, endLine: number, silent
     inline.map = [image.line, image.line + 1];
     inline.children = [];
   }
-  state.push('helix_img_grid_close', 'div', -1).block = true;
+  state.push('ryuk_img_grid_close', 'div', -1).block = true;
   state.line = closing + 1;
   return true;
 }
@@ -389,19 +389,19 @@ export function createEditorMarkdownParser(): MarkdownIt {
   // Existing editor convention: tab-indented prose does not become an indented code block.
   md.disable('code');
   installMath(md);
-  md.inline.ruler.before('link', 'helix_wiki', wikiLink);
-  md.inline.ruler.before('backticks', 'helix_space_code', spaceCode);
-  md.inline.ruler.before('link', 'helix_legacy_link', legacyLink);
-  md.block.ruler.before('html_block', 'helix_empty', emptyParagraph, { alt: ['paragraph', 'reference', 'blockquote', 'list'] });
-  md.block.ruler.before('fence', 'helix_img_grid', imageGrid, { alt: ['paragraph', 'reference', 'blockquote', 'list'] });
-  md.renderer.rules.helix_empty = () => '<p></p>\n';
-  md.renderer.rules.helix_wiki = (tokens, index, _options, _env, renderer) =>
+  md.inline.ruler.before('link', 'ryuk_wiki', wikiLink);
+  md.inline.ruler.before('backticks', 'ryuk_space_code', spaceCode);
+  md.inline.ruler.before('link', 'ryuk_legacy_link', legacyLink);
+  md.block.ruler.before('html_block', 'ryuk_empty', emptyParagraph, { alt: ['paragraph', 'reference', 'blockquote', 'list'] });
+  md.block.ruler.before('fence', 'ryuk_img_grid', imageGrid, { alt: ['paragraph', 'reference', 'blockquote', 'list'] });
+  md.renderer.rules.ryuk_empty = () => '<p></p>\n';
+  md.renderer.rules.ryuk_wiki = (tokens, index, _options, _env, renderer) =>
     `<span${renderer.renderAttrs(tokens[index])}>${md.utils.escapeHtml(tokens[index].content)}</span>`;
-  md.core.ruler.before('block', 'helix_wiki_index', state => { delete state.env[wikiIndexKey]; });
+  md.core.ruler.before('block', 'ryuk_wiki_index', state => { delete state.env[wikiIndexKey]; });
 
-  md.core.ruler.after('inline', 'helix_literal_html', literalHtml);
+  md.core.ruler.after('inline', 'ryuk_literal_html', literalHtml);
 
-  md.core.ruler.before('inline', 'helix_tasks', state => {
+  md.core.ruler.before('inline', 'ryuk_tasks', state => {
     const lists: { open: Token; firstItem: boolean; item: Token | null; firstParagraph: boolean }[] = [];
     for (const token of state.tokens) {
       if (token.type === 'bullet_list_open' || token.type === 'ordered_list_open') {
@@ -431,7 +431,7 @@ export function createEditorMarkdownParser(): MarkdownIt {
     }
   });
 
-  md.core.ruler.after('inline', 'helix_images', state => {
+  md.core.ruler.after('inline', 'ryuk_images', state => {
     let paragraph: Token | null = null;
     let cell: Token | null = null;
     // Tight list items render no <p>, so a simple item (open, hidden paragraph, inline, close) carries the marker.
@@ -445,15 +445,15 @@ export function createEditorMarkdownParser(): MarkdownIt {
       else if (token.type === 'list_item_open') items.push({ token, index, hasCode: false });
       else if (token.type === 'list_item_close') {
         const item = items.pop();
-        if (item?.hasCode && index - item.index === 4) item.token.attrSet('data-helix-code', '');
+        if (item?.hasCode && index - item.index === 4) item.token.attrSet('data-ryuk-code', '');
       }
       if (token.type !== 'inline') continue;
       for (const child of token.children ?? []) {
         // ProseMirror's DOM parser otherwise collapses or drops whitespace-only code spans.
         if (child.type === 'code_inline') {
           child.attrSet('style', 'white-space: pre-wrap');
-          paragraph?.attrSet('data-helix-code', '');
-          cell?.attrSet('data-helix-code', '');
+          paragraph?.attrSet('data-ryuk-code', '');
+          cell?.attrSet('data-ryuk-code', '');
           if (paragraph?.hidden && items.length) items[items.length - 1].hasCode = true;
         }
         if (child.type === 'image') {
@@ -465,34 +465,35 @@ export function createEditorMarkdownParser(): MarkdownIt {
         token.children[0].type !== 'image' || !token.map || token.map[0] < 2) continue;
       lines ??= state.src.split('\n');
       const line = token.map[0];
-      if (lines[line].startsWith('![') && lines[line - 1].trim() === '') paragraph.meta = { helixImageGap: true };
+      if (lines[line].startsWith('![') && lines[line - 1].trim() === '') paragraph.meta = { ryukImageGap: true };
     }
   });
   // Callout rendering splits the title line from the body at the first newline of the opening
   // paragraph, so that one soft break must stay a newline instead of becoming a space.
-  md.core.ruler.after('inline', 'helix_callout_title', state => {
+  md.core.ruler.after('inline', 'ryuk_callout_title', state => {
     for (let index = 0; index + 2 < state.tokens.length; index++) {
       const [quote, paragraph, inline] = [state.tokens[index], state.tokens[index + 1], state.tokens[index + 2]];
       if (quote.type !== 'blockquote_open' || paragraph.type !== 'paragraph_open' || inline.type !== 'inline') continue;
       if (!/^\[![\w-]+\]/u.test(inline.content)) continue;
       const softbreak = inline.children?.find(child => child.type === 'softbreak');
-      if (softbreak) softbreak.meta = { helixCalloutTitle: true };
+      if (softbreak) softbreak.meta = { ryukCalloutTitle: true };
     }
   });
   md.renderer.rules.paragraph_open = (tokens, index, options, _env, renderer) =>
-    (tokens[index].meta?.helixImageGap ? '<p></p>\n' : '') + renderer.renderToken(tokens, index, options);
+    (tokens[index].meta?.ryukImageGap ? '<p></p>\n' : '') + renderer.renderToken(tokens, index, options);
 
   md.block.ruler.at('fence', (state, startLine, endLine, silent) => {
     if (!fenceRule(state, startLine, endLine, silent)) return false;
     if (silent) return true;
     const token = state.tokens[state.tokens.length - 1];
-    if (token.info.trim() === 'helix-secret' && token.map) {
+    // Read-compat: notes written before the RyukNotes rebrand use the legacy fence name.
+    if ((token.info.trim() === 'ryuk-secret' || token.info.trim() === 'helix-secret') && token.map) {
       const line = token.map[1] - 1;
       const closing = state.src.slice(state.bMarks[line] + state.tShift[line], state.eMarks[line]);
       let length = 0;
       while (closing[length] === token.markup[0]) length++;
       const indentation = state.sCount[line] - state.blkIndent;
-      token.meta = { helixSecretClosed: indentation >= 0 && indentation < 4 &&
+      token.meta = { ryukSecretClosed: indentation >= 0 && indentation < 4 &&
         length >= token.markup.length && /^[ \t]*$/u.test(closing.slice(length)) };
     }
     return true;
@@ -500,20 +501,20 @@ export function createEditorMarkdownParser(): MarkdownIt {
   const renderFence = md.renderer.rules.fence!;
   md.renderer.rules.fence = (tokens, index, options, env, renderer) => {
     const token = tokens[index];
-    if (token.info.trim() === 'helix-secret' && token.meta?.helixSecretClosed) {
+    if ((token.info.trim() === 'ryuk-secret' || token.info.trim() === 'helix-secret') && token.meta?.ryukSecretClosed) {
       return `<div data-secret-block="${md.utils.escapeHtml(encodeURIComponent(token.content.replace(/\n$/, '')))}"></div>\n`;
     }
     // Only the final structural LF is parser-added; leading and extra trailing blank lines are literal.
     return renderFence(tokens, index, options, env, renderer).replace(/\n<\/code>/u, '</code>');
   };
-  md.renderer.rules.softbreak = (tokens, index) => (tokens[index].meta?.helixCalloutTitle ? '\n' : ' ');
+  md.renderer.rules.softbreak = (tokens, index) => (tokens[index].meta?.ryukCalloutTitle ? '\n' : ' ');
   md.renderer.rules.hardbreak = () => '<br>';
   return md;
 }
 
 const mathBlocks = MarkdownIt({ html: true });
 installMath(mathBlocks);
-mathBlocks.inline.ruler.before('link', 'helix_legacy_link', legacyLink);
+mathBlocks.inline.ruler.before('link', 'ryuk_legacy_link', legacyLink);
 
 /**
  * Inline tokens of each blank-line-separated block, parsed on its own like the editor does, with
@@ -532,7 +533,7 @@ function inlineTokensByBlock(source: string): Token[] {
       if (token.meta?.sourceHref) {
         const { from, to } = token.meta.sourceHref;
         token.meta = { ...token.meta, sourceHref: { from: from + start, to: to + start } };
-      } else if (token.type === 'helix_math_inline') {
+      } else if (token.type === 'ryuk_math_inline') {
         token.meta = { ...token.meta, from: token.meta.from + start, to: token.meta.to + start };
       }
       tokens.push(token);
@@ -558,7 +559,7 @@ export function legacyLinkRanges(source: string): { from: number; to: number }[]
 /** Inline math coordinates use the same delimiter and escape rules as rendering. */
 export function inlineMathRanges(source: string): { from: number; to: number }[] {
   if (!source.includes('$')) return [];
-  return inlineTokensByBlock(source).filter(token => token.type === 'helix_math_inline').map(token => token.meta);
+  return inlineTokensByBlock(source).filter(token => token.type === 'ryuk_math_inline').map(token => token.meta);
 }
 
 /** Source coordinates of semantic display-math blocks, including nested containers. */
@@ -566,7 +567,7 @@ export function displayMathRanges(source: string): { from: number; to: number; p
   if (!source.includes('$$')) return [];
   const tokens: Token[] = [];
   mathBlocks.block.parse(source, mathBlocks, {}, tokens);
-  const ranges = tokens.filter(token => token.type === 'helix_math_block' && token.map);
+  const ranges = tokens.filter(token => token.type === 'ryuk_math_block' && token.map);
   if (!ranges.length) return [];
   const starts = [0];
   for (let i = 0; i < source.length; i++) if (source[i] === '\n') starts.push(i + 1);

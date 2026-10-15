@@ -41,7 +41,7 @@ pub fn run() {
     // Inject the compile-time platform so the frontend never sniffs the (sometimes
     // mobile-looking) WebKitGTK user-agent. (#63)
     let platform_init = format!(
-        "window.__HELIX_PLATFORM__={{mobile:{},android:{},ios:{}}};",
+        "window.__RYUK_PLATFORM__={{mobile:{},android:{},ios:{}}};",
         cfg!(mobile),
         cfg!(target_os = "android"),
         cfg!(target_os = "ios"),
@@ -49,7 +49,7 @@ pub fn run() {
 
     let mut builder = tauri::Builder::default()
         .plugin(
-            tauri::plugin::Builder::<tauri::Wry>::new("helix-platform")
+            tauri::plugin::Builder::<tauri::Wry>::new("ryuk-platform")
                 .js_init_script(platform_init)
                 .build(),
         )
@@ -347,7 +347,7 @@ pub fn run() {
         }));
 
         // Updater plugin removed with the upstream endpoint config (Canari fork:
-        // the fork must never update itself from HelixNotes releases).
+        // the fork must never update itself from RyukNotes releases).
         let window_state_builder = tauri_plugin_window_state::Builder::default();
         #[cfg(target_os = "linux")]
         let window_state_builder = window_state_builder.with_state_flags(

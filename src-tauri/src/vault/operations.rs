@@ -14,7 +14,7 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 pub fn ryuknotes_dir(vault_path: &str) -> PathBuf {
-    Path::new(vault_path).join(".helixnotes")
+    Path::new(vault_path).join(".ryuknotes")
 }
 
 fn canonicalize_path(path: &Path, label: &str) -> Result<PathBuf, String> {
@@ -28,7 +28,7 @@ fn ensure_vault_content_path(
 ) -> Result<PathBuf, String> {
     let vault = canonicalize_path(Path::new(vault_path), "vault path")?;
     let requested = canonicalize_path(requested_path, "vault item path")?;
-    let metadata = vault.join(".helixnotes");
+    let metadata = vault.join(".ryuknotes");
 
     if !requested.starts_with(&vault)
         || requested.starts_with(&metadata)
@@ -278,7 +278,7 @@ fn move_without_replacing(src: &Path, dest: &Path) -> Result<(), String> {
     if same_object {
         let parent = src.parent().ok_or("Item has no parent directory")?;
         let staging = loop {
-            let candidate = parent.join(format!(".helixnotes-rename-{}", Uuid::new_v4()));
+            let candidate = parent.join(format!(".ryuknotes-rename-{}", Uuid::new_v4()));
             match rename_exclusive(src, &candidate) {
                 Ok(()) => break candidate,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -917,7 +917,7 @@ pub(crate) fn replace_file_atomically(path: &Path, content: &[u8]) -> Result<(),
     };
     let parent = path.parent().ok_or("File has no parent directory")?;
     let mut temporary = tempfile::Builder::new()
-        .prefix(".helixnotes-save-")
+        .prefix(".ryuknotes-save-")
         .tempfile_in(parent)
         .map_err(|error| error.to_string())?;
     temporary
@@ -1750,7 +1750,7 @@ pub fn restore_notebook(vault_path: &str, trash_path: &str) -> Result<String, St
         ancestor.push(component);
         if fs::symlink_metadata(&ancestor).is_ok() {
             let canonical = canonicalize_path(&ancestor, "notebook destination")?;
-            if !canonical.starts_with(&vault) || canonical.starts_with(vault.join(".helixnotes")) {
+            if !canonical.starts_with(&vault) || canonical.starts_with(vault.join(".ryuknotes")) {
                 return Err("Path must stay inside the active vault".to_string());
             }
             if !canonical.is_dir() {
@@ -1859,7 +1859,7 @@ pub fn save_attachment(vault_path: &str, name: &str, data: &[u8]) -> Result<Stri
 
     let safe_name = sanitize_filename(name);
     let mut temporary = tempfile::Builder::new()
-        .prefix(".helixnotes-asset-")
+        .prefix(".ryuknotes-asset-")
         .tempfile_in(&attachments_dir)
         .map_err(|error| error.to_string())?;
     temporary
@@ -1873,7 +1873,7 @@ pub fn save_attachment(vault_path: &str, name: &str, data: &[u8]) -> Result<Stri
     loop {
         let filename = format!("{}_{}", Uuid::new_v4(), safe_name);
         match persist_without_replacing(temporary, attachments_dir.join(&filename)) {
-            Ok(_) => return Ok(format!(".helixnotes/attachments/{filename}")),
+            Ok(_) => return Ok(format!(".ryuknotes/attachments/{filename}")),
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
                 temporary = error.file;
             }
@@ -1911,7 +1911,7 @@ pub fn import_note(
     if !source.starts_with(&source_root) {
         return Err("Source attachment root does not own the note".into());
     }
-    let source_attachments = source_root.join(".helixnotes/attachments");
+    let source_attachments = source_root.join(".ryuknotes/attachments");
     let raw = fs::read_to_string(&source).map_err(|error| error.to_string())?;
     if raw != expected_raw {
         return Err("The source note changed on disk. Reopen it before importing.".into());
@@ -1956,7 +1956,7 @@ pub fn import_note(
         {
             return Err("Import attachments must be relative non-Markdown files".into());
         }
-        let base = if decoded.starts_with(".helixnotes/attachments/") || reference.pdf {
+        let base = if decoded.starts_with(".ryuknotes/attachments/") || reference.pdf {
             source_root.as_path()
         } else {
             source.parent().ok_or("Source note has no parent")?
@@ -1970,14 +1970,14 @@ pub fn import_note(
                 .map_err(|_| "Attachments must stay inside the source note's folder or managed attachment root")?
         };
         let components: Vec<_> = relative_target.components().collect();
-        let helix_attachment = components
+        let ryuk_attachment = components
             .first()
-            .is_some_and(|part| part.as_os_str() == ".helixnotes")
+            .is_some_and(|part| part.as_os_str() == ".ryuknotes")
             && components
                 .get(1)
                 .is_some_and(|part| part.as_os_str() == "attachments");
         if components.iter().enumerate().any(|(index, part)| {
-            part.as_os_str().to_string_lossy().starts_with('.') && !(helix_attachment && index == 0)
+            part.as_os_str().to_string_lossy().starts_with('.') && !(ryuk_attachment && index == 0)
         }) {
             return Err("Hidden metadata is not imported as an attachment".into());
         }
@@ -1989,7 +1989,7 @@ pub fn import_note(
     if !references.is_empty() {
         fs::create_dir_all(&attachments).map_err(|error| error.to_string())?;
         if canonicalize_path(&attachments, "attachment destination")?
-            != vault.join(".helixnotes/attachments")
+            != vault.join(".ryuknotes/attachments")
         {
             return Err("Attachment destination must not use symbolic links".into());
         }
@@ -2010,7 +2010,7 @@ pub fn import_note(
                         .to_string_lossy(),
                 );
                 let mut temporary = tempfile::Builder::new()
-                    .prefix(".helixnotes-import-")
+                    .prefix(".ryuknotes-import-")
                     .tempfile_in(&attachments)
                     .map_err(|error| error.to_string())?;
                 let mut file = fs::File::open(&target).map_err(|error| error.to_string())?;
@@ -2043,7 +2043,7 @@ pub fn import_note(
                     }
                 };
                 let relative =
-                    format!(".helixnotes/attachments/{}", urlencoding::encode(&filename));
+                    format!(".ryuknotes/attachments/{}", urlencoding::encode(&filename));
                 copied.insert(target, relative.clone());
                 relative
             };
@@ -2070,7 +2070,7 @@ pub fn import_note(
         rewritten.push_str(&raw[previous..]);
         let filename = source.file_name().ok_or("Source note has no filename")?;
         let mut temporary = tempfile::Builder::new()
-            .prefix(".helixnotes-import-")
+            .prefix(".ryuknotes-import-")
             .tempfile_in(&directory)
             .map_err(|error| error.to_string())?;
         temporary
@@ -2788,12 +2788,12 @@ mod tests {
     #[test]
     fn all_tags_excludes_only_root_metadata_subtree_and_hidden_filenames() {
         let parent = tempfile::tempdir().unwrap();
-        let root = parent.path().join(".helixnotes");
+        let root = parent.path().join(".ryuknotes");
         let fixtures = [
             ("Root.md", "root"),
-            (".helixnotes/history/Stored.md", "excluded"),
-            ("Notebook/.helixnotes/Nested.md", "nested"),
-            (".helixnotes-other/Visible.md", "similar"),
+            (".ryuknotes/history/Stored.md", "excluded"),
+            ("Notebook/.ryuknotes/Nested.md", "nested"),
+            (".ryuknotes-other/Visible.md", "similar"),
             (".obsidian/Visible.md", "obsidian"),
             ("assets/Visible.md", "assets"),
             (".other/Visible.md", "other"),
@@ -2837,10 +2837,10 @@ mod tests {
         )
         .unwrap();
         symlink(outside.path(), vault.path().join("Directory")).unwrap();
-        fs::create_dir(vault.path().join(".helixnotes")).unwrap();
+        fs::create_dir(vault.path().join(".ryuknotes")).unwrap();
         symlink(
             outside.path().join("External.md"),
-            vault.path().join(".helixnotes/Excluded.md"),
+            vault.path().join(".ryuknotes/Excluded.md"),
         )
         .unwrap();
 

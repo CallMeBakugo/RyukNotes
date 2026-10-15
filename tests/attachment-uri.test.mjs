@@ -30,8 +30,8 @@ function fixture(note = '/vault/Projects/Note.md', vault = '/vault', known = [])
 for (const name of ['photo%20one.png', 'photo).png', 'photo(one.png', 'photo#one?.png', "café 雪 + 'image'.png"]) {
   test(`rich save/reload preserves the actual attachment filename ${JSON.stringify(name)}`, () => {
     const f = fixture();
-    const expected = `/vault/.helixnotes/attachments/${name}`;
-    let markdown = `![Photo](../.helixnotes/attachments/${encodedName(name)}?v=1#preview)`;
+    const expected = `/vault/.ryuknotes/attachments/${name}`;
+    let markdown = `![Photo](../.ryuknotes/attachments/${encodedName(name)}?v=1#preview)`;
     for (let round = 0; round < 3; round++) {
       const src = imageSource(markdown);
       assert.ok(src, 'round trips must not turn an image into malformed Markdown');
@@ -46,11 +46,11 @@ for (const name of ['photo%20one.png', 'photo).png', 'photo(one.png', 'photo#one
 
 test('Windows and UNC asset URLs preserve encoded filenames across repeated saves', () => {
   for (const [vault, note, absolute] of [
-    ['C:\\Notes', 'C:\\Notes\\Projects\\Note.md', 'C:/Notes/.helixnotes/attachments/photo%20).png'],
-    ['\\\\server\\share\\Notes', '\\\\server\\share\\Notes\\Projects\\Note.md', '//server/share/Notes/.helixnotes/attachments/photo%20).png']
+    ['C:\\Notes', 'C:\\Notes\\Projects\\Note.md', 'C:/Notes/.ryuknotes/attachments/photo%20).png'],
+    ['\\\\server\\share\\Notes', '\\\\server\\share\\Notes\\Projects\\Note.md', '//server/share/Notes/.ryuknotes/attachments/photo%20).png']
   ]) {
     const f = fixture(note, vault);
-    let markdown = '![Photo](.helixnotes/attachments/photo%2520%29.png#preview)';
+    let markdown = '![Photo](.ryuknotes/attachments/photo%2520%29.png#preview)';
     for (let round = 0; round < 3; round++) {
       const asset = f.resolve(imageSource(markdown));
       assert.equal(assetPath(asset), absolute);
@@ -61,13 +61,13 @@ test('Windows and UNC asset URLs preserve encoded filenames across repeated save
 
 test('an external note uses its configured source vault, not the active destination vault', () => {
   const f = fixture('/source/Notebook/Note.md', '/destination', ['/source', '/destination']);
-  assert.equal(assetPath(f.resolve('.helixnotes/attachments/image.png')), '/source/.helixnotes/attachments/image.png');
-  assert.equal(assetPath(f.resolve('../.helixnotes/attachments/image.png')), '/source/.helixnotes/attachments/image.png');
+  assert.equal(assetPath(f.resolve('.ryuknotes/attachments/image.png')), '/source/.ryuknotes/attachments/image.png');
+  assert.equal(assetPath(f.resolve('../.ryuknotes/attachments/image.png')), '/source/.ryuknotes/attachments/image.png');
 });
 
 test('an unconfigured external note resolves its own relative assets without borrowing active-vault metadata', () => {
   const f = fixture('/external/Note.md', '/destination');
-  assert.equal(assetPath(f.resolve('.helixnotes/attachments/image.png')), '/external/.helixnotes/attachments/image.png');
+  assert.equal(assetPath(f.resolve('.ryuknotes/attachments/image.png')), '/external/.ryuknotes/attachments/image.png');
   assert.equal(assetPath(f.resolve('images/image.png')), '/external/images/image.png');
 });
 
@@ -75,7 +75,7 @@ for (const name of ['Screenshot #1.png', '100% (final).png', 'a%20b #c?d.png', "
   test(`a newly stored attachment ${JSON.stringify(name)} resolves to its own file and saves back unchanged`, () => {
     const f = fixture();
     // The backend returns the raw stored path, which uploadAsset must encode before using it as a destination.
-    const stored = `.helixnotes/attachments/0b1c2d3e_${name}`;
+    const stored = `.ryuknotes/attachments/0b1c2d3e_${name}`;
     const destination = paths.encodeMarkdownPath(stored);
     assert.equal(imageSource(`![x](${destination})`), destination, 'the encoded destination parses as one image');
     const asset = f.resolve(destination);

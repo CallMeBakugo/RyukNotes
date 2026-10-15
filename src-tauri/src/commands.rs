@@ -1099,8 +1099,8 @@ fn scan_all_note_titles(vault_path: &str) -> Result<Vec<NoteTitleEntry>, String>
 
     let paths: Vec<PathBuf> = walkdir::WalkDir::new(vault)
         .into_iter()
-        // Cross-platform exclusion (string "/.helixnotes/" checks miss Windows
-        // backslash paths, which leaked .helixnotes/history snapshots in as dupes).
+        // Cross-platform exclusion (string "/.ryuknotes/" checks miss Windows
+        // backslash paths, which leaked .ryuknotes/history snapshots in as dupes).
         .filter_entry(|e| {
             e.depth() == 0 || (!operations::is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
         })
@@ -1222,7 +1222,7 @@ fn scan_graph_data(vault_path: &str) -> Result<crate::types::GraphData, String> 
     let vault = std::path::Path::new(vault_path);
     let hn_dir = operations::ryuknotes_dir(vault_path);
 
-    // Collect every note path first. Cross-platform exclusion (string "/.helixnotes/" checks miss
+    // Collect every note path first. Cross-platform exclusion (string "/.ryuknotes/" checks miss
     // Windows backslash paths; is_hidden also covers .stversions/.stfolder/.trash/.git).
     let candidates: Vec<PathBuf> = walkdir::WalkDir::new(vault)
         .into_iter()
@@ -1515,8 +1515,8 @@ mod note_title_scan_tests {
             .map(|index| format!("tag-{index}"))
             .collect::<Vec<_>>()
             .join(", ");
-        fs::create_dir_all(vault.join("Notebook/.helixnotes")).unwrap();
-        fs::create_dir_all(vault.join(".helixnotes/history")).unwrap();
+        fs::create_dir_all(vault.join("Notebook/.ryuknotes")).unwrap();
+        fs::create_dir_all(vault.join(".ryuknotes/history")).unwrap();
         fs::write(
             vault.join("Notebook/Long.md"),
             format!("---\ntags: [{tags}]\ntitle: Long Title\n---\n# Long Title\n"),
@@ -1524,7 +1524,7 @@ mod note_title_scan_tests {
         .unwrap();
         fs::write(vault.join("Plain.md"), "# No frontmatter\n").unwrap();
         fs::write(
-            vault.join(".helixnotes/history/Old.md"),
+            vault.join(".ryuknotes/history/Old.md"),
             "---\ntitle: Old\n---\n",
         )
         .unwrap();
@@ -1554,7 +1554,7 @@ mod graph_scan_tests {
         let vault = parent.path().join("vault");
         fs::create_dir_all(vault.join("folder")).unwrap();
         fs::create_dir_all(vault.join("other")).unwrap();
-        fs::create_dir_all(vault.join(".helixnotes")).unwrap();
+        fs::create_dir_all(vault.join(".ryuknotes")).unwrap();
         let write = |path: &str, text: &str| fs::write(vault.join(path), text).unwrap();
         write("A.md", "---\ntitle: \"Alpha\"\n---\n[[Beta]] [[folder/C|alias]] [[Twin#Head]] [[missing]] [[unterminated");
         write(
@@ -1565,7 +1565,7 @@ mod graph_scan_tests {
         write("folder/Twin.md", "---\ntitle: Twin\n---\n");
         write("other/Twin.md", "---\ntitle: Twin\n---\n");
         write("A.sync-conflict-20260101.md", "[[Beta]]");
-        write(".helixnotes/Hidden.md", "[[Beta]]");
+        write(".ryuknotes/Hidden.md", "[[Beta]]");
         write("ignored.txt", "[[Beta]]");
 
         let graph = scan_graph_data(vault.to_str().unwrap()).unwrap();
@@ -2038,8 +2038,8 @@ mod vault_state_scope_tests {
     async fn queued_state_write_keeps_its_originating_vault() -> Result<(), String> {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        std::fs::create_dir(first.path().join(".helixnotes")).unwrap();
-        std::fs::create_dir(second.path().join(".helixnotes")).unwrap();
+        std::fs::create_dir(first.path().join(".ryuknotes")).unwrap();
+        std::fs::create_dir(second.path().join(".ryuknotes")).unwrap();
         let first_path = first.path().to_string_lossy().into_owned();
         let second_path = second.path().to_string_lossy().into_owned();
         let first_state = VaultState {
@@ -2542,7 +2542,7 @@ fn scan_vault_stats(vault_path: &str) -> Result<VaultStats, String> {
             if relative
                 .parent()
                 .and_then(Path::file_name)
-                .is_some_and(|name| name == ".helixnotes")
+                .is_some_and(|name| name == ".ryuknotes")
             {
                 return is_directory && entry.file_name() == "attachments";
             }
@@ -2634,22 +2634,22 @@ mod vault_stats_tests {
         write_fixture(
             vault.path(),
             &[
-                (&[".helixnotes", "attachments", "image.png"], b"123"),
-                (&[".helixnotes", "attachments", "Manual.md"], b"1234"),
+                (&[".ryuknotes", "attachments", "image.png"], b"123"),
+                (&[".ryuknotes", "attachments", "Manual.md"], b"1234"),
                 (
-                    &[".helixnotes", "attachments", "Nested", "icon.svg"],
+                    &[".ryuknotes", "attachments", "Nested", "icon.svg"],
                     b"12345",
                 ),
                 (
-                    &[".helixnotes", "attachments", ".trash-backup", "backup.bin"],
+                    &[".ryuknotes", "attachments", ".trash-backup", "backup.bin"],
                     b"123456",
                 ),
-                (&[".helixnotes", "settings.json"], b"excluded"),
-                (&[".helixnotes", "history", "Snapshot.md"], b"excluded"),
-                (&[".helixnotes", "trash", "Deleted.md"], b"excluded"),
-                (&[".helixnotes", "attachments-old", "old.png"], b"excluded"),
+                (&[".ryuknotes", "settings.json"], b"excluded"),
+                (&[".ryuknotes", "history", "Snapshot.md"], b"excluded"),
+                (&[".ryuknotes", "trash", "Deleted.md"], b"excluded"),
+                (&[".ryuknotes", "attachments-old", "old.png"], b"excluded"),
                 (
-                    &[".helixnotes", "attachments", ".trash", "deleted.png"],
+                    &[".ryuknotes", "attachments", ".trash", "deleted.png"],
                     b"excluded",
                 ),
             ],
@@ -2665,24 +2665,24 @@ mod vault_stats_tests {
             vault.path(),
             &[
                 (&[".trash-backup", "Note.md"], b"1"),
-                (&[".helixnotes-backup", "Note.md"], b"12"),
+                (&[".ryuknotes-backup", "Note.md"], b"12"),
                 (&["attachments-old", "Note.md"], b"123"),
                 (&["Work.notebook", "attachments-old", "Note.md"], b"1234"),
                 (&["Work.notebook", ".trash-backup", "picture.png"], b"12345"),
                 (&["Files", ".trash"], b"123456"),
-                (&["Files", ".helixnotes"], b"1234567"),
+                (&["Files", ".ryuknotes"], b"1234567"),
                 (
-                    &["Work.notebook", ".helixnotes", "attachments", "photo.png"],
+                    &["Work.notebook", ".ryuknotes", "attachments", "photo.png"],
                     b"12345678",
                 ),
                 (&[".trash", "Deleted.md"], b"excluded"),
                 (&["Work.notebook", ".trash", "deleted.png"], b"excluded"),
                 (
-                    &["Work.notebook", ".helixnotes", "history", "Snapshot.md"],
+                    &["Work.notebook", ".ryuknotes", "history", "Snapshot.md"],
                     b"excluded",
                 ),
                 (
-                    &["Work.notebook", ".helixnotes", "attachments-old", "old.png"],
+                    &["Work.notebook", ".ryuknotes", "attachments-old", "old.png"],
                     b"excluded",
                 ),
             ],
@@ -2695,10 +2695,10 @@ mod vault_stats_tests {
     fn vault_stats_ignore_excluded_names_outside_the_vault() {
         let locations: &[&[&str]] = &[
             &[".trash", "vault"],
-            &[".helixnotes", "history", "vault"],
-            &[".helixnotes", "attachments-old", "vault"],
+            &[".ryuknotes", "history", "vault"],
+            &[".ryuknotes", "attachments-old", "vault"],
             &[".trash"],
-            &[".helixnotes"],
+            &[".ryuknotes"],
         ];
         for components in locations {
             let root = tempfile::tempdir().unwrap();
@@ -2711,8 +2711,8 @@ mod vault_stats_tests {
                 &[
                     (&["Note.md"], b"hello"),
                     (&["Notebook", "photo.png"], b"123"),
-                    (&[".helixnotes", "attachments", "photo.png"], b"12"),
-                    (&[".helixnotes", "history", "Snapshot.md"], b"excluded"),
+                    (&[".ryuknotes", "attachments", "photo.png"], b"12"),
+                    (&[".ryuknotes", "history", "Snapshot.md"], b"excluded"),
                     (&[".trash", "Deleted.md"], b"excluded"),
                 ],
             );
@@ -2789,8 +2789,8 @@ pub struct OrphanAttachment {
     pub size: u64,
 }
 
-// Conservatively find files in .helixnotes/attachments not referenced by ANY note. Scans every
-// .md in the vault (including .helixnotes/trash, so a restorable trashed note keeps its files)
+// Conservatively find files in .ryuknotes/attachments not referenced by ANY note. Scans every
+// .md in the vault (including .ryuknotes/trash, so a restorable trashed note keeps its files)
 // plus notebook_icons.json and tag_styles.json. A single matcher finds all basename substrings
 // in each source, first raw and then decoded in place (including URL-encoded paths).
 // When in doubt a file is KEPT: a leftover orphan is harmless, a wrong deletion is not.
@@ -3338,7 +3338,7 @@ mod external_access_tests {
     #[test]
     fn external_urls_allow_supported_schemes() {
         for url in [
-            "https://helixnotes.com",
+            "https://github.com/CallMeBakugo/RyukNotes",
             "http://example.com",
             "mailto:hello@example.com",
             "tel:+123456789",
@@ -3497,8 +3497,8 @@ mod external_access_tests {
         operations::ensure_vault_structure(&destination).unwrap();
         std::fs::create_dir(source_root.join("Notebook")).unwrap();
         let source = source_root.join("Notebook/Note.md");
-        let image = source_root.join(".helixnotes/attachments/photo%20).png");
-        let href = ".helixnotes/attachments/photo%2520%29.png";
+        let image = source_root.join(".ryuknotes/attachments/photo%20).png");
+        let href = ".ryuknotes/attachments/photo%2520%29.png";
         let raw = format!("![Image]({href})");
         std::fs::write(&source, &raw).unwrap();
         std::fs::write(&image, b"source image").unwrap();
@@ -3537,11 +3537,11 @@ mod external_access_tests {
         )
         .await
         .unwrap();
-        assert!(note.raw.contains(".helixnotes/attachments/"));
+        assert!(note.raw.contains(".ryuknotes/attachments/"));
         assert_eq!(std::fs::read_to_string(source).unwrap(), raw);
         assert_eq!(std::fs::read(image).unwrap(), b"source image");
         let files: Vec<_> =
-            std::fs::read_dir(std::path::Path::new(&destination).join(".helixnotes/attachments"))
+            std::fs::read_dir(std::path::Path::new(&destination).join(".ryuknotes/attachments"))
                 .unwrap()
                 .collect();
         assert_eq!(files.len(), 1);
@@ -3559,7 +3559,7 @@ mod external_access_tests {
         crate::vault::operations::ensure_vault_structure(&vault_path).unwrap();
         let outside = root.path().join("outside.md");
         let non_markdown = root.path().join("outside.txt");
-        let internal = vault.join(".helixnotes/history/snapshot.md");
+        let internal = vault.join(".ryuknotes/history/snapshot.md");
         fs::create_dir_all(internal.parent().unwrap()).unwrap();
         for path in [&outside, &non_markdown, &internal] {
             fs::write(path, "Original").unwrap();
@@ -4476,7 +4476,7 @@ pub fn db_get_tasks(state: State<'_, AppState>, note_id: Option<String>) -> Resu
 }
 
 /// Generic key-value state inside the vault (Quick Access paths etc.),
-/// replacing the .helixnotes/state.json file in DB mode.
+/// replacing the .ryuknotes/state.json file in DB mode.
 #[tauri::command]
 pub fn db_get_state(state: State<'_, AppState>, key: String) -> Result<Option<serde_json::Value>, String> {
     with_db(&state, |db| db.get_state(&key))
@@ -4770,7 +4770,7 @@ fn write_private_file(path: &std::path::Path, data: &[u8]) -> Result<(), String>
 
     let folder = path.parent().ok_or("File has no parent directory")?;
     let mut temporary = tempfile::Builder::new()
-        .prefix(".helixnotes-config-")
+        .prefix(".ryuknotes-config-")
         .tempfile_in(folder)
         .map_err(|error| error.to_string())?;
     #[cfg(unix)]
