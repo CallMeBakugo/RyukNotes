@@ -9302,15 +9302,7 @@
 	<div class="link-modal-overlay" onclick={(e) => closeFromOverlay(e, linkModalCancel)} onkeydown={(e) => closeOnEscape(e, linkModalCancel)}>
 		<div class="link-modal" role="dialog" aria-modal="true" aria-label="Insert link" tabindex="-1">
 			<div class="link-modal-header">
-				<svg width="28" height="28" viewBox="0 0 48 48" fill="none">
-					<rect width="48" height="48" rx="12" fill="var(--accent)" />
-					<circle cx="16" cy="16" r="3.5" fill="white" opacity="0.9" />
-					<circle cx="32" cy="16" r="3.5" fill="white" opacity="0.9" />
-					<circle cx="16" cy="32" r="3.5" fill="white" opacity="0.9" />
-					<circle cx="32" cy="32" r="3.5" fill="white" opacity="0.9" />
-					<line x1="19" y1="18" x2="29" y2="30" stroke="white" stroke-width="2" stroke-linecap="round" opacity="0.7" />
-					<line x1="29" y1="18" x2="19" y2="30" stroke="white" stroke-width="2" stroke-linecap="round" opacity="0.7" />
-				</svg>
+				<img src="/ryuk-logo.png" alt="Ryuk's Notebook" width="28" height="28" />
 				<span>Insert Link</span>
 			</div>
 			<input
