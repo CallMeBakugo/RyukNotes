@@ -367,28 +367,35 @@ fn session_restore(vault_flag: &Option<String>, tail: &[String]) -> Result<(), S
 
 /// Writes the session grounding files into a per-note context directory.
 ///
-/// `context.md` carries the note's full content; `.hermes.md` is Hermes's
+/// `context.md` carries the home note's full content; `.hermes.md` is Hermes's
 /// auto-loaded project context file (cwd-only), so a session launched with
 /// `hermes --in <dir>` reads these rules from the system prompt at startup —
 /// the note grounds the session without any manual step. Paths inside
 /// `.hermes.md` are absolute: on `--resume <id> --in <dir>` Hermes injects
 /// the dir's `.hermes.md` even though the process cwd may not move there.
+///
+/// `extras` are additional notes folded into the grounding: each lands in the
+/// context file as its own `## <title>` section (skipped when unreadable —
+/// the home note is the session's home; extras are best-effort context).
 fn write_session_context(
     dir: &std::path::Path,
     note_id: &str,
     title: &str,
     content: &str,
     vault_path: &std::path::Path,
+    extras: &[(String, String, String)], // (id, title, content)
 ) -> Result<std::path::PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let context_file = dir.join("context.md");
-    std::fs::write(
-        &context_file,
-        format!(
-            "# {title}\n\n{content}\n\n---\n\n*(This file grounds the session in a Ryuk's Notebook note titled \"{title}\". The note id is {note_id}.)*\n"
-        ),
-    )
-    .map_err(|e| e.to_string())?;
+    let mut ctx = format!(
+        "# {title}\n\n{content}\n\n---\n\n*(This file grounds the session in a Ryuk's Notebook note titled \"{title}\". The note id is {note_id}.)*\n"
+    );
+    for (extra_id, extra_title, extra_content) in extras {
+        ctx.push_str(&format!(
+            "\n\n# Additional context: {extra_title}\n\n*Note id: `{extra_id}`*\n\n{extra_content}\n"
+        ));
+    }
+    std::fs::write(&context_file, ctx).map_err(|e| e.to_string())?;
 
     // Hermes loads this file automatically (cwd-only project context) and pins
     // it in the system prompt: the note IS the basis for the session.
@@ -435,7 +442,7 @@ fn resume_with_fresh_grounding(
         let title = String::from(note["title"].as_str().unwrap_or(""));
         let content = String::from(note["content"].as_str().unwrap_or(""));
         let context_dir = std::env::temp_dir().join("ryuk-sessions").join(note_id);
-        let _ = write_session_context(&context_dir, note_id, &title, &content, &vault_path);
+        let _ = write_session_context(&context_dir, note_id, &title, &content, &vault_path, &[]);
         println!("grounding refreshed: {}", context_dir.display());
         let status = Command::new("hermes")
             .arg("--resume")
@@ -462,10 +469,14 @@ fn session_start(vault_flag: &Option<String>, tail: &[String]) -> Result<(), Str
     if ids.is_empty() {
         return Err("session start --notes <id> [<id> ...]".into());
     }
-    if ids.len() > 1 {
-        return Err("session start takes one note; the note is the session's home".into());
-    }
     let note_id = ids[0].clone();
+    // Extra notes may follow the first --notes value as bare positionals
+    // (`session start --notes home extra1 extra2 --prompt ...`) or as repeated
+    // `--notes` flags; both forms collect into extra_ids.
+    let mut extra_ids: Vec<String> = ids[1..].to_vec();
+    for bare in positional(tail, &["--notes", "--prompt"]) {
+        extra_ids.push(bare);
+    }
     let db = open_vault(vault_flag.as_deref())?;
 
     // Linked session? Resume it — the note IS the session's home. Refresh the
@@ -487,8 +498,36 @@ fn session_start(vault_flag: &Option<String>, tail: &[String]) -> Result<(), Str
     let content = String::from(note["content"].as_str().unwrap_or(""));
     let context_dir = std::env::temp_dir().join("ryuk-sessions").join(&note_id);
     let vault_path = resolve_vault(vault_flag.as_deref())?;
-    let context_file =
-        write_session_context(&context_dir, &note_id, &title, &content, &vault_path)?;
+    // Additional notes: best-effort extra grounding, skipped when unreadable.
+    let extras: Vec<(String, String, String)> = extra_ids
+        .iter()
+        .filter_map(|extra_id| {
+            db.get_note_full(extra_id).ok().flatten().map(|n| {
+                (
+                    extra_id.clone(),
+                    String::from(n["title"].as_str().unwrap_or("")),
+                    String::from(n["content"].as_str().unwrap_or("")),
+                )
+            })
+        })
+        .collect();
+    for (extra_id, ..) in &extras {
+        println!("extra context: {extra_id}");
+    }
+    for missing in extra_ids
+        .iter()
+        .filter(|id| !extras.iter().any(|(eid, ..)| eid == *id))
+    {
+        eprintln!("warning: no readable note with id {missing}; skipped");
+    }
+    let context_file = write_session_context(
+        &context_dir,
+        &note_id,
+        &title,
+        &content,
+        &vault_path,
+        &extras,
+    )?;
     println!("context: {}", context_file.display());
     println!("grounding: {}", context_dir.join(".hermes.md").display());
 
@@ -588,6 +627,7 @@ mod session_grounding_tests {
             "Test Title",
             "Body of the note.",
             std::path::Path::new("/home/u/Notes/ryuknotes.rn"),
+            &[],
         )
         .unwrap();
         assert!(context.is_file());
@@ -613,7 +653,7 @@ mod session_grounding_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(".hermes.md"), "stale").unwrap();
-        write_session_context(&dir, "n", "t", "c", std::path::Path::new("/v.rn")).unwrap();
+        write_session_context(&dir, "n", "t", "c", std::path::Path::new("/v.rn"), &[]).unwrap();
         let text = std::fs::read_to_string(dir.join(".hermes.md")).unwrap();
         assert!(
             !text.contains("stale"),

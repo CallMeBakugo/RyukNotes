@@ -1,7 +1,7 @@
 [package]
 name = "ryuknotes"
 default-run = "ryuknotes"
-version = "1.4.0"
+version = "1.4.1"
 description = "Local markdown note-taking app"
 authors = ["RyukNotes"]
 license = "AGPL-3.0-or-later"
