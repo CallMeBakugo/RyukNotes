@@ -209,6 +209,21 @@ impl VaultDb {
         Ok(())
     }
 
+    /// Reverse lookup: the note a hermes session is linked to (latest link
+    /// wins, matching idx_session_links_session). Used by `session restore`
+    /// to refresh the grounding context before resuming.
+    pub fn get_note_for_session(&self, session_id: &str) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT note_id FROM session_links WHERE session_id = ?1
+                 ORDER BY created DESC LIMIT 1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
     /// Inserts a note (or replaces it wholesale by id) and refreshes its tags
     /// and the search index in one transaction.
     pub fn upsert_note(&self, note: &NewNote) -> Result<(), String> {

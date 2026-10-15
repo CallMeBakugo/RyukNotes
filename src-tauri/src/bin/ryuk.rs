@@ -341,16 +341,28 @@ fn session_restore(vault_flag: &Option<String>, tail: &[String]) -> Result<(), S
         .first()
         .cloned()
         .ok_or("session restore <session-id>")?;
-    let _ = vault_flag; // restoring does not need the vault; keep the flag accepted
-    let status = Command::new("hermes")
-        .arg("--resume")
-        .arg(&session_id)
-        .status()
-        .map_err(|e| format!("launching hermes: {e}"))?;
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-    Ok(())
+    // Restoring by session id: refresh the grounding of the note this session
+    // is linked to (if any) so the resumed session re-reads the live note.
+    let db = open_vault(vault_flag.as_deref()).ok();
+    let note = db
+        .as_ref()
+        .and_then(|db| db.get_note_for_session(&session_id).ok())
+        .flatten();
+    let exit = match (db.as_ref(), note) {
+        (Some(db), Some(note_id)) => {
+            resume_with_fresh_grounding(db, &note_id, &session_id, vault_flag.as_deref())?
+        }
+        _ => {
+            // No vault or no linked note: plain resume.
+            let status = Command::new("hermes")
+                .arg("--resume")
+                .arg(&session_id)
+                .status()
+                .map_err(|e| format!("launching hermes: {e}"))?;
+            status.code().unwrap_or(1)
+        }
+    };
+    std::process::exit(exit);
 }
 
 /// Writes the session grounding files into a per-note context directory.
@@ -358,7 +370,9 @@ fn session_restore(vault_flag: &Option<String>, tail: &[String]) -> Result<(), S
 /// `context.md` carries the note's full content; `.hermes.md` is Hermes's
 /// auto-loaded project context file (cwd-only), so a session launched with
 /// `hermes --in <dir>` reads these rules from the system prompt at startup —
-/// the note grounds the session without any manual step.
+/// the note grounds the session without any manual step. Paths inside
+/// `.hermes.md` are absolute: on `--resume <id> --in <dir>` Hermes injects
+/// the dir's `.hermes.md` even though the process cwd may not move there.
 fn write_session_context(
     dir: &std::path::Path,
     note_id: &str,
@@ -386,10 +400,10 @@ fn write_session_context(
              This Hermes session was launched from Ryuk's Notebook for the note \
              \"{title}\" (note id: `{note_id}`).\n\n\
              ## Rules\n\n\
-             - `context.md` in this directory holds the full content of that note \
-             as of session launch. It is the authoritative grounding for this \
-             session: read it before answering, and treat it as the basis for \
-             every response in this session.\n\
+             - `{ctx}` holds the full content of that note. It is the \
+             authoritative grounding for this session: read it before \
+             answering, and treat it as the basis for every response in this \
+             session.\n\
              - The note id is `{note_id}`. When the task refers to \"the note\", \
              that is the note.\n\
              - `context.md` is a launch-time snapshot. If freshness matters, \
@@ -398,11 +412,48 @@ fn write_session_context(
              - Output destined for this note (summaries, findings, artifacts) \
              should be written so `ryuk session import` can file it back into \
              the vault.\n",
+            ctx = context_file.display(),
             vault = vault_path.display(),
         ),
     )
     .map_err(|e| e.to_string())?;
     Ok(context_file)
+}
+
+/// Refreshes the grounding context for a note (latest vault content) and
+/// resumes the linked Hermes session from the note's context directory, so
+/// resumed sessions re-read the note as their basis instead of relying on the
+/// launch-time snapshot. Returns the hermes exit status.
+fn resume_with_fresh_grounding(
+    db: &VaultDb,
+    note_id: &str,
+    session_id: &str,
+    vault_flag: Option<&str>,
+) -> Result<i32, String> {
+    let vault_path = resolve_vault(vault_flag)?;
+    if let Ok(Some(note)) = db.get_note_full(note_id) {
+        let title = String::from(note["title"].as_str().unwrap_or(""));
+        let content = String::from(note["content"].as_str().unwrap_or(""));
+        let context_dir = std::env::temp_dir().join("ryuk-sessions").join(note_id);
+        let _ = write_session_context(&context_dir, note_id, &title, &content, &vault_path);
+        println!("grounding refreshed: {}", context_dir.display());
+        let status = Command::new("hermes")
+            .arg("--resume")
+            .arg(session_id)
+            .arg("--in")
+            .arg(&context_dir)
+            .status()
+            .map_err(|e| format!("launching hermes: {e}"))?;
+        Ok(status.code().unwrap_or(0))
+    } else {
+        // No note (or unreadable): plain resume, no grounding to refresh.
+        let status = Command::new("hermes")
+            .arg("--resume")
+            .arg(session_id)
+            .status()
+            .map_err(|e| format!("launching hermes: {e}"))?;
+        Ok(status.code().unwrap_or(0))
+    }
 }
 
 fn session_start(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String> {
@@ -417,15 +468,13 @@ fn session_start(vault_flag: &Option<String>, tail: &[String]) -> Result<(), Str
     let note_id = ids[0].clone();
     let db = open_vault(vault_flag.as_deref())?;
 
-    // Linked session? Resume it — the note IS the session's home.
+    // Linked session? Resume it — the note IS the session's home. Refresh the
+    // grounding from the live note so the resumed session reads the current
+    // content, not the launch-time snapshot.
     if let Some(session_id) = db.get_session_link(&note_id)? {
         println!("resuming linked session {session_id}");
-        let status = Command::new("hermes")
-            .arg("--resume")
-            .arg(&session_id)
-            .status()
-            .map_err(|e| format!("launching hermes: {e}"))?;
-        std::process::exit(status.code().unwrap_or(0));
+        let exit = resume_with_fresh_grounding(&db, &note_id, &session_id, vault_flag.as_deref())?;
+        std::process::exit(exit);
     }
 
     // New session: hermes runs inside a per-note workspace so the session can
@@ -499,12 +548,8 @@ fn session_resume_for_note(vault_flag: &Option<String>, tail: &[String]) -> Resu
     let session_id = db
         .get_session_link(&note_id)?
         .ok_or_else(|| format!("note {note_id} has no linked session yet"))?;
-    let status = Command::new("hermes")
-        .arg("--resume")
-        .arg(&session_id)
-        .status()
-        .map_err(|e| format!("launching hermes: {e}"))?;
-    std::process::exit(status.code().unwrap_or(0));
+    let exit = resume_with_fresh_grounding(&db, &note_id, &session_id, vault_flag.as_deref())?;
+    std::process::exit(exit);
 }
 
 fn session_list_links(vault_flag: &Option<String>) -> Result<(), String> {
@@ -575,5 +620,55 @@ mod session_grounding_tests {
             "relaunch must replace stale grounding"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod session_link_tests {
+    use app_lib::vault::db::{NewNote, VaultDb};
+
+    fn mem_db() -> VaultDb {
+        VaultDb::open_in_memory().expect("in-memory vault")
+    }
+
+    fn seed_note(db: &VaultDb, id: &str) {
+        db.upsert_note(&NewNote {
+            id: id.to_string(),
+            title: id.to_string(),
+            content: "x".to_string(),
+            pinned: false,
+            tags: vec![],
+            created: "2026-10-15T00:00:00Z".to_string(),
+            modified: "2026-10-15T00:00:00Z".to_string(),
+        })
+        .expect("seed note");
+    }
+
+    #[test]
+    fn reverse_lookup_finds_note_for_session() {
+        let db = mem_db();
+        seed_note(&db, "note-a");
+        db.set_session_link("note-a", "20261015_000000_aaaa")
+            .unwrap();
+        assert_eq!(
+            db.get_note_for_session("20261015_000000_aaaa").unwrap(),
+            Some("note-a".to_string())
+        );
+        assert_eq!(db.get_note_for_session("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn latest_link_wins_on_reverse_lookup() {
+        let db = mem_db();
+        seed_note(&db, "note-old");
+        seed_note(&db, "note-new");
+        db.set_session_link("note-old", "20261015_000000_aaaa")
+            .unwrap();
+        db.set_session_link("note-new", "20261015_000000_aaaa")
+            .unwrap();
+        assert_eq!(
+            db.get_note_for_session("20261015_000000_aaaa").unwrap(),
+            Some("note-new".to_string())
+        );
     }
 }
