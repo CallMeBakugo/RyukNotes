@@ -51,7 +51,9 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
         let raw = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) => {
-                report.warnings.push(format!("unreadable {}: {e}", path.display()));
+                report
+                    .warnings
+                    .push(format!("unreadable {}: {e}", path.display()));
                 report.files_skipped += 1;
                 continue;
             }
@@ -75,7 +77,9 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
         };
         let note_id = note.id.clone();
         if let Err(e) = db.upsert_note(&note) {
-            report.warnings.push(format!("failed to import {}: {e}", path.display()));
+            report
+                .warnings
+                .push(format!("failed to import {}: {e}", path.display()));
             report.files_skipped += 1;
             continue;
         }
@@ -95,7 +99,10 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
                     continue;
                 }
                 if let Ok(snapshot) = std::fs::read_to_string(&history_path) {
-                    if db.add_version(&note_id, &snapshot, &rfc3339(Utc::now())).is_ok() {
+                    if db
+                        .add_version(&note_id, &snapshot, &rfc3339(Utc::now()))
+                        .is_ok()
+                    {
                         report.versions_imported += 1;
                     }
                 }
@@ -180,7 +187,11 @@ mod tests {
             "id: id-deleted\ntitle: Deleted\ntags: [old]\npinned: false\ncreated: 2026-01-03T00:00:00Z\nmodified: 2026-02-03T00:00:00Z\n",
             "Deleted body.",
         );
-        std::fs::write(meta.join("history/id-alpha/2026-01-15.md"), "Alpha old body.").unwrap();
+        std::fs::write(
+            meta.join("history/id-alpha/2026-01-15.md"),
+            "Alpha old body.",
+        )
+        .unwrap();
         std::fs::write(meta.join("state.json"), "{}").unwrap();
 
         let db = VaultDb::open_in_memory().unwrap();
@@ -265,8 +276,12 @@ mod real_vault_tests {
         let live = db.list_notes(false).unwrap().len();
         println!(
             "imported={} trashed={} versions={} skipped={} total={} live={}",
-            report.notes_imported, report.notes_trashed, report.versions_imported,
-            report.files_skipped, total, live
+            report.notes_imported,
+            report.notes_trashed,
+            report.versions_imported,
+            report.files_skipped,
+            total,
+            live
         );
         for w in &report.warnings {
             println!("WARN: {w}");

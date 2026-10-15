@@ -142,7 +142,10 @@ impl VaultDb {
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
-        let db = Self { conn, max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES };
+        let db = Self {
+            conn,
+            max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+        };
         db.set_meta("schema_version", &SCHEMA_VERSION.to_string())?;
         Ok(db)
     }
@@ -209,7 +212,10 @@ impl VaultDb {
     /// Inserts a note (or replaces it wholesale by id) and refreshes its tags
     /// and the search index in one transaction.
     pub fn upsert_note(&self, note: &NewNote) -> Result<(), String> {
-        let tx = self.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
         tx.execute(
             "INSERT INTO notes(id, title, content, pinned, trashed, created, modified)
              VALUES(?1, ?2, ?3, ?4, 0, ?5, ?6)
@@ -231,11 +237,8 @@ impl VaultDb {
         tx.execute("DELETE FROM note_tags WHERE note_id = ?1", params![note.id])
             .map_err(|e| e.to_string())?;
         for tag in &note.tags {
-            tx.execute(
-                "INSERT OR IGNORE INTO tags(name) VALUES(?1)",
-                params![tag],
-            )
-            .map_err(|e| e.to_string())?;
+            tx.execute("INSERT OR IGNORE INTO tags(name) VALUES(?1)", params![tag])
+                .map_err(|e| e.to_string())?;
             tx.execute(
                 "INSERT OR IGNORE INTO note_tags(note_id, tag) VALUES(?1, ?2)",
                 params![note.id, tag],
@@ -258,7 +261,12 @@ impl VaultDb {
 
     /// Stores a history snapshot. The version id is the SHA-256 of
     /// (note id, content), so identical snapshots dedupe across re-imports.
-    pub fn add_version(&self, note_id: &str, content: &str, created: &str) -> Result<String, String> {
+    pub fn add_version(
+        &self,
+        note_id: &str,
+        content: &str,
+        created: &str,
+    ) -> Result<String, String> {
         let digest = {
             use sha2::Digest;
             let mut hasher = sha2::Sha256::new();
@@ -279,14 +287,17 @@ impl VaultDb {
     pub fn list_versions(&self, note_id: &str) -> Result<Vec<(String, String, String)>, String> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, content, created FROM versions WHERE note_id = ?1 ORDER BY created")
+            .prepare(
+                "SELECT id, content, created FROM versions WHERE note_id = ?1 ORDER BY created",
+            )
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(params![note_id], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     pub fn get_note_created(&self, id: &str) -> Result<Option<String>, String> {
@@ -332,10 +343,7 @@ impl VaultDb {
     }
 
     /// Full note (meta + tags + content) for the frontend adapter.
-    pub fn get_note_full(
-        &self,
-        id: &str,
-    ) -> Result<Option<serde_json::Value>, String> {
+    pub fn get_note_full(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
         let row = self
             .conn
             .query_row(
@@ -358,20 +366,22 @@ impl VaultDb {
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        Ok(row.map(|(id, title, content, pinned, trashed, created, modified, tags)| {
-            serde_json::json!({
-                "id": id,
-                "title": title,
-                "content": content,
-                "pinned": pinned != 0,
-                "trashed": trashed != 0,
-                "created": created,
-                "modified": modified,
-                "tags": tags
-                    .map(|b| b.split('\u{1f}').map(str::to_string).collect::<Vec<_>>())
-                    .unwrap_or_default(),
-            })
-        }))
+        Ok(row.map(
+            |(id, title, content, pinned, trashed, created, modified, tags)| {
+                serde_json::json!({
+                    "id": id,
+                    "title": title,
+                    "content": content,
+                    "pinned": pinned != 0,
+                    "trashed": trashed != 0,
+                    "created": created,
+                    "modified": modified,
+                    "tags": tags
+                        .map(|b| b.split('\u{1f}').map(str::to_string).collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                })
+            },
+        ))
     }
 
     pub fn get_note_content(&self, id: &str) -> Result<Option<String>, String> {
@@ -414,7 +424,8 @@ impl VaultDb {
                 })
             })
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     /// Full-text search over title and content.
@@ -443,7 +454,8 @@ impl VaultDb {
                 })
             })
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     /// Stores an attachment BLOB, deduplicated by SHA-256. When the hash
@@ -511,7 +523,10 @@ impl VaultDb {
             .map_err(|e| e.to_string())
     }
 
-    pub fn get_attachment_data(&self, id: &str) -> Result<Option<(AttachmentMeta, Vec<u8>)>, String> {
+    pub fn get_attachment_data(
+        &self,
+        id: &str,
+    ) -> Result<Option<(AttachmentMeta, Vec<u8>)>, String> {
         let row = self
             .conn
             .query_row(
@@ -556,19 +571,30 @@ mod tests {
     #[test]
     fn notes_round_trip_with_tags_and_retagging() {
         let db = VaultDb::open_in_memory().unwrap();
-        db.upsert_note(&note("a", "First", vec!["immunology", "crypto"])).unwrap();
-        db.upsert_note(&note("b", "Second", vec!["immunology"])).unwrap();
+        db.upsert_note(&note("a", "First", vec!["immunology", "crypto"]))
+            .unwrap();
+        db.upsert_note(&note("b", "Second", vec!["immunology"]))
+            .unwrap();
         let all = db.list_notes(false).unwrap();
         assert_eq!(all.len(), 2);
         let first = all.iter().find(|n| n.id == "a").unwrap();
         assert_eq!(first.tags.len(), 2);
 
         // Retagging replaces, not accumulates.
-        db.upsert_note(&note("a", "First", vec!["renamed-tag"])).unwrap();
-        let first = db.list_notes(false).unwrap().into_iter().find(|n| n.id == "a").unwrap();
+        db.upsert_note(&note("a", "First", vec!["renamed-tag"]))
+            .unwrap();
+        let first = db
+            .list_notes(false)
+            .unwrap()
+            .into_iter()
+            .find(|n| n.id == "a")
+            .unwrap();
         assert_eq!(first.tags, vec!["renamed-tag".to_string()]);
 
-        assert_eq!(db.get_note_content("a").unwrap().unwrap(), "Body of First. Cryptococcus research notes.");
+        assert_eq!(
+            db.get_note_content("a").unwrap().unwrap(),
+            "Body of First. Cryptococcus research notes."
+        );
     }
 
     #[test]
@@ -588,8 +614,24 @@ mod tests {
         let db = VaultDb::open_in_memory().unwrap();
         db.upsert_note(&note("a", "Receipts", vec![])).unwrap();
         let payload = b"fake png bytes for a recovery code screenshot";
-        let m1 = db.add_attachment("a", "codes.png", "image/png", payload, "2026-10-13T00:00:00Z").unwrap();
-        let m2 = db.add_attachment("a", "same-thing-again.png", "image/png", payload, "2026-10-13T00:00:00Z").unwrap();
+        let m1 = db
+            .add_attachment(
+                "a",
+                "codes.png",
+                "image/png",
+                payload,
+                "2026-10-13T00:00:00Z",
+            )
+            .unwrap();
+        let m2 = db
+            .add_attachment(
+                "a",
+                "same-thing-again.png",
+                "image/png",
+                payload,
+                "2026-10-13T00:00:00Z",
+            )
+            .unwrap();
         assert_eq!(m1.id, m2.id, "identical content must dedupe to one row");
         assert_eq!(m1.sha256.len(), 64);
 
@@ -597,18 +639,29 @@ mod tests {
         assert_eq!(data, payload.to_vec());
 
         let too_big = vec![0u8; (DEFAULT_MAX_ATTACHMENT_BYTES + 1) as usize];
-        assert!(db.add_attachment("a", "movie.mp4", "video/mp4", &too_big, "now").is_err());
+        assert!(db
+            .add_attachment("a", "movie.mp4", "video/mp4", &too_big, "now")
+            .is_err());
     }
 
     #[test]
     fn deleting_a_note_cascades_tags_and_attachments() {
         let db = VaultDb::open_in_memory().unwrap();
         db.upsert_note(&note("a", "Doomed", vec!["x"])).unwrap();
-        db.add_attachment("a", "f.txt", "text/plain", b"data", "now").unwrap();
-        db.conn.execute("DELETE FROM notes WHERE id = 'a'", []).unwrap();
-        let n: i64 = db.conn.query_row("SELECT COUNT(*) FROM note_tags", [], |r| r.get(0)).unwrap();
+        db.add_attachment("a", "f.txt", "text/plain", b"data", "now")
+            .unwrap();
+        db.conn
+            .execute("DELETE FROM notes WHERE id = 'a'", [])
+            .unwrap();
+        let n: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM note_tags", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 0);
-        let n: i64 = db.conn.query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get(0)).unwrap();
+        let n: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 0);
     }
 }

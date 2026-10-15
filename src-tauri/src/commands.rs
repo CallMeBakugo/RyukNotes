@@ -4043,6 +4043,7 @@ fn vault_matches_identity(vault: &VaultConfig, path: &str, bookmark_id: Option<&
     }
 }
 
+#[cfg(test)]
 fn active_vault_index(config: &AppConfig) -> Result<usize, String> {
     let active = config.active_vault.as_deref().ok_or("No active vault")?;
     config
@@ -4054,6 +4055,7 @@ fn active_vault_index(config: &AppConfig) -> Result<usize, String> {
         .ok_or_else(|| "Active vault not found in config".to_string())
 }
 
+#[cfg(test)]
 fn active_vault_config(config: &AppConfig) -> Result<&VaultConfig, String> {
     Ok(&config.vaults[active_vault_index(config)?])
 }
@@ -4197,19 +4199,28 @@ pub fn db_is_open(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(slot.is_some())
 }
 
-fn with_db<T>(state: &State<'_, AppState>, f: impl FnOnce(&crate::vault::db::VaultDb) -> Result<T, String>) -> Result<T, String> {
+fn with_db<T>(
+    state: &State<'_, AppState>,
+    f: impl FnOnce(&crate::vault::db::VaultDb) -> Result<T, String>,
+) -> Result<T, String> {
     let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
     let db = slot.as_ref().ok_or("No vault database is open")?;
     f(db)
 }
 
 #[tauri::command]
-pub fn db_list_notes(state: State<'_, AppState>, include_trashed: bool) -> Result<Vec<crate::vault::db::NoteSummary>, String> {
+pub fn db_list_notes(
+    state: State<'_, AppState>,
+    include_trashed: bool,
+) -> Result<Vec<crate::vault::db::NoteSummary>, String> {
     with_db(&state, |db| db.list_notes(include_trashed))
 }
 
 #[tauri::command]
-pub fn db_get_note(state: State<'_, AppState>, id: String) -> Result<Option<serde_json::Value>, String> {
+pub fn db_get_note(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Option<serde_json::Value>, String> {
     with_db(&state, |db| db.get_note_full(&id))
 }
 
@@ -4224,9 +4235,7 @@ pub fn db_save_note(
 ) -> Result<(), String> {
     let now = chrono::Utc::now().to_rfc3339();
     with_db(&state, |db| {
-        let created = db
-            .get_note_created(&id)?
-            .unwrap_or_else(|| now.clone());
+        let created = db.get_note_created(&id)?.unwrap_or_else(|| now.clone());
         db.upsert_note(&crate::vault::db::NewNote {
             id,
             title,
@@ -4240,7 +4249,10 @@ pub fn db_save_note(
 }
 
 #[tauri::command]
-pub fn db_search_notes(state: State<'_, AppState>, query: String) -> Result<Vec<crate::vault::db::NoteSummary>, String> {
+pub fn db_search_notes(
+    state: State<'_, AppState>,
+    query: String,
+) -> Result<Vec<crate::vault::db::NoteSummary>, String> {
     with_db(&state, |db| db.search(&query))
 }
 
@@ -4253,7 +4265,9 @@ pub fn db_add_attachment(
     data: Vec<u8>,
 ) -> Result<crate::vault::db::AttachmentMeta, String> {
     let now = chrono::Utc::now().to_rfc3339();
-    with_db(&state, |db| db.add_attachment(&note_id, &filename, &mime_type, &data, &now))
+    with_db(&state, |db| {
+        db.add_attachment(&note_id, &filename, &mime_type, &data, &now)
+    })
 }
 
 #[tauri::command]
@@ -4261,19 +4275,17 @@ pub fn db_get_attachment(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<Option<serde_json::Value>, String> {
-    with_db(&state, |db| {
-        match db.get_attachment_data(&id)? {
-            Some((meta, data)) => Ok(Some(serde_json::json!({
-                "id": meta.id,
-                "noteId": meta.note_id,
-                "filename": meta.filename,
-                "mimeType": meta.mime_type,
-                "size": meta.size,
-                "sha256": meta.sha256,
-                "data": data,
-            }))),
-            None => Ok(None),
-        }
+    with_db(&state, |db| match db.get_attachment_data(&id)? {
+        Some((meta, data)) => Ok(Some(serde_json::json!({
+            "id": meta.id,
+            "noteId": meta.note_id,
+            "filename": meta.filename,
+            "mimeType": meta.mime_type,
+            "size": meta.size,
+            "sha256": meta.sha256,
+            "data": data,
+        }))),
+        None => Ok(None),
     })
 }
 
@@ -4325,7 +4337,9 @@ pub fn db_list_versions(
 pub async fn db_open_vault(state: State<'_, AppState>, path: String) -> Result<(), String> {
     let _transition = state.vault_transition.lock().await;
     if !path.ends_with(".rn") {
-        return Err(format!("'{path}' is not a RyukNotes database (expected a .rn file)"));
+        return Err(format!(
+            "'{path}' is not a RyukNotes database (expected a .rn file)"
+        ));
     }
     if !std::path::Path::new(&path).is_file() {
         return Err(format!("'{path}' does not exist"));
@@ -4368,8 +4382,7 @@ pub fn spawn_ryuk_terminal(args: Vec<String>) -> Result<(), String> {
         std::env::var_os("PATH")
             .map(|paths| {
                 std::env::split_paths(&paths).any(|dir| {
-                    dir.join(program).is_file()
-                        || dir.join(format!("{program}.sh")).is_file()
+                    dir.join(program).is_file() || dir.join(format!("{program}.sh")).is_file()
                 })
             })
             .unwrap_or(false)
@@ -4397,7 +4410,9 @@ pub fn db_vault_stats(state: State<'_, AppState>) -> Result<crate::types::VaultS
     with_db(&state, |db| {
         let total_notes: u64 = db
             .conn
-            .query_row("SELECT COUNT(*) FROM notes WHERE trashed = 0", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM notes WHERE trashed = 0", [], |r| {
+                r.get(0)
+            })
             .map_err(|e| e.to_string())?;
         let total_attachments: u64 = db
             .conn
@@ -4405,11 +4420,17 @@ pub fn db_vault_stats(state: State<'_, AppState>) -> Result<crate::types::VaultS
             .map_err(|e| e.to_string())?;
         let notes_size: u64 = db
             .conn
-            .query_row("SELECT COALESCE(SUM(LENGTH(content)), 0) FROM notes WHERE trashed = 0", [], |r| r.get(0))
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM notes WHERE trashed = 0",
+                [],
+                |r| r.get(0),
+            )
             .map_err(|e| e.to_string())?;
         let attachments_size: u64 = db
             .conn
-            .query_row("SELECT COALESCE(SUM(size), 0) FROM attachments", [], |r| r.get(0))
+            .query_row("SELECT COALESCE(SUM(size), 0) FROM attachments", [], |r| {
+                r.get(0)
+            })
             .map_err(|e| e.to_string())?;
         let total_size = notes_size + attachments_size;
         Ok(crate::types::VaultStats {
@@ -4434,7 +4455,8 @@ pub fn db_empty_trash(state: State<'_, AppState>) -> Result<u32, String> {
             let rows = stmt
                 .query_map([], |row| row.get(0))
                 .map_err(|e| e.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
         };
         let mut deleted = 0;
         for id in &ids {
@@ -4448,13 +4470,20 @@ pub fn db_empty_trash(state: State<'_, AppState>) -> Result<u32, String> {
 
 /// DB-mode task extraction: checkbox items parsed straight from note bodies.
 #[tauri::command]
-pub fn db_get_tasks(state: State<'_, AppState>, note_id: Option<String>) -> Result<Vec<crate::types::TaskItem>, String> {
+pub fn db_get_tasks(
+    state: State<'_, AppState>,
+    note_id: Option<String>,
+) -> Result<Vec<crate::types::TaskItem>, String> {
     with_db(&state, |db| {
         let notes = if let Some(id) = note_id {
             let Some(note) = db.get_note_full(&id)? else {
                 return Ok(Vec::new());
             };
-            vec![(String::from(note["id"].as_str().unwrap_or("")), String::from(note["title"].as_str().unwrap_or("")), String::from(note["content"].as_str().unwrap_or("")))]
+            vec![(
+                String::from(note["id"].as_str().unwrap_or("")),
+                String::from(note["title"].as_str().unwrap_or("")),
+                String::from(note["content"].as_str().unwrap_or("")),
+            )]
         } else {
             let mut stmt = db
                 .conn
@@ -4462,10 +4491,15 @@ pub fn db_get_tasks(state: State<'_, AppState>, note_id: Option<String>) -> Resu
                 .map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })
                 .map_err(|e| e.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
         };
         let mut tasks = Vec::new();
         for (id, title, content) in notes {
@@ -4478,18 +4512,28 @@ pub fn db_get_tasks(state: State<'_, AppState>, note_id: Option<String>) -> Resu
 /// Generic key-value state inside the vault (Quick Access paths etc.),
 /// replacing the .ryuknotes/state.json file in DB mode.
 #[tauri::command]
-pub fn db_get_state(state: State<'_, AppState>, key: String) -> Result<Option<serde_json::Value>, String> {
+pub fn db_get_state(
+    state: State<'_, AppState>,
+    key: String,
+) -> Result<Option<serde_json::Value>, String> {
     with_db(&state, |db| db.get_state(&key))
 }
 
 #[tauri::command]
-pub fn db_set_state(state: State<'_, AppState>, key: String, value: serde_json::Value) -> Result<(), String> {
+pub fn db_set_state(
+    state: State<'_, AppState>,
+    key: String,
+    value: serde_json::Value,
+) -> Result<(), String> {
     with_db(&state, |db| db.set_state(&key, &value))
 }
 
 /// DB-mode backup: a clean snapshot via VACUUM INTO, safe while the app runs.
 #[tauri::command]
-pub fn db_create_backup(app: AppHandle, state: State<'_, AppState>) -> Result<crate::types::BackupEntry, String> {
+pub fn db_create_backup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::types::BackupEntry, String> {
     let vault_path = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.active_vault.clone().ok_or("No active vault")?
@@ -4519,7 +4563,9 @@ pub fn db_create_backup(app: AppHandle, state: State<'_, AppState>) -> Result<cr
             .map_err(|e| e.to_string())?;
         Ok(())
     })?;
-    let size = std::fs::metadata(&backup_path).map(|m| m.len()).unwrap_or(0);
+    let size = std::fs::metadata(&backup_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
     let _ = app;
     Ok(crate::types::BackupEntry {
         filename,
@@ -4533,7 +4579,11 @@ pub fn db_create_backup(app: AppHandle, state: State<'_, AppState>) -> Result<cr
 /// DB-mode restore: close the DB, copy the backup over the vault, reopen.
 /// The frontend must refresh all lists afterward.
 #[tauri::command]
-pub fn db_restore_backup(state: State<'_, AppState>, backup_path: String, vault_path: String) -> Result<(), String> {
+pub fn db_restore_backup(
+    state: State<'_, AppState>,
+    backup_path: String,
+    vault_path: String,
+) -> Result<(), String> {
     // Close the DB so we are not copying over an open handle.
     {
         let mut slot = state.vault_db.lock().map_err(|e| e.to_string())?;
@@ -4559,13 +4609,19 @@ pub fn db_export_md(state: State<'_, AppState>, out_dir: String) -> Result<u32, 
         let notes = db.list_notes(true)?;
         let mut written = 0;
         for summary in &notes {
-            let Some(full) = db.get_note_full(&summary.id)? else { continue };
+            let Some(full) = db.get_note_full(&summary.id)? else {
+                continue;
+            };
             let meta = crate::types::NoteMeta {
                 id: summary.id.clone(),
                 title: String::from(full["title"].as_str().unwrap_or("")),
                 tags: full["tags"]
                     .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 pinned: summary.pinned,
                 created: crate::vault::frontmatter::parse_date_flexible(
@@ -4596,7 +4652,9 @@ pub fn db_export_md(state: State<'_, AppState>, out_dir: String) -> Result<u32, 
 
 /// List DB-mode backups (*.rn snapshots) in the backup dir.
 #[tauri::command]
-pub fn db_list_backups(state: State<'_, AppState>) -> Result<Vec<crate::types::BackupEntry>, String> {
+pub fn db_list_backups(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::types::BackupEntry>, String> {
     let (backup_dir, vault_path) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         (
@@ -4611,7 +4669,11 @@ pub fn db_list_backups(state: State<'_, AppState>) -> Result<Vec<crate::types::B
             if path.extension().and_then(|e| e.to_str()) != Some("rn") {
                 continue;
             }
-            let filename = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let filename = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
             if !filename.contains("-db-backup-") {
                 continue;
             }
@@ -4620,9 +4682,7 @@ pub fn db_list_backups(state: State<'_, AppState>) -> Result<Vec<crate::types::B
                 .metadata()
                 .ok()
                 .and_then(|m| m.modified().ok())
-                .map(|t| {
-                    chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
-                })
+                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
                 .unwrap_or_default();
             let stem = std::path::Path::new(&vault_path)
                 .file_stem()
@@ -4958,6 +5018,7 @@ mod config_resilience_tests {
         assert_eq!(names, vec![std::ffi::OsString::from("config.json")]);
     }
 
+    #[allow(dead_code)] // helper kept for future config-roundtrip tests
     fn vault(path: &str) -> crate::types::VaultConfig {
         serde_json::from_value(serde_json::json!({ "path": path, "name": path })).unwrap()
     }
@@ -5724,7 +5785,15 @@ mod db_command_tests {
 
         // Saving before opening fails cleanly.
         db_close(state.clone()).unwrap();
-        assert!(db_save_note(state.clone(), "x".into(), "T".into(), "c".into(), false, vec![]).is_err());
+        assert!(db_save_note(
+            state.clone(),
+            "x".into(),
+            "T".into(),
+            "c".into(),
+            false,
+            vec![]
+        )
+        .is_err());
 
         db_open(state.clone(), db_path.to_string_lossy().into_owned()).unwrap();
         db_save_note(
@@ -5743,10 +5812,15 @@ mod db_command_tests {
         assert!(notes[0].pinned);
         assert_eq!(notes[0].tags.len(), 2);
 
-        let note_json = db_get_note(state.clone(), "note-1".into()).unwrap().unwrap();
+        let note_json = db_get_note(state.clone(), "note-1".into())
+            .unwrap()
+            .unwrap();
         assert_eq!(note_json["content"], "Cytokine signaling study");
         assert_eq!(note_json["title"], "Deltaferon notes");
-        assert_eq!(note_json["tags"], serde_json::json!(["immunology", "research"]));
+        assert_eq!(
+            note_json["tags"],
+            serde_json::json!(["immunology", "research"])
+        );
 
         let hits = db_search_notes(state.clone(), "cytokine".into()).unwrap();
         assert_eq!(hits.len(), 1);
@@ -5760,7 +5834,9 @@ mod db_command_tests {
         assert_eq!(db_list_notes(state.clone(), false).unwrap().len(), 1);
         db_delete_note(state.clone(), "note-1".into()).unwrap();
         assert!(db_list_notes(state.clone(), true).unwrap().is_empty());
-        assert!(db_get_note(state.clone(), "note-1".into()).unwrap().is_none());
+        assert!(db_get_note(state.clone(), "note-1".into())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -5768,8 +5844,20 @@ mod db_command_tests {
         let app = app_with_state();
         let state: tauri::State<AppState> = app.state();
         let dir = tempfile::tempdir().unwrap();
-        db_open(state.clone(), dir.path().join("v.rn").to_string_lossy().into_owned()).unwrap();
-        db_save_note(state.clone(), "n1".into(), "Receipts".into(), "body".into(), false, vec![]).unwrap();
+        db_open(
+            state.clone(),
+            dir.path().join("v.rn").to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        db_save_note(
+            state.clone(),
+            "n1".into(),
+            "Receipts".into(),
+            "body".into(),
+            false,
+            vec![],
+        )
+        .unwrap();
 
         let meta = db_add_attachment(
             state.clone(),
@@ -5781,9 +5869,14 @@ mod db_command_tests {
         .unwrap();
         assert_eq!(meta.size, 14);
 
-        let fetched = db_get_attachment(state.clone(), meta.id.clone()).unwrap().unwrap();
+        let fetched = db_get_attachment(state.clone(), meta.id.clone())
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched["filename"], "proton-recovery.txt");
-        assert_eq!(fetched["data"], serde_json::json!(b"recovery codes".to_vec()));
+        assert_eq!(
+            fetched["data"],
+            serde_json::json!(b"recovery codes".to_vec())
+        );
 
         // Attachment for a missing note leaves the note foreign-key intact? No:
         // attachments require an existing note (FK enforced).

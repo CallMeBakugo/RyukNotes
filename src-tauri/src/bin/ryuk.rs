@@ -171,12 +171,17 @@ fn notes_show(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String
 }
 
 fn notes_new(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String> {
-    let title = positional(tail, &[]).first().cloned().ok_or("notes new <title>")?;
+    let title = positional(tail, &[])
+        .first()
+        .cloned()
+        .ok_or("notes new <title>")?;
     let tags = flag_values(tail, "--tag");
     let content = if tail.iter().any(|a| a == "--stdin") {
         use std::io::Read;
         let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf).map_err(|e| e.to_string())?;
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| e.to_string())?;
         buf
     } else {
         String::new()
@@ -198,16 +203,23 @@ fn notes_new(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String>
 }
 
 fn notes_tag(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String> {
-    let id = positional(tail, &[]).first().cloned().ok_or("notes tag <id>")?;
+    let id = positional(tail, &[])
+        .first()
+        .cloned()
+        .ok_or("notes tag <id>")?;
     let add = flag_values(tail, "--add");
     let remove = flag_values(tail, "--remove");
     let db = open_vault(vault_flag.as_deref())?;
-    let Some(mut note) = db.get_note_full(&id)? else {
+    let Some(note) = db.get_note_full(&id)? else {
         return Err(format!("no note with id {id}"));
     };
     let mut tags: Vec<String> = note["tags"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     for tag in add {
         if !tags.contains(&tag) {
@@ -228,7 +240,10 @@ fn notes_tag(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String>
 }
 
 fn notes_search(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String> {
-    let query = positional(tail, &[]).first().cloned().ok_or("notes search <query>")?;
+    let query = positional(tail, &[])
+        .first()
+        .cloned()
+        .ok_or("notes search <query>")?;
     // FTS5 raw queries break on '/' and other syntax; wrap as a quoted phrase.
     let quoted = format!("\"{}\"", query.replace('"', "\"\""));
     let db = open_vault(vault_flag.as_deref())?;
@@ -250,10 +265,16 @@ fn notes_trash(vault_flag: &Option<String>, tail: &[String], trash: bool) -> Res
 /// { "session_id": "...", "title": "...", "changed": [...], "decisions": [...],
 ///   "todos": [...], "topics": [...], "tags": [...] }
 fn session_import(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String> {
-    let file = flag_values(tail, "--file").first().cloned().ok_or("session import --file <json>")?;
+    let file = flag_values(tail, "--file")
+        .first()
+        .cloned()
+        .ok_or("session import --file <json>")?;
     let raw = std::fs::read_to_string(&file).map_err(|e| format!("reading {file}: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-    let session_id = v["session_id"].as_str().ok_or("summary json needs session_id")?.to_string();
+    let session_id = v["session_id"]
+        .as_str()
+        .ok_or("summary json needs session_id")?
+        .to_string();
     let title = v["title"]
         .as_str()
         .map(String::from)
@@ -261,7 +282,11 @@ fn session_import(vault_flag: &Option<String>, tail: &[String]) -> Result<(), St
     let lines_of = |key: &str| -> Vec<String> {
         v[key]
             .as_array()
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let mut body = String::new();
@@ -312,7 +337,10 @@ fn session_import(vault_flag: &Option<String>, tail: &[String]) -> Result<(), St
 }
 
 fn session_restore(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String> {
-    let session_id = positional(tail, &[]).first().cloned().ok_or("session restore <session-id>")?;
+    let session_id = positional(tail, &[])
+        .first()
+        .cloned()
+        .ok_or("session restore <session-id>")?;
     let _ = vault_flag; // restoring does not need the vault; keep the flag accepted
     let status = Command::new("hermes")
         .arg("--resume")
@@ -323,6 +351,58 @@ fn session_restore(vault_flag: &Option<String>, tail: &[String]) -> Result<(), S
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
+}
+
+/// Writes the session grounding files into a per-note context directory.
+///
+/// `context.md` carries the note's full content; `.hermes.md` is Hermes's
+/// auto-loaded project context file (cwd-only), so a session launched with
+/// `hermes --in <dir>` reads these rules from the system prompt at startup —
+/// the note grounds the session without any manual step.
+fn write_session_context(
+    dir: &std::path::Path,
+    note_id: &str,
+    title: &str,
+    content: &str,
+    vault_path: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let context_file = dir.join("context.md");
+    std::fs::write(
+        &context_file,
+        format!(
+            "# {title}\n\n{content}\n\n---\n\n*(This file grounds the session in a Ryuk's Notebook note titled \"{title}\". The note id is {note_id}.)*\n"
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Hermes loads this file automatically (cwd-only project context) and pins
+    // it in the system prompt: the note IS the basis for the session.
+    let hermes_file = dir.join(".hermes.md");
+    std::fs::write(
+        &hermes_file,
+        format!(
+            "# RyukNotes Session Grounding\n\n\
+             This Hermes session was launched from Ryuk's Notebook for the note \
+             \"{title}\" (note id: `{note_id}`).\n\n\
+             ## Rules\n\n\
+             - `context.md` in this directory holds the full content of that note \
+             as of session launch. It is the authoritative grounding for this \
+             session: read it before answering, and treat it as the basis for \
+             every response in this session.\n\
+             - The note id is `{note_id}`. When the task refers to \"the note\", \
+             that is the note.\n\
+             - `context.md` is a launch-time snapshot. If freshness matters, \
+             check the live note in the vault: \
+             `ryuk --vault \"{vault}\" notes show {note_id}`.\n\
+             - Output destined for this note (summaries, findings, artifacts) \
+             should be written so `ryuk session import` can file it back into \
+             the vault.\n",
+            vault = vault_path.display(),
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(context_file)
 }
 
 fn session_start(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String> {
@@ -357,14 +437,11 @@ fn session_start(vault_flag: &Option<String>, tail: &[String]) -> Result<(), Str
     let title = String::from(note["title"].as_str().unwrap_or(""));
     let content = String::from(note["content"].as_str().unwrap_or(""));
     let context_dir = std::env::temp_dir().join("ryuk-sessions").join(&note_id);
-    std::fs::create_dir_all(&context_dir).map_err(|e| e.to_string())?;
-    let context_file = context_dir.join("context.md");
-    std::fs::write(
-        &context_file,
-        format!("# {title}\n\n{content}\n\n---\n\n*(This file grounds the session in a Ryuk's Notebook note titled \"{title}\". The note id is {note_id}.)*\n"),
-    )
-    .map_err(|e| e.to_string())?;
+    let vault_path = resolve_vault(vault_flag.as_deref())?;
+    let context_file =
+        write_session_context(&context_dir, &note_id, &title, &content, &vault_path)?;
     println!("context: {}", context_file.display());
+    println!("grounding: {}", context_dir.join(".hermes.md").display());
 
     let before = newest_session_in_workspace(&note_id);
     let mut cmd = Command::new("hermes");
@@ -404,13 +481,20 @@ fn newest_session_in_workspace(needle: &str) -> Option<String> {
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let line = text.lines().rev().find(|l| {
         // session ids look like 20261013_185649_b600fe
-        l.contains('_') && l.split_whitespace().last().map(|w| w.chars().filter(|c| *c == '_').count() == 2).unwrap_or(false)
+        l.contains('_')
+            && l.split_whitespace()
+                .last()
+                .map(|w| w.chars().filter(|c| *c == '_').count() == 2)
+                .unwrap_or(false)
     })?;
     line.split_whitespace().last().map(String::from)
 }
 
 fn session_resume_for_note(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String> {
-    let note_id = positional(tail, &[]).first().cloned().ok_or("session resume-for-note <note-id>")?;
+    let note_id = positional(tail, &[])
+        .first()
+        .cloned()
+        .ok_or("session resume-for-note <note-id>")?;
     let db = open_vault(vault_flag.as_deref())?;
     let session_id = db
         .get_session_link(&note_id)?
@@ -443,4 +527,53 @@ fn session_list_links(vault_flag: &Option<String>) -> Result<(), String> {
         println!("{note_id}  {title}  ->  {session_id}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod session_grounding_tests {
+    use super::write_session_context;
+
+    #[test]
+    fn writes_context_and_hermes_grounding() {
+        let dir = std::env::temp_dir().join("ryuk-grounding-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let context = write_session_context(
+            &dir,
+            "test-note-1",
+            "Test Title",
+            "Body of the note.",
+            std::path::Path::new("/home/u/Notes/ryuknotes.rn"),
+        )
+        .unwrap();
+        assert!(context.is_file());
+
+        let grounding = dir.join(".hermes.md");
+        assert!(grounding.is_file(), ".hermes.md must exist for auto-load");
+        let text = std::fs::read_to_string(&grounding).unwrap();
+        assert!(text.contains("test-note-1"));
+        assert!(text.contains("Test Title"));
+        assert!(text.contains("context.md"));
+        // The freshness pointer must carry the actual vault path.
+        assert!(text.contains("/home/u/Notes/ryuknotes.rn"));
+
+        let ctx = std::fs::read_to_string(&context).unwrap();
+        assert!(ctx.contains("Body of the note."));
+        assert!(ctx.contains("test-note-1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overwrites_stale_grounding_on_relaunch() {
+        let dir = std::env::temp_dir().join("ryuk-grounding-test-2");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".hermes.md"), "stale").unwrap();
+        write_session_context(&dir, "n", "t", "c", std::path::Path::new("/v.rn")).unwrap();
+        let text = std::fs::read_to_string(dir.join(".hermes.md")).unwrap();
+        assert!(
+            !text.contains("stale"),
+            "relaunch must replace stale grounding"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

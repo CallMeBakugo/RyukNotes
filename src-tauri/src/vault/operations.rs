@@ -2042,8 +2042,7 @@ pub fn import_note(
                         Err(error) => return Err(error.error.to_string()),
                     }
                 };
-                let relative =
-                    format!(".ryuknotes/attachments/{}", urlencoding::encode(&filename));
+                let relative = format!(".ryuknotes/attachments/{}", urlencoding::encode(&filename));
                 copied.insert(target, relative.clone());
                 relative
             };
@@ -2777,8 +2776,8 @@ mod exclusive_rename_fallback_tests {
 mod tests {
     use super::{
         compare_natural_names, create_notebook, duplicate_note, get_note_switcher_titles,
-        ryuknotes_dir, load_notebook_icons, load_tag_styles, patch_tag_style, permanent_delete,
-        read_note, replace_file_atomically, restore_notebook, save_note, scan_notebooks,
+        load_notebook_icons, load_tag_styles, patch_tag_style, permanent_delete, read_note,
+        replace_file_atomically, restore_notebook, ryuknotes_dir, save_note, scan_notebooks,
         set_notebook_icon,
     };
     use crate::types::{TagStyle, TagStyleChange};
@@ -3159,10 +3158,8 @@ mod tests {
 
     #[test]
     fn rejects_invalid_tag_color() {
-        let vault = std::env::temp_dir().join(format!(
-            "ryuknotes-tag-style-color-test-{}",
-            Uuid::new_v4()
-        ));
+        let vault =
+            std::env::temp_dir().join(format!("ryuknotes-tag-style-color-test-{}", Uuid::new_v4()));
         let vault_path = vault.to_string_lossy();
 
         let err = patch_tag_style(
@@ -3178,10 +3175,8 @@ mod tests {
 
     #[test]
     fn clearing_empty_tag_style_removes_entry() {
-        let vault = std::env::temp_dir().join(format!(
-            "ryuknotes-tag-style-clear-test-{}",
-            Uuid::new_v4()
-        ));
+        let vault =
+            std::env::temp_dir().join(format!("ryuknotes-tag-style-clear-test-{}", Uuid::new_v4()));
         let vault_path = vault.to_string_lossy();
 
         patch_tag_style(
