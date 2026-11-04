@@ -243,6 +243,57 @@ mod tests {
         import_md_vault(vault.path(), &db).unwrap();
         assert_eq!(db.list_versions("id-only").unwrap().len(), 1);
     }
+
+    #[test]
+    fn reimport_links_existing_blob_from_body_and_history_idempotently() {
+        let source = tempfile::tempdir().unwrap();
+        let db = VaultDb::open_in_memory().unwrap();
+        db.upsert_note(&NewNote {
+            id: "owner".into(),
+            title: "Owner".into(),
+            content: String::new(),
+            pinned: false,
+            tags: vec![],
+            created: "now".into(),
+            modified: "now".into(),
+        })
+        .unwrap();
+        let asset = db
+            .add_attachment("owner", "file", "text/plain", b"shared", "now")
+            .unwrap();
+        write_note(
+            source.path(),
+            "Copy.md",
+            "id: copy\ntitle: Copy\n",
+            &format!("![copy]({})", asset.id),
+        );
+        write_note(
+            source.path(),
+            "History.md",
+            "id: history\ntitle: History\n",
+            "",
+        );
+        let history = source.path().join(".ryuknotes/history/history");
+        std::fs::create_dir_all(&history).unwrap();
+        std::fs::write(history.join("snapshot.md"), &asset.id).unwrap();
+        for _ in 0..2 {
+            import_md_vault(source.path(), &db).unwrap();
+        }
+        assert_eq!(
+            db.get_attachment_data(&asset.id)
+                .unwrap()
+                .unwrap()
+                .0
+                .note_ids,
+            vec!["copy", "history", "owner"]
+        );
+        db.delete_note("owner").unwrap();
+        assert_eq!(
+            db.get_attachment_data(&asset.id).unwrap().unwrap().1,
+            b"shared"
+        );
+        assert_eq!(db.list_versions("history").unwrap().len(), 1);
+    }
 }
 
 #[cfg(test)]

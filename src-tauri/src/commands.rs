@@ -4283,7 +4283,7 @@ pub fn db_get_attachment(
     with_db(&state, |db| match db.get_attachment_data(&id)? {
         Some((meta, data)) => Ok(Some(serde_json::json!({
             "id": meta.id,
-            "noteId": meta.note_id,
+            "noteIds": meta.note_ids,
             "filename": meta.filename,
             "mimeType": meta.mime_type,
             "size": meta.size,
@@ -6010,6 +6010,53 @@ mod db_command_tests {
             fetched["data"],
             serde_json::json!(b"recovery codes".to_vec())
         );
+
+        db_save_note(
+            state.clone(),
+            "n2".into(),
+            "Shared".into(),
+            "body".into(),
+            false,
+            vec![],
+            None,
+        )
+        .unwrap();
+        let shared = db_add_attachment(
+            state.clone(),
+            "n2".into(),
+            "copy.txt".into(),
+            "text/plain".into(),
+            b"recovery codes".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(shared.id, meta.id);
+        assert_eq!(shared.note_id.as_deref(), Some("n2"));
+        let stats = db_vault_stats(state.clone()).unwrap();
+        assert_eq!(stats.total_attachments, 1);
+        assert_eq!(stats.attachments_size, 14);
+        assert!(db_add_attachment(
+            state.clone(),
+            "missing".into(),
+            "copy".into(),
+            "text/plain".into(),
+            b"recovery codes".to_vec()
+        )
+        .is_err());
+        db_trash_note(state.clone(), "n1".into()).unwrap();
+        assert_eq!(db_empty_trash(state.clone()).unwrap(), 1);
+        let fetched = db_get_attachment(state.clone(), meta.id.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched["noteIds"], serde_json::json!(["n2"]));
+        assert!(fetched.get("noteId").is_none());
+        assert_eq!(
+            fetched["data"],
+            serde_json::json!(b"recovery codes".to_vec())
+        );
+        db_delete_note(state.clone(), "n2".into()).unwrap();
+        assert!(db_get_attachment(state.clone(), meta.id.clone())
+            .unwrap()
+            .is_some());
 
         // Attachment for a missing note leaves the note foreign-key intact? No:
         // attachments require an existing note (FK enforced).

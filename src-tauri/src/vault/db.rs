@@ -22,7 +22,7 @@ use std::path::Path;
 /// to accidental video drops.
 pub const DEFAULT_MAX_ATTACHMENT_BYTES: i64 = 25 * 1024 * 1024;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
@@ -52,7 +52,6 @@ CREATE TABLE IF NOT EXISTS note_tags (
 
 CREATE TABLE IF NOT EXISTS attachments (
     id        TEXT PRIMARY KEY,
-    note_id   TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
     filename  TEXT NOT NULL,
     mime_type TEXT NOT NULL,
     size      INTEGER NOT NULL,
@@ -60,8 +59,12 @@ CREATE TABLE IF NOT EXISTS attachments (
     data      BLOB NOT NULL,
     created   TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_attachments_note ON attachments(note_id);
-CREATE INDEX IF NOT EXISTS idx_attachments_hash ON attachments(sha256);
+CREATE TABLE IF NOT EXISTS note_attachments (
+    note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    attachment_id TEXT NOT NULL REFERENCES attachments(id) ON DELETE RESTRICT,
+    PRIMARY KEY (note_id, attachment_id)
+);
+CREATE INDEX IF NOT EXISTS idx_note_attachments_attachment ON note_attachments(attachment_id);
 
 CREATE TABLE IF NOT EXISTS versions (
     id        TEXT PRIMARY KEY,
@@ -115,7 +118,9 @@ pub struct NoteSummary {
 #[serde(rename_all = "camelCase")]
 pub struct AttachmentMeta {
     pub id: String,
-    pub note_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_id: Option<String>,
+    pub note_ids: Vec<String>,
     pub filename: String,
     pub mime_type: String,
     pub size: i64,
@@ -141,13 +146,142 @@ impl VaultDb {
             .map_err(|e| e.to_string())?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| e.to_string())?;
-        conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
-        let db = Self {
+        let has_meta: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let version = if has_meta {
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            raw.ok_or("Vault schema version is missing")?
+                .parse::<i64>()
+                .map_err(|_| "Invalid vault schema version")?
+        } else {
+            let tables: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if tables != 0 {
+                return Err("Unrecognized vault schema".into());
+            }
+            0
+        };
+        if !(0..=SCHEMA_VERSION).contains(&version) || (has_meta && version == 0) {
+            return Err(format!("Unsupported vault schema version {version}"));
+        }
+        if version == 1 {
+            // VACUUM INTO makes a consistent snapshot, including committed WAL data.
+            if let Some(path) = conn.path().filter(|p| !p.is_empty() && *p != ":memory:") {
+                let backup = format!("{path}.pre-v2-{}.bak", uuid::Uuid::new_v4());
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                // Reserve a private, empty destination; SQLite accepts an empty file.
+                drop(options.open(&backup).map_err(|e| e.to_string())?);
+                conn.execute("VACUUM INTO ?1", params![backup])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        if version == SCHEMA_VERSION {
+            return Ok(Self {
+                conn,
+                max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+            });
+        }
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+        // Another process may have migrated after the initial inspection/snapshot.
+        let locked_has_meta: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if locked_has_meta {
+            let locked_version: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if locked_version.as_deref() != Some(version.to_string().as_str()) {
+                return Err("Vault schema changed while opening; retry opening the vault".into());
+            }
+        } else if version != 0 {
+            return Err("Vault schema changed while opening".into());
+        }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .map_err(|e| e.to_string())?;
+        if version == 1 {
+            tx.execute_batch(r#"
+                CREATE TEMP TABLE attachment_owners AS SELECT note_id, id FROM attachments;
+                CREATE TABLE attachments_v2 (
+                    id TEXT PRIMARY KEY, filename TEXT NOT NULL, mime_type TEXT NOT NULL,
+                    size INTEGER NOT NULL, sha256 TEXT NOT NULL UNIQUE,
+                    data BLOB NOT NULL, created TEXT NOT NULL
+                );
+                INSERT INTO attachments_v2 SELECT id, filename, mime_type, size, sha256, data, created FROM attachments;
+            "#).map_err(|e| e.to_string())?;
+            let mismatch: bool = tx.query_row(
+                "SELECT EXISTS(SELECT id, filename, mime_type, size, sha256, data, created FROM attachments EXCEPT SELECT * FROM attachments_v2) OR (SELECT COUNT(*) FROM attachments) != (SELECT COUNT(*) FROM attachments_v2)",
+                [], |r| r.get(0),
+            ).map_err(|e| e.to_string())?;
+            if mismatch {
+                return Err("Attachment migration validation failed".into());
+            }
+            tx.execute_batch(
+                "DROP TABLE attachments; ALTER TABLE attachments_v2 RENAME TO attachments;",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+        if version == 1 {
+            tx.execute_batch(r#"
+                INSERT INTO note_attachments SELECT note_id, id FROM attachment_owners;
+                DROP TABLE attachment_owners;
+                INSERT OR IGNORE INTO note_attachments
+                    SELECT n.id, a.id FROM notes n JOIN attachments a ON instr(n.content, a.id) > 0;
+                INSERT OR IGNORE INTO note_attachments
+                    SELECT v.note_id, a.id FROM versions v JOIN attachments a ON instr(v.content, a.id) > 0;
+            "#).map_err(|e| e.to_string())?;
+        }
+        let invalid: bool = tx
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(|e| e.to_string())?
+            .exists([])
+            .map_err(|e| e.to_string())?;
+        if invalid {
+            return Err("Vault foreign-key validation failed".into());
+        }
+        tx.execute("INSERT INTO meta(key, value) VALUES('schema_version', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![SCHEMA_VERSION.to_string()]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(Self {
             conn,
             max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
-        };
-        db.set_meta("schema_version", &SCHEMA_VERSION.to_string())?;
-        Ok(db)
+        })
     }
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
@@ -287,6 +421,7 @@ impl VaultDb {
             )
             .map_err(|e| e.to_string())?;
         }
+        Self::link_content(&tx, &note.id, &note.content)?;
         // Refresh the FTS row for this note (delete-then-insert by rowid).
         tx.execute(
             "DELETE FROM notes_fts WHERE rowid = (SELECT rowid FROM notes WHERE id = ?1)",
@@ -316,13 +451,18 @@ impl VaultDb {
             hasher.update(content.as_bytes());
             format!("{:x}", hasher.finalize())
         };
-        self.conn
-            .execute(
-                "INSERT INTO versions(id, note_id, content, created) VALUES(?1, ?2, ?3, ?4)
-                 ON CONFLICT(id) DO NOTHING",
-                params![digest, note_id, content, created],
-            )
+        let tx = self
+            .conn
+            .unchecked_transaction()
             .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO versions(id, note_id, content, created) VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO NOTHING",
+            params![digest, note_id, content, created],
+        )
+        .map_err(|e| e.to_string())?;
+        Self::link_content(&tx, note_id, content)?;
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(digest)
     }
 
@@ -500,8 +640,18 @@ impl VaultDb {
             .map_err(|e| e.to_string())
     }
 
-    /// Stores an attachment BLOB, deduplicated by SHA-256. When the hash
-    /// already exists the existing row is (re)linked to the note.
+    fn link_content(conn: &Connection, note_id: &str, content: &str) -> Result<(), String> {
+        // Conservative UUID matching may retain extra links; it never discards bytes.
+        conn.execute(
+            "INSERT OR IGNORE INTO note_attachments(note_id, attachment_id)
+             SELECT ?1, id FROM attachments WHERE instr(?2, id) > 0",
+            params![note_id, content],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Deduplicate bytes and record each requesting note in the same transaction.
     pub fn add_attachment(
         &self,
         note_id: &str,
@@ -512,85 +662,100 @@ impl VaultDb {
     ) -> Result<AttachmentMeta, String> {
         if data.len() as i64 > self.max_attachment_bytes {
             return Err(format!(
-                "Attachment {} is {} bytes; the vault cap is {} bytes",
-                filename,
-                data.len(),
+                "Attachment {filename} exceeds the vault cap of {} bytes",
                 self.max_attachment_bytes
             ));
         }
         let digest = {
             use sha2::Digest;
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(data);
-            format!("{:x}", hasher.finalize())
+            format!("{:x}", sha2::Sha256::digest(data))
         };
-        if let Some(meta) = self.get_attachment_by_hash(&digest)? {
-            return Ok(meta);
-        }
-        let id = uuid::Uuid::new_v4().to_string();
-        self.conn
-            .execute(
-                "INSERT INTO attachments(id, note_id, filename, mime_type, size, sha256, data, created)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![id, note_id, filename, mime_type, data.len() as i64, digest, data, now],
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO attachments(id, filename, mime_type, size, sha256, data, created)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(sha256) DO NOTHING",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                filename,
+                mime_type,
+                data.len() as i64,
+                digest,
+                data,
+                now
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        let id: String = tx
+            .query_row(
+                "SELECT id FROM attachments WHERE sha256 = ?1",
+                params![digest],
+                |r| r.get(0),
             )
             .map_err(|e| e.to_string())?;
-        Ok(AttachmentMeta {
-            id,
-            note_id: note_id.to_string(),
-            filename: filename.to_string(),
-            mime_type: mime_type.to_string(),
-            size: data.len() as i64,
-            sha256: digest,
-        })
+        // Even a duplicate must pass the note foreign key.
+        tx.execute(
+            "INSERT OR IGNORE INTO note_attachments(note_id, attachment_id) VALUES(?1, ?2)",
+            params![note_id, id],
+        )
+        .map_err(|e| e.to_string())?;
+        let mut meta = self.attachment_meta(&id)?.ok_or("Attachment disappeared")?;
+        meta.note_id = Some(note_id.to_string());
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(meta)
     }
 
-    fn get_attachment_by_hash(&self, digest: &str) -> Result<Option<AttachmentMeta>, String> {
-        self.conn
+    fn attachment_meta(&self, id: &str) -> Result<Option<AttachmentMeta>, String> {
+        let mut meta = self
+            .conn
             .query_row(
-                "SELECT id, note_id, filename, mime_type, size, sha256 FROM attachments WHERE sha256 = ?1",
-                params![digest],
+                "SELECT id, filename, mime_type, size, sha256 FROM attachments WHERE id = ?1",
+                params![id],
                 |row| {
                     Ok(AttachmentMeta {
                         id: row.get(0)?,
-                        note_id: row.get(1)?,
-                        filename: row.get(2)?,
-                        mime_type: row.get(3)?,
-                        size: row.get(4)?,
-                        sha256: row.get(5)?,
+                        note_id: None,
+                        note_ids: Vec::new(),
+                        filename: row.get(1)?,
+                        mime_type: row.get(2)?,
+                        size: row.get(3)?,
+                        sha256: row.get(4)?,
                     })
                 },
             )
             .optional()
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        if let Some(meta) = &mut meta {
+            let mut stmt = self.conn.prepare("SELECT note_id FROM note_attachments WHERE attachment_id = ?1 ORDER BY note_id")
+                .map_err(|e| e.to_string())?;
+            meta.note_ids = stmt
+                .query_map(params![id], |r| r.get(0))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(meta)
     }
 
     pub fn get_attachment_data(
         &self,
         id: &str,
     ) -> Result<Option<(AttachmentMeta, Vec<u8>)>, String> {
-        let row = self
+        let Some(meta) = self.attachment_meta(id)? else {
+            return Ok(None);
+        };
+        let data = self
             .conn
             .query_row(
-                "SELECT id, note_id, filename, mime_type, size, sha256, data FROM attachments WHERE id = ?1",
+                "SELECT data FROM attachments WHERE id = ?1",
                 params![id],
-                |row| {
-                    Ok((
-                        AttachmentMeta {
-                            id: row.get(0)?,
-                            note_id: row.get(1)?,
-                            filename: row.get(2)?,
-                            mime_type: row.get(3)?,
-                            size: row.get(4)?,
-                            sha256: row.get(5)?,
-                        },
-                        row.get::<_, Vec<u8>>(6)?,
-                    ))
-                },
+                |r| r.get(0),
             )
-            .optional()
             .map_err(|e| e.to_string())?;
-        Ok(row)
+        Ok(Some((meta, data)))
     }
 }
 
@@ -687,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_note_cascades_tags_and_attachments() {
+    fn deleting_a_note_cascades_tags_but_retains_attachment_bytes() {
         let db = VaultDb::open_in_memory().unwrap();
         db.upsert_note(&note("a", "Doomed", vec!["x"])).unwrap();
         db.add_attachment("a", "f.txt", "text/plain", b"data", "now")
@@ -704,6 +869,197 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 0);
+        assert_eq!(n, 1);
+    }
+    fn legacy_fixture(conn: &Connection) {
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(
+            r#"
+            DROP TABLE note_attachments;
+            DROP TABLE attachments;
+            CREATE TABLE attachments (
+                id TEXT PRIMARY KEY,
+                note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+                filename TEXT NOT NULL, mime_type TEXT NOT NULL, size INTEGER NOT NULL,
+                sha256 TEXT NOT NULL UNIQUE, data BLOB NOT NULL, created TEXT NOT NULL
+            );
+            CREATE INDEX idx_attachments_note ON attachments(note_id);
+            CREATE INDEX idx_attachments_hash ON attachments(sha256);
+            INSERT INTO meta VALUES('schema_version', '1');
+            INSERT INTO notes VALUES('a', 'Owner', '', 0, 0, 'then', 'then');
+            INSERT INTO notes VALUES('b', 'Shared', '![image](asset-id)', 0, 1, 'then', 'then');
+            INSERT INTO notes VALUES('c', 'History', '', 0, 0, 'then', 'then');
+            INSERT INTO versions VALUES('version', 'c', 'asset-id', 'then');
+            INSERT INTO attachments VALUES('asset-id', 'a', 'f.bin', 'application/octet-stream',
+                3, 'hash', X'0001FF', 'then');
+        "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn shared_bytes_survive_both_owners_and_failed_requests_are_atomic() {
+        let db = VaultDb::open_in_memory().unwrap();
+        for id in ["a", "b"] {
+            db.upsert_note(&note(id, id, vec![])).unwrap();
+        }
+        let first = db
+            .add_attachment("a", "a.txt", "text/plain", b"shared", "now")
+            .unwrap();
+        let second = db
+            .add_attachment("b", "b.txt", "text/plain", b"shared", "now")
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.note_id.as_deref(), Some("b"));
+        assert_eq!(second.note_ids, vec!["a", "b"]);
+        db.add_attachment("b", "again", "text/plain", b"shared", "now")
+            .unwrap();
+        for payload in [b"shared".as_slice(), b"new bytes".as_slice()] {
+            assert!(db
+                .add_attachment("missing", "x", "text/plain", payload, "now")
+                .is_err());
+        }
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        db.set_note_trashed("a", true).unwrap();
+        db.set_note_trashed("a", false).unwrap();
+        db.delete_note("a").unwrap();
+        let (meta, data) = db.get_attachment_data(&first.id).unwrap().unwrap();
+        assert_eq!(meta.note_ids, vec!["b"]);
+        assert_eq!(data, b"shared");
+        db.delete_note("b").unwrap();
+        assert!(db
+            .get_attachment_data(&first.id)
+            .unwrap()
+            .unwrap()
+            .0
+            .note_ids
+            .is_empty());
+    }
+
+    #[test]
+    fn copied_content_and_history_acquire_links_without_discarding_old_links() {
+        let db = VaultDb::open_in_memory().unwrap();
+        db.upsert_note(&note("a", "a", vec![])).unwrap();
+        let asset = db
+            .add_attachment("a", "x", "text/plain", b"bytes", "now")
+            .unwrap();
+        let mut copy = note("b", "copy", vec![]);
+        copy.content = format!("![copy]({})", asset.id);
+        db.upsert_note(&copy).unwrap();
+        copy.content.clear();
+        db.upsert_note(&copy).unwrap();
+        db.upsert_note(&note("c", "history", vec![])).unwrap();
+        db.add_version("c", &asset.id, "now").unwrap();
+        db.add_version("c", &asset.id, "now").unwrap();
+        assert_eq!(
+            db.get_attachment_data(&asset.id)
+                .unwrap()
+                .unwrap()
+                .0
+                .note_ids,
+            vec!["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn v1_migration_preserves_bytes_links_history_and_snapshot_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.rn");
+        let conn = Connection::open(&path).unwrap();
+        legacy_fixture(&conn);
+        drop(conn);
+        let db = VaultDb::open(&path).unwrap();
+        let (meta, bytes) = db.get_attachment_data("asset-id").unwrap().unwrap();
+        assert_eq!(meta.note_ids, vec!["a", "b", "c"]);
+        assert_eq!(meta.filename, "f.bin");
+        assert_eq!(meta.sha256, "hash");
+        assert_eq!(bytes, vec![0, 1, 255]);
+        db.delete_note("a").unwrap();
+        assert!(db.get_attachment_data("asset-id").unwrap().is_some());
+        drop(db);
+        let db = VaultDb::open(&path).unwrap();
+        assert_eq!(
+            db.get_attachment_data("asset-id")
+                .unwrap()
+                .unwrap()
+                .0
+                .note_ids,
+            vec!["b", "c"]
+        );
+        let snapshots: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "bak"))
+            .collect();
+        assert_eq!(snapshots.len(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&snapshots[0])
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let snapshot = Connection::open(&snapshots[0]).unwrap();
+        let owner: String = snapshot
+            .query_row("SELECT note_id FROM attachments", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(owner, "a");
+        drop(snapshot);
+        // Restoring a v1 snapshot must run the migration again successfully.
+        assert!(VaultDb::open(&snapshots[0])
+            .unwrap()
+            .get_attachment_data("asset-id")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_and_future_versions_are_rejected() {
+        let conn = Connection::open_in_memory().unwrap();
+        legacy_fixture(&conn);
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute("UPDATE attachments SET note_id = 'missing'", [])
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid.rn");
+        conn.execute("VACUUM INTO ?1", params![path.to_string_lossy().as_ref()])
+            .unwrap();
+        assert!(VaultDb::open(&path).is_err());
+        let original = Connection::open(&path).unwrap();
+        let version: String = original
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "1");
+        let owner: String = original
+            .query_row("SELECT note_id FROM attachments", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(owner, "missing");
+        original
+            .execute("UPDATE meta SET value='999' WHERE key='schema_version'", [])
+            .unwrap();
+        drop(original);
+        assert!(VaultDb::open(&path).is_err());
+        let original = Connection::open(&path).unwrap();
+        let version: String = original
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "999");
     }
 }
