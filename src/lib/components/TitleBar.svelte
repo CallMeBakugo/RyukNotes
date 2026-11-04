@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { getCurrentWindow } from '@tauri-apps/api/window';
-	import { vaultReady, focusMode, readOnly, updateAvailable, showSettings, settingsTab, appConfig, activeNotePath, activeVaultConfig } from '$lib/stores/app';
+	import { vaultReady, focusMode, readOnly, appConfig, activeNotePath, activeVaultConfig } from '$lib/stores/app';
 	import NoteSwitcher from './NoteSwitcher.svelte';
 	import { isTrashedNote } from '$lib/utils/paths';
 
@@ -74,12 +74,6 @@
 	<div class="titlebar-brand">
 		<img class="titlebar-logo" src="/ryuk-logo.png" alt="Ryuk's Notebook" width="18" height="18" />
 		<span class="titlebar-title">Ryuk's Notebook</span>
-		{#if $updateAvailable}
-			<!-- svelte-ignore a11y_no_static_element_interactions -->
-		<button class="update-badge" onmousedown={(e) => e.stopPropagation()} onclick={() => { $settingsTab = 'updates'; $showSettings = true; }}>
-				v{$updateAvailable.version} available
-			</button>
-		{/if}
 	</div>
 	{#if $appConfig?.show_note_switcher}
 		<div class="titlebar-note-switcher">
@@ -189,25 +183,6 @@
 	.titlebar-logo {
 		border-radius: 4px;
 		flex-shrink: 0;
-	}
-
-	.update-badge {
-		font-size: 10px;
-		font-weight: 600;
-		color: var(--accent);
-		background: color-mix(in srgb, var(--accent) 12%, transparent);
-		border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
-		border-radius: 10px;
-		padding: 1px 8px;
-		cursor: pointer;
-		pointer-events: auto;
-		-webkit-app-region: no-drag;
-		transition: background 0.15s, border-color 0.15s;
-	}
-
-	.update-badge:hover {
-		background: color-mix(in srgb, var(--accent) 20%, transparent);
-		border-color: color-mix(in srgb, var(--accent) 40%, transparent);
 	}
 
 	.titlebar-actions {

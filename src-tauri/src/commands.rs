@@ -4949,7 +4949,7 @@ pub fn is_mobile_platform() -> bool {
 #[tauri::command]
 pub fn get_install_type() -> String {
     // Build-time override for distro packagers (e.g. Solus): build with
-    // RYUKNOTES_INSTALL_TYPE=solus to report that type and suppress the in-app updater.
+    // RYUKNOTES_INSTALL_TYPE=solus to report that install type.
     if let Some(forced) = option_env!("RYUKNOTES_INSTALL_TYPE") {
         if !forced.is_empty() {
             return forced.to_string();

@@ -48,8 +48,6 @@
 		tasksOnlyFlagged,
 		tasksSort,
 		activeTag,
-		updateAvailable as globalUpdateAvailable,
-		settingsTab,
 		navHistory,
 		viewerNote,
 		notebookSortMode,
@@ -1094,11 +1092,6 @@
 						{#if $viewMode === 'notebook'}{$activeNotebook?.name ?? 'Notebook'}{:else if $viewMode === 'tag' && $activeTag}<TagLabel name={$activeTag} size={16} />{:else if $viewMode === 'quickaccess'}Quick Access{:else if $viewMode === 'daily'}Daily Notes{:else if $viewMode === 'tasks'}Tasks{:else if $viewMode === 'hermes'}Hermes{:else if $viewMode === 'trash'}Trash{:else}All Notes{/if}
 					{/if}
 				</span>
-				{#if $globalUpdateAvailable && $mobileView === 'sidebar'}
-					<button class="mobile-update-badge" onclick={() => { $settingsTab = 'updates'; $showSettings = true; }}>
-						v{$globalUpdateAvailable.version}
-					</button>
-				{/if}
 			{/if}
 			<div class="mobile-header-actions">
 				{#if $mobileView === 'editor'}
@@ -1479,20 +1472,6 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 		padding: 0 4px;
-	}
-
-	.mobile-update-badge {
-		background: var(--accent);
-		color: white;
-		border: none;
-		border-radius: 10px;
-		padding: 2px 8px;
-		font-size: 11px;
-		font-weight: 600;
-		font-family: inherit;
-		cursor: pointer;
-		white-space: nowrap;
-		flex-shrink: 0;
 	}
 
 	.mobile-header-actions {

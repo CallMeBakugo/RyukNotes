@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import '../app.css';
-	import { resolvedTheme, appConfig, activeNotePath, installType, platformIsMobile, checkForUpdate, isManagedInstall, customThemes } from '$lib/stores/app';
+	import { resolvedTheme, appConfig, activeNotePath, installType, platformIsMobile, customThemes } from '$lib/stores/app';
 	import { openFile, openUrl, getInstallType, isMobilePlatform } from '$lib/api';
 	import { get } from 'svelte/store';
 	import { darkThemes, isMobile, isAndroid } from '$lib/platform';
@@ -102,17 +102,15 @@
 		}
 	}
 
-	// Detect install type and check for updates on startup
+	// Detect platform and install type on startup
 	onMount(() => {
 		// Authoritative platform from the backend (compile-time), overriding the UA guess. (#63)
 		isMobilePlatform().then((m) => platformIsMobile.set(m)).catch(() => {});
 		if (isMobile) {
 			installType.set('android');
-			// Android updates come from the F-droid repo / Obtainium, so no in-app update check.
 		} else {
 			getInstallType().then(t => {
 				installType.set(t);
-				if (!isManagedInstall(t)) checkForUpdate();
 			}).catch(() => {});
 		}
 	});

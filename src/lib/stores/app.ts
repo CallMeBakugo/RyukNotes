@@ -115,37 +115,9 @@ export const resolvedTheme = derived(
   },
 );
 
-// Update state
-export const updateAvailable = writable<{
-  version: string;
-  body?: string;
-} | null>(null);
-export const updateObj = writable<any>(null);
 export const installType = writable<string>("native");
 // True only on the Android/iOS build. Reconfirmed from the backend at startup (see +layout). (#63)
 export const platformIsMobile = writable<boolean>(isMobile);
-
-// Install types that handle their own updates (in-app auto-updater, or a
-// package-manager notice for deb/aur). Anything else - e.g. a distro repo build
-// that sets the RYUKNOTES_INSTALL_TYPE build flag (Solus, etc.) - is "managed":
-// the app does no update check and shows no update UI at all.
-const SELF_UPDATING_INSTALL_TYPES = ["macos", "windows", "deb", "aur", "appimage", "native", "android"];
-export function isManagedInstall(type: string): boolean {
-  return !SELF_UPDATING_INSTALL_TYPES.includes(type);
-}
-
-export async function checkForUpdate() {
-  try {
-    const { check } = await import("@tauri-apps/plugin-updater");
-    const update = await check();
-    if (update) {
-      updateAvailable.set({ version: update.version, body: update.body });
-      updateObj.set(update);
-    }
-  } catch {
-    // Silent fail - don't disrupt app startup
-  }
-}
 
 // Note navigation history
 interface NavHistoryState { stack: string[]; index: number; skipping: boolean; }
