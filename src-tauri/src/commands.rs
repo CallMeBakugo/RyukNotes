@@ -4235,10 +4235,15 @@ pub fn db_save_note(
     tags: Vec<String>,
     expected_raw: Option<String>,
 ) -> Result<(), String> {
+    let max_versions = state
+        .config
+        .lock()
+        .map_err(|e| e.to_string())?
+        .max_versions_per_note;
     let now = chrono::Utc::now().to_rfc3339();
     with_db(&state, |db| {
         let created = db.get_note_created(&id)?.unwrap_or_else(|| now.clone());
-        db.upsert_note_checked(
+        db.upsert_note_with_history(
             &crate::vault::db::NewNote {
                 id,
                 title,
@@ -4249,6 +4254,7 @@ pub fn db_save_note(
                 modified: now,
             },
             expected_raw.as_deref(),
+            Some(max_versions),
         )
     })
 }
@@ -4262,20 +4268,19 @@ pub fn db_search_notes(
 }
 
 /// A captured vault path must still name the open connection after an async paste.
-fn validate_attachment_vault(
-    db: &crate::vault::db::VaultDb,
-    vault_path: &str,
-) -> Result<(), String> {
+fn validate_db_vault(db: &crate::vault::db::VaultDb, vault_path: &str) -> Result<(), String> {
     let requested = std::fs::canonicalize(vault_path).map_err(|e| e.to_string())?;
     let open = db.conn.path().ok_or("No vault database is open")?;
     let opened = std::fs::canonicalize(open).map_err(|e| e.to_string())?;
     if requested != opened {
-        return Err("The image belongs to a different vault; retry in its original note.".into());
+        return Err(
+            "The operation belongs to a different vault; retry in its original note.".into(),
+        );
     }
     Ok(())
 }
 
-fn image_mime_type(name: &str, data: &[u8]) -> Result<&'static str, String> {
+pub(crate) fn image_mime_type(name: &str, data: &[u8]) -> Result<&'static str, String> {
     if data.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Ok("image/png");
     }
@@ -4316,7 +4321,7 @@ pub fn db_save_image(
     let mime = image_mime_type(&name, &data)?;
     let now = chrono::Utc::now().to_rfc3339();
     with_db(&state, |db| {
-        validate_attachment_vault(db, &vault_path)?;
+        validate_db_vault(db, &vault_path)?;
         let meta = db.add_attachment(&note_id, &name, mime, &data, &now)?;
         Ok(format!(".rn-attachments/{}", meta.id))
     })
@@ -4330,7 +4335,7 @@ pub(crate) fn db_image_data(
 ) -> Result<(String, Vec<u8>), String> {
     let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
     let db = slot.as_ref().ok_or("No vault database is open")?;
-    validate_attachment_vault(db, vault_path)?;
+    validate_db_vault(db, vault_path)?;
     let (meta, data) = db.get_attachment_data(id)?.ok_or("Image not found")?;
     match meta.mime_type.as_str() {
         "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/svg+xml"
@@ -4385,6 +4390,240 @@ pub fn db_restore_note(state: State<'_, AppState>, id: String) -> Result<(), Str
 #[tauri::command]
 pub fn db_delete_note(state: State<'_, AppState>, id: String) -> Result<(), String> {
     with_db(&state, |db| db.delete_note(&id))
+}
+
+#[tauri::command]
+pub fn db_import_note<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    vault_path: String,
+    source_path: String,
+    notebook_relative: Option<String>,
+    expected_raw: String,
+    references: Vec<operations::ExternalNoteReference>,
+) -> Result<serde_json::Value, String> {
+    let root = asset_scope::external_note_root(&app, Path::new(&source_path))?;
+    let prepared =
+        operations::prepare_note_import(&source_path, &root, &expected_raw, references, |path| {
+            ensure_scoped_path(&app, path)
+        })?;
+    with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        let id =
+            crate::vault::db_import::import_single(db, prepared, notebook_relative.as_deref())?;
+        db.get_note_full(&id)?
+            .ok_or("Imported note disappeared".into())
+    })
+}
+
+#[tauri::command]
+pub fn db_create_note(
+    state: State<'_, AppState>,
+    vault_path: String,
+    notebook_relative: Option<String>,
+    title: String,
+) -> Result<serde_json::Value, String> {
+    with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &db.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut layout = crate::vault::db_notebooks::Layout::load(&tx)?;
+        let relative =
+            crate::vault::db_notebooks::relative("", notebook_relative.as_deref().unwrap_or(""))?;
+        layout.require(&relative)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let note = crate::vault::db::NewNote {
+            id: uuid::Uuid::new_v4().to_string(),
+            title,
+            content: String::new(),
+            pinned: false,
+            tags: vec![],
+            created: now.clone(),
+            modified: now,
+        };
+        crate::vault::db::VaultDb::write_note(&tx, &note, None, None)?;
+        layout.assign(&note.id, &relative)?;
+        layout.save(&tx)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        db.get_note_full(&note.id)?
+            .ok_or("Created note disappeared".into())
+    })
+}
+
+#[tauri::command]
+pub fn db_move_note(
+    state: State<'_, AppState>,
+    vault_path: String,
+    note_path: String,
+    dest_notebook: String,
+) -> Result<String, String> {
+    with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        crate::vault::db_notebooks::move_note(db, &vault_path, &note_path, &dest_notebook)
+    })
+}
+
+#[tauri::command]
+pub fn db_get_notebooks(state: State<'_, AppState>) -> Result<Vec<NotebookEntry>, String> {
+    with_db(&state, |db| {
+        crate::vault::db_notebooks::list(db, db.conn.path().ok_or("No vault path")?)
+    })
+}
+
+#[tauri::command]
+pub fn db_create_notebook(
+    state: State<'_, AppState>,
+    vault_path: String,
+    parent_relative: Option<String>,
+    name: String,
+) -> Result<NotebookEntry, String> {
+    with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        crate::vault::db_notebooks::create(db, &vault_path, parent_relative.as_deref(), &name)
+    })
+}
+
+#[tauri::command]
+pub fn db_rename_notebook(
+    state: State<'_, AppState>,
+    vault_path: String,
+    path: String,
+    new_name: String,
+) -> Result<String, String> {
+    with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        let source = crate::vault::db_notebooks::relative(&vault_path, &path)?;
+        let name = crate::vault::db_notebooks::relative("", &new_name)?;
+        if name.is_empty() || name.contains('/') {
+            return Err("Invalid notebook name".into());
+        }
+        let parent = source
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or("");
+        let target = if parent.is_empty() {
+            name
+        } else {
+            format!("{parent}/{name}")
+        };
+        crate::vault::db_notebooks::repath(db, &vault_path, &path, &target)
+    })
+}
+
+#[tauri::command]
+pub fn db_move_notebook(
+    state: State<'_, AppState>,
+    vault_path: String,
+    notebook_path: String,
+    dest_parent: String,
+) -> Result<String, String> {
+    with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        let source = crate::vault::db_notebooks::relative(&vault_path, &notebook_path)?;
+        let parent = crate::vault::db_notebooks::relative(&vault_path, &dest_parent)?;
+        let name = source.rsplit('/').next().ok_or("Invalid notebook")?;
+        let target = if parent.is_empty() {
+            name.into()
+        } else {
+            format!("{parent}/{name}")
+        };
+        crate::vault::db_notebooks::repath(db, &vault_path, &source, &target)
+    })
+}
+
+#[tauri::command]
+pub fn db_get_notes(
+    state: State<'_, AppState>,
+    notebook_path: Option<String>,
+) -> Result<Vec<crate::vault::db::NoteSummary>, String> {
+    with_db(&state, |db| {
+        let notes = db.list_notes(false)?;
+        let Some(path) = notebook_path else {
+            return Ok(notes);
+        };
+        let relative =
+            crate::vault::db_notebooks::relative(db.conn.path().ok_or("No vault path")?, &path)?;
+        let layout = crate::vault::db_notebooks::Layout::load(&db.conn)?;
+        layout.require(&relative)?;
+        Ok(notes
+            .into_iter()
+            .filter(|note| layout.notes.get(&note.id).map(String::as_str).unwrap_or("") == relative)
+            .collect())
+    })
+}
+
+#[tauri::command]
+pub fn db_count_root_notes(state: State<'_, AppState>) -> Result<usize, String> {
+    with_db(&state, |db| {
+        let layout = crate::vault::db_notebooks::Layout::load(&db.conn)?;
+        Ok(db
+            .list_notes(false)?
+            .iter()
+            .filter(|note| !layout.notes.contains_key(&note.id))
+            .count())
+    })
+}
+
+#[tauri::command]
+pub fn db_get_note_versions(
+    state: State<'_, AppState>,
+    vault_path: String,
+    note_id: String,
+) -> Result<Vec<crate::types::VersionEntry>, String> {
+    with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        let mut versions = db
+            .list_versions(&note_id)?
+            .into_iter()
+            .map(|(_, content, created)| crate::types::VersionEntry {
+                timestamp: created,
+                size: content.len() as u64,
+            })
+            .collect::<Vec<_>>();
+        versions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok(versions)
+    })
+}
+
+#[tauri::command]
+pub fn db_get_note_version_content(
+    state: State<'_, AppState>,
+    vault_path: String,
+    note_id: String,
+    timestamp: String,
+) -> Result<String, String> {
+    with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        db.list_versions(&note_id)?
+            .into_iter()
+            .find(|(_, _, created)| created == &timestamp)
+            .map(|(_, content, _)| content)
+            .ok_or("Version not found".into())
+    })
+}
+
+#[tauri::command]
+pub fn db_create_version(
+    state: State<'_, AppState>,
+    vault_path: String,
+    path: String,
+    note_id: String,
+) -> Result<(), String> {
+    if path != note_id {
+        return Err("Version note ID does not match the note path".into());
+    }
+    let limit = state
+        .config
+        .lock()
+        .map_err(|e| e.to_string())?
+        .max_versions_per_note;
+    with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        db.force_version(&note_id, limit)
+    })
 }
 
 #[tauri::command]
@@ -5892,9 +6131,19 @@ mod db_command_tests {
 
     fn app_with_state() -> tauri::App<tauri::test::MockRuntime> {
         tauri::test::mock_builder()
+            .plugin(tauri_plugin_fs::init())
             .invoke_handler(tauri::generate_handler![
                 super::db_save_image,
-                super::db_get_attachment
+                super::db_get_attachment,
+                super::db_import_note,
+                super::db_move_note,
+                super::db_create_notebook,
+                super::db_create_note,
+                super::db_get_notes,
+                super::db_get_notebooks,
+                super::db_get_note_versions,
+                super::db_get_note_version_content,
+                super::db_create_version
             ])
             .manage(AppState::new(AppConfig::default()))
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
@@ -6266,5 +6515,282 @@ mod db_command_tests {
         .is_err());
         assert!(db_image_data(state.inner(), &path, id).is_err());
         assert_eq!(db_vault_stats(state).unwrap().total_attachments, 0);
+    }
+
+    fn db_ipc(
+        webview: &tauri::WebviewWindow<tauri::test::MockRuntime>,
+        command: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        tauri::test::get_ipc_response(
+            webview,
+            tauri::webview::InvokeRequest {
+                cmd: command.into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "http://tauri.localhost".parse().unwrap(),
+                body: tauri::ipc::InvokeBody::Json(args),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.into(),
+            },
+        )
+        .map(|response| response.deserialize().unwrap())
+        .map_err(|error| format!("{error:?}"))
+    }
+
+    #[test]
+    fn db_single_import_is_scoped_atomic_and_never_overwrites_an_existing_note() {
+        let app = app_with_state();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "workflow", Default::default())
+            .build()
+            .unwrap();
+        let state = app.state::<AppState>();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.rn").to_string_lossy().into_owned();
+        db_open(state.clone(), path.clone()).unwrap();
+        db_save_note(
+            state.clone(),
+            "source-id".into(),
+            "Keep".into(),
+            "precious".into(),
+            false,
+            vec![],
+            None,
+        )
+        .unwrap();
+        db_ipc(
+            &webview,
+            "db_create_notebook",
+            serde_json::json!({"vaultPath":path,"parentRelative":null,"name":"Research"}),
+        )
+        .unwrap();
+        let source = dir.path().join("source.md");
+        let image = dir.path().join("image.png");
+        let raw = "---\nid: source-id\ntitle: Imported\ntags: [research]\npinned: true\n---\n![image](image.png)";
+        std::fs::write(&source, raw).unwrap();
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\nimage").unwrap();
+        let from = raw.find("image.png").unwrap();
+        let args = serde_json::json!({"vaultPath":path,"sourcePath":source,"notebookRelative":"Research","expectedRaw":raw,
+            "references":[{"from":from,"to":from+9,"href":"image.png","html":false}]});
+        assert!(db_ipc(&webview, "db_import_note", args.clone()).is_err());
+        app.fs_scope().allow_file(&source).unwrap();
+        assert!(db_ipc(&webview, "db_import_note", args.clone()).is_err());
+        assert_eq!(db_list_notes(state.clone(), true).unwrap().len(), 1);
+        assert_eq!(db_vault_stats(state.clone()).unwrap().total_attachments, 0);
+        app.fs_scope().allow_file(&image).unwrap();
+        let imported = db_ipc(&webview, "db_import_note", args.clone()).unwrap();
+        assert_ne!(imported["id"], "source-id");
+        assert_eq!(imported["title"], "Imported");
+        assert_eq!(imported["tags"], serde_json::json!(["research"]));
+        assert_eq!(imported["pinned"], true);
+        assert!(imported["content"]
+            .as_str()
+            .unwrap()
+            .contains(".rn-attachments/"));
+        let second = db_ipc(&webview, "db_import_note", args.clone()).unwrap();
+        assert_ne!(imported["id"], second["id"]);
+        assert_eq!(db_vault_stats(state.clone()).unwrap().total_attachments, 1);
+        let selected = db_ipc(
+            &webview,
+            "db_get_notes",
+            serde_json::json!({"notebookPath":format!("{path}/Research")}),
+        )
+        .unwrap();
+        assert_eq!(selected.as_array().unwrap().len(), 2);
+        assert_eq!(
+            db_get_note(state.clone(), "source-id".into())
+                .unwrap()
+                .unwrap()["content"],
+            "precious"
+        );
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), raw);
+        std::fs::write(&source, "changed").unwrap();
+        assert!(db_ipc(&webview, "db_import_note", args).is_err());
+        assert_eq!(db_list_notes(state, true).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn db_move_preserves_note_identity_trash_history_and_attachment_links() {
+        let app = app_with_state();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "workflow", Default::default())
+            .build()
+            .unwrap();
+        let state = app.state::<AppState>();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.rn").to_string_lossy().into_owned();
+        db_open(state.clone(), path.clone()).unwrap();
+        db_ipc(
+            &webview,
+            "db_create_notebook",
+            serde_json::json!({"vaultPath":path,"parentRelative":null,"name":"A"}),
+        )
+        .unwrap();
+        db_ipc(
+            &webview,
+            "db_create_notebook",
+            serde_json::json!({"vaultPath":path,"parentRelative":null,"name":"B"}),
+        )
+        .unwrap();
+        let note = db_ipc(
+            &webview,
+            "db_create_note",
+            serde_json::json!({"vaultPath":path,"notebookRelative":"A","title":"Move me"}),
+        )
+        .unwrap();
+        let id = note["id"].as_str().unwrap().to_string();
+        db_save_note(
+            state.clone(),
+            id.clone(),
+            "Move me".into(),
+            "before".into(),
+            true,
+            vec!["keep".into()],
+            Some("".into()),
+        )
+        .unwrap();
+        db_create_version(state.clone(), path.clone(), id.clone(), id.clone()).unwrap();
+        let attachment = db_add_attachment(
+            state.clone(),
+            id.clone(),
+            "file".into(),
+            "text/plain".into(),
+            b"bytes".to_vec(),
+        )
+        .unwrap();
+        db_trash_note(state.clone(), id.clone()).unwrap();
+        let before = db_get_note(state.clone(), id.clone()).unwrap().unwrap();
+        let versions = db_list_versions(state.clone(), id.clone()).unwrap();
+        let args =
+            serde_json::json!({"vaultPath":path,"notePath":id,"destNotebook":format!("{path}/B")});
+        assert_eq!(db_ipc(&webview, "db_move_note", args).unwrap(), id);
+        assert_eq!(
+            db_get_note(state.clone(), id.clone()).unwrap().unwrap(),
+            before
+        );
+        assert_eq!(
+            db_list_versions(state.clone(), id.clone()).unwrap(),
+            versions
+        );
+        assert_eq!(
+            db_get_attachment(state.clone(), attachment.id)
+                .unwrap()
+                .unwrap()["noteIds"],
+            serde_json::json!([id])
+        );
+        db_restore_note(state.clone(), id.clone()).unwrap();
+        assert!(db_get_notes(state.clone(), Some(format!("{path}/A")))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db_get_notes(state.clone(), Some(format!("{path}/B"))).unwrap()[0].id,
+            id
+        );
+        assert!(db_move_note(
+            state.clone(),
+            path.clone(),
+            id.clone(),
+            format!("{path}/missing")
+        )
+        .is_err());
+        assert_eq!(
+            db_move_note(state.clone(), path.clone(), id.clone(), path.clone()).unwrap(),
+            id
+        );
+        assert_eq!(db_count_root_notes(state.clone()).unwrap(), 1);
+        db_close(state.clone()).unwrap();
+        db_open(state.clone(), path).unwrap();
+        assert_eq!(db_get_notebooks(state.clone()).unwrap().len(), 2);
+        assert_eq!(
+            db_get_note(state, id).unwrap().unwrap()["content"],
+            "before"
+        );
+    }
+
+    #[test]
+    fn db_save_history_preserves_prior_body_with_cooldown_retention_and_conflicts() {
+        let app = app_with_state();
+        let state = app.state::<AppState>();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.rn").to_string_lossy().into_owned();
+        db_open(state.clone(), path.clone()).unwrap();
+        let save = |body: &str, expected: Option<&str>| {
+            db_save_note(
+                state.clone(),
+                "n".into(),
+                "Title".into(),
+                body.into(),
+                false,
+                vec![],
+                expected.map(str::to_string),
+            )
+        };
+        save("first", None).unwrap();
+        assert!(db_list_versions(state.clone(), "n".into())
+            .unwrap()
+            .is_empty());
+        save("second", Some("first")).unwrap();
+        save("third", Some("second")).unwrap();
+        let versions = db_get_note_versions(state.clone(), path.clone(), "n".into()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(
+            db_get_note_version_content(
+                state.clone(),
+                path.clone(),
+                "n".into(),
+                versions[0].timestamp.clone()
+            )
+            .unwrap(),
+            "first"
+        );
+        assert!(save("conflict", Some("stale")).is_err());
+        assert_eq!(
+            db_get_note(state.clone(), "n".into()).unwrap().unwrap()["content"],
+            "third"
+        );
+        with_db(&state, |db| {
+            db.conn
+                .execute("UPDATE versions SET created='2000-01-01T00:00:00Z'", [])
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .unwrap();
+        state.config.lock().unwrap().max_versions_per_note = 1;
+        with_db(&state,|db| db.conn.execute_batch("CREATE TRIGGER reject_save BEFORE UPDATE ON notes BEGIN SELECT RAISE(ABORT, 'test failure'); END;").map_err(|e| e.to_string())).unwrap();
+        assert!(save("failed", Some("third")).is_err());
+        assert_eq!(
+            db_get_note(state.clone(), "n".into()).unwrap().unwrap()["content"],
+            "third"
+        );
+        let unchanged = db_list_versions(state.clone(), "n".into()).unwrap();
+        assert_eq!(unchanged.len(), 1);
+        assert_eq!(unchanged[0]["created"], "2000-01-01T00:00:00Z");
+        with_db(&state, |db| {
+            db.conn
+                .execute_batch("DROP TRIGGER reject_save")
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        save("fourth", Some("third")).unwrap();
+        let versions = db_get_note_versions(state.clone(), path.clone(), "n".into()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(
+            db_get_note_version_content(
+                state.clone(),
+                path.clone(),
+                "n".into(),
+                versions[0].timestamp.clone()
+            )
+            .unwrap(),
+            "third"
+        );
+        state.config.lock().unwrap().max_versions_per_note = 0;
+        db_create_version(state.clone(), path.clone(), "n".into(), "n".into()).unwrap();
+        db_create_version(state.clone(), path.clone(), "n".into(), "n".into()).unwrap();
+        assert_eq!(
+            db_get_note_versions(state.clone(), path, "n".into())
+                .unwrap()
+                .len(),
+            3
+        );
     }
 }

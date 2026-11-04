@@ -1,6 +1,6 @@
 /** Stable, vault-relative DB attachment references; never filesystem paths. */
 export function dbAttachmentId(source: string): string | null {
-	return /^\.rn-attachments\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(source)?.[1] ?? null;
+	return /^\.rn-attachments\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[?#].*)?$/i.exec(source)?.[1] ?? null;
 }
 
 export function isDbAssetUrl(source: string): boolean {
@@ -12,7 +12,7 @@ export function dbAssetReference(source: string): string | null {
 	try {
 		const path = decodeURIComponent(new URL(source).pathname.slice(1));
 		const reference = `.rn-attachments/${path.slice(path.lastIndexOf('/') + 1)}`;
-		return dbAttachmentId(reference) ? reference : null;
+		return dbAttachmentId(reference) ? reference + new URL(source).search + new URL(source).hash : null;
 	} catch {
 		return null;
 	}

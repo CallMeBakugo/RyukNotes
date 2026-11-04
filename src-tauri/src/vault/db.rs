@@ -371,11 +371,30 @@ impl VaultDb {
         note: &NewNote,
         expected_raw: Option<&str>,
     ) -> Result<(), String> {
+        self.upsert_note_with_history(note, expected_raw, None)
+    }
+
+    pub fn upsert_note_with_history(
+        &self,
+        note: &NewNote,
+        expected_raw: Option<&str>,
+        max_versions: Option<u32>,
+    ) -> Result<(), String> {
         let tx = rusqlite::Transaction::new_unchecked(
             &self.conn,
             rusqlite::TransactionBehavior::Immediate,
         )
         .map_err(|e| e.to_string())?;
+        Self::write_note(&tx, note, expected_raw, max_versions)?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn write_note(
+        tx: &Connection,
+        note: &NewNote,
+        expected_raw: Option<&str>,
+        max_versions: Option<u32>,
+    ) -> Result<(), String> {
         if let Some(expected) = expected_raw {
             let stored: Option<String> = tx
                 .query_row(
@@ -390,6 +409,19 @@ impl VaultDb {
                     "Save conflict: note changed in database. Your edits have not been written."
                         .to_string(),
                 );
+            }
+        }
+        if let Some(limit) = max_versions {
+            let previous: Option<String> = tx
+                .query_row(
+                    "SELECT content FROM notes WHERE id=?1",
+                    params![note.id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if let Some(previous) = previous.filter(|body| body != &note.content) {
+                Self::snapshot_on(tx, &note.id, &previous, limit, false)?;
             }
         }
         tx.execute(
@@ -421,7 +453,7 @@ impl VaultDb {
             )
             .map_err(|e| e.to_string())?;
         }
-        Self::link_content(&tx, &note.id, &note.content)?;
+        Self::link_content(tx, &note.id, &note.content)?;
         // Refresh the FTS row for this note (delete-then-insert by rowid).
         tx.execute(
             "DELETE FROM notes_fts WHERE rowid = (SELECT rowid FROM notes WHERE id = ?1)",
@@ -433,7 +465,7 @@ impl VaultDb {
             params![note.id, note.title, note.content],
         )
         .map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())
+        Ok(())
     }
 
     /// Stores a history snapshot. The version id is the SHA-256 of
@@ -464,6 +496,75 @@ impl VaultDb {
         Self::link_content(&tx, note_id, content)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(digest)
+    }
+
+    pub(crate) fn snapshot_on(
+        conn: &Connection,
+        note_id: &str,
+        content: &str,
+        max_versions: u32,
+        force: bool,
+    ) -> Result<String, String> {
+        let now = chrono::Utc::now();
+        let latest: Option<String> = conn.query_row(
+            "SELECT created FROM versions WHERE note_id=?1 ORDER BY julianday(created) DESC, created DESC LIMIT 1",
+            params![note_id], |r| r.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        if !force
+            && latest
+                .as_deref()
+                .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+                .is_some_and(|last| (now - last.with_timezone(&chrono::Utc)).num_seconds() < 300)
+        {
+            return Ok(String::new());
+        }
+        let mut instant = now;
+        let timestamp = loop {
+            let timestamp = instant.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM versions WHERE note_id=?1 AND created=?2)",
+                    params![note_id, timestamp],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if !exists {
+                break timestamp;
+            }
+            instant += chrono::Duration::nanoseconds(1);
+        };
+        conn.execute(
+            "INSERT INTO versions(id,note_id,content,created) VALUES(?1,?2,?3,?4)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                note_id,
+                content,
+                timestamp
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Self::link_content(conn, note_id, content)?;
+        if max_versions > 0 {
+            conn.execute("DELETE FROM versions WHERE note_id=?1 AND id NOT IN (SELECT id FROM versions WHERE note_id=?1 ORDER BY julianday(created) DESC, created DESC, id DESC LIMIT ?2)", params![note_id, max_versions]).map_err(|e| e.to_string())?;
+        }
+        Ok(timestamp)
+    }
+
+    pub fn force_version(&self, note_id: &str, max_versions: u32) -> Result<(), String> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|e| e.to_string())?;
+        let content: String = tx
+            .query_row(
+                "SELECT content FROM notes WHERE id=?1",
+                params![note_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        Self::snapshot_on(&tx, note_id, &content, max_versions, true)?;
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn list_versions(&self, note_id: &str) -> Result<Vec<(String, String, String)>, String> {
@@ -508,20 +609,28 @@ impl VaultDb {
     }
 
     pub fn delete_note(&self, id: &str) -> Result<(), String> {
-        self.conn
-            .execute(
-                "DELETE FROM notes_fts WHERE rowid = (SELECT rowid FROM notes WHERE id = ?1)",
-                params![id],
-            )
-            .map_err(|e| e.to_string())?;
-        let changed = self
-            .conn
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM notes_fts WHERE rowid = (SELECT rowid FROM notes WHERE id = ?1)",
+            params![id],
+        )
+        .map_err(|e| e.to_string())?;
+        if tx
             .execute("DELETE FROM notes WHERE id = ?1", params![id])
-            .map_err(|e| e.to_string())?;
-        if changed == 0 {
+            .map_err(|e| e.to_string())?
+            == 0
+        {
             return Err(format!("No note with id {id}"));
         }
-        Ok(())
+        let mut layout = super::db_notebooks::Layout::load(&tx)?;
+        if layout.notes.remove(id).is_some() {
+            layout.save(&tx)?;
+        }
+        tx.commit().map_err(|e| e.to_string())
     }
 
     /// Full note (meta + tags + content) for the frontend adapter.
@@ -640,7 +749,11 @@ impl VaultDb {
             .map_err(|e| e.to_string())
     }
 
-    fn link_content(conn: &Connection, note_id: &str, content: &str) -> Result<(), String> {
+    pub(crate) fn link_content(
+        conn: &Connection,
+        note_id: &str,
+        content: &str,
+    ) -> Result<(), String> {
         // Conservative UUID matching may retain extra links; it never discards bytes.
         conn.execute(
             "INSERT OR IGNORE INTO note_attachments(note_id, attachment_id)
@@ -660,6 +773,27 @@ impl VaultDb {
         data: &[u8],
         now: &str,
     ) -> Result<AttachmentMeta, String> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|e| e.to_string())?;
+        let id = self.store_attachment_on(&tx, note_id, filename, mime_type, data, now)?;
+        let mut meta = self.attachment_meta(&id)?.ok_or("Attachment disappeared")?;
+        meta.note_id = Some(note_id.to_string());
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(meta)
+    }
+
+    pub(crate) fn store_attachment_on(
+        &self,
+        tx: &Connection,
+        note_id: &str,
+        filename: &str,
+        mime_type: &str,
+        data: &[u8],
+        now: &str,
+    ) -> Result<String, String> {
         if data.len() as i64 > self.max_attachment_bytes {
             return Err(format!(
                 "Attachment {filename} exceeds the vault cap of {} bytes",
@@ -670,11 +804,6 @@ impl VaultDb {
             use sha2::Digest;
             format!("{:x}", sha2::Sha256::digest(data))
         };
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )
-        .map_err(|e| e.to_string())?;
         tx.execute(
             "INSERT INTO attachments(id, filename, mime_type, size, sha256, data, created)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(sha256) DO NOTHING",
@@ -702,10 +831,7 @@ impl VaultDb {
             params![note_id, id],
         )
         .map_err(|e| e.to_string())?;
-        let mut meta = self.attachment_meta(&id)?.ok_or("Attachment disappeared")?;
-        meta.note_id = Some(note_id.to_string());
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok(meta)
+        Ok(id)
     }
 
     fn attachment_meta(&self, id: &str) -> Result<Option<AttachmentMeta>, String> {

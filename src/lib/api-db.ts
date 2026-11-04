@@ -5,8 +5,8 @@
 // as note paths, and NoteEntry/NoteContent shapes are synthesized from the
 // db_* command results.
 //
-// Not supported in DB mode (by design or deferred): notebooks (the vault is
-// flat/tag-first), importNote, moveNote, fs watcher events, and filesystem attachments.
+// Filesystem watchers and filesystem-only attachment tools remain separate.
+// Notebook membership is logical metadata; note paths remain stable IDs.
 
 import { invoke } from "@tauri-apps/api/core";
 import type {
@@ -16,7 +16,11 @@ import type {
   SearchPage,
   TrashContents,
   VaultState,
+  NotebookEntry,
+  VersionEntry,
 } from "./types";
+
+import type { ExternalNoteReference } from "./editor/externalNote";
 
 let dbMode = false;
 
@@ -65,14 +69,21 @@ export async function dbOpenVault(path: string): Promise<void> {
 }
 
 export async function dbGetNotes(notebookPath: string | null): Promise<NoteEntry[]> {
-  if (notebookPath) return []; // DB vaults are flat; there are no notebooks.
-  const notes: DbNote[] = await invoke("db_list_notes", { includeTrashed: false });
+  const notes: DbNote[] = await invoke("db_get_notes", { notebookPath });
   return notes.map(toEntry);
 }
 
-export async function dbReadNote(path: string): Promise<NoteContent> {
+export async function dbReadNote(path: string, vaultPath?: string): Promise<NoteContent> {
   const note = await invoke<Record<string, unknown> | null>("db_get_note", { id: path });
+  if (!note && vaultPath && /^(?:\/|[A-Za-z]:[\\/])/.test(path) && path.endsWith('.md')) {
+    return invoke("read_note", { vaultPath, path }); // Native scope checks still govern external viewers.
+  }
   if (!note) throw new Error(`No note with id ${path}`);
+  return toContent(note);
+}
+
+function toContent(note: Record<string, unknown>): NoteContent {
+  const path = String(note.id);
   const meta: NoteMeta = {
     id: String(note.id),
     title: String(note.title),
@@ -102,7 +113,12 @@ export async function dbSaveNote(
   return dbReadNote(path);
 }
 
-export async function dbCreateNote(title: string): Promise<NoteEntry> {
+export async function dbCreateNote(title: string, notebookRelative: string | null = null, vaultPath?: string): Promise<NoteEntry> {
+  if (vaultPath) {
+    const full = await invoke<Record<string, unknown>>("db_create_note", { vaultPath, notebookRelative, title });
+    const note = toContent(full);
+    return { path: note.path, relative_path: note.meta.title, meta: note.meta, preview: note.content.slice(0, 120) };
+  }
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   await invoke("db_save_note", {
@@ -401,4 +417,33 @@ export async function dbSetTaskDue(noteId: string, line: number, rawLine: string
 export async function dbSaveImage(vaultPath: string, name: string, data: number[], noteId?: string | null): Promise<string> {
   if (!noteId) throw new Error("Select a note before inserting an image.");
   return invoke("db_save_image", { vaultPath, noteId, name, data });
+}
+
+
+export async function dbImportNote(vaultPath: string, sourcePath: string, notebookRelative: string | null, expectedRaw: string, references: ExternalNoteReference[]): Promise<NoteContent> {
+  return toContent(await invoke<Record<string, unknown>>("db_import_note", { vaultPath, sourcePath, notebookRelative, expectedRaw, references }));
+}
+
+export async function dbMoveNote(vaultPath: string, notePath: string, destNotebook: string): Promise<string> {
+  return invoke("db_move_note", { vaultPath, notePath, destNotebook });
+}
+
+export async function dbGetNotebooks(): Promise<NotebookEntry[]> {
+  return invoke("db_get_notebooks");
+}
+
+export async function dbCreateNotebook(vaultPath: string, parentRelative: string | null, name: string): Promise<NotebookEntry> {
+  return invoke("db_create_notebook", { vaultPath, parentRelative, name });
+}
+
+export async function dbGetNoteVersions(vaultPath: string, noteId: string): Promise<VersionEntry[]> {
+  return invoke("db_get_note_versions", { vaultPath, noteId });
+}
+
+export async function dbGetNoteVersionContent(vaultPath: string, noteId: string, timestamp: string): Promise<string> {
+  return invoke("db_get_note_version_content", { vaultPath, noteId, timestamp });
+}
+
+export async function dbCreateVersion(vaultPath: string, path: string, noteId: string): Promise<void> {
+  return invoke("db_create_version", { vaultPath, path, noteId });
 }

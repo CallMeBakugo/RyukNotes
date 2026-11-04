@@ -150,6 +150,115 @@ fn collect_md_files(
     Ok(())
 }
 
+/// A single external import is a copy: never overwrite a colliding note id.
+pub(crate) fn import_single(
+    db: &VaultDb,
+    prepared: super::operations::PreparedNoteImport,
+    notebook: Option<&str>,
+) -> Result<String, String> {
+    use std::io::Read;
+    let mut payloads = Vec::new();
+    for (path, _) in &prepared.targets {
+        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let before = file.metadata().map_err(|e| e.to_string())?;
+        let mut data = Vec::new();
+        (&file)
+            .take(db.max_attachment_bytes as u64 + 1)
+            .read_to_end(&mut data)
+            .map_err(|e| e.to_string())?;
+        let after = file.metadata().map_err(|e| e.to_string())?;
+        if data.len() as i64 > db.max_attachment_bytes {
+            return Err("Attachment exceeds the vault cap".into());
+        }
+        if before.len() != data.len() as u64
+            || before.len() != after.len()
+            || before.modified().ok() != after.modified().ok()
+        {
+            return Err("Attachment changed while importing".into());
+        }
+        payloads.push(data);
+    }
+    let filename = prepared
+        .source
+        .file_name()
+        .ok_or("Source has no filename")?
+        .to_string_lossy();
+    let (mut meta, body) = frontmatter::parse_note(&prepared.raw, &filename);
+    let tx =
+        rusqlite::Transaction::new_unchecked(&db.conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+    let mut layout = super::db_notebooks::Layout::load(&tx)?;
+    let relative = super::db_notebooks::relative("", notebook.unwrap_or(""))?;
+    layout.require(&relative)?;
+    while tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM notes WHERE id=?1)",
+            rusqlite::params![meta.id],
+            |r| r.get::<_, bool>(0),
+        )
+        .map_err(|e| e.to_string())?
+    {
+        meta.id = uuid::Uuid::new_v4().to_string();
+    }
+    let mut note = NewNote {
+        id: meta.id,
+        title: meta.title,
+        content: body,
+        pinned: meta.pinned,
+        tags: meta.tags,
+        created: meta.created.to_rfc3339(),
+        modified: meta.modified.to_rfc3339(),
+    };
+    VaultDb::write_note(&tx, &note, None, None)?;
+    let mut rewritten = String::new();
+    let mut previous = 0;
+    for ((reference, (path, suffix)), data) in prepared
+        .references
+        .iter()
+        .zip(&prepared.targets)
+        .zip(&payloads)
+    {
+        let name = path
+            .file_name()
+            .ok_or("Attachment has no filename")?
+            .to_string_lossy();
+        let mime = crate::commands::image_mime_type(&name, data).unwrap_or_else(|_| {
+            if name.ends_with(".pdf") {
+                "application/pdf"
+            } else {
+                "application/octet-stream"
+            }
+        });
+        let id =
+            db.store_attachment_on(&tx, &note.id, &name, mime, data, &Utc::now().to_rfc3339())?;
+        let mut href = format!(".rn-attachments/{id}{suffix}");
+        if reference.html {
+            href = href
+                .replace('&', "&amp;")
+                .replace('"', "&quot;")
+                .replace('\'', "&#39;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+        } else {
+            href = href
+                .replace(' ', "%20")
+                .replace('"', "%22")
+                .replace('<', "%3C")
+                .replace('>', "%3E");
+        }
+        rewritten.push_str(&prepared.raw[previous..reference.from]);
+        rewritten.push_str(&href);
+        previous = reference.to;
+    }
+    rewritten.push_str(&prepared.raw[previous..]);
+    note.content = frontmatter::parse_note(&rewritten, &filename).1;
+    VaultDb::write_note(&tx, &note, None, None)?;
+    layout.assign(&note.id, &relative)?;
+    layout.save(&tx)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(note.id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

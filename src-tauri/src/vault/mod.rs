@@ -1,5 +1,6 @@
 pub mod db;
 pub mod db_import;
+pub mod db_notebooks;
 pub mod frontmatter;
 pub mod import;
 pub mod operations;

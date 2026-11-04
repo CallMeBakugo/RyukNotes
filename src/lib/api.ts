@@ -31,6 +31,14 @@ import {
   dbSetTaskPriority,
   dbSetTaskDue,
   dbSaveImage,
+  setDbMode,
+  dbImportNote,
+  dbMoveNote,
+  dbGetNotebooks,
+  dbCreateNotebook,
+  dbGetNoteVersions,
+  dbGetNoteVersionContent,
+  dbCreateVersion,
 } from "./api-db";
 import type { ExternalNoteReference } from "./editor/externalNote";
 import type {
@@ -59,15 +67,20 @@ import type {
 
 export async function openVault(path: string): Promise<void> {
   if (looksLikeDbVault(path)) return dbOpenVault(path);
-  return invoke("open_vault", { path });
+  await invoke("open_vault", { path });
+  setDbMode(false);
 }
 
 export async function chooseExternalVault(): Promise<ExternalVaultResult | null> {
-  return invoke("choose_external_vault");
+  const result = await invoke<ExternalVaultResult | null>("choose_external_vault");
+  if (result) setDbMode(false);
+  return result;
 }
 
 export async function restoreExternalVault(bookmarkId: string): Promise<ExternalVaultResult> {
-  return invoke("restore_external_vault", { bookmarkId });
+  const result = await invoke<ExternalVaultResult>("restore_external_vault", { bookmarkId });
+  setDbMode(false);
+  return result;
 }
 
 export async function removeVault(path: string, bookmarkId?: string | null): Promise<void> {
@@ -144,12 +157,12 @@ export async function setContentWidth(width: number | null): Promise<void> {
 }
 
 export async function getNotebooks(): Promise<NotebookEntry[]> {
-  if (isDbVault()) return [];
+  if (isDbVault()) return dbGetNotebooks();
   return invoke("get_notebooks");
 }
 
 export async function countRootNotes(): Promise<number> {
-  if (isDbVault()) return (await dbGetNotes(null)).length;
+  if (isDbVault()) return invoke("db_count_root_notes");
   return invoke("count_root_notes");
 }
 
@@ -158,6 +171,7 @@ export async function createNotebook(
   parentRelative: string | null,
   name: string,
 ): Promise<NotebookEntry> {
+  if (isDbVault()) return dbCreateNotebook(vaultPath, parentRelative, name);
   return invoke("create_notebook", { vaultPath, parentRelative, name });
 }
 
@@ -166,10 +180,12 @@ export async function renameNotebook(
   path: string,
   newName: string,
 ): Promise<string> {
+  if (isDbVault()) return invoke("db_rename_notebook", { vaultPath, path, newName });
   return invoke("rename_notebook", { vaultPath, path, newName });
 }
 
 export async function deleteNotebook(vaultPath: string, path: string): Promise<void> {
+  if (isDbVault()) throw new Error("Database notebook deletion is not supported yet.");
   return invoke("delete_notebook", { vaultPath, path });
 }
 
@@ -178,6 +194,7 @@ export async function moveNotebook(
   notebookPath: string,
   destParent: string,
 ): Promise<string> {
+  if (isDbVault()) return invoke("db_move_notebook", { vaultPath, notebookPath, destParent });
   return invoke("move_notebook", { vaultPath, notebookPath, destParent });
 }
 
@@ -189,7 +206,7 @@ export async function getNotes(
 }
 
 export async function readNote(vaultPath: string, path: string): Promise<NoteContent> {
-  if (isDbVault()) return dbReadNote(path);
+  if (isDbVault()) return dbReadNote(path, vaultPath);
   return invoke("read_note", { vaultPath, path });
 }
 
@@ -211,6 +228,7 @@ export async function importNote(
   expectedRaw: string,
   references: ExternalNoteReference[],
 ): Promise<NoteContent> {
+  if (isDbVault()) return dbImportNote(vaultPath, sourcePath, notebookRelative, expectedRaw, references);
   return invoke("import_note", { vaultPath, sourcePath, notebookRelative, expectedRaw, references });
 }
 
@@ -219,7 +237,7 @@ export async function createNote(
   notebookRelative: string | null,
   title: string,
 ): Promise<NoteEntry> {
-  if (isDbVault()) return dbCreateNote(title);
+  if (isDbVault()) return dbCreateNote(title, notebookRelative, vaultPath);
   return invoke("create_note", { vaultPath, notebookRelative, title });
 }
 
@@ -252,6 +270,7 @@ export async function moveNote(
   notePath: string,
   destNotebook: string,
 ): Promise<string> {
+  if (isDbVault()) return dbMoveNote(vaultPath, notePath, destNotebook);
   return invoke("move_note", { vaultPath, notePath, destNotebook });
 }
 
@@ -359,7 +378,7 @@ export async function saveImage(vaultPath: string, name: string, data: number[],
 export function resolveAttachmentImage(source: string, vaultPath: string | null): string | null {
   if (isDbAssetUrl(source)) return source;
   const id = dbAttachmentId(source);
-  return id && looksLikeDbVault(vaultPath) ? convertFileSrc(`${vaultPath}/${id}`, 'dbasset') : null;
+  return id && looksLikeDbVault(vaultPath) ? convertFileSrc(`${vaultPath}/${id}`, 'dbasset') + source.slice(source.search(/[?#]/) < 0 ? source.length : source.search(/[?#]/)) : null;
 }
 
 export async function saveAttachment(
@@ -637,6 +656,7 @@ export async function setTaskDue(
 // ── Version History ──
 
 export async function getNoteVersions(vaultPath: string, noteId: string): Promise<VersionEntry[]> {
+  if (isDbVault()) return dbGetNoteVersions(vaultPath, noteId);
   return invoke("get_note_versions", { vaultPath, noteId });
 }
 
@@ -645,6 +665,7 @@ export async function getNoteVersionContent(
   noteId: string,
   timestamp: string,
 ): Promise<string> {
+  if (isDbVault()) return dbGetNoteVersionContent(vaultPath, noteId, timestamp);
   return invoke("get_note_version_content", { vaultPath, noteId, timestamp });
 }
 
@@ -653,6 +674,7 @@ export async function createVersion(
   path: string,
   noteId: string,
 ): Promise<void> {
+  if (isDbVault()) return dbCreateVersion(vaultPath, path, noteId);
   return invoke("create_version", { vaultPath, path, noteId });
 }
 

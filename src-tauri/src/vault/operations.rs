@@ -1892,16 +1892,20 @@ pub struct ExternalNoteReference {
     pub pdf: bool,
 }
 
-/// Import an accepted Markdown snapshot and its scoped relative attachments without overwriting files.
-pub fn import_note(
-    vault_path: &str,
+pub(crate) struct PreparedNoteImport {
+    pub source: PathBuf,
+    pub raw: String,
+    pub references: Vec<ExternalNoteReference>,
+    pub targets: Vec<(PathBuf, String)>,
+}
+
+pub(crate) fn prepare_note_import(
     source_path: &str,
     source_root: &Path,
-    notebook_relative: Option<&str>,
     expected_raw: &str,
     mut references: Vec<ExternalNoteReference>,
     authorize: impl Fn(&Path) -> Result<(), String>,
-) -> Result<NoteContent, String> {
+) -> Result<PreparedNoteImport, String> {
     let source = canonicalize_path(Path::new(source_path), "source note")?;
     authorize(&source)?;
     if !source.is_file() || source.extension().and_then(|ext| ext.to_str()) != Some("md") {
@@ -1916,15 +1920,6 @@ pub fn import_note(
     if raw != expected_raw {
         return Err("The source note changed on disk. Reopen it before importing.".into());
     }
-    let relative = notebook_relative.map(safe_relative_path).transpose()?;
-    let directory = Path::new(vault_path).join(relative.unwrap_or(Path::new("")));
-    ensure_vault_content_dir(vault_path, &directory)?;
-    let vault = canonicalize_path(Path::new(vault_path), "vault path")?;
-    let canonical_directory = canonicalize_path(&directory, "import destination")?;
-    if canonical_directory != vault.join(relative.unwrap_or(Path::new(""))) {
-        return Err("Import destination must not use symbolic links".into());
-    }
-    let attachments = ryuknotes_dir(vault_path).join("attachments");
     references.sort_by_key(|reference| reference.from);
     let mut previous = 0;
     let mut targets = Vec::new();
@@ -1986,6 +1981,45 @@ pub fn import_note(
         }
         targets.push((target, suffix.to_string()));
     }
+    Ok(PreparedNoteImport {
+        source,
+        raw,
+        references,
+        targets,
+    })
+}
+
+/// Import an accepted Markdown snapshot and its scoped relative attachments without overwriting files.
+pub fn import_note(
+    vault_path: &str,
+    source_path: &str,
+    source_root: &Path,
+    notebook_relative: Option<&str>,
+    expected_raw: &str,
+    references: Vec<ExternalNoteReference>,
+    authorize: impl Fn(&Path) -> Result<(), String>,
+) -> Result<NoteContent, String> {
+    let PreparedNoteImport {
+        source,
+        raw,
+        references,
+        targets,
+    } = prepare_note_import(
+        source_path,
+        source_root,
+        expected_raw,
+        references,
+        authorize,
+    )?;
+    let relative = notebook_relative.map(safe_relative_path).transpose()?;
+    let directory = Path::new(vault_path).join(relative.unwrap_or(Path::new("")));
+    ensure_vault_content_dir(vault_path, &directory)?;
+    let vault = canonicalize_path(Path::new(vault_path), "vault path")?;
+    let canonical_directory = canonicalize_path(&directory, "import destination")?;
+    if canonical_directory != vault.join(relative.unwrap_or(Path::new(""))) {
+        return Err("Import destination must not use symbolic links".into());
+    }
+    let attachments = ryuknotes_dir(vault_path).join("attachments");
     if !references.is_empty() {
         fs::create_dir_all(&attachments).map_err(|error| error.to_string())?;
         if canonicalize_path(&attachments, "attachment destination")?
