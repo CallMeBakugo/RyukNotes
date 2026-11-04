@@ -6,8 +6,7 @@
 // db_* command results.
 //
 // Not supported in DB mode (by design or deferred): notebooks (the vault is
-// flat/tag-first), importNote, moveNote, fs watcher events, attachments by
-// relative path (deferred to the attachment rewiring slice).
+// flat/tag-first), importNote, moveNote, fs watcher events, and filesystem attachments.
 
 import { invoke } from "@tauri-apps/api/core";
 import type {
@@ -396,4 +395,10 @@ export async function dbSetTaskDue(noteId: string, line: number, rawLine: string
   }
   note.lines[idx] = text.replace(/\s{2,}/g, " ").replace(/\s+$/, "");
   await writeNoteLines(noteId, note);
+}
+
+/** The owner is captured before clipboard/file reads; never infer it from current UI state. */
+export async function dbSaveImage(vaultPath: string, name: string, data: number[], noteId?: string | null): Promise<string> {
+  if (!noteId) throw new Error("Select a note before inserting an image.");
+  return invoke("db_save_image", { vaultPath, noteId, name, data });
 }

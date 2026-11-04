@@ -13,7 +13,11 @@ const declaration = parse(source, { modern: true }).instance.content.body.find(n
 );
 const owningRoot = parse(source, { modern: true }).instance.content.body.find(node => node.type === 'FunctionDeclaration' && node.id.name === 'currentNoteAssetRoot');
 const { code } = await transformWithEsbuild(`${owningRoot ? source.slice(owningRoot.start, owningRoot.end) : ''}\n${source.slice(declaration.start, declaration.end)}`, 'resolve-image.ts', { loader: 'ts', format: 'esm' });
-const script = new Script(`${code}\nresolveImageSrc;`);
+const apiSource = await readFile(new URL('../src/lib/api.ts', import.meta.url), 'utf8');
+const helperStart = apiSource.indexOf('export function resolveAttachmentImage');
+const helperSource = apiSource.slice(helperStart, apiSource.indexOf('\nexport ', helperStart + 1)).replace('export function', 'function');
+const { code: attachmentCode } = await transformWithEsbuild(helperSource, 'attachment-source.ts', { loader: 'ts', format: 'esm' });
+const script = new Script(`${attachmentCode}\n${code}\nresolveImageSrc;`);
 const parser = createEditorMarkdownParser();
 const imageSource = markdown => parser.parseInline(markdown, {}).flatMap(token => token.children ?? []).find(token => token.type === 'image')?.attrGet('src');
 const assetPath = url => decodeURIComponent(new URL(url).pathname.slice(1));
@@ -22,7 +26,8 @@ function fixture(note = '/vault/Projects/Note.md', vault = '/vault', known = [])
   const context = createContext({ ...paths,
     $activeNotePath: note, $appConfig: { active_vault: vault, vaults: known.map(path => ({ path })) },
     normalizePath: path => paths.resolvePathFromFile('', path),
-    convertFileSrc: path => `http://asset.localhost/${encodeURIComponent(path)}`,
+    looksLikeDbVault: path => !!path?.endsWith('.rn'),
+    convertFileSrc: (path, protocol = 'asset') => `http://${protocol}.localhost/${encodeURIComponent(path)}`,
   });
   return { context, resolve: script.runInContext(context) };
 }
@@ -103,4 +108,25 @@ test('Windows drive letters stay literal when a path outside the vault is writte
     'C:/Users/me/pic%20one.png',
   );
   assert.equal(paths.resolveFileReference('C:/Users/me/pic%20one.png', '/v/Note.md', '/v').path, 'C:/Users/me/pic one.png');
+});
+
+
+test('DB images round-trip through rich rendering and Markdown without embedding bytes or vault paths', () => {
+  const id = '54fd232f-c42a-432b-8ba8-e1b346d23a07';
+  const vault = '/vaults/雪 #1%.rn';
+  const f = fixture('note-id', vault);
+  const reference = `.rn-attachments/${id}`;
+  let markdown = `![Photo](${reference})`;
+  for (let round = 0; round < 3; round++) {
+    const display = f.resolve(imageSource(markdown));
+    assert.equal(new URL(display).hostname, 'dbasset.localhost');
+    assert.equal(decodeURIComponent(new URL(display).pathname.slice(1)), `${vault}/${id}`);
+    assert.equal(f.resolve(display), display, 'already resolved images must not be proxied');
+    const saved = paths.assetSourceToMarkdown(display, 'note-id', vault);
+    assert.equal(saved, reference);
+    markdown = `![Photo](${saved})`;
+  }
+  for (const prefix of ['dbasset://localhost/', 'http://dbasset.localhost/', 'https://dbasset.localhost/']) {
+    assert.equal(paths.assetSourceToMarkdown(prefix + encodeURIComponent(`${vault}/${id}`), 'note-id', vault), reference);
+  }
 });

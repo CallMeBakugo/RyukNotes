@@ -1,3 +1,23 @@
+/** Stable, vault-relative DB attachment references; never filesystem paths. */
+export function dbAttachmentId(source: string): string | null {
+	return /^\.rn-attachments\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(source)?.[1] ?? null;
+}
+
+export function isDbAssetUrl(source: string): boolean {
+	return source.startsWith('dbasset:') || source.startsWith('http://dbasset.localhost/') || source.startsWith('https://dbasset.localhost/');
+}
+
+export function dbAssetReference(source: string): string | null {
+	if (!isDbAssetUrl(source)) return null;
+	try {
+		const path = decodeURIComponent(new URL(source).pathname.slice(1));
+		const reference = `.rn-attachments/${path.slice(path.lastIndexOf('/') + 1)}`;
+		return dbAttachmentId(reference) ? reference : null;
+	} catch {
+		return null;
+	}
+}
+
 function pathParts(path: string): string[] {
 	return path.replace(/\\/g, '/').split('/').filter(Boolean);
 }
@@ -94,6 +114,8 @@ export function assetSourceToMarkdown(
 	notePath: string | null,
 	vaultRoot: string | null,
 ): string {
+	const dbReference = dbAssetReference(source);
+	if (dbReference) return dbReference;
 	if (source.startsWith('blob:')) return '';
 	if (source.startsWith('imgproxy:') || source.startsWith('http://imgproxy.localhost') || source.startsWith('https://imgproxy.localhost')) {
 		try {

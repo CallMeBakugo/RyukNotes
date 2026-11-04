@@ -4261,6 +4261,84 @@ pub fn db_search_notes(
     with_db(&state, |db| db.search(&query))
 }
 
+/// A captured vault path must still name the open connection after an async paste.
+fn validate_attachment_vault(
+    db: &crate::vault::db::VaultDb,
+    vault_path: &str,
+) -> Result<(), String> {
+    let requested = std::fs::canonicalize(vault_path).map_err(|e| e.to_string())?;
+    let open = db.conn.path().ok_or("No vault database is open")?;
+    let opened = std::fs::canonicalize(open).map_err(|e| e.to_string())?;
+    if requested != opened {
+        return Err("The image belongs to a different vault; retry in its original note.".into());
+    }
+    Ok(())
+}
+
+fn image_mime_type(name: &str, data: &[u8]) -> Result<&'static str, String> {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Ok("image/png");
+    }
+    if data.starts_with(b"\xff\xd8\xff") {
+        return Ok("image/jpeg");
+    }
+    if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        return Ok("image/gif");
+    }
+    if data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP") {
+        return Ok("image/webp");
+    }
+    // Browser-supported formats whose extensions are retained by the file picker.
+    match std::path::Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "svg" => Ok("image/svg+xml"),
+        "avif" => Ok("image/avif"),
+        "bmp" => Ok("image/bmp"),
+        "ico" => Ok("image/x-icon"),
+        "tif" | "tiff" => Ok("image/tiff"),
+        _ => Err("Unsupported image format".into()),
+    }
+}
+
+#[tauri::command]
+pub fn db_save_image(
+    state: State<'_, AppState>,
+    vault_path: String,
+    note_id: String,
+    name: String,
+    data: Vec<u8>,
+) -> Result<String, String> {
+    let mime = image_mime_type(&name, &data)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    with_db(&state, |db| {
+        validate_attachment_vault(db, &vault_path)?;
+        let meta = db.add_attachment(&note_id, &name, mime, &data, &now)?;
+        Ok(format!(".rn-attachments/{}", meta.id))
+    })
+}
+
+/// Shared DB fetch used by the native image transport; never opens a vault from a URL.
+pub(crate) fn db_image_data(
+    state: &AppState,
+    vault_path: &str,
+    id: &str,
+) -> Result<(String, Vec<u8>), String> {
+    let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+    let db = slot.as_ref().ok_or("No vault database is open")?;
+    validate_attachment_vault(db, vault_path)?;
+    let (meta, data) = db.get_attachment_data(id)?.ok_or("Image not found")?;
+    match meta.mime_type.as_str() {
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/svg+xml"
+        | "image/avif" | "image/bmp" | "image/x-icon" | "image/tiff" => Ok((meta.mime_type, data)),
+        _ => Err("Attachment is not an image".into()),
+    }
+}
+
 #[tauri::command]
 pub fn db_add_attachment(
     state: State<'_, AppState>,
@@ -5814,6 +5892,10 @@ mod db_command_tests {
 
     fn app_with_state() -> tauri::App<tauri::test::MockRuntime> {
         tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![
+                super::db_save_image,
+                super::db_get_attachment
+            ])
             .manage(AppState::new(AppConfig::default()))
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap()
@@ -6068,5 +6150,121 @@ mod db_command_tests {
             vec![1, 2, 3]
         )
         .is_err());
+    }
+
+    #[test]
+    fn db_image_paste_dedupes_across_notes_and_survives_reopen() {
+        let app = app_with_state();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let state: tauri::State<AppState> = app.state();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("images.rn").to_string_lossy().into_owned();
+        db_open(state.clone(), path.clone()).unwrap();
+        for id in ["n1", "n2"] {
+            db_save_note(
+                state.clone(),
+                id.into(),
+                id.into(),
+                "".into(),
+                false,
+                vec![],
+                None,
+            )
+            .unwrap();
+        }
+        let png: Vec<u8> = vec![
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 207,
+            240, 255, 63, 0, 6, 254, 2, 254, 12, 117, 137, 222, 0, 0, 0, 0, 73, 69, 78, 68, 174,
+            66, 96, 130,
+        ];
+        let mut references = Vec::new();
+        for note_id in ["n1", "n1", "n2"] {
+            let reference: String = tauri::test::get_ipc_response(
+                &webview,
+                tauri::webview::InvokeRequest {
+                    cmd: "db_save_image".into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: "http://tauri.localhost".parse().unwrap(),
+                    body: tauri::ipc::InvokeBody::Json(serde_json::json!({
+                        "vaultPath": path, "noteId": note_id, "name": "clipboard.png", "data": png,
+                    })),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.into(),
+                },
+            )
+            .unwrap()
+            .deserialize()
+            .unwrap();
+            references.push(reference);
+        }
+        assert!(references
+            .iter()
+            .all(|reference| reference == &references[0]));
+        let id = references[0].strip_prefix(".rn-attachments/").unwrap();
+        let stats = db_vault_stats(state.clone()).unwrap();
+        assert_eq!(stats.total_attachments, 1);
+        let fetched = db_get_attachment(state.clone(), id.into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched["noteIds"], serde_json::json!(["n1", "n2"]));
+        assert_eq!(fetched["data"], serde_json::json!(png));
+        db_save_note(
+            state.clone(),
+            "n1".into(),
+            "Image".into(),
+            format!("![image]({})", references[0]),
+            false,
+            vec![],
+            Some("".into()),
+        )
+        .unwrap();
+        db_close(state.clone()).unwrap();
+        db_open(state.clone(), path.clone()).unwrap();
+        assert!(
+            db_get_note(state.clone(), "n1".into()).unwrap().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains(id)
+        );
+        let (mime, bytes) = db_image_data(state.inner(), &path, id).unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(bytes, png);
+        assert!(db_save_image(
+            state.clone(),
+            path.clone(),
+            "missing".into(),
+            "x.png".into(),
+            png.clone()
+        )
+        .is_err());
+        let mut oversized = png.clone();
+        oversized.resize(
+            (crate::vault::db::DEFAULT_MAX_ATTACHMENT_BYTES + 1) as usize,
+            0,
+        );
+        assert!(db_save_image(
+            state.clone(),
+            path.clone(),
+            "n1".into(),
+            "x.png".into(),
+            oversized
+        )
+        .is_err());
+        let other = dir.path().join("other.rn").to_string_lossy().into_owned();
+        db_open(state.clone(), other).unwrap();
+        assert!(db_save_image(
+            state.clone(),
+            path.clone(),
+            "n1".into(),
+            "x.png".into(),
+            png
+        )
+        .is_err());
+        assert!(db_image_data(state.inner(), &path, id).is_err());
+        assert_eq!(db_vault_stats(state).unwrap().total_attachments, 0);
     }
 }

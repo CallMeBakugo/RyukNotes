@@ -30,12 +30,13 @@
 	import { Decoration, DecorationSet } from '@tiptap/pm/view';
 	import { DOMParser as PMDOMParser, DOMSerializer, type Node as ProseMirrorNode } from '@tiptap/pm/model';
 	import { convertFileSrc } from '@tauri-apps/api/core';
+	import { isDbVault } from '$lib/api-db';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { readFile } from '@tauri-apps/plugin-fs';
 	import { openFile, openUrl, copyFileTo, copyImageToClipboard as copyImageToClipboardCmd, writeBytesTo, copyPngToClipboard, copyTextToClipboard } from '$lib/api';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { activeNote, activeNotePath, appConfig, editorDirty, sourceMode, focusMode, readOnly, quickAccessPaths, notes, navHistory, canGoBack, canGoForward, viewerNote, viewMode, notebooks, outlineWidth } from '$lib/stores/app';
-	import { saveNote, importNote, createNote, saveImage, saveAttachment, readClipboardImage, readClipboardContents, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout, spawnRyukTerminal } from '$lib/api';
+	import { saveNote, importNote, createNote, saveImage, resolveAttachmentImage, saveAttachment, readClipboardImage, readClipboardContents, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout, spawnRyukTerminal } from '$lib/api';
 	import type { NoteContent, VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord, FileEvent, SearchTarget, ToolbarLayout } from '$lib/types';
 	import { listen } from '@tauri-apps/api/event';
 	import { debounce } from '$lib/utils/debounce';
@@ -3361,6 +3362,8 @@
 	}
 
 	function resolveImageSrc(src: string): string {
+		const attachment = resolveAttachmentImage(src, $appConfig?.active_vault ?? null);
+		if (attachment) return attachment;
 		// Already a proxied, asset, data, or blob URL
 		if (src.startsWith('data:') || src.startsWith('asset:') || src.startsWith('blob:') || src.startsWith('imgproxy:') || src.startsWith('http://imgproxy.localhost') || src.startsWith('https://imgproxy.localhost')) {
 			return src;
@@ -3481,7 +3484,7 @@
 				const url = match[0];
 				let relativePath = savedBlobImages.get(url);
 				if (!relativePath) {
-					relativePath = await saveBlobImage(vault, url);
+					relativePath = await saveBlobImage(vault, url, entry.path);
 					savedBlobImages.set(url, relativePath);
 				}
 				body = body.replaceAll(url, relativePath);
@@ -3557,7 +3560,7 @@
 				for (const url of blobUrls) {
 					let relativePath = blobImages.get(url);
 					if (!relativePath) {
-						relativePath = await saveBlobImage(vault, url);
+						relativePath = await saveBlobImage(vault, url, path);
 						blobImages.set(url, relativePath);
 					}
 					body = body.replaceAll(url, relativePath);
@@ -6405,7 +6408,7 @@
 			try {
 				const data = Array.from(new Uint8Array(await file.arrayBuffer()));
 				if (!canInsert(origin)) return;
-				sources.push(resolveImageSrc(encodeMarkdownPath(await saveImage(origin.vault!, file.name, data))));
+				sources.push(resolveImageSrc(encodeMarkdownPath(await saveImage(origin.vault!, file.name, data, origin.noteId ?? origin.path))));
 			} catch (e) {
 				console.error('Failed to insert image:', e);
 			}
@@ -7032,7 +7035,7 @@
 	async function uploadAsset(origin: EditorOrigin, name: string, data: number[], kind: AssetKind) {
 		if (!canInsert(origin)) return;
 		const relativePath = kind === 'image'
-			? await saveImage(origin.vault!, name, data)
+			? await saveImage(origin.vault!, name, data, origin.noteId ?? origin.path)
 			: await saveAttachment(origin.vault!, name, data);
 		if (!canInsert(origin)) return;
 		const label = `${name} (${Math.round(data.length / 1024)} kB)`;
@@ -7086,13 +7089,13 @@
 		input.value = '';
 	}
 
-	async function saveBlobImage(vault: string, blobUrl: string): Promise<string> {
+	async function saveBlobImage(vault: string, blobUrl: string, noteId: string): Promise<string> {
 		const resp = await fetch(blobUrl);
 		if (!resp.ok) throw new Error(`Failed to read pasted image: ${resp.status}`);
 		const blob = await resp.blob();
 		const ext = blob.type.split('/')[1] || 'png';
 		const buffer = await blob.arrayBuffer();
-		return saveImage(vault, `pasted-image.${ext}`, Array.from(new Uint8Array(buffer)));
+		return saveImage(vault, `pasted-image.${ext}`, Array.from(new Uint8Array(buffer)), noteId);
 	}
 
 	function replaceSavedBlob(origin: EditorOrigin, blobUrl: string, relativePath: string) {
@@ -8750,14 +8753,16 @@
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 00-2 2v3M16 3h3a2 2 0 012 2v3M8 21H5a2 2 0 01-2-2v-3M16 21h3a2 2 0 002-2v-3"/></svg>
 				</button>
 			{/if}
-			{#if !isMobile && !imageToolbar.src.startsWith('imgproxy:') && !imageToolbar.src.startsWith('http://imgproxy.localhost') && !imageToolbar.src.startsWith('https://imgproxy.localhost')}
-				<span class="img-toolbar-sep"></span>
-				<button onclick={copyImageToClipboard} title="Copy image">
-					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
-				</button>
-				<button onclick={openImageInApp} title="Open in default app">
-					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-				</button>
+			{#if !isDbVault()}
+				{#if !isMobile && !imageToolbar.src.startsWith('imgproxy:') && !imageToolbar.src.startsWith('http://imgproxy.localhost') && !imageToolbar.src.startsWith('https://imgproxy.localhost')}
+					<span class="img-toolbar-sep"></span>
+					<button onclick={copyImageToClipboard} title="Copy image">
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+					</button>
+					<button onclick={openImageInApp} title="Open in default app">
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+					</button>
+				{/if}
 			{/if}
 		</div>
 	</div>

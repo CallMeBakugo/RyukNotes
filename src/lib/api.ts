@@ -1,4 +1,5 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { dbAttachmentId, isDbAssetUrl } from "./utils/paths";
 import {
   isDbVault,
   looksLikeDbVault,
@@ -29,6 +30,7 @@ import {
   dbSetTaskDone,
   dbSetTaskPriority,
   dbSetTaskDue,
+  dbSaveImage,
 } from "./api-db";
 import type { ExternalNoteReference } from "./editor/externalNote";
 import type {
@@ -348,8 +350,16 @@ export async function copyImageToClipboard(path: string): Promise<void> {
   return invoke("copy_image_to_clipboard", { path });
 }
 
-export async function saveImage(vaultPath: string, name: string, data: number[]): Promise<string> {
+export async function saveImage(vaultPath: string, name: string, data: number[], noteId?: string | null): Promise<string> {
+  if (looksLikeDbVault(vaultPath)) return dbSaveImage(vaultPath, name, data, noteId);
   return invoke("save_image", { vaultPath, name, data });
+}
+
+/** Synchronous rendering bridge; Markdown keeps only the stable attachment reference. */
+export function resolveAttachmentImage(source: string, vaultPath: string | null): string | null {
+  if (isDbAssetUrl(source)) return source;
+  const id = dbAttachmentId(source);
+  return id && looksLikeDbVault(vaultPath) ? convertFileSrc(`${vaultPath}/${id}`, 'dbasset') : null;
 }
 
 export async function saveAttachment(

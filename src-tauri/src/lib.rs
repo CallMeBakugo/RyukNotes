@@ -257,6 +257,7 @@ pub fn run() {
             commands::db_save_note,
             commands::db_search_notes,
             commands::db_add_attachment,
+            commands::db_save_image,
             commands::db_get_attachment,
             commands::db_trash_note,
             commands::db_restore_note,
@@ -281,6 +282,38 @@ pub fn run() {
             #[cfg(desktop)]
             commands::cancel_window_close,
         ])
+        .register_asynchronous_uri_scheme_protocol("dbasset", |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
+            std::thread::spawn(move || {
+                let result = (|| -> Result<(String, Vec<u8>), String> {
+                    if request.method() != tauri::http::Method::GET {
+                        return Err("Unsupported method".into());
+                    }
+                    let encoded = request.uri().path().strip_prefix('/').unwrap_or("");
+                    let path = urlencoding::decode(encoded).map_err(|e| e.to_string())?;
+                    let (vault, id) = path.rsplit_once('/').ok_or("Invalid image path")?;
+                    uuid::Uuid::parse_str(id).map_err(|e| e.to_string())?;
+                    commands::db_image_data(app.state::<AppState>().inner(), vault, id)
+                })();
+                let response = match result {
+                    Ok((mime, bytes)) => tauri::http::Response::builder()
+                        .status(200)
+                        .header("Content-Type", mime)
+                        .header("Cache-Control", "no-store")
+                        .header("Access-Control-Allow-Origin", "*")
+                        .header("X-Content-Type-Options", "nosniff")
+                        .header(
+                            "Content-Security-Policy",
+                            "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+                        )
+                        .body(bytes),
+                    Err(_) => tauri::http::Response::builder()
+                        .status(404)
+                        .body(Vec::new()),
+                };
+                responder.respond(response.expect("valid database image response"));
+            });
+        })
         .register_asynchronous_uri_scheme_protocol("imgproxy", |_ctx, request, responder| {
             let path = request.uri().path().to_string();
             std::thread::spawn(move || {
