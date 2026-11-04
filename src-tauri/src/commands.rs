@@ -4534,46 +4534,88 @@ pub fn db_create_backup(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<crate::types::BackupEntry, String> {
-    let vault_path = {
+    use tauri::Emitter;
+    let (vault_path, bookmark_id, backup_location, max_count) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
-        config.active_vault.clone().ok_or("No active vault")?
+        (
+            config.active_vault.clone().ok_or("No active vault")?,
+            config.active_bookmark_id.clone(),
+            config.backup_location.clone(),
+            config.backup_max_count,
+        )
     };
-    let backup_dir = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        crate::backup::get_backup_dir(&config.backup_location)?
-    };
-    std::fs::create_dir_all(&backup_dir).map_err(|e| e.to_string())?;
-    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-    let stem = std::path::Path::new(&vault_path)
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let filename = format!("{stem}-db-backup-{stamp}.rn");
-    let backup_path = backup_dir.join(&filename);
-    with_db(&state, |db| {
-        db.conn
-            .pragma_update(None, "wal_checkpoint", "TRUNCATE")
-            .map_err(|e| e.to_string())?;
-        db.conn
-            .execute(
-                "VACUUM INTO ?1",
-                rusqlite::params![backup_path.to_string_lossy().as_ref()],
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    })?;
-    let size = std::fs::metadata(&backup_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let _ = app;
-    Ok(crate::types::BackupEntry {
-        filename,
-        path: backup_path.to_string_lossy().into_owned(),
-        size,
-        created: chrono::Utc::now().to_rfc3339(),
-        other_vault: false,
-    })
+    let result = (|| -> Result<crate::types::BackupEntry, String> {
+        let backup_dir = crate::backup::get_backup_dir(&backup_location)?;
+        std::fs::create_dir_all(&backup_dir).map_err(|e| e.to_string())?;
+        let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        let stem = std::path::Path::new(&vault_path)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let filename = format!("{stem}-db-backup-{stamp}.rn");
+        let backup_path = backup_dir.join(&filename);
+        with_db(&state, |db| {
+            db.conn
+                .pragma_update(None, "wal_checkpoint", "TRUNCATE")
+                .map_err(|e| e.to_string())?;
+            db.conn
+                .execute(
+                    "VACUUM INTO ?1",
+                    rusqlite::params![backup_path.to_string_lossy().as_ref()],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })?;
+        let size = std::fs::metadata(&backup_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        Ok(crate::types::BackupEntry {
+            filename,
+            path: backup_path.to_string_lossy().into_owned(),
+            size,
+            created: chrono::Utc::now().to_rfc3339(),
+            other_vault: false,
+        })
+    })();
+    match &result {
+        Ok(entry) => {
+            if let Ok(mut config) = state.config.lock() {
+                let mut next = config.clone();
+                if let Some(vault) = next.vaults.iter_mut().find(|candidate| {
+                    vault_matches_identity(candidate, &vault_path, bookmark_id.as_deref())
+                }) {
+                    vault.last_backup_time = Some(entry.created.clone());
+                    match save_app_config(&next) {
+                        Ok(()) => *config = next,
+                        Err(error) => log::error!("Could not persist backup timestamp: {error}"),
+                    }
+                }
+            }
+            if let Err(error) = crate::backup::get_backup_dir(&backup_location)
+                .and_then(|dir| crate::backup::cleanup_old_db_backups(&dir, &vault_path, max_count))
+            {
+                log::error!("Could not prune completed DB backups: {error}");
+            }
+            let _ = app.emit(
+                "backup-done",
+                serde_json::json!({
+                    "vault_path": vault_path, "bookmark_id": bookmark_id,
+                    "success": true, "entry": entry,
+                }),
+            );
+        }
+        Err(error) => {
+            let _ = app.emit(
+                "backup-done",
+                serde_json::json!({
+                    "vault_path": vault_path, "bookmark_id": bookmark_id,
+                    "success": false, "error": error,
+                }),
+            );
+        }
+    }
+    result
 }
 
 /// DB-mode restore: close the DB, copy the backup over the vault, reopen.

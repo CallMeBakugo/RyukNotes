@@ -787,6 +787,50 @@ pub fn cleanup_old_backups(
     Ok(())
 }
 
+/// Prune DB snapshots matching this vault's exact stem and timestamp format.
+/// Legacy snapshot names identify vaults by stem, so equal stems share retention.
+pub fn cleanup_old_db_backups(
+    backup_dir: &Path,
+    vault_path: &str,
+    max_count: u32,
+) -> Result<(), String> {
+    let stem = Path::new(vault_path)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let prefix = format!("{stem}-db-backup-");
+    let mut owned = Vec::new();
+    for entry in fs::read_dir(backup_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if !entry.file_type().map_err(|e| e.to_string())?.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(stamp) = name
+            .strip_prefix(&prefix)
+            .and_then(|s| s.strip_suffix(".rn"))
+        else {
+            continue;
+        };
+        if stamp.len() == 15
+            && stamp.bytes().enumerate().all(|(i, b)| {
+                if i == 8 {
+                    b == b'-'
+                } else {
+                    b.is_ascii_digit()
+                }
+            })
+        {
+            owned.push((name, entry.path()));
+        }
+    }
+    owned.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in owned.into_iter().skip(max_count as usize) {
+        fs::remove_file(path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{cleanup_old_backups, create_backup, delete_backup, list_backups, restore_backup};
@@ -797,6 +841,34 @@ mod tests {
     use uuid::Uuid;
     use zip::write::SimpleFileOptions;
     use zip::{ZipArchive, ZipWriter};
+
+    #[test]
+    fn db_retention_keeps_newest_and_ignores_unrelated_files() {
+        let dir = tempdir().unwrap();
+        let names = [
+            "vault-db-backup-20260101-000000.rn",
+            "vault-db-backup-20260102-000000.rn",
+            "vault-db-backup-20260103-000000.rn",
+            "vault-extra-db-backup-20260101-000000.rn",
+            "vault-db-backup-invalid.rn",
+            "vault-db-backup-20260101-000000.zip",
+            "vault.rn",
+        ];
+        for name in names {
+            fs::write(dir.path().join(name), b"snapshot").unwrap();
+        }
+        super::cleanup_old_db_backups(dir.path(), "/notes/vault.rn", 2).unwrap();
+        assert!(!dir.path().join(names[0]).exists());
+        for name in &names[1..] {
+            assert!(dir.path().join(name).exists(), "{name}");
+        }
+        super::cleanup_old_db_backups(dir.path(), "/notes/vault.rn", 0).unwrap();
+        assert!(!dir.path().join(names[1]).exists());
+        assert!(!dir.path().join(names[2]).exists());
+        for name in &names[3..] {
+            assert!(dir.path().join(name).exists(), "{name}");
+        }
+    }
 
     #[test]
     fn delete_backup_rejects_files_outside_backup_directory() {
