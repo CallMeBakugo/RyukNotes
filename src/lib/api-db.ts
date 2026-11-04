@@ -90,11 +90,13 @@ export async function dbSaveNote(
   path: string,
   meta: NoteMeta,
   body: string,
+  expectedRaw: string,
 ): Promise<NoteContent> {
   await invoke("db_save_note", {
     id: meta.id ?? path,
     title: meta.title,
     content: body,
+    expectedRaw,
     pinned: meta.pinned ?? false,
     tags: meta.tags ?? [],
   });

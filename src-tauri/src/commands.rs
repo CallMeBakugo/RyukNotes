@@ -4225,6 +4225,7 @@ pub fn db_get_note(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn db_save_note(
     state: State<'_, AppState>,
     id: String,
@@ -4232,19 +4233,23 @@ pub fn db_save_note(
     content: String,
     pinned: bool,
     tags: Vec<String>,
+    expected_raw: Option<String>,
 ) -> Result<(), String> {
     let now = chrono::Utc::now().to_rfc3339();
     with_db(&state, |db| {
         let created = db.get_note_created(&id)?.unwrap_or_else(|| now.clone());
-        db.upsert_note(&crate::vault::db::NewNote {
-            id,
-            title,
-            content,
-            pinned,
-            tags,
-            created,
-            modified: now,
-        })
+        db.upsert_note_checked(
+            &crate::vault::db::NewNote {
+                id,
+                title,
+                content,
+                pinned,
+                tags,
+                created,
+                modified: now,
+            },
+            expected_raw.as_deref(),
+        )
     })
 }
 
@@ -5833,7 +5838,8 @@ mod db_command_tests {
             "T".into(),
             "c".into(),
             false,
-            vec![]
+            vec![],
+            None,
         )
         .is_err());
 
@@ -5845,6 +5851,7 @@ mod db_command_tests {
             "Cytokine signaling study".into(),
             true,
             vec!["immunology".into(), "research".into()],
+            None,
         )
         .unwrap();
 
@@ -5882,6 +5889,89 @@ mod db_command_tests {
     }
 
     #[test]
+    fn db_save_rejects_stale_content_from_another_connection() {
+        let app = app_with_state();
+        let state: tauri::State<AppState> = app.state();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.rn");
+        db_open(state.clone(), path.to_string_lossy().into_owned()).unwrap();
+        db_save_note(
+            state.clone(),
+            "n1".into(),
+            "Original".into(),
+            "baseline".into(),
+            false,
+            vec![],
+            None,
+        )
+        .unwrap();
+
+        // Simulate the CLI writing through its own SQLite connection.
+        let cli = crate::vault::db::VaultDb::open(&path).unwrap();
+        cli.upsert_note(&crate::vault::db::NewNote {
+            id: "n1".into(),
+            title: "CLI title".into(),
+            content: "CLI content".into(),
+            pinned: true,
+            tags: vec!["cli".into()],
+            created: "2026-01-01".into(),
+            modified: "2026-01-02".into(),
+        })
+        .unwrap();
+        let before = db_get_note(state.clone(), "n1".into()).unwrap().unwrap();
+        let error = db_save_note(
+            state.clone(),
+            "n1".into(),
+            "GUI title".into(),
+            "GUI content".into(),
+            false,
+            vec!["gui".into()],
+            Some("baseline".into()),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("Save conflict:"));
+        assert_eq!(
+            db_get_note(state.clone(), "n1".into()).unwrap().unwrap(),
+            before
+        );
+        assert_eq!(
+            db_search_notes(state.clone(), "CLI".into()).unwrap().len(),
+            1
+        );
+        assert!(db_search_notes(state.clone(), "GUI".into())
+            .unwrap()
+            .is_empty());
+
+        db_save_note(
+            state.clone(),
+            "n1".into(),
+            "GUI title".into(),
+            "GUI content".into(),
+            false,
+            vec![],
+            Some("CLI content".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            db_get_note(state.clone(), "n1".into()).unwrap().unwrap()["content"],
+            "GUI content"
+        );
+
+        db_delete_note(state.clone(), "n1".into()).unwrap();
+        assert!(db_save_note(
+            state.clone(),
+            "n1".into(),
+            "Deleted".into(),
+            "resurrected".into(),
+            false,
+            vec![],
+            Some("GUI content".into()),
+        )
+        .is_err());
+        assert!(db_get_note(state, "n1".into()).unwrap().is_none());
+    }
+
+    #[test]
     fn db_attachment_commands_round_trip() {
         let app = app_with_state();
         let state: tauri::State<AppState> = app.state();
@@ -5898,6 +5988,7 @@ mod db_command_tests {
             "body".into(),
             false,
             vec![],
+            None,
         )
         .unwrap();
 

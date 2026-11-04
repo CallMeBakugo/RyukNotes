@@ -227,10 +227,37 @@ impl VaultDb {
     /// Inserts a note (or replaces it wholesale by id) and refreshes its tags
     /// and the search index in one transaction.
     pub fn upsert_note(&self, note: &NewNote) -> Result<(), String> {
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| e.to_string())?;
+        self.upsert_note_checked(note, None)
+    }
+
+    /// Checks the editor baseline under the same write lock as the update.
+    /// A missing note is also a conflict: stale editors must not resurrect it.
+    pub fn upsert_note_checked(
+        &self,
+        note: &NewNote,
+        expected_raw: Option<&str>,
+    ) -> Result<(), String> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|e| e.to_string())?;
+        if let Some(expected) = expected_raw {
+            let stored: Option<String> = tx
+                .query_row(
+                    "SELECT content FROM notes WHERE id = ?1",
+                    params![note.id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if stored.as_deref() != Some(expected) {
+                return Err(
+                    "Save conflict: note changed in database. Your edits have not been written."
+                        .to_string(),
+                );
+            }
+        }
         tx.execute(
             "INSERT INTO notes(id, title, content, pinned, trashed, created, modified)
              VALUES(?1, ?2, ?3, ?4, 0, ?5, ?6)

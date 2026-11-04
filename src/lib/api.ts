@@ -198,7 +198,7 @@ export async function saveNote(
   body: string,
   expectedRaw: string,
 ): Promise<NoteContent> {
-  if (isDbVault()) return dbSaveNote(path, meta, body);
+  if (isDbVault()) return dbSaveNote(path, meta, body, expectedRaw);
   return invoke("save_note", { vaultPath, path, meta, body, expectedRaw });
 }
 
