@@ -1,4 +1,8 @@
 <script lang="ts">
+	import { createEditorWorkspace, provideEditorWorkspace, splitRatioBounds, type PaneId } from '$lib/stores/editor-workspace';
+	import { defaultEditorPane, provideEditorPane } from '$lib/stores/editor-pane';
+	import EditorPaneHost from './EditorPaneHost.svelte';
+
 	import { onMount, onDestroy, tick, untrack } from 'svelte';
 	import { listen } from '@tauri-apps/api/event';
 	import Sidebar from './Sidebar.svelte';
@@ -25,14 +29,9 @@
 		resolvedTheme,
 		customThemes,
 		focusMode,
-		readOnly,
-		activeNote,
-		activeNotePath,
 		activeNotebook,
-		editorDirty,
 		showInfo,
 		showSettings,
-		sourceMode,
 		mobileView,
 		appConfig,
 		quickAccessPaths,
@@ -48,8 +47,6 @@
 		tasksOnlyFlagged,
 		tasksSort,
 		activeTag,
-		navHistory,
-		viewerNote,
 		notebookSortMode,
 		notebookOrder,
 		noteOrder,
@@ -67,12 +64,28 @@
 	import { openNoteWindow } from '$lib/utils/window';
 	import { normalizeStartupView, resolveStartupTarget } from '$lib/utils/startup-view';
 	import { isCurrentVaultEvent, sameNoteTags, updateNoteList } from '$lib/utils/note-list-updates';
-	import { beginNoteNavigation, isCurrentNoteNavigation, cancelNoteNavigation } from '$lib/utils/note-navigation';
 	import { isPathInDirectory, isTrashedNote } from '$lib/utils/paths';
 	import { get } from 'svelte/store';
 	import type { VaultState, FileEvent, NotebookEntry, NoteEntry, TaskItem, SearchResult } from '$lib/types';
 	import { completeWindowClose, cancelWindowClose } from '$lib/api';
 	import type { StartupTarget } from '$lib/utils/startup-view';
+
+	// Keep the original pane's legacy stores for routes awaiting Stage 3 retargeting.
+	// Each new pane receives independent stores; this first context never follows focus.
+	const workspace = createEditorWorkspace(defaultEditorPane);
+	provideEditorWorkspace(workspace);
+	provideEditorPane(get(workspace).panes[0].context);
+	const activePane = workspace.activePane;
+	const activeNote = $derived($activePane.context.activeNote);
+	const activeNotePath = $derived($activePane.context.activeNotePath);
+	const viewerNote = $derived($activePane.context.viewerNote);
+	const editorDirty = $derived($activePane.context.editorDirty);
+	const sourceMode = $derived($activePane.context.sourceMode);
+	const readOnly = $derived($activePane.context.readOnly);
+	const navHistory = $derived($activePane.context.navHistory);
+	const beginNoteNavigation = $derived($activePane.context.beginNoteNavigation);
+	const isCurrentNoteNavigation = $derived($activePane.context.isCurrentNoteNavigation);
+	const cancelNoteNavigation = $derived($activePane.context.cancelNoteNavigation);
 
 	function findNotebookByPath(list: NotebookEntry[], relPath: string): NotebookEntry | null {
 		for (const nb of list) {
@@ -85,7 +98,73 @@
 
 	let sidebar = $state<Sidebar>();
 	let noteList = $state<NoteList>();
-	let editor = $state<Editor>();
+	let mobileEditor = $state<Editor>();
+	let editorInstances = $state<Record<PaneId, Editor | undefined>>({});
+	const editor = $derived(isMobile ? mobileEditor : editorInstances[$workspace.activePaneId]);
+	let editorAreaWidth = $state(0);
+	let separatorWidth = $state(0);
+	const availableEditorWidth = $derived(Math.max(0, editorAreaWidth - separatorWidth));
+	const splitBounds = $derived(splitRatioBounds(availableEditorWidth));
+	const workspaceId = $props.id();
+	let splitBusy = $state(false);
+	let splitError = $state('');
+
+	function activatePane(id: PaneId) {
+		workspace.activate(id);
+	}
+
+	function activateOpenNote(path: string): boolean {
+		const activated = workspace.activateOpenNote(path);
+		if (activated) {
+			taskNoteOpened = true;
+			if (isMobile) $mobileView = 'editor';
+		}
+		return activated;
+	}
+
+	async function toggleSplit() {
+		if (splitBusy) return;
+		splitError = '';
+		if ($workspace.panes.length === 1) {
+			workspace.openSplit();
+			return;
+		}
+		splitBusy = true;
+		try {
+			const closed = await workspace.closeSecond(async (second) => {
+				const instance = editorInstances[second.id];
+				return (!instance || await instance.flushSave())
+					&& !get(second.context.editorDirty) && ownerIsCurrent();
+			});
+			if (!closed) splitError = 'Save the second pane before closing it.';
+		} catch (error) {
+			console.error('Failed to close second pane:', error);
+			splitError = 'The second pane could not be saved. It remains open.';
+		} finally {
+			splitBusy = false;
+		}
+	}
+
+	function resizeSplit(delta: number) {
+		const width = availableEditorWidth;
+		if (width > 0) workspace.resize($workspace.splitRatio + delta / width, width);
+	}
+
+	$effect(() => {
+		workspace.resize(untrack(() => $workspace.splitRatio), availableEditorWidth);
+	});
+
+	async function flushWorkspace(): Promise<boolean> {
+		if (isMobile) return mobileEditor ? mobileEditor.flushSave() : true;
+		for (const pane of $workspace.panes) {
+			const instance = editorInstances[pane.id];
+			if ((instance && !(await instance.flushSave())) || get(pane.context.editorDirty)) {
+				workspace.activate(pane.id);
+				return false;
+			}
+		}
+		return true;
+	}
 	let outlineOpen = $state(false);
 	let outlinePanelId = $state('');
 
@@ -207,8 +286,8 @@
 	let noteRelativePath = $derived($activeNotePath && $appConfig?.active_vault ? $activeNotePath.replace($appConfig.active_vault + '/', '') : '');
 	let isQuickAccess = $derived(noteRelativePath ? $quickAccessPaths.includes(noteRelativePath) : false);
 	let backupInterval: ReturnType<typeof setInterval> | null = null;
-	let unsubDirty: (() => void) | null = null;
-	let prevDirty = false;
+
+
 
 
 
@@ -285,13 +364,19 @@
 		}
 	});
 
+	$effect(() => {
+		if (!$editorDirty && stateReady && ownerIsCurrent()) untrack(drainPendingOpenFiles);
+	});
+
 	async function navigateHistory(direction: -1 | 1) {
 		const token = beginNavigation();
 		if (!navigationIsCurrent(token)) return;
 		if (editor && !(await editor.flushSave())) return;
 		if (!navigationIsCurrent(token)) return;
-		const path = navHistory.go(direction);
-		if (!path) return;
+		const history = get(navHistory);
+		const path = history.stack[history.index + direction];
+		if (!path || activateOpenNote(path)) return;
+		navHistory.go(direction);
 		try {
 			const content = await readNote(ownerVault!, path);
 			if (!navigationIsCurrent(token)) return;
@@ -308,7 +393,7 @@
 
 	async function handleOpenFile(filePath: string, token = beginNavigation()): Promise<boolean> {
 		if (!navigationIsCurrent(token) || !filePath || !filePath.endsWith('.md')) return false;
-		if (filePath === $activeNotePath) return true; // Never replace an open draft with a stale disk read.
+		if (activateOpenNote(filePath)) return true; // Never replace an open draft with a stale disk read.
 		const isExternal = !isPathInDirectory(filePath, ownerVault);
 		if (isExternal && isAndroid) return false;
 		if (editor && !(await editor.flushSave())) return false;
@@ -316,6 +401,7 @@
 		try {
 			const content = await readNote(ownerVault!, filePath);
 			if (!navigationIsCurrent(token)) return false;
+			if (activateOpenNote(filePath)) return true;
 			$viewerNote = isExternal ? { path: filePath, content: content.content } : null;
 			$activeNote = content;
 			$activeNotePath = filePath;
@@ -420,7 +506,7 @@
 
 	async function prepareVaultSwitch(): Promise<boolean> {
 		const token = beginNavigation();
-		if (editor && !(await editor.flushSave())) return false;
+		if (!(await flushWorkspace())) return false;
 		if (!navigationIsCurrent(token)) return false;
 		await persistVaultState();
 		return navigationIsCurrent(token);
@@ -457,6 +543,7 @@
 		// Selecting a real vault note exits viewer mode
 		$viewerNote = null;
 		taskNoteOpened = true;
+
 		editor?.loadNote(path, content, task);
 		if (isMobile) $mobileView = 'editor';
 	}
@@ -464,8 +551,7 @@
 	async function selectNoteFromSwitcher(path: string, token = beginNavigation(), canSelect?: () => boolean): Promise<boolean> {
 		const current = () => navigationIsCurrent(token) && (canSelect?.() ?? true);
 		if (!current()) return false;
-		const currentPath = $activeNotePath;
-		if (currentPath && currentPath.replace(/\\/g, '/') === path.replace(/\\/g, '/')) return true;
+		if (activateOpenNote(path)) return true;
 		if (editor && !(await editor.flushSave())) return false;
 		if (!current()) return false;
 		try {
@@ -473,6 +559,7 @@
 			if (!current()) return false;
 			if (editor && !(await editor.flushSave())) return false;
 			if (!current()) return false;
+			if (activateOpenNote(path)) return true;
 			$viewerNote = null;
 			$activeNote = content;
 			$activeNotePath = path;
@@ -545,6 +632,7 @@
 		if (!ownerIsCurrent()) return;
 		beginNavigation();
 		taskNoteOpened = false;
+
 		// Picking a notebook/tag/Tasks/etc. in the sidebar is a request to browse that view's
 		// notes - so if the notes list was hidden, bring it back rather than navigating blindly
 		// into a panel the user can't see. revealNoteList() re-mounts the list and refreshes it.
@@ -602,6 +690,7 @@
 			if (!navigationIsCurrent(token)) return;
 			const entry = await createDailyNote(ownerVault!);
 			if (!navigationIsCurrent(token)) return;
+			if (activateOpenNote(entry.path)) return;
 			const content = await readNote(ownerVault!, entry.path);
 			if (!navigationIsCurrent(token)) return;
 			if (editor && !(await editor.flushSave())) return;
@@ -907,7 +996,7 @@
 				event.preventDefault();
 				if (!ownerIsCurrent()) { await cancelWindowClose(); return; }
 				try {
-					if (editor && !(await editor.flushSave())) { await cancelWindowClose(); return; }
+					if (!(await flushWorkspace())) { await cancelWindowClose(); return; }
 					if (!ownerIsCurrent()) { await cancelWindowClose(); return; }
 					await persistVaultState();
 					if (!ownerIsCurrent()) { await cancelWindowClose(); return; }
@@ -1039,11 +1128,7 @@
 		checkScheduledBackup();
 		backupInterval = setInterval(checkScheduledBackup, 5 * 60 * 1000);
 
-		unsubDirty = editorDirty.subscribe((d) => {
-			if (!ownerIsCurrent()) return;
-			if (!d) drainPendingOpenFiles();
-			prevDirty = d;
-		});
+
 		persistState();
 	});
 
@@ -1062,7 +1147,7 @@
 		unlistenOpenFile?.();
 		removeMobileFlushListeners?.();
 		if (backupInterval) clearInterval(backupInterval);
-		unsubDirty?.();
+
 	});
 </script>
 
@@ -1190,10 +1275,10 @@
 				<Sidebar bind:this={sidebar} onViewChanged={handleViewChanged} onBeforeNoteChange={() => editor?.flushSave() ?? Promise.resolve(true)} onBeforePathMutation={() => editor?.beginPathMutation() ?? Promise.resolve(() => {})} onPathsMoved={handlePathsMoved} />
 			</div>
 			<div class="mobile-panel" class:active={$mobileView === 'notelist'}>
-				<NoteList bind:this={noteList} onNoteSelected={handleNoteSelected} onBeforeNoteSwitch={() => editor?.flushSave() ?? Promise.resolve(true)} onBeforeNoteDuplicate={() => editor?.forceSave() ?? Promise.resolve(true)} onBeforePathMutation={() => editor?.beginPathMutation() ?? Promise.resolve(() => {})} onPathsMoved={handlePathsMoved} onUpdateActiveNote={updateActiveNoteMetadata} onTagsChanged={handleTagsChanged} onRefreshTags={() => { if (!isMobile) void sidebar?.refreshTags(); }} onNoteMoved={() => sidebar?.refresh()} onNoteCreated={(token) => { editor?.focusTitle(token); }} onToggleTask={toggleTask} onSetTaskPriority={changeTaskPriority} onSetTaskDue={changeTaskDue} />
+				<NoteList bind:this={noteList} onNoteSelected={handleNoteSelected} onActivateOpenNote={activateOpenNote} onBeforeNoteSwitch={() => editor?.flushSave() ?? Promise.resolve(true)} onBeforeNoteDuplicate={() => editor?.forceSave() ?? Promise.resolve(true)} onBeforePathMutation={() => editor?.beginPathMutation() ?? Promise.resolve(() => {})} onPathsMoved={handlePathsMoved} onUpdateActiveNote={updateActiveNoteMetadata} onTagsChanged={handleTagsChanged} onRefreshTags={() => { if (!isMobile) void sidebar?.refreshTags(); }} onNoteMoved={() => sidebar?.refresh()} onNoteCreated={(token) => { editor?.focusTitle(token); }} onToggleTask={toggleTask} onSetTaskPriority={changeTaskPriority} onSetTaskDue={changeTaskDue} />
 			</div>
 			<div class="mobile-panel" class:active={$mobileView === 'editor'}>
-				<Editor bind:this={editor} onMoveToTrash={trashOpenNote} onOutlineChange={handleOutlineChange} onShowTag={showTagNotes} />
+				<Editor bind:this={mobileEditor} onMoveToTrash={trashOpenNote} onOutlineChange={handleOutlineChange} onShowTag={showTagNotes} />
 			</div>
 		</div>
 
@@ -1251,7 +1336,7 @@
 
 				{#if !$notelistCollapsed}
 					<div class="notelist-panel" style="width: {$notelistWidth}px">
-						<NoteList bind:this={noteList} onNoteSelected={handleNoteSelected} onBeforeNoteSwitch={() => editor?.flushSave() ?? Promise.resolve(true)} onBeforeNoteDuplicate={() => editor?.forceSave() ?? Promise.resolve(true)} onBeforePathMutation={() => editor?.beginPathMutation() ?? Promise.resolve(() => {})} onPathsMoved={handlePathsMoved} onUpdateActiveNote={updateActiveNoteMetadata} onTagsChanged={handleTagsChanged} onRefreshTags={() => { if (!isMobile) void sidebar?.refreshTags(); }} onNoteMoved={() => sidebar?.refresh()} onNoteCreated={(token) => { editor?.focusTitle(token); }} onToggleTask={toggleTask} onSetTaskPriority={changeTaskPriority} onSetTaskDue={changeTaskDue} />
+						<NoteList bind:this={noteList} onNoteSelected={handleNoteSelected} onActivateOpenNote={activateOpenNote} onBeforeNoteSwitch={() => editor?.flushSave() ?? Promise.resolve(true)} onBeforeNoteDuplicate={() => editor?.forceSave() ?? Promise.resolve(true)} onBeforePathMutation={() => editor?.beginPathMutation() ?? Promise.resolve(() => {})} onPathsMoved={handlePathsMoved} onUpdateActiveNote={updateActiveNoteMetadata} onTagsChanged={handleTagsChanged} onRefreshTags={() => { if (!isMobile) void sidebar?.refreshTags(); }} onNoteMoved={() => sidebar?.refresh()} onNoteCreated={(token) => { editor?.focusTitle(token); }} onToggleTask={toggleTask} onSetTaskPriority={changeTaskPriority} onSetTaskDue={changeTaskDue} />
 					</div>
 
 					<ResizeHandle onResize={handleNotelistResize} />
@@ -1270,15 +1355,38 @@
 			{/if}
 
 			<div class="editor-panel">
-				<Editor bind:this={editor} onMoveToTrash={trashOpenNote} onShowTag={showTagNotes} />
-				{#if $viewMode === 'tasks' && !taskNoteOpened}
-					<div class="tasks-editor-placeholder">
-						<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-							<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>
-						</svg>
-						<p>Select a task to open its note</p>
-					</div>
-				{/if}
+				<div class="workspace-toolbar">
+					<span>{$workspace.panes.length === 2 ? 'Split view' : 'Editor'}</span>
+					<button class:active={$workspace.panes.length === 2} disabled={splitBusy}
+						onclick={toggleSplit} aria-pressed={$workspace.panes.length === 2}
+						title={$workspace.panes.length === 2 ? 'Close second pane' : 'Open second pane'}>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M12 4v16" /></svg>
+						{$workspace.panes.length === 2 ? 'Close second pane' : 'Split view'}
+					</button>
+				</div>
+				{#if splitError}<div class="split-error" role="alert">{splitError}</div>{/if}
+				<div class="editor-workspace" bind:clientWidth={editorAreaWidth}>
+					{#each $workspace.panes as pane, index (pane.id)}
+						{#if index === 1}
+							<div class="split-separator" bind:clientWidth={separatorWidth}>
+							<ResizeHandle onResize={resizeSplit} label="Resize editor panes"
+								value={Math.round($workspace.splitRatio * 100)} min={Math.round(splitBounds[0] * 100)} max={Math.round(splitBounds[1] * 100)}
+								controls={`${workspaceId}-${$workspace.panes[0].id} ${workspaceId}-${pane.id}`} />
+							</div>
+						{/if}
+						<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+						<section class="editor-pane" class:active={$workspace.activePaneId === pane.id}
+							id={`${workspaceId}-${pane.id}`} aria-label={`Editor pane ${index + 1}`}
+							style:flex={$workspace.panes.length === 1 ? '1 1 0' : `${index === 0 ? $workspace.splitRatio : 1 - $workspace.splitRatio} 1 0`}
+							onpointerdown={() => activatePane(pane.id)} onfocusin={() => activatePane(pane.id)}>
+							{#if $workspace.panes.length === 2}
+								<button class="pane-label" aria-pressed={$workspace.activePaneId === pane.id} onclick={() => activatePane(pane.id)}>Pane {index + 1}</button>
+							{/if}
+							<EditorPaneHost pane={pane.context} onEditorChange={(instance) => { editorInstances = { ...editorInstances, [pane.id]: instance }; }}
+								onMoveToTrash={trashOpenNote} onShowTag={showTagNotes} showTaskPlaceholder={$viewMode === 'tasks' && !taskNoteOpened} />
+						</section>
+					{/each}
+				</div>
 			</div>
 		</div>
 	</div>
@@ -1350,23 +1458,23 @@
 		flex: 1;
 		height: 100%;
 		overflow: hidden;
-		min-width: 300px;
+		min-width: 0;
 		position: relative;
 	}
 
-	.tasks-editor-placeholder {
-		position: absolute;
-		inset: 0;
-		z-index: 5;
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		justify-content: center;
-		gap: 12px;
-		background: var(--bg-primary);
-		color: var(--text-tertiary);
-		font-size: 14px;
-	}
+	.editor-panel { display: flex; flex-direction: column; min-width: 0; }
+	.workspace-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 10px; border-bottom: 1px solid var(--border-color); background: var(--bg-secondary); color: var(--text-tertiary); font-size: 11px; }
+	.workspace-toolbar button { display: flex; align-items: center; gap: 6px; padding: 4px 8px; border: none; border-radius: 6px; background: var(--bg-hover); color: var(--text-secondary); cursor: pointer; }
+	.workspace-toolbar button:hover, .workspace-toolbar button.active { color: var(--accent); background: var(--accent-light); }
+	.workspace-toolbar button:focus-visible, .pane-label:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+	.workspace-toolbar button:disabled { opacity: 0.5; cursor: default; }
+	.split-error { padding: 6px 10px; color: var(--text-primary); background: var(--bg-secondary); font-size: 12px; }
+	.editor-workspace { display: flex; flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
+	.split-separator { display: flex; flex-shrink: 0; }
+	.editor-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; position: relative; }
+	.editor-pane.active { box-shadow: inset 0 2px var(--accent); }
+	.pane-label { flex-shrink: 0; border: none; border-bottom: 1px solid var(--border-color); background: var(--bg-secondary); color: var(--text-tertiary); padding: 4px 8px; text-align: left; font-size: 11px; cursor: pointer; }
+	.editor-pane.active .pane-label { color: var(--accent); }
 
 	.focus-topbar {
 		display: flex;

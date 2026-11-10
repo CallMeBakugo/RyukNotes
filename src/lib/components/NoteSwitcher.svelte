@@ -1,6 +1,8 @@
 <script lang="ts">
+	import { getActiveEditorPane } from '$lib/stores/editor-workspace';
+
 	import { tick } from 'svelte';
-	import { activeNote, activeNotePath, appConfig, navHistory } from '$lib/stores/app';
+	import { appConfig } from '$lib/stores/app';
 	import { getNoteSwitcherTitles, getQuickAccess } from '$lib/api';
 	import { openNoteWindow } from '$lib/utils/window';
 	import {
@@ -11,6 +13,11 @@
 		type NoteSwitcherSections
 	} from '$lib/utils/note-switcher';
 	import type { NoteEntry, NoteTitleEntry } from '$lib/types';
+
+	const activePane = getActiveEditorPane();
+	const activeNote = $derived($activePane.activeNote);
+	const activeNotePath = $derived($activePane.activeNotePath);
+	const navHistory = $derived($activePane.navHistory);
 
 	let { onSelectNote = async () => false }: {
 		onSelectNote?: (path: string) => Promise<boolean>;

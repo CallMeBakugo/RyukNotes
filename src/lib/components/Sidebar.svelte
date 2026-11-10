@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { getActiveEditorPane } from '$lib/stores/editor-workspace';
+
 	import { onDestroy, tick } from 'svelte';
 	import { get } from 'svelte/store';
 	import { isDbVault } from '$lib/api-db';
@@ -8,9 +10,6 @@
 		tags,
 		viewMode,
 		activeNotebook,
-		activeNotePath,
-		editorDirty,
-		activeNote,
 		activeTag,
 		showSearch,
 		sidebarCollapsed,
@@ -24,7 +23,7 @@
 		rootNoteCount,
 		notebookSortMode,
 		notebookOrder,
-		noteOrder
+		noteOrder,
 	} from '$lib/stores/app';
 	import { getNotebooks, getAllTags, createNotebook, deleteNotebook, renameNotebook, moveNotebook, getNotebookIcons, setNotebookIcon, getTagStyles, importNotebookIcon, getQuickAccess, addQuickAccess, removeQuickAccess, emptyTrash, moveNote, countRootNotes } from '$lib/api';
 	import { open as openDialog } from '@tauri-apps/plugin-dialog';
@@ -44,6 +43,11 @@
 		normalizeNotebookIconKey,
 		type NotebookIconId
 	} from '$lib/utils/notebook-icons';
+
+	const activePane = getActiveEditorPane();
+	const activeNote = $derived($activePane.activeNote);
+	const activeNotePath = $derived($activePane.activeNotePath);
+	const editorDirty = $derived($activePane.editorDirty);
 
 	let { onViewChanged = () => {}, onBeforeNoteChange = async () => true, onBeforePathMutation = async () => null, onPathsMoved = async (_old: string, _next: string) => {} }: {
 		onViewChanged?: () => void;

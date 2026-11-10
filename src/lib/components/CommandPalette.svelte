@@ -1,7 +1,12 @@
 <script lang="ts">
-	import { showCommandPalette, showSearch, theme, sourceMode, viewMode, activeNotebook, activeTag } from '$lib/stores/app';
+	import { getActiveEditorPane } from '$lib/stores/editor-workspace';
+
+	import { showCommandPalette, showSearch, theme, viewMode, activeNotebook, activeTag } from '$lib/stores/app';
 	import { setTheme, reindex } from '$lib/api';
 	import { darkThemes } from '$lib/platform';
+
+	const activePane = getActiveEditorPane();
+	const sourceMode = $derived($activePane.sourceMode);
 
 	// onNavigate runs the parent's view-change handler (refreshes the note list and reveals it
 	// if it was hidden), so opening a view here behaves exactly like clicking it in the sidebar.

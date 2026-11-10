@@ -1,8 +1,14 @@
 <script lang="ts">
+	import { getActiveEditorPane } from '$lib/stores/editor-workspace';
+
 	import { getCurrentWindow } from '@tauri-apps/api/window';
-	import { vaultReady, focusMode, readOnly, appConfig, activeNotePath, activeVaultConfig } from '$lib/stores/app';
+	import { vaultReady, focusMode, appConfig, activeVaultConfig } from '$lib/stores/app';
 	import NoteSwitcher from './NoteSwitcher.svelte';
 	import { isTrashedNote } from '$lib/utils/paths';
+
+	const activePane = getActiveEditorPane();
+	const readOnly = $derived($activePane.readOnly);
+	const activeNotePath = $derived($activePane.activeNotePath);
 
 	let {
 		onNewNote = () => {},

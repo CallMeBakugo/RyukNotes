@@ -113,3 +113,128 @@ test('pane history traversal/remapping and navigation cancellation do not cross 
   left.cancelNoteNavigation(newer);
   assert.equal(left.isCurrentNoteNavigation(newer), false);
 });
+
+const workspaceModule = load(await readFile(new URL('../src/lib/stores/editor-workspace.ts', import.meta.url), 'utf8'), {
+  'svelte/store': stores,
+  svelte: {
+    getContext: key => context.get(key),
+    setContext: (key, value) => { context.set(key, value); return value; },
+  },
+  './editor-pane': pane,
+});
+
+test('workspace keeps stable contexts, opens one empty second pane and never exceeds two', async () => {
+  const workspace = workspaceModule.createEditorWorkspace();
+  const first = stores.get(workspace).panes[0];
+  first.context.activeNotePath.set('/vault/first.md');
+  first.context.editorDirty.set(true);
+  workspace.openSplit();
+  const split = stores.get(workspace);
+  assert.equal(split.panes.length, 2);
+  assert.equal(split.panes[0], first);
+  assert.equal(split.activePaneId, split.panes[1].id);
+  for (const key of ['activeNote', 'activeNotePath', 'viewerNote']) {
+    assert.equal(stores.get(split.panes[1].context[key]), null);
+  }
+  assert.equal(stores.get(split.panes[1].context.editorDirty), false);
+  workspace.openSplit();
+  assert.equal(stores.get(workspace).panes[1], split.panes[1]);
+  workspace.activate(first.id);
+  assert.equal(stores.get(workspace.activePane), first);
+  workspace.activate('absent');
+  assert.equal(stores.get(workspace.activePane), first);
+  await workspace.closeSecond(async () => true);
+  assert.equal(stores.get(workspace).panes.length, 1);
+  assert.equal(stores.get(workspace).panes[0], first);
+  assert.equal(stores.get(first.context.editorDirty), true);
+  workspace.openSplit();
+  assert.notEqual(stores.get(workspace).panes[1].id, split.panes[1].id);
+});
+
+test('same-note selection activates its existing owner without touching either draft', () => {
+  const workspace = workspaceModule.createEditorWorkspace();
+  const first = stores.get(workspace).panes[0];
+  const content = { path: '/vault/a.md', raw: 'disk', content: 'unsaved draft' };
+  first.context.activeNote.set(content);
+  first.context.activeNotePath.set(content.path);
+  first.context.editorDirty.set(true);
+  workspace.openSplit();
+  const second = stores.get(workspace).panes[1];
+  second.context.activeNotePath.set('/vault/b.md');
+  assert.equal(workspace.activateOpenNote('\\vault\\a.md'), true);
+  assert.equal(stores.get(workspace).activePaneId, first.id);
+  assert.equal(stores.get(first.context.activeNote), content);
+  assert.equal(stores.get(first.context.editorDirty), true);
+  assert.equal(stores.get(second.context.activeNotePath), '/vault/b.md');
+  assert.equal(workspace.activateOpenNote('/vault/unopened.md'), false);
+  assert.equal(stores.get(workspace).activePaneId, first.id);
+});
+
+test('shared controls follow the selected pane but a captured host context never changes', async () => {
+  const workspace = workspaceModule.createEditorWorkspace();
+  context = new Map();
+  workspaceModule.provideEditorWorkspace(workspace);
+  const active = workspaceModule.getActiveEditorPane();
+  const first = stores.get(active);
+  const seen = [];
+  const unsubscribe = active.subscribe(value => seen.push(value));
+  workspace.openSplit();
+  const second = stores.get(active);
+  assert.notEqual(second, first);
+  assert.equal(first, stores.get(workspace).panes[0].context);
+  await workspace.closeSecond(async () => true);
+  assert.equal(stores.get(active), first);
+  assert.equal(seen.length, 3);
+  unsubscribe();
+  context = new Map();
+  assert.equal(stores.get(workspaceModule.getActiveEditorPane()), pane.defaultEditorPane);
+});
+
+test('split ratio is bounded by available width and recovers from invalid measurements', () => {
+  const workspace = workspaceModule.createEditorWorkspace();
+  workspace.resize(-1, 1000);
+  assert.equal(stores.get(workspace).splitRatio, 0.24);
+  workspace.resize(9, 1000);
+  assert.equal(stores.get(workspace).splitRatio, 0.76);
+  workspace.resize(0.2, 400);
+  assert.equal(stores.get(workspace).splitRatio, 0.5);
+  workspace.resize(NaN, 1000);
+  assert.equal(stores.get(workspace).splitRatio, 0.5);
+  workspace.resize(0.8, 0);
+  assert.equal(stores.get(workspace).splitRatio, 0.5);
+  workspace.resize(0.9, 4000);
+  assert.equal(stores.get(workspace).splitRatio, 0.8);
+  workspace.resize(0, 4000);
+  assert.equal(stores.get(workspace).splitRatio, 0.2);
+});
+
+
+test('a rejected pane close preserves both contexts and focuses the unsaved owner', async () => {
+  const workspace = workspaceModule.createEditorWorkspace();
+  workspace.openSplit();
+  const before = stores.get(workspace);
+  const second = before.panes[1];
+  second.context.editorDirty.set(true);
+  workspace.activate(before.panes[0].id);
+  const closed = await workspace.closeSecond(async owner => {
+    assert.equal(owner, second);
+    return false;
+  });
+  assert.equal(closed, false);
+  assert.equal(stores.get(workspace).panes, before.panes);
+  assert.equal(stores.get(workspace).activePaneId, second.id);
+  assert.equal(stores.get(second.context.editorDirty), true);
+});
+
+test('a delayed close cannot remove a newly opened replacement pane', async () => {
+  const workspace = workspaceModule.createEditorWorkspace();
+  workspace.openSplit();
+  let finish;
+  const delayed = workspace.closeSecond(() => new Promise(resolve => { finish = resolve; }));
+  await workspace.closeSecond(async () => true);
+  workspace.openSplit();
+  const replacement = stores.get(workspace).panes[1];
+  finish(true);
+  assert.equal(await delayed, false);
+  assert.equal(stores.get(workspace).panes[1], replacement);
+});

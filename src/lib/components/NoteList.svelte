@@ -1,23 +1,22 @@
 <script lang="ts">
+	import { getActiveEditorPane } from '$lib/stores/editor-workspace';
+
 	import { onDestroy, tick, untrack } from 'svelte';
 	import { get } from 'svelte/store';
 	import {
 		notes,
 		sortedNotes,
-		activeNotePath,
-		activeNote,
 		viewMode,
 		activeNotebook,
 		activeTag,
 		sortMode,
 		groupNotesByDate,
-		editorDirty,
 		quickAccessPaths,
 		appConfig,
 		notelistCollapsed,
 		noteOrder,
 		notebooks,
-		mobileView
+		mobileView,
 	} from '$lib/stores/app';
 	import {
 		getNotes,
@@ -45,14 +44,22 @@
 	import { tagIterationKey } from '$lib/utils/tag-styles';
 	import { updateNoteList } from '$lib/utils/note-list-updates';
 	import { buildNoteListRows, noteListOffsets, noteListWindow, noteListRevealScrollTop } from '$lib/utils/note-list-window';
-	import { beginNoteNavigation, isCurrentNoteNavigation, cancelNoteNavigation } from '$lib/utils/note-navigation';
 	import type { NoteEntry, NoteMeta, TrashNotebookEntry, SortMode, TaskItem } from '$lib/types';
 	import TasksView from './TasksView.svelte';
 	import TagSuggestInput from './TagSuggestInput.svelte';
 	import TagLabel from './TagLabel.svelte';
 	import { isMobile, isAndroid } from '$lib/platform';
 
-	let { onNoteSelected = (_path: string, _content: string, _task?: TaskItem) => {}, onNoteMoved = () => {}, onBeforeNoteSwitch = async () => true, onBeforeNoteDuplicate = async () => true, onBeforePathMutation = async () => null, onPathsMoved = async (_old: string, _next: string) => {}, onUpdateActiveNote, onTagsChanged, onRefreshTags, onNoteCreated = () => {}, onToggleTask = async (_t: TaskItem) => {}, onSetTaskPriority = async (_t: TaskItem, _p: string | null) => {}, onSetTaskDue = async (_t: TaskItem, _d: string | null) => {} }: {
+	const activePane = getActiveEditorPane();
+	const activeNote = $derived($activePane.activeNote);
+	const activeNotePath = $derived($activePane.activeNotePath);
+	const editorDirty = $derived($activePane.editorDirty);
+	const beginNoteNavigation = $derived($activePane.beginNoteNavigation);
+	const isCurrentNoteNavigation = $derived($activePane.isCurrentNoteNavigation);
+	const cancelNoteNavigation = $derived($activePane.cancelNoteNavigation);
+
+	let { onActivateOpenNote = (_path: string) => false, onNoteSelected = (_path: string, _content: string, _task?: TaskItem) => {}, onNoteMoved = () => {}, onBeforeNoteSwitch = async () => true, onBeforeNoteDuplicate = async () => true, onBeforePathMutation = async () => null, onPathsMoved = async (_old: string, _next: string) => {}, onUpdateActiveNote, onTagsChanged, onRefreshTags, onNoteCreated = () => {}, onToggleTask = async (_t: TaskItem) => {}, onSetTaskPriority = async (_t: TaskItem, _p: string | null) => {}, onSetTaskDue = async (_t: TaskItem, _d: string | null) => {} }: {
+		onActivateOpenNote?: (path: string) => boolean;
 		onNoteSelected?: (path: string, content: string, task?: TaskItem) => void;
 		onNoteMoved?: () => void;
 		onBeforeNoteSwitch?: () => Promise<boolean>;
@@ -120,6 +127,7 @@
 		try {
 			const entry = await createDailyNote(ownerVault!, date);
 			if (!navigationIsCurrent(token)) return;
+			if (onActivateOpenNote(entry.path)) return;
 			const content = await readNote(ownerVault!, entry.path);
 			if (!navigationIsCurrent(token)) return;
 			if (!(await onBeforeNoteSwitch())) return;
@@ -565,6 +573,10 @@
 
 	async function selectNote(note: NoteEntry, token = beginNavigation()) {
 		if (!navigationIsCurrent(token)) return;
+		if (onActivateOpenNote(note.path)) {
+			if (isMobile) $mobileView = 'editor';
+			return;
+		}
 		if ($activeNotePath === note.path) {
 			if (isMobile) $mobileView = 'editor';
 			return;
@@ -574,6 +586,7 @@
 			if (!navigationIsCurrent(token)) return;
 			if (!(await onBeforeNoteSwitch())) return;
 			if (!navigationIsCurrent(token)) return;
+			if (onActivateOpenNote(note.path)) return;
 			$activeNote = content;
 			$activeNotePath = note.path;
 			$editorDirty = false;
@@ -586,11 +599,16 @@
 	async function openTask(task: TaskItem) {
 		const token = beginNavigation();
 		if (!navigationIsCurrent(token)) return;
+		if (onActivateOpenNote(task.note_path)) {
+			if (isMobile) $mobileView = 'editor';
+			return;
+		}
 		try {
 			const content = await readNote(ownerVault!, task.note_path);
 			if (!navigationIsCurrent(token)) return;
 			if (!(await onBeforeNoteSwitch())) return;
 			if (!navigationIsCurrent(token)) return;
+			if (onActivateOpenNote(task.note_path)) return;
 			$activeNote = content;
 			$activeNotePath = task.note_path;
 			$editorDirty = false;
