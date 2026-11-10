@@ -3,21 +3,23 @@
   import Editor from './Editor.svelte';
   import { provideEditorPane, type EditorPane } from '$lib/stores/editor-pane';
 
-  let { pane, onEditorChange, onMoveToTrash, onShowTag, showTaskPlaceholder = false }: {
+  let { pane, paneId, onEditorChange, onMoveToTrash, onShowTag, showTaskPlaceholder = false }: {
     pane: EditorPane;
+    paneId: string;
     showTaskPlaceholder?: boolean;
     onEditorChange: (editor: Editor | undefined) => void;
     onMoveToTrash: (path: string) => Promise<boolean>;
     onShowTag: (tag: string) => void;
   } = $props();
   // Keyed by pane ID in the parent: this context never follows active-pane focus.
-  provideEditorPane(untrack(() => pane));
+  const context = provideEditorPane(untrack(() => pane));
+  const activeNotePath = context.activeNotePath;
   let editor = $state<Editor>();
   $effect(() => { const instance = editor; untrack(() => onEditorChange(instance)); });
   onDestroy(() => onEditorChange(undefined));
 </script>
 
-<div class="pane-surface">
+<div class="pane-surface" data-pane-id={paneId} data-note-path={$activeNotePath ?? undefined}>
   <Editor bind:this={editor} {onMoveToTrash} {onShowTag} />
   {#if showTaskPlaceholder}
     <div class="tasks-editor-placeholder">

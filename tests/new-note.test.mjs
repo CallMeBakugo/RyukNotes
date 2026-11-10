@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { createContext, Script } from 'node:vm';
+import { get, writable } from 'svelte/store';
 import { parse } from 'svelte/compiler';
 import { transformWithEsbuild } from 'vite';
 import { RevisionSaveQueue } from '../src/lib/utils/revision-save.ts';
@@ -37,11 +38,15 @@ function fixture(overrides = {}) {
   const context = createContext({
     ownerVault: vault,
     ownerIsCurrent: () => context.$appConfig.active_vault === vault,
-    beginNavigation: beginNoteNavigation,
-    navigationIsCurrent: token => context.ownerIsCurrent() && isCurrentNoteNavigation(token),
+    get,
+    beginNavigation: () => {
+      const generation = beginNoteNavigation();
+      return { context: paneContext, generation, isCurrent: () => isCurrentNoteNavigation(generation) };
+    },
+    navigationIsCurrent: token => context.ownerIsCurrent() && token.isCurrent(),
     $appConfig: { active_vault: vault }, $viewMode: 'all', $sortMode: 'modified',
     $activeNotebook: null, $activeNotePath: null, $activeNote: null, $editorDirty: false, $notes: [],
-    noteCache: new Map(), onBeforeNoteSwitch: async () => true,
+    noteCache: new Map(), onActivateOpenNote: () => false, onBeforeNoteSwitch: async () => true,
     createNote: async (origin, notebook, title) => {
       assert.equal(origin, vault);
       assert.equal(notebook, null);
@@ -59,7 +64,14 @@ function fixture(overrides = {}) {
     console: { error: (...args) => errors.push(args) },
     ...overrides
   });
-  return { context, entry, created, selected, focused, errors, create: createScript.runInContext(context) };
+  const paneContext = {};
+  for (const key of ['activeNote', 'activeNotePath', 'editorDirty']) {
+    paneContext[key] = writable(context['$' + key]);
+    Object.defineProperty(context, '$' + key, {
+      get: () => get(paneContext[key]), set: value => paneContext[key].set(value),
+    });
+  }
+  return { context, paneContext, entry, created, selected, focused, errors, create: createScript.runInContext(context) };
 }
 
 for (const mode of ['rich', 'source']) {

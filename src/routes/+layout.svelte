@@ -85,17 +85,18 @@
 		}
 	}
 
-	function resolveAndHandleLink(href: string) {
+	function resolveAndHandleLink(href: string, element?: Element) {
 		if (href.startsWith('http://') || href.startsWith('https://') || href.startsWith('mailto:') || href.startsWith('tel:') || href.startsWith('sms:')) {
 			openUrl(href).catch((err) => console.error('Failed to open URL:', err));
 		} else if (!href.startsWith('#')) {
 			const config = get(appConfig);
-			const note = get(activeNotePath);
+			const origin = element?.closest<HTMLElement>('[data-pane-id]');
+			const note = origin?.dataset.notePath ?? get(activeNotePath);
 			const root = noteAssetRoot(note, config?.active_vault ?? null, config?.vaults.map(vault => vault.path) ?? []);
 			const absPath = resolveFileReference(href, note, root).path;
 			// Internal .md note link - navigate within the app
 			if (absPath.endsWith('.md')) {
-				window.dispatchEvent(new CustomEvent('ryuknotes-open-note', { detail: absPath }));
+				window.dispatchEvent(new CustomEvent('ryuknotes-open-note', { detail: { path: absPath, paneId: origin?.dataset.paneId } }));
 			} else {
 				openLocalFile(absPath);
 			}
@@ -135,7 +136,7 @@
 			e.preventDefault();
 			e.stopPropagation();
 			e.stopImmediatePropagation();
-			resolveAndHandleLink(href);
+			resolveAndHandleLink(href, target);
 		}
 
 		document.addEventListener('click', handleLinkClick, true);
@@ -169,7 +170,7 @@
 			const href = target.getAttribute('href');
 			if (!href) return;
 			e.preventDefault();
-			resolveAndHandleLink(href);
+			resolveAndHandleLink(href, target);
 		}
 
 		if (isMobile) {

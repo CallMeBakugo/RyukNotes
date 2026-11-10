@@ -10,9 +10,11 @@
 	import { getCurrentWebview } from '@tauri-apps/api/webview';
 	import type { OrphanAttachment } from '$lib/api';
 	import type { ImportResult, BackupEntry, CustomTheme, CustomThemeColors, StartupView, VaultStats } from '$lib/types';
+	import { waitForVaultJob, type VaultJobResult } from '$lib/utils/vault-job';
+	import type { PaneRelease } from '$lib/stores/editor-workspace';
 	import { normalizeStartupView } from '$lib/utils/startup-view';
 
-	let { onBeforeVaultSwitch }: { onBeforeVaultSwitch: () => Promise<boolean> } = $props();
+	let { onBeforeVaultSwitch, onBeginMaintenance }: { onBeforeVaultSwitch: () => Promise<boolean>; onBeginMaintenance: () => Promise<PaneRelease | null> } = $props();
 
 	const modKey = navigator.platform.startsWith('Mac') ? '⌘' : 'Ctrl';
 
@@ -92,8 +94,10 @@
 		const current = () => request === cleanupRequest && $showSettings && maintenanceVault === vault;
 		scanningOrphanedAttachments = true;
 		orphanError = '';
+		let release: PaneRelease | null = null;
 		try {
-			if (!(await onBeforeVaultSwitch())) throw new Error('Save the current note before scanning attachments.');
+			release = await onBeginMaintenance();
+			if (!release) throw new Error('Save every pane before scanning attachments.');
 			if (!current()) return;
 			const found = await findOrphanedAttachments(vault);
 			if (!current()) return;
@@ -102,6 +106,7 @@
 		} catch (error) {
 			if (current()) orphanError = String(error);
 		} finally {
+			await release?.();
 			if (current()) scanningOrphanedAttachments = false;
 		}
 	}
@@ -114,8 +119,10 @@
 		const current = () => request === cleanupRequest && $showSettings && maintenanceVault === vault;
 		trashingOrphanedAttachments = true;
 		orphanError = '';
+		let release: PaneRelease | null = null;
 		try {
-			if (!(await onBeforeVaultSwitch())) throw new Error('Save the current note before cleaning attachments.');
+			release = await onBeginMaintenance();
+			if (!release) throw new Error('Save every pane before cleaning attachments.');
 			if (!current()) return;
 			await trashOrphanedAttachments(vault, names);
 			if (!current()) return;
@@ -125,6 +132,7 @@
 		} catch (error) {
 			if (current()) orphanError = String(error);
 		} finally {
+			await release?.();
 			if (current()) trashingOrphanedAttachments = false;
 		}
 	}
@@ -136,7 +144,6 @@
 	let restoreConfirm = $state<BackupEntry | null>(null);
 	let backupRequest = 0;
 	let backupReadRequest = 0;
-	let backupUnlisten: (() => void) | null = null;
 	const lastBackupTime = $derived(activeVaultConfig($appConfig)?.last_backup_time ?? null);
 
 	$effect(() => {
@@ -144,14 +151,10 @@
 		void $showSettings;
 		backupRequest++;
 		backupReadRequest++;
-		backupUnlisten?.();
-		backupUnlisten = null;
 		backupLoading = false;
 		return () => {
 			backupRequest++;
 			backupReadRequest++;
-			backupUnlisten?.();
-			backupUnlisten = null;
 		};
 	});
 
@@ -167,6 +170,12 @@
 		}
 	}
 
+	async function runVaultJob(vault: string, eventName: 'backup-done' | 'restore-done', start: () => Promise<void>): Promise<{ entry?: BackupEntry }> {
+		if (isDbVault()) { await start(); return {}; }
+		return waitForVaultJob<VaultJobResult & { entry?: BackupEntry }>(vault,
+			handler => listen<VaultJobResult & { entry?: BackupEntry }>(eventName, ({ payload }) => handler(payload)), start);
+	}
+
 	async function handleBackupNow() {
 		const vault = maintenanceVault;
 		if (!vault || backupLoading) return;
@@ -174,41 +183,27 @@
 		const current = () => request === backupRequest && maintenanceVault === vault && $showSettings;
 		backupLoading = true;
 		backupMessage = null;
-		let stop: (() => void) | undefined;
-		let finished = false;
+		let release: PaneRelease | null = null;
 		try {
-			if (!(await onBeforeVaultSwitch())) throw new Error('Save the current note before creating a backup.');
+			release = await onBeginMaintenance();
+			if (!release) throw new Error('Save every pane before creating a backup.');
 			if (!current()) return;
-			stop = await listen<{ vault_path: string; success: boolean; entry?: BackupEntry; error?: string }>('backup-done', (event) => {
-				const data = event.payload;
-				if (data.vault_path !== vault || !current()) return;
-				finished = true;
-				stop?.();
-				backupUnlisten = null;
-				backupLoading = false;
-				if (data.success) {
-					backupMessage = { type: 'success', text: 'Backup created successfully' };
-					const timestamp = data.entry?.created;
-					const currentVault = activeVaultConfig($appConfig);
-					if (timestamp && currentVault && $appConfig) {
-						$appConfig = { ...$appConfig, vaults: $appConfig.vaults.map(item =>
-							item === currentVault ? { ...item, last_backup_time: timestamp } : item) };
-					}
-					void loadBackups();
-				} else {
-					backupMessage = { type: 'error', text: `Backup failed: ${data.error}` };
-				}
-			});
-			if (!current() || finished) { stop(); return; }
-			backupUnlisten = stop;
-			await createBackup(vault);
-		} catch (e) {
-			stop?.();
+			const result = await runVaultJob(vault, 'backup-done', () => createBackup(vault));
 			if (current()) {
-				backupUnlisten = null;
-				backupMessage = { type: 'error', text: `Backup failed: ${e}` };
-				backupLoading = false;
+				backupMessage = { type: 'success', text: 'Backup created successfully' };
+				await loadBackups();
+				const timestamp = result.entry?.created ?? backups[0]?.created;
+				const currentVault = activeVaultConfig($appConfig);
+				if (current() && timestamp && currentVault && $appConfig) {
+					$appConfig = { ...$appConfig, vaults: $appConfig.vaults.map(item =>
+						item === currentVault ? { ...item, last_backup_time: timestamp } : item) };
+				}
 			}
+		} catch (error) {
+			if (current()) backupMessage = { type: 'error', text: `Backup failed: ${error}` };
+		} finally {
+			await release?.();
+			if (current()) backupLoading = false;
 		}
 	}
 
@@ -220,32 +215,18 @@
 		restoreConfirm = null;
 		backupLoading = true;
 		backupMessage = null;
-		let stop: (() => void) | undefined;
-		let finished = false;
+		let release: PaneRelease | null = null;
 		try {
-			if (!(await onBeforeVaultSwitch())) throw new Error('Save the current note before restoring a backup.');
+			release = await onBeginMaintenance();
+			if (!release) throw new Error('Save every pane before restoring a backup.');
 			if (!current()) return;
-			stop = await listen<{ vault_path: string; success: boolean; error?: string }>('restore-done', (event) => {
-				const data = event.payload;
-				if (data.vault_path !== vault || !current()) return;
-				finished = true;
-				stop?.();
-				backupUnlisten = null;
-				backupMessage = data.success
-					? { type: 'success', text: 'Backup restored successfully.' }
-					: { type: 'error', text: `Restore failed: ${data.error}` };
-				backupLoading = false;
-			});
-			if (!current() || finished) { stop(); return; }
-			backupUnlisten = stop;
-			await restoreBackup(vault, entry.path);
-		} catch (e) {
-			stop?.();
-			if (current()) {
-				backupUnlisten = null;
-				backupMessage = { type: 'error', text: `Restore failed: ${e}` };
-				backupLoading = false;
-			}
+			await runVaultJob(vault, 'restore-done', () => restoreBackup(vault, entry.path));
+			if (current()) backupMessage = { type: 'success', text: 'Backup restored successfully.' };
+		} catch (error) {
+			if (current()) backupMessage = { type: 'error', text: `Restore failed: ${error}` };
+		} finally {
+			await release?.();
+			if (current()) backupLoading = false;
 		}
 	}
 

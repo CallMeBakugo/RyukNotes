@@ -47,6 +47,7 @@
 	import { RevisionSaveQueue, type SaveRevision } from '$lib/utils/revision-save';
 	import { isCurrentVaultEvent } from '$lib/utils/note-list-updates';
 	import { getEditorPane } from '$lib/stores/editor-pane';
+	import { getEditorWorkspace } from '$lib/stores/editor-workspace';
 	import { encryptSecretText, decryptSecretText, readSecretTitle } from '$lib/utils/secrets';
 	import { WrapSelectedText } from '$lib/editor/extensions/wrapSelectedText';
 	import { CodeBlockInputScroll } from '$lib/editor/extensions/codeBlockInputScroll';
@@ -78,10 +79,13 @@
 	import { isMobile, isAndroid } from '$lib/platform';
 	import ResizeHandle from './ResizeHandle.svelte';
 
+	const paneContext = getEditorPane();
+	const workspace = getEditorWorkspace();
+	const paneIsActive = () => !workspace || get(workspace.activePane).context === paneContext;
 	// Stable instance dependencies; app/vault/list preferences remain shared above.
 	const { activeNote, activeNotePath, viewerNote, editorDirty, sourceMode, readOnly,
 		navHistory, canGoBack, canGoForward, beginNoteNavigation, isCurrentNoteNavigation,
-		cancelNoteNavigation } = getEditorPane();
+		cancelNoteNavigation } = paneContext;
 	const componentId = $props.id();
 	const outlinePanelId = `${componentId}-outline`;
 	let { onMoveToTrash, onOutlineChange, onShowTag }: {
@@ -966,6 +970,7 @@
 			const content = await importNote(vaultRoot, v.path, folderPath || null, raw, externalNoteReferences(raw));
 			if (!isCurrent()) return;
 			const dest = content.path;
+			if (workspace?.activateOpenNote(dest, paneContext)) { viewerImportPickerOpen = false; return; }
 			// Switch to the imported note as a real vault note
 			$viewerNote = null;
 			$readOnly = false;
@@ -2772,13 +2777,14 @@
 	let editorNavigationToken: number | null = null;
 
 	function beginEditorNoteNavigation(): () => boolean {
-		const token = beginNoteNavigation();
+		const intent = workspace?.captureNavigation(paneContext);
+		const token = intent?.generation ?? beginNoteNavigation();
 		editorNavigationToken = token;
 		const vault = $appConfig?.active_vault;
 		const path = $activeNotePath;
 		const session = saves.capture();
 		return () => !editorDisposed
-			&& isCurrentNoteNavigation(token)
+			&& isCurrentNoteNavigation(token) && (!intent || intent.isCurrent())
 			&& vault === $appConfig?.active_vault
 			&& path === $activeNotePath
 			&& saves.isCurrentSession(session);
@@ -2867,6 +2873,16 @@
 	// Scan the document for wiki-link marks whose visible text has been changed by
 	// the user (text ≠ stored title, and the link is not an explicit alias).
 	// Each match triggers a note rename and the mark is updated in-place.
+	async function renameWithPaneBarrier(vault: string, path: string, title: string) {
+		const release = workspace ? await workspace.acquireMutation() : await beginPathMutation();
+		if (!release) throw new Error('Save all affected notes before renaming.');
+		try {
+			const next = await renameNote(vault, path, title);
+			workspace?.remapPaths(path, next);
+			return next;
+		} finally { await release(); }
+	}
+
 	async function checkWikiLinkRenames() {
 		if (!editor || !$appConfig?.enable_wiki_links || isLoadingNote) return;
 		const origin = captureOrigin();
@@ -2892,31 +2908,51 @@
 		// Save the current note before renaming so the Rust backend has the latest content
 		if (!(await forceSave()) || !isOriginCurrent(origin, true)) return;
 
-		for (const item of toRename) {
-			try {
-				const absPath = resolveNotePath(item.mark.attrs.path);
-				const newPath = await renameNote(origin.vault!, absPath, item.newTitle);
-				if (!isOriginCurrent(origin, true)) return;
-				// Update the mark attrs in the editor (title + path) so the next save
-				// serialises [[NewTitle]] and doesn't re-trigger the rename check
-				if (editor) {
-					const wikiMarkType = editor.schema.marks.wikiLink;
-					const tr = editor.state.tr;
-					tr.addMark(
-						item.pos,
-						item.pos + item.size,
-						wikiMarkType.create({ title: item.newTitle, path: newPath, aliased: false }),
-					);
-					ignoreNextUpdate = true;
-					editor.view.dispatch(tr);
-					ignoreNextUpdate = false;
+		const release = workspace ? await workspace.acquireMutation() : await beginPathMutation();
+		if (!release) return;
+		try {
+			for (const item of toRename) {
+				try {
+					const absPath = resolveNotePath(item.mark.attrs.path);
+					const newPath = await renameNote(origin.vault!, absPath, item.newTitle);
+					workspace?.remapPaths(absPath, newPath);
+					if (!isOriginCurrent(origin, true)) return;
+					// Update the mark attrs in the editor (title + path) so the next save
+					// serialises [[NewTitle]] and doesn't re-trigger the rename check
+					if (editor) {
+						const wikiMarkType = editor.schema.marks.wikiLink;
+						const tr = editor.state.tr;
+						tr.addMark(
+							item.pos,
+							item.pos + item.size,
+							wikiMarkType.create({ title: item.newTitle, path: newPath, aliased: false }),
+						);
+						ignoreNextUpdate = true;
+						editor.view.dispatch(tr);
+						ignoreNextUpdate = false;
+					}
+					refreshWikiLinkTitles();
+				} catch (e) {
+					console.error('Failed to rename note from wiki-link edit:', e);
 				}
-				refreshWikiLinkTitles();
-			} catch (e) {
-				console.error('Failed to rename note from wiki-link edit:', e);
 			}
+		} finally { await release(); }
+		if (isOriginCurrent(origin, true)) {
+			markEdited();
+		} else if (!editorDisposed && editor && origin.path === $activeNotePath
+			&& origin.vault === $appConfig?.active_vault && origin.sourceMode === $sourceMode) {
+			// Native rename may have reloaded [[Old|New]] as [[New|New]]. Retain
+			// the edited link's non-alias behavior on the reconciled, current baseline.
+			const titles = new Set(toRename.map(item => item.newTitle));
+			const tr = editor.state.tr;
+			editor.state.doc.descendants((node, pos) => {
+				if (!node.isText || !titles.has(node.text ?? '')) return;
+				const mark = node.marks.find(mark => mark.type.name === 'wikiLink'
+					&& mark.attrs.aliased && mark.attrs.title === node.text);
+				if (mark) tr.addMark(pos, pos + node.nodeSize, mark.type.create({ ...mark.attrs, aliased: false }));
+			});
+			if (tr.docChanged) editor.view.dispatch(tr);
 		}
-		if (isOriginCurrent(origin, true)) markEdited();
 	}
 
 	function insertWikiLink(entry: NoteTitleEntry, originalRef?: string) {
@@ -3266,6 +3302,7 @@
 					const content = await readNote(vault, newNote.path);
 					if (!isCurrent()) return;
 					if (!(await flushSave()) || !isCurrent()) return;
+					if (workspace?.activateOpenNote(newNote.path, paneContext)) return;
 					$activeNote = content;
 					$activeNotePath = newNote.path;
 					$editorDirty = false;
@@ -3277,10 +3314,11 @@
 		}
 		try {
 			const absPath = resolveNotePath(path);
-			if (absPath === $activeNotePath) return;
+			if (workspace?.activateOpenNote(absPath, paneContext) || absPath === $activeNotePath) return;
 			const content = await readNote(vault, absPath);
 			if (!isCurrent()) return;
 			if (!(await flushSave()) || !isCurrent()) return;
+			if (workspace?.activateOpenNote(absPath, paneContext)) return;
 			$activeNote = content;
 			$activeNotePath = absPath;
 		} catch (e) {
@@ -3306,10 +3344,11 @@
 		wikiLinkNavDisambig = null;
 		try {
 			const absPath = resolveNotePath(entry.path);
-			if (absPath === $activeNotePath) return;
+			if (workspace?.activateOpenNote(absPath, paneContext) || absPath === $activeNotePath) return;
 			const content = await readNote(vault, absPath);
 			if (!isCurrent()) return;
 			if (!(await flushSave()) || !isCurrent()) return;
+			if (workspace?.activateOpenNote(absPath, paneContext)) return;
 			$activeNote = content;
 			$activeNotePath = absPath;
 		} catch (e) {
@@ -3472,6 +3511,7 @@
 
 	async function saveConflictCopy() {
 		if (!saveError?.conflict || !$activeNote || !$activeNotePath || !$appConfig?.active_vault || retryingSave) return;
+		const isCurrent = beginEditorNoteNavigation();
 		const origin = captureOrigin();
 		const vault = origin.vault!;
 		const originalPath = origin.path!;
@@ -3480,7 +3520,7 @@
 		retryingSave = true;
 		try {
 			await saves.idle();
-			if (!isOriginCurrent(origin, true)) return;
+			if (!isCurrent() || !isOriginCurrent(origin, true)) return;
 			const parent = originalPath.slice(vault.length + 1).replace(/[/\\][^/\\]+$/, '');
 			const notebook = parent === originalPath.slice(vault.length + 1) ? null : parent.replace(/\\/g, '/');
 			const entry = await createNote(vault, notebook, `${meta.title} (conflict copy)`);
@@ -3495,9 +3535,9 @@
 			}
 			const copy = await readNote(vault, entry.path);
 			await saveNote(vault, entry.path, { ...copy.meta, pinned: meta.pinned, tags: meta.tags }, body, copy.raw);
-			if (!isOriginCurrent(origin, true)) return;
+			if (!isCurrent() || !isOriginCurrent(origin, true)) return;
 			const current = await readNote(vault, entry.path);
-			if (!isOriginCurrent(origin, true)) return;
+			if (!isCurrent() || !isOriginCurrent(origin, true)) return;
 			$activeNotePath = entry.path;
 			$activeNote = current;
 			loadNote(entry.path, current.content);
@@ -3511,12 +3551,13 @@
 	async function reloadConflictedNote() {
 		if (!saveError?.conflict || !$activeNotePath || !$appConfig?.active_vault) return;
 		if (!window.confirm('Discard your unsaved draft and reload this note from disk? Choose Save a copy to keep the draft.')) return;
+		const isCurrent = beginEditorNoteNavigation();
 		const origin = captureOrigin();
 		try {
 			await saves.idle();
-			if (!isOriginCurrent(origin, true)) return;
+			if (!isCurrent() || !isOriginCurrent(origin, true)) return;
 			const content = await readNote(origin.vault!, origin.path!);
-			if (!isOriginCurrent(origin, true)) return;
+			if (!isCurrent() || !isOriginCurrent(origin, true)) return;
 			$activeNote = content;
 			loadNote(origin.path!, content.content);
 		} catch (error) {
@@ -3869,7 +3910,7 @@
 		const vault = $appConfig?.active_vault;
 		const path = $activeNotePath;
 		tick().then(() => {
-			if (editorDisposed || !isCurrentNoteNavigation(navigationToken)
+			if (editorDisposed || !paneIsActive() || !isCurrentNoteNavigation(navigationToken)
 				|| vault !== $appConfig?.active_vault || path !== $activeNotePath) return;
 			if (titleInput) {
 				titleInput.focus();
@@ -3883,12 +3924,15 @@
 		const vault = $appConfig?.active_vault;
 		if (!isCurrent() || !vault) return;
 		if (!(await flushSave()) || !isCurrent()) return;
-		const path = navHistory.go(direction);
-		if (!path) return;
+		const history = get(navHistory);
+		const path = history.stack[history.index + direction];
+		if (!path || workspace?.activateOpenNote(path, paneContext)) return;
+		navHistory.go(direction);
 		try {
 			const content = await readNote(vault, path);
 			if (!isCurrent()) return;
 			if (!(await flushSave()) || !isCurrent()) return;
+			if (workspace?.activateOpenNote(path, paneContext)) return;
 			$activeNote = content;
 			$activeNotePath = path;
 			$editorDirty = false;
@@ -3931,7 +3975,9 @@
 	export async function beginPathMutation(): Promise<(() => void) | null> {
 		if (externalOperationBusy) return null;
 		const path = $activeNotePath;
-		if (!(await flushSave()) || externalOperationBusy || path !== $activeNotePath) return null;
+		if ($editorDirty && !(await forceSave(true))) return null;
+		await saves.idle();
+		if ($editorDirty || externalOperationBusy || path !== $activeNotePath) return null;
 		externalOperationBusy = true;
 		source.configure(true, !isMobile && ($appConfig?.show_line_numbers ?? false));
 		editor?.setEditable(false);
@@ -3990,6 +4036,7 @@
 	}
 
 	export function loadNote(path: string, content: string, taskTarget?: TaskRecord) {
+		navHistory.push(path);
 		loadFailure = null;
 		cancelProgressiveLoad();
 		endToolbarCustomization();
@@ -7162,7 +7209,7 @@
 				if (!isCurrent() || !source.view) return;
 				if (noteSearchOpen) return;
 				source.select(anchor, head, true);
-				if (!isMobile) source.focus();
+				if (!isMobile && paneIsActive()) source.focus();
 			});
 		} else if (!isSource && lastSourceMode) {
 			clearOutline();
@@ -7180,7 +7227,7 @@
 				const head = selection.empty ? anchor : positionAt(selection.head);
 				const sel = TextSelection.between(editor.state.doc.resolve(anchor), editor.state.doc.resolve(head));
 				editor.view.dispatch(editor.state.tr.setSelection(sel).scrollIntoView());
-				if (!isMobile) editor.view.focus();
+				if (!isMobile && paneIsActive()) editor.view.focus();
 				requestAnimationFrame(() => { if (isCurrent()) editor?.commands.scrollIntoView(); });
 			};
 			if (isMobile) {
@@ -7376,7 +7423,13 @@
 	}).catch(e => console.error('Failed to listen for toolbar changes:', e));
 
 	function handleOpenNote(event: Event) {
-		const path = (event as CustomEvent<string>).detail;
+		const detail = (event as CustomEvent<string | { path: string; paneId?: string }>).detail;
+		const path = typeof detail === 'string' ? detail : detail.path;
+		if (workspace) {
+			const state = get(workspace);
+			const id = typeof detail === 'string' ? state.activePaneId : detail.paneId ?? state.activePaneId;
+			if (!state.panes.some(p => p.id === id && p.context === paneContext)) return;
+		}
 		if (typeof path === 'string' && path) void navigateToWikiLink(path, '');
 	}
 	window.addEventListener('ryuknotes-open-note', handleOpenNote);
@@ -7828,7 +7881,7 @@
 							if (stem !== newTitle) {
 								renamingNote = origin.snapshot;
 								try {
-									const newPath = await renameNote(origin.vault, oldPath, newTitle);
+									const newPath = await renameWithPaneBarrier(origin.vault, oldPath, newTitle);
 									if (isOriginCurrent(origin)) {
 										loadedPath = newPath;
 										$activeNotePath = newPath;

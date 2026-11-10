@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { getActiveEditorPane } from '$lib/stores/editor-workspace';
+	import { getActiveEditorPane, getEditorWorkspace, type PaneNavigation, type PaneRelease } from '$lib/stores/editor-workspace';
 
 	import { onDestroy, tick, untrack } from 'svelte';
 	import { get } from 'svelte/store';
@@ -51,25 +51,23 @@
 	import { isMobile, isAndroid } from '$lib/platform';
 
 	const activePane = getActiveEditorPane();
+	const workspace = getEditorWorkspace()!;
 	const activeNote = $derived($activePane.activeNote);
 	const activeNotePath = $derived($activePane.activeNotePath);
 	const editorDirty = $derived($activePane.editorDirty);
-	const beginNoteNavigation = $derived($activePane.beginNoteNavigation);
-	const isCurrentNoteNavigation = $derived($activePane.isCurrentNoteNavigation);
-	const cancelNoteNavigation = $derived($activePane.cancelNoteNavigation);
 
 	let { onActivateOpenNote = (_path: string) => false, onNoteSelected = (_path: string, _content: string, _task?: TaskItem) => {}, onNoteMoved = () => {}, onBeforeNoteSwitch = async () => true, onBeforeNoteDuplicate = async () => true, onBeforePathMutation = async () => null, onPathsMoved = async (_old: string, _next: string) => {}, onUpdateActiveNote, onTagsChanged, onRefreshTags, onNoteCreated = () => {}, onToggleTask = async (_t: TaskItem) => {}, onSetTaskPriority = async (_t: TaskItem, _p: string | null) => {}, onSetTaskDue = async (_t: TaskItem, _d: string | null) => {} }: {
-		onActivateOpenNote?: (path: string) => boolean;
-		onNoteSelected?: (path: string, content: string, task?: TaskItem) => void;
+		onActivateOpenNote?: (path: string, token?: PaneNavigation) => boolean;
+		onNoteSelected?: (path: string, content: string, task?: TaskItem, token?: PaneNavigation) => void;
 		onNoteMoved?: () => void;
-		onBeforeNoteSwitch?: () => Promise<boolean>;
+		onBeforeNoteSwitch?: (token?: PaneNavigation) => Promise<boolean>;
 		onBeforeNoteDuplicate?: () => Promise<boolean>;
-		onBeforePathMutation?: () => Promise<(() => void) | null>;
+		onBeforePathMutation?: (paths?: readonly string[]) => Promise<PaneRelease | null>;
 		onPathsMoved?: (oldPath: string, newPath: string) => Promise<void>;
 		onUpdateActiveNote: (patch: Pick<NoteMeta, 'pinned' | 'tags'>) => Promise<boolean>;
 		onTagsChanged: (path: string, nextTags: string[]) => void;
 		onRefreshTags: () => void;
-		onNoteCreated?: (token: number) => void;
+		onNoteCreated?: (token: PaneNavigation) => void;
 		onToggleTask?: (t: TaskItem) => Promise<void>;
 		onSetTaskPriority?: (t: TaskItem, p: string | null) => Promise<void>;
 		onSetTaskDue?: (t: TaskItem, d: string | null) => Promise<void>;
@@ -127,15 +125,16 @@
 		try {
 			const entry = await createDailyNote(ownerVault!, date);
 			if (!navigationIsCurrent(token)) return;
-			if (onActivateOpenNote(entry.path)) return;
+			if (onActivateOpenNote(entry.path, token)) return;
 			const content = await readNote(ownerVault!, entry.path);
 			if (!navigationIsCurrent(token)) return;
-			if (!(await onBeforeNoteSwitch())) return;
+			if (!(await onBeforeNoteSwitch(token))) return;
 			if (!navigationIsCurrent(token)) return;
-			$activeNote = content;
-			$activeNotePath = entry.path;
-			$editorDirty = false;
-			onNoteSelected(entry.path, content.content);
+			if (onActivateOpenNote(entry.path, token)) return;
+			token.context.activeNote.set(content);
+			token.context.activeNotePath.set(entry.path);
+			token.context.editorDirty.set(false);
+			onNoteSelected(entry.path, content.content, undefined, token);
 			if (!dailyDates.has(date)) {
 				dailyDates = new Set([...dailyDates, date]);
 				onNoteMoved();
@@ -239,18 +238,23 @@
 	let measurementFrame: number | null = null;
 	let disposed = false;
 	const ownerVault = get(appConfig)?.active_vault ?? null;
-	let navigationToken = 0;
+	const navigationIntents = new Set<PaneNavigation>();
 
 	function ownerIsCurrent() {
 		return !disposed && (get(appConfig)?.active_vault ?? null) === ownerVault;
 	}
 
-	function beginNavigation() {
-		return navigationToken = beginNoteNavigation();
+	function beginNavigation(path?: string) {
+		const token = workspace.captureForPath(path);
+		for (const older of navigationIntents) {
+			if (older.paneId === token.paneId || !older.isCurrent()) navigationIntents.delete(older);
+		}
+		navigationIntents.add(token);
+		return token;
 	}
 
-	function navigationIsCurrent(token: number) {
-		return ownerIsCurrent() && isCurrentNoteNavigation(token);
+	function navigationIsCurrent(token: PaneNavigation) {
+		return ownerIsCurrent() && token.isCurrent();
 	}
 	const BUFFER = 10;
 	let offsets = $derived.by(() => {
@@ -296,10 +300,10 @@
 		});
 	}
 
-	export async function revealNote(path: string, token: number): Promise<boolean> {
+	export async function revealNote(path: string, token: PaneNavigation): Promise<boolean> {
 		const view = cacheKey();
-		const current = () => ownerIsCurrent() && isCurrentNoteNavigation(token)
-			&& $activeNotePath === path && cacheKey() === view;
+		const current = () => ownerIsCurrent() && token.isCurrent()
+			&& get(token.context.activeNotePath) === path && cacheKey() === view;
 		if (!current()) return false;
 		clearSelection();
 		stickToBottom = false;
@@ -376,7 +380,7 @@
 	onDestroy(() => {
 		disposed = true;
 		refreshRequest++;
-		cancelNoteNavigation(navigationToken);
+		for (const intent of navigationIntents) intent.cancel();
 		if (longPressTimer) clearTimeout(longPressTimer);
 		rowObserver?.disconnect();
 		if (measurementFrame !== null) cancelAnimationFrame(measurementFrame);
@@ -571,48 +575,48 @@
 		}
 	}
 
-	async function selectNote(note: NoteEntry, token = beginNavigation()) {
+	async function selectNote(note: NoteEntry, token = beginNavigation(note.path)) {
 		if (!navigationIsCurrent(token)) return;
-		if (onActivateOpenNote(note.path)) {
+		if (onActivateOpenNote(note.path, token)) {
 			if (isMobile) $mobileView = 'editor';
 			return;
 		}
-		if ($activeNotePath === note.path) {
+		if (get(token.context.activeNotePath) === note.path) {
 			if (isMobile) $mobileView = 'editor';
 			return;
 		}
 		try {
 			const content = await readNote(ownerVault!, note.path);
 			if (!navigationIsCurrent(token)) return;
-			if (!(await onBeforeNoteSwitch())) return;
+			if (!(await onBeforeNoteSwitch(token))) return;
 			if (!navigationIsCurrent(token)) return;
-			if (onActivateOpenNote(note.path)) return;
-			$activeNote = content;
-			$activeNotePath = note.path;
-			$editorDirty = false;
-			onNoteSelected(note.path, content.content);
+			if (onActivateOpenNote(note.path, token)) return;
+			token.context.activeNote.set(content);
+			token.context.activeNotePath.set(note.path);
+			token.context.editorDirty.set(false);
+			onNoteSelected(note.path, content.content, undefined, token);
 		} catch (e) {
 			console.error('Failed to read note:', e);
 		}
 	}
 
 	async function openTask(task: TaskItem) {
-		const token = beginNavigation();
+		const token = beginNavigation(task.note_path);
 		if (!navigationIsCurrent(token)) return;
-		if (onActivateOpenNote(task.note_path)) {
+		if (onActivateOpenNote(task.note_path, token)) {
 			if (isMobile) $mobileView = 'editor';
 			return;
 		}
 		try {
 			const content = await readNote(ownerVault!, task.note_path);
 			if (!navigationIsCurrent(token)) return;
-			if (!(await onBeforeNoteSwitch())) return;
+			if (!(await onBeforeNoteSwitch(token))) return;
 			if (!navigationIsCurrent(token)) return;
-			if (onActivateOpenNote(task.note_path)) return;
-			$activeNote = content;
-			$activeNotePath = task.note_path;
-			$editorDirty = false;
-			onNoteSelected(task.note_path, content.content, task);
+			if (onActivateOpenNote(task.note_path, token)) return;
+			token.context.activeNote.set(content);
+			token.context.activeNotePath.set(task.note_path);
+			token.context.editorDirty.set(false);
+			onNoteSelected(task.note_path, content.content, task, token);
 		} catch (e) {
 			console.error('Failed to open task note:', e);
 		}
@@ -635,9 +639,9 @@
 		let nbRelative: string | null = null;
 		if ($viewMode === 'notebook' && $activeNotebook) {
 			nbRelative = $activeNotebook.relative_path || null;
-		} else if ($appConfig?.active_vault && $activeNotePath) {
+		} else if ($appConfig?.active_vault && get(token.context.activeNotePath)) {
 			const vaultN = $appConfig.active_vault.replace(/\\/g, '/');
-			const apN = $activeNotePath.replace(/\\/g, '/');
+			const apN = get(token.context.activeNotePath)!.replace(/\\/g, '/');
 			if (apN.startsWith(vaultN + '/')) {
 				const rel = apN.slice(vaultN.length + 1);
 				const slash = rel.lastIndexOf('/');
@@ -645,7 +649,7 @@
 			}
 		}
 		try {
-			if (!(await onBeforeNoteSwitch())) return;
+			if (!(await onBeforeNoteSwitch(token))) return;
 			if (!navigationIsCurrent(token)) return;
 			const entry = await createNote(ownerVault!, nbRelative, 'Untitled');
 			if (!ownerIsCurrent()) return;
@@ -657,12 +661,13 @@
 			// The first save must use the exact file created on disk, not wait for a watcher echo.
 			const content = await readNote(ownerVault!, entry.path);
 			if (!navigationIsCurrent(token)) return;
-			if (!(await onBeforeNoteSwitch())) return;
+			if (!(await onBeforeNoteSwitch(token))) return;
 			if (!navigationIsCurrent(token)) return;
-			$activeNote = content;
-			$activeNotePath = entry.path;
-			$editorDirty = false;
-			onNoteSelected(entry.path, content.content);
+			if (onActivateOpenNote(entry.path, token)) return;
+			token.context.activeNote.set(content);
+			token.context.activeNotePath.set(entry.path);
+			token.context.editorDirty.set(false);
+			onNoteSelected(entry.path, content.content, undefined, token);
 			onNoteCreated(token);
 		} catch (e) {
 			console.error('Failed to create note:', e);
@@ -674,7 +679,7 @@
 		if (!navigationIsCurrent(token)) return;
 		contextMenu = null;
 		try {
-			if ($activeNotePath === note.path && $editorDirty) {
+			{
 				const saved = await onBeforeNoteDuplicate();
 				if (!saved) {
 					console.error('Failed to save note before duplicating');
@@ -708,11 +713,12 @@
 			editingNote = null;
 			return;
 		}
-		const release = $activeNotePath === note.path ? await onBeforePathMutation() : () => {};
+		const requestedTitle = editValue.trim();
+		const release = await onBeforePathMutation();
 		if (!release) return;
 		try {
 			if (!ownerIsCurrent()) return;
-			const newTitle = editValue.trim();
+			const newTitle = requestedTitle;
 			const newPath = await renameNote(ownerVault!, note.path, newTitle);
 			if (!ownerIsCurrent()) return;
 			renameManualNoteOrderPath(note.path, newPath);
@@ -727,114 +733,164 @@
 		} catch (e) {
 			console.error('Failed to rename:', e);
 		} finally {
-			release();
+			await release();
 		}
 	}
 
 	async function handleDelete(note: NoteEntry) {
-		contextMenu = null;
+		const release = await onBeforePathMutation([note.path]);
+		if (!release)
+			return;
 		try {
-			if ($activeNotePath === note.path && !(await onBeforeNoteSwitch())) return;
-			if (!ownerIsCurrent()) return;
-			await deleteNote(ownerVault!, note.path);
-			if (!ownerIsCurrent()) return;
-			removeManualNoteOrderPath(note.path);
-			noteCache.clear();
-			// Remove from local store immediately (avoid full vault re-scan)
-			$notes = $notes.filter(n => n.path !== note.path);
-			if ($activeNotePath === note.path) {
-				$activeNote = null;
-				$activeNotePath = null;
+			contextMenu = null;
+			try {
+				if (!ownerIsCurrent())
+					return;
+				await deleteNote(ownerVault!, note.path);
+				if (!ownerIsCurrent())
+					return;
+				removeManualNoteOrderPath(note.path);
+				noteCache.clear();
+				// Remove from local store immediately (avoid full vault re-scan)
+				$notes = $notes.filter(n => n.path !== note.path);
 			}
-		} catch (e) {
-			console.error('Failed to delete:', e);
+			catch (e) {
+				console.error('Failed to delete:', e);
+			}
+		}
+		finally {
+			await release();
 		}
 	}
 
 
 	async function handleRestore(note: NoteEntry) {
-		contextMenu = null;
+		const release = await onBeforePathMutation([note.path]);
+		if (!release)
+			return;
 		try {
-			await restoreNote(ownerVault!, note.path, null);
-			if (!ownerIsCurrent()) return;
-			noteCache.clear();
-			await refresh();
-		} catch (e) {
-			console.error('Failed to restore:', e);
+			contextMenu = null;
+			try {
+				await restoreNote(ownerVault!, note.path, null);
+				if (!ownerIsCurrent())
+					return;
+				noteCache.clear();
+				await refresh();
+			}
+			catch (e) {
+				console.error('Failed to restore:', e);
+			}
+		}
+		finally {
+			await release();
 		}
 	}
 
 	async function handlePermanentDelete(note: NoteEntry) {
-		contextMenu = null;
+		const release = await onBeforePathMutation([note.path]);
+		if (!release)
+			return;
 		try {
-			await permanentDelete(ownerVault!, note.path);
-			if (!ownerIsCurrent()) return;
-			removeManualNoteOrderPath(note.path);
-			noteCache.clear();
-			$notes = $notes.filter(n => n.path !== note.path);
-			if ($activeNotePath === note.path) {
-				$activeNote = null;
-				$activeNotePath = null;
+			contextMenu = null;
+			try {
+				await permanentDelete(ownerVault!, note.path);
+				if (!ownerIsCurrent())
+					return;
+				removeManualNoteOrderPath(note.path);
+				noteCache.clear();
+				$notes = $notes.filter(n => n.path !== note.path);
 			}
-		} catch (e) {
-			console.error('Failed to delete permanently:', e);
+			catch (e) {
+				console.error('Failed to delete permanently:', e);
+			}
+		}
+		finally {
+			await release();
 		}
 	}
 
 	async function handleRestoreNotebook(nb: TrashNotebookEntry) {
-		trashBusy = nb.path;
+		const release = await onBeforePathMutation([nb.path]);
+		if (!release)
+			return;
 		try {
-			await restoreNotebook(ownerVault!, nb.path);
-			if (!ownerIsCurrent()) return;
-			noteCache.clear();
-			await refresh();
-		} catch (e) {
-			console.error('Failed to restore notebook:', e);
-		} finally {
-			trashBusy = null;
+			trashBusy = nb.path;
+			try {
+				await restoreNotebook(ownerVault!, nb.path);
+				if (!ownerIsCurrent())
+					return;
+				noteCache.clear();
+				await refresh();
+			}
+			catch (e) {
+				console.error('Failed to restore notebook:', e);
+			}
+			finally {
+				trashBusy = null;
+			}
+		}
+		finally {
+			await release();
 		}
 	}
 
 	async function handleDeleteNotebook(nb: TrashNotebookEntry) {
-		trashBusy = nb.path;
+		const release = await onBeforePathMutation([nb.path]);
+		if (!release)
+			return;
 		try {
-			await permanentDelete(ownerVault!, nb.path);
-			if (!ownerIsCurrent()) return;
-			noteCache.clear();
-			trashNotebooks = trashNotebooks.filter(n => n.path !== nb.path);
-		} catch (e) {
-			console.error('Failed to delete notebook permanently:', e);
-		} finally {
-			trashBusy = null;
+			trashBusy = nb.path;
+			try {
+				await permanentDelete(ownerVault!, nb.path);
+				if (!ownerIsCurrent())
+					return;
+				noteCache.clear();
+				trashNotebooks = trashNotebooks.filter(n => n.path !== nb.path);
+			}
+			catch (e) {
+				console.error('Failed to delete notebook permanently:', e);
+			}
+			finally {
+				trashBusy = null;
+			}
+		}
+		finally {
+			await release();
 		}
 	}
 
 	async function updateMetadata(path: string, update: (meta: NoteMeta) => void) {
-		if (!ownerIsCurrent()) return;
-		const diskNote = $activeNotePath === path && $activeNote ? $activeNote : await readNote(ownerVault!, path);
-		if (!ownerIsCurrent()) return;
-		const current = $activeNotePath === path && $activeNote ? $activeNote : diskNote;
-		const meta = { ...current.meta, tags: [...current.meta.tags] };
-		update(meta);
-		if ($activeNotePath === path && $activeNote) {
-			if (!(await onUpdateActiveNote({ pinned: meta.pinned, tags: meta.tags }))) {
-				throw new Error('Note still has unsaved changes');
-			}
-		} else {
+		const release = await onBeforePathMutation([path]);
+		if (!release)
+			return;
+		try {
+			if (!ownerIsCurrent())
+				return;
+			const current = await readNote(ownerVault!, path);
+			if (!ownerIsCurrent())
+				return;
+			const meta = { ...current.meta, tags: [...current.meta.tags] };
+			update(meta);
 			await saveNote(ownerVault!, path, meta, current.content, current.raw);
-		}
-		if (!ownerIsCurrent()) return;
-		if (current.meta.tags.length !== meta.tags.length || current.meta.tags.some((tag) => !meta.tags.includes(tag))) {
-			onTagsChanged(path, meta.tags);
-		}
-		let entry = $notes.find((note) => note.path === path);
-		if (!entry) {
-			for (const list of noteCache.values()) {
-				entry = list.find((note) => note.path === path);
-				if (entry) break;
+			if (!ownerIsCurrent())
+				return;
+			if (current.meta.tags.length !== meta.tags.length || current.meta.tags.some((tag) => !meta.tags.includes(tag))) {
+				onTagsChanged(path, meta.tags);
 			}
+			let entry = $notes.find((note) => note.path === path);
+			if (!entry) {
+				for (const list of noteCache.values()) {
+					entry = list.find((note) => note.path === path);
+					if (entry)
+						break;
+				}
+			}
+			if (entry)
+				updateNote({ ...entry, meta: { ...entry.meta, pinned: meta.pinned, tags: meta.tags } });
 		}
-		if (entry) updateNote({ ...entry, meta: { ...entry.meta, pinned: meta.pinned, tags: meta.tags } });
+		finally {
+			await release();
+		}
 	}
 
 	async function handleTogglePin(note: NoteEntry) {
@@ -1010,7 +1066,7 @@
 	async function handleMoveNote(note: NoteEntry, destPath: string) {
 		contextMenu = null;
 		movePickerNote = null;
-		const release = $activeNotePath === note.path ? await onBeforePathMutation() : () => {};
+		const release = await onBeforePathMutation();
 		if (!release) return;
 		try {
 			if (!ownerIsCurrent()) return;
@@ -1024,7 +1080,7 @@
 		} catch (e) {
 			console.error('Failed to move note:', e);
 		} finally {
-			release();
+			await release();
 		}
 	}
 
@@ -1128,26 +1184,34 @@
 	}
 
 	// Batch operations
+	// Batch operations
 	async function handleBatchDelete() {
-		const toDelete = new Set(selectedPaths);
-		if ($activeNotePath && toDelete.has($activeNotePath) && !(await onBeforeNoteSwitch())) return;
-		if (!ownerIsCurrent()) return;
-		noteCache.clear();
-		for (const path of toDelete) removeManualNoteOrderPath(path);
-		$notes = $notes.filter(n => !toDelete.has(n.path));
-		if ($activeNotePath && toDelete.has($activeNotePath)) {
-			$activeNote = null;
-			$activeNotePath = null;
+		const capturedPaths = [...selectedPaths];
+		const release = await onBeforePathMutation(capturedPaths);
+		if (!release)
+			return;
+		try {
+			const toDelete = new Set(capturedPaths);
+			if (!ownerIsCurrent())
+				return;
+			noteCache.clear();
+			for (const path of toDelete)
+				removeManualNoteOrderPath(path);
+			$notes = $notes.filter(n => !toDelete.has(n.path));
+			clearSelection();
+			await Promise.all([...toDelete].map(p => deleteNote(ownerVault!, p).catch(e => console.error('Failed to delete:', p, e))));
+			if (!ownerIsCurrent())
+				return;
+			onNoteMoved();
 		}
-		clearSelection();
-		await Promise.all([...toDelete].map(p => deleteNote(ownerVault!, p).catch(e => console.error('Failed to delete:', p, e))));
-		if (!ownerIsCurrent()) return;
-		onNoteMoved();
+		finally {
+			await release();
+		}
 	}
 
 	async function handleBatchMove(destPath: string) {
 		const toMove = new Set(selectedPaths);
-		const release = $activeNotePath && toMove.has($activeNotePath) ? await onBeforePathMutation() : () => {};
+		const release = await onBeforePathMutation();
 		if (!release) return;
 		try {
 			if (!ownerIsCurrent()) return;
@@ -1166,31 +1230,47 @@
 			clearSelection();
 			if (ownerIsCurrent()) onNoteMoved();
 		} finally {
-			release();
+			await release();
 		}
 	}
 
 	async function handleBatchRestore() {
-		const toRestore = [...selectedPaths];
-		noteCache.clear();
-		clearSelection();
-		await Promise.all(toRestore.map(p => restoreNote(ownerVault!, p, null).catch(e => console.error('Failed to restore:', p, e))));
-		await refresh();
-		if (!ownerIsCurrent()) return;
-		onNoteMoved();
+		const capturedPaths = [...selectedPaths];
+		const release = await onBeforePathMutation(capturedPaths);
+		if (!release)
+			return;
+		try {
+			const toRestore = capturedPaths;
+			noteCache.clear();
+			clearSelection();
+			await Promise.all(toRestore.map(p => restoreNote(ownerVault!, p, null).catch(e => console.error('Failed to restore:', p, e))));
+			await refresh();
+			if (!ownerIsCurrent())
+				return;
+			onNoteMoved();
+		}
+		finally {
+			await release();
+		}
 	}
 
 	async function handleBatchPermanentDelete() {
-		const toDelete = new Set(selectedPaths);
-		noteCache.clear();
-		for (const path of toDelete) removeManualNoteOrderPath(path);
-		$notes = $notes.filter(n => !toDelete.has(n.path));
-		if ($activeNotePath && toDelete.has($activeNotePath)) {
-			$activeNote = null;
-			$activeNotePath = null;
+		const capturedPaths = [...selectedPaths];
+		const release = await onBeforePathMutation(capturedPaths);
+		if (!release)
+			return;
+		try {
+			const toDelete = new Set(capturedPaths);
+			noteCache.clear();
+			for (const path of toDelete)
+				removeManualNoteOrderPath(path);
+			$notes = $notes.filter(n => !toDelete.has(n.path));
+			clearSelection();
+			await Promise.all([...toDelete].map(p => permanentDelete(ownerVault!, p).catch(e => console.error('Failed to delete:', p, e))));
 		}
-		clearSelection();
-		await Promise.all([...toDelete].map(p => permanentDelete(ownerVault!, p).catch(e => console.error('Failed to delete:', p, e))));
+		finally {
+			await release();
+		}
 	}
 
 	function handleWindowClick(event: MouseEvent) {

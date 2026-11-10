@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { getActiveEditorPane } from '$lib/stores/editor-workspace';
+	import { getActiveEditorPane, type PaneRelease } from '$lib/stores/editor-workspace';
 
 	import { onDestroy, tick } from 'svelte';
 	import { get } from 'svelte/store';
@@ -52,7 +52,7 @@
 	let { onViewChanged = () => {}, onBeforeNoteChange = async () => true, onBeforePathMutation = async () => null, onPathsMoved = async (_old: string, _next: string) => {} }: {
 		onViewChanged?: () => void;
 		onBeforeNoteChange?: () => Promise<boolean>;
-		onBeforePathMutation?: () => Promise<(() => void) | null>;
+		onBeforePathMutation?: (paths?: readonly string[]) => Promise<PaneRelease | null>;
 		onPathsMoved?: (oldPath: string, nextPath: string) => Promise<void>;
 	} = $props();
 
@@ -390,11 +390,12 @@
 			editingNotebook = null;
 			return;
 		}
+		const requestedTitle = editValue.trim();
 		const release = await onBeforePathMutation();
 		if (!release) return;
 		try {
 			if (!ownerIsCurrent()) return;
-			const newPath = await renameNotebook(ownerVault!, nb.path, editValue.trim());
+			const newPath = await renameNotebook(ownerVault!, nb.path, requestedTitle);
 			if (!ownerIsCurrent()) return;
 			migratePaths(nb.path, newPath);
 			await onPathsMoved(nb.path, newPath);
@@ -404,7 +405,7 @@
 		} catch (e) {
 			console.error('Failed to rename:', e);
 		} finally {
-			release();
+			await release();
 		}
 	}
 
@@ -427,18 +428,28 @@
 	}
 
 	async function confirmDelete(nb: NotebookEntry) {
-		deleteConfirm = null;
+		const release = await onBeforePathMutation();
+		if (!release)
+			return;
 		try {
-			if (!(await onBeforeNoteChange())) return;
-			if (!ownerIsCurrent()) return;
-			await deleteNotebook(ownerVault!, nb.path);
-			if (!ownerIsCurrent()) return;
-			if ($activeNotebook?.path === nb.path) {
-				selectAllNotes();
+			deleteConfirm = null;
+			try {
+				if (!ownerIsCurrent())
+					return;
+				await deleteNotebook(ownerVault!, nb.path);
+				if (!ownerIsCurrent())
+					return;
+				if ($activeNotebook?.path === nb.path) {
+					selectAllNotes();
+				}
+				await refresh();
 			}
-			await refresh();
-		} catch (e) {
-			console.error('Failed to delete:', e);
+			catch (e) {
+				console.error('Failed to delete:', e);
+			}
+		}
+		finally {
+			await release();
 		}
 	}
 
@@ -465,7 +476,7 @@
 			}
 			if (ownerIsCurrent()) await refresh();
 		} finally {
-			release();
+			await release();
 		}
 	}
 
@@ -496,7 +507,7 @@
 		} catch (error) {
 			console.error('Failed to move notebook:', error);
 		} finally {
-			release();
+			await release();
 		}
 	}
 
@@ -589,7 +600,7 @@
 		const srcParent = parentOf(srcPath);
 		const targetParent = parentOf(targetPath);
 		let actualSrcPath = srcPath;
-		const release = srcParent !== targetParent ? await onBeforePathMutation() : () => {};
+		const release = srcParent !== targetParent ? await onBeforePathMutation() : async () => {};
 		if (!release) return;
 		try {
 			// Step 1: if different parents, move src into target's parent first
@@ -629,7 +640,7 @@
 		} catch (e) {
 			console.error('Failed to reorder notebook:', e);
 		} finally {
-			release();
+			await release();
 		}
 	}
 
@@ -777,20 +788,24 @@
 	}
 
 	async function handleEmptyTrash() {
-		trashContextMenu = null;
-		const previous = $activeNote;
-		const path = $activeNotePath;
+		const release = await onBeforePathMutation(undefined);
+		if (!release)
+			return;
 		try {
-			await emptyTrash(ownerVault!);
-			if (!ownerIsCurrent()) return;
-			// Clear selection and refresh the list (with cache invalidation)
-			if ($activeNotePath === path && $activeNote === previous) {
-				$activeNote = null;
-				$activeNotePath = '';
+			trashContextMenu = null;
+			try {
+				await emptyTrash(ownerVault!);
+				if (!ownerIsCurrent())
+					return;
+				// Clear selection and refresh the list (with cache invalidation)
+				onViewChanged();
 			}
-			onViewChanged();
-		} catch (e) {
-			console.error('Failed to empty trash:', e);
+			catch (e) {
+				console.error('Failed to empty trash:', e);
+			}
+		}
+		finally {
+			await release();
 		}
 	}
 

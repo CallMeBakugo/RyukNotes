@@ -7,13 +7,14 @@ import ts from 'typescript';
 import * as navigation from '../src/lib/utils/note-navigation.ts';
 import * as naturalSort from '../src/lib/utils/natural-sort.ts';
 
-function load(source, imports) {
+function load(source, imports, globals = {}) {
   const exports = {};
   const { outputText } = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   });
   runInNewContext(outputText, {
     exports,
+    ...globals,
     require: name => {
       assert.ok(name in imports, `Unexpected dependency: ${name}`);
       return imports[name];
@@ -237,4 +238,217 @@ test('a delayed close cannot remove a newly opened replacement pane', async () =
   finish(true);
   assert.equal(await delayed, false);
   assert.equal(stores.get(workspace).panes[1], replacement);
+});
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+test('navigation captures its destination and only newer intents in that pane cancel it', async () => {
+  const workspace = workspaceModule.createEditorWorkspace();
+  const left = stores.get(workspace).panes[0];
+  const a = workspace.captureNavigation();
+  const load = deferred();
+  const publishing = load.promise.then(value => { if (a.isCurrent()) a.context.activeNotePath.set(value); });
+  workspace.openSplit();
+  const right = stores.get(workspace).panes[1];
+  const b = workspace.captureNavigation();
+  const newerB = workspace.captureNavigation();
+  assert.equal(a.isCurrent(), true);
+  assert.equal(b.isCurrent(), false);
+  assert.equal(newerB.isCurrent(), true);
+  load.resolve('left-note');
+  await publishing;
+  assert.equal(stores.get(left.context.activeNotePath), 'left-note');
+  assert.equal(stores.get(right.context.activeNotePath), null);
+  const newerA = workspace.captureNavigation(left.context);
+  assert.equal(a.isCurrent(), false);
+  assert.equal(newerA.isCurrent(), true);
+  assert.equal(newerB.isCurrent(), true);
+});
+
+test('same-note destination capture uses the existing owner and cancels its older load', () => {
+  const workspace = workspaceModule.createEditorWorkspace();
+  const left = stores.get(workspace).panes[0];
+  left.context.activeNotePath.set('already-open');
+  const pending = workspace.captureNavigation();
+  workspace.openSplit();
+  const rightPending = workspace.captureNavigation();
+  const selecting = workspace.captureForPath('already-open');
+  assert.equal(selecting.context, left.context);
+  assert.equal(pending.isCurrent(), false);
+  assert.equal(rightPending.isCurrent(), true);
+  assert.equal(workspace.activateOpenNote('already-open', selecting.context), true);
+  assert.equal(selecting.isCurrent(), true);
+});
+
+function barrierFixture() {
+  const workspace = workspaceModule.createEditorWorkspace();
+  workspace.openSplit();
+  const owners = stores.get(workspace).panes;
+  owners[0].context.activeNotePath.set('/vault/folder/a.md');
+  owners[1].context.activeNotePath.set('/vault/folder/b.md');
+  const locks = new Set();
+  const calls = [];
+  for (const owner of owners) {
+    workspace.registerEditor(owner.id, {
+      flushSave: async () => { owner.context.editorDirty.set(false); return true; },
+      beginPathMutation: async () => {
+        calls.push(owner.id);
+        owner.context.editorDirty.set(false);
+        locks.add(owner.id);
+        return () => locks.delete(owner.id);
+      },
+    });
+  }
+  return { workspace, owners, locks, calls };
+}
+
+test('all-pane maintenance locks every owner through reconciliation and aggregates inactive dirtiness', async () => {
+  const f = barrierFixture();
+  f.owners[0].context.editorDirty.set(true);
+  f.owners[1].context.editorDirty.set(true);
+  assert.equal(stores.get(f.workspace.anyDirty), true);
+  const oldIntent = f.workspace.captureNavigation();
+  const reload = deferred();
+  f.workspace.onReconcile(async owners => {
+    assert.equal(owners.length, 2);
+    assert.equal(f.locks.size, 2);
+    await reload.promise;
+  });
+  const release = await f.workspace.acquireMutation();
+  assert.ok(release);
+  assert.equal(stores.get(f.workspace.anyDirty), false);
+  assert.equal(f.locks.size, 2);
+  assert.equal(f.workspace.isBlocked(), true);
+  assert.equal(oldIntent.isCurrent(), false);
+  assert.equal(f.workspace.captureNavigation().isCurrent(), false);
+  assert.equal(await f.workspace.acquireMutation(), null);
+  const finishing = release();
+  assert.equal(f.locks.size, 2);
+  reload.resolve();
+  await finishing;
+  await release();
+  assert.equal(f.locks.size, 0);
+  assert.equal(f.workspace.isBlocked(), false);
+  assert.equal(oldIntent.isCurrent(), false, 'pre-maintenance reads stay invalid after unlock');
+});
+
+test('failed acquisition rolls back earlier locks and retains the unsaved inactive pane', async () => {
+  const f = barrierFixture();
+  const second = f.owners[1];
+  second.context.editorDirty.set(true);
+  f.workspace.registerEditor(second.id, { beginPathMutation: async () => null });
+  let mutations = 0;
+  const release = await f.workspace.acquireMutation();
+  if (release) { mutations++; await release(); }
+  assert.equal(mutations, 0);
+  assert.equal(f.locks.size, 0);
+  assert.equal(f.workspace.isBlocked(), false);
+  assert.equal(stores.get(second.context.editorDirty), true);
+  assert.equal(stores.get(f.workspace.anyDirty), true);
+});
+
+test('targeted mutations resolve every affected owner and do not lock sibling prefixes', async () => {
+  const f = barrierFixture();
+  f.owners[1].context.activeNotePath.set('/vault/folder-other/b.md');
+  const release = await f.workspace.acquireMutation(['/vault/folder']);
+  assert.ok(release);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0], f.owners[0].id);
+  await release();
+  f.workspace.remapPaths('/vault/folder', '/vault/moved');
+  assert.equal(stores.get(f.owners[0].context.activeNotePath), '/vault/moved/a.md');
+  assert.equal(stores.get(f.owners[1].context.activeNotePath), '/vault/folder-other/b.md');
+});
+
+test('flush-all rechecks aggregate dirtiness after the final save and handles rejected saves', async () => {
+  const f = barrierFixture();
+  const pending = deferred();
+  f.workspace.registerEditor(f.owners[1].id, { flushSave: () => pending.promise });
+  const flushing = f.workspace.flushAll();
+  await new Promise(resolve => setImmediate(resolve));
+  f.owners[0].context.editorDirty.set(true);
+  pending.resolve(true);
+  assert.equal(await flushing, false);
+  f.workspace.registerEditor(f.owners[1].id, { flushSave: async () => { throw new Error('disk failure'); } });
+  assert.equal(await f.workspace.flushAll(), false);
+});
+
+
+// Execute the actual shared-control open function, with deferred API reads, rather
+// than a second implementation of its async navigation algorithm.
+const layoutSource = await readFile(new URL('../src/lib/components/AppLayout.svelte', import.meta.url), 'utf8');
+const layoutScript = layoutSource.slice(layoutSource.indexOf('>') + 1, layoutSource.indexOf('</script>'));
+const layoutAst = ts.createSourceFile('layout.ts', layoutScript, ts.ScriptTarget.Latest, true);
+const openDeclaration = layoutAst.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'selectNoteFromSwitcher');
+
+function controlFixture() {
+  const workspace = workspaceModule.createEditorWorkspace();
+  const left = stores.get(workspace).panes[0];
+  workspace.openSplit();
+  const right = stores.get(workspace).panes[1];
+  workspace.activate(left.id);
+  const reads = new Map();
+  const opened = [];
+  const controls = load(openDeclaration.getText(layoutAst) + '\nexports.open = selectNoteFromSwitcher;', {}, {
+    get: stores.get,
+    ownerVault: '/vault',
+    beginNavigation: path => workspace.captureForPath(path),
+    navigationIsCurrent: token => token.isCurrent(),
+    activateOpenNote: (path, token) => workspace.activateOpenNote(path, token?.context),
+    editorFor: () => ({ flushSave: async () => true }),
+    readNote: async (_, path) => {
+      const read = deferred();
+      reads.set(path, read);
+      return read.promise;
+    },
+    handleNoteSelected: (path, _, __, token) => opened.push({ path, id: token.paneId }),
+  });
+  return { workspace, left, right, reads, opened, open: controls.open };
+}
+
+test('shared-control loads complete in their captured panes when focus changes during both reads', async () => {
+  const f = controlFixture();
+  const a = f.open('/vault/a.md');
+  await new Promise(resolve => setImmediate(resolve));
+  f.workspace.activate(f.right.id);
+  const b = f.open('/vault/b.md');
+  await new Promise(resolve => setImmediate(resolve));
+  f.reads.get('/vault/b.md').resolve({ path: '/vault/b.md', content: 'right' });
+  assert.equal(await b, true);
+  f.reads.get('/vault/a.md').resolve({ path: '/vault/a.md', content: 'left' });
+  assert.equal(await a, true);
+  assert.equal(stores.get(f.left.context.activeNotePath), '/vault/a.md');
+  assert.equal(stores.get(f.right.context.activeNotePath), '/vault/b.md');
+  assert.equal(stores.get(f.workspace).activePaneId, f.right.id);
+});
+
+test('an older shared-control read cannot overwrite a newer intent in its destination', async () => {
+  const f = controlFixture();
+  const old = f.open('/vault/old.md');
+  await new Promise(resolve => setImmediate(resolve));
+  const latest = f.open('/vault/latest.md');
+  await new Promise(resolve => setImmediate(resolve));
+  f.reads.get('/vault/latest.md').resolve({ path: '/vault/latest.md', content: 'new' });
+  assert.equal(await latest, true);
+  f.reads.get('/vault/old.md').resolve({ path: '/vault/old.md', content: 'stale' });
+  assert.equal(await old, false);
+  assert.equal(stores.get(f.left.context.activeNotePath), '/vault/latest.md');
+});
+
+test('shared-control selection of an already-open note preserves its unsaved buffer without reading', async () => {
+  const f = controlFixture();
+  const draft = { path: '/vault/open.md', content: 'unsaved' };
+  f.right.context.activeNote.set(draft);
+  f.right.context.activeNotePath.set(draft.path);
+  f.right.context.editorDirty.set(true);
+  assert.equal(await f.open(draft.path), true);
+  assert.equal(stores.get(f.workspace).activePaneId, f.right.id);
+  assert.equal(stores.get(f.right.context.activeNote), draft);
+  assert.equal(stores.get(f.right.context.editorDirty), true);
+  assert.equal(f.reads.size, 0);
 });

@@ -25,7 +25,7 @@ function fixture(path = '/external/External.md') {
   const loaded = [];
   const messages = [];
   const files = new Map([[path, original]]);
-  const context = createContext({
+  const context = createContext({ workspace: undefined, paneContext: undefined,
     beginEditorNoteNavigation: () => () => current,
     $viewerNote: { path, content: original.content }, $activeNote: original,
     $appConfig: { active_vault: '/vault' }, $readOnly: true, $focusMode: true,

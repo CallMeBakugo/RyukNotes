@@ -10,10 +10,15 @@
 	import { isMobile } from '$lib/platform';
 	import type { FileEvent } from '$lib/types';
 	import { isCurrentVaultEvent } from '$lib/utils/note-list-updates';
-	import { provideEditorPane } from '$lib/stores/editor-pane';
+	import { get } from 'svelte/store';
+	import { createEditorWorkspace, provideEditorWorkspace } from '$lib/stores/editor-workspace';
+	import { provideEditorPane, defaultEditorPane } from '$lib/stores/editor-pane';
 
 	const { activeNote, activeNotePath, editorDirty, readOnly, sourceMode,
-		beginNoteNavigation, isCurrentNoteNavigation, cancelNoteNavigation } = provideEditorPane();
+		cancelNoteNavigation } = provideEditorPane();
+
+	const workspace = createEditorWorkspace(defaultEditorPane);
+	provideEditorWorkspace(workspace);
 
 	let { notePath, vaultPath }: { notePath: string; vaultPath: string | null } = $props();
 	const ownerVault = untrack(() => vaultPath);
@@ -22,6 +27,27 @@
 	const appWebview = getCurrentWebview();
 	const isMac = navigator.platform.startsWith('Mac');
 	let editor = $state<Editor>(null!);
+	$effect(() => { workspace.registerEditor('pane-1', editor); });
+	workspace.onReconcile(async (owners) => {
+		for (const owner of owners) {
+			const path = get(owner.context.activeNotePath);
+			if (!path || disposed) continue;
+			try {
+				const content = await readNote(ownerVault!, path);
+				if (disposed || get(owner.context.activeNotePath) !== path) continue;
+				if (get(owner.context.editorDirty)) { editor?.flagExternalConflict(); continue; }
+				if (content.raw !== get(owner.context.activeNote)?.raw) {
+					owner.context.activeNote.set(content);
+					editor?.loadNote(path, content.content);
+				}
+			} catch (error) {
+				if (!disposed && /not found|no such|does not exist|query returned no rows/i.test(String(error))) {
+					owner.context.activeNote.set(null);
+					owner.context.activeNotePath.set(null);
+				} else console.error('Failed to refresh detached note:', error);
+			}
+		}
+	});
 	let unlistenFileChange: (() => void) | null = null;
 	let unlistenUiScale: (() => void) | null = null;
 	let unlistenClose: (() => void) | null = null;
@@ -95,12 +121,13 @@
 	onMount(() => {
 		const vault = ownerVault;
 		const path = notePath;
-		const token = beginNoteNavigation();
+		const intent = workspace.captureNavigation();
+		const token = intent.generation;
 		initialNavigationToken = token;
 		const isCurrentOwner = () => !disposed && (vault === null || vault === $appConfig?.active_vault);
 		if (isMobile) {
 			const flush = () => {
-				if (isCurrentOwner()) void editor?.flushSave();
+				if (isCurrentOwner()) void workspace.flushAll();
 			};
 			const onVisibilityChange = () => {
 				if (document.visibilityState === 'hidden') flush();
@@ -121,9 +148,12 @@
 					event.preventDefault();
 					if (!isCurrentOwner()) { await cancelWindowClose(); return; }
 					try {
-						if (editor && !(await editor.flushSave())) { await cancelWindowClose(); return; }
+						const release = await workspace.acquireMutation();
+						if (!release) { await cancelWindowClose(); return; }
+						try {
 						if (!isCurrentOwner()) { await cancelWindowClose(); return; }
 						await completeWindowClose();
+						} finally { await release(); }
 					} catch (error) {
 						console.error('Failed to close window:', error);
 						try { await cancelWindowClose(); } catch (cancelError) { console.error('Failed to cancel window close:', cancelError); }
@@ -160,28 +190,34 @@
 			}
 			if (!isCurrentOwner()) return;
 
-			if (isCurrentNoteNavigation(token)) {
+			if (intent.isCurrent()) {
 				try {
 					const content = await readNote(ownerVault!, path);
 					if (!isCurrentOwner()) return;
-					if (isCurrentNoteNavigation(token)) {
+					if (intent.isCurrent()) {
 						$activeNote = content;
 						$activeNotePath = path;
 						$editorDirty = false;
 						initialLoadTimer = setTimeout(() => {
 							initialLoadTimer = null;
-							if (!isCurrentOwner() || !isCurrentNoteNavigation(token)
+							if (!isCurrentOwner() || !intent.isCurrent()
 								|| $activeNotePath !== path || $activeNote !== content || $editorDirty) return;
 							editor?.loadNote(path, content.content);
 						}, 50);
 					}
 				} catch (e) {
-					if (isCurrentOwner() && isCurrentNoteNavigation(token)) loadError = String(e);
+					if (isCurrentOwner() && intent.isCurrent()) loadError = String(e);
 				}
 			}
 			if (!isCurrentOwner()) return;
 
 			async function refreshOpenNote(restored = false) {
+				if (workspace.isBlocked()) return;
+				if (restored) {
+					const release = await workspace.acquireMutation();
+					if (release) await release();
+					return;
+				}
 				const path = $activeNotePath;
 				const openingNote = $activeNote;
 				if (!path || !openingNote) return;
@@ -229,6 +265,7 @@
 
 	onDestroy(() => {
 		disposed = true;
+		workspace.dispose();
 		if (initialNavigationToken !== null) cancelNoteNavigation(initialNavigationToken);
 		if (initialLoadTimer !== null) clearTimeout(initialLoadTimer);
 		unlistenFileChange?.();

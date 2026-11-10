@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { createEditorWorkspace, provideEditorWorkspace, splitRatioBounds, type PaneId } from '$lib/stores/editor-workspace';
+	import { createEditorWorkspace, provideEditorWorkspace, splitRatioBounds, type PaneId, type PaneNavigation, type PaneRelease, type WorkspacePane } from '$lib/stores/editor-workspace';
 	import { defaultEditorPane, provideEditorPane } from '$lib/stores/editor-pane';
 	import EditorPaneHost from './EditorPaneHost.svelte';
 
@@ -76,6 +76,8 @@
 	provideEditorWorkspace(workspace);
 	provideEditorPane(get(workspace).panes[0].context);
 	const activePane = workspace.activePane;
+	const anyDirty = workspace.anyDirty;
+	const workspaceBusy = workspace.busy;
 	const activeNote = $derived($activePane.context.activeNote);
 	const activeNotePath = $derived($activePane.context.activeNotePath);
 	const viewerNote = $derived($activePane.context.viewerNote);
@@ -83,9 +85,6 @@
 	const sourceMode = $derived($activePane.context.sourceMode);
 	const readOnly = $derived($activePane.context.readOnly);
 	const navHistory = $derived($activePane.context.navHistory);
-	const beginNoteNavigation = $derived($activePane.context.beginNoteNavigation);
-	const isCurrentNoteNavigation = $derived($activePane.context.isCurrentNoteNavigation);
-	const cancelNoteNavigation = $derived($activePane.context.cancelNoteNavigation);
 
 	function findNotebookByPath(list: NotebookEntry[], relPath: string): NotebookEntry | null {
 		for (const nb of list) {
@@ -100,6 +99,9 @@
 	let noteList = $state<NoteList>();
 	let mobileEditor = $state<Editor>();
 	let editorInstances = $state<Record<PaneId, Editor | undefined>>({});
+	$effect(() => {
+		workspace.registerEditor($workspace.panes[0].id, isMobile ? mobileEditor : editorInstances[$workspace.panes[0].id]);
+	});
 	const editor = $derived(isMobile ? mobileEditor : editorInstances[$workspace.activePaneId]);
 	let editorAreaWidth = $state(0);
 	let separatorWidth = $state(0);
@@ -113,8 +115,8 @@
 		workspace.activate(id);
 	}
 
-	function activateOpenNote(path: string): boolean {
-		const activated = workspace.activateOpenNote(path);
+	function activateOpenNote(path: string, token?: PaneNavigation): boolean {
+		const activated = workspace.activateOpenNote(path, token?.context);
 		if (activated) {
 			taskNoteOpened = true;
 			if (isMobile) $mobileView = 'editor';
@@ -154,16 +156,24 @@
 		workspace.resize(untrack(() => $workspace.splitRatio), availableEditorWidth);
 	});
 
+	function editorFor(token: PaneNavigation) {
+		return isMobile ? mobileEditor : editorInstances[token.paneId];
+	}
+
 	async function flushWorkspace(): Promise<boolean> {
-		if (isMobile) return mobileEditor ? mobileEditor.flushSave() : true;
-		for (const pane of $workspace.panes) {
-			const instance = editorInstances[pane.id];
-			if ((instance && !(await instance.flushSave())) || get(pane.context.editorDirty)) {
-				workspace.activate(pane.id);
-				return false;
-			}
-		}
-		return true;
+		return workspace.flushAll();
+	}
+
+	async function flushDestination(token?: PaneNavigation): Promise<boolean> {
+		const intent = token ?? beginNavigation();
+		const instance = editorFor(intent);
+		return navigationIsCurrent(intent) && (!instance || await instance.flushSave())
+			&& navigationIsCurrent(intent) && !get(intent.context.editorDirty);
+	}
+
+	async function beginPaneMutation(paths?: readonly string[]): Promise<PaneRelease | null> {
+		if (backupInFlight) return null;
+		return workspace.acquireMutation(paths);
 	}
 	let outlineOpen = $state(false);
 	let outlinePanelId = $state('');
@@ -172,17 +182,18 @@
 		outlineOpen = open;
 		outlinePanelId = panelId;
 	}
-	let pendingSearchReveal = $state<{ path: string; token: number } | null>(null);
+	let pendingSearchReveal = $state<{ path: string; token: PaneNavigation } | null>(null);
 	let unlistenFileChange: (() => void) | null = null;
 	let unlistenClose: (() => void) | null = null;
 	let unlistenVaultRestored: (() => void) | null = null;
 	let fileRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 	const ownerVault = get(appConfig)?.active_vault ?? null;
 	activateVaultData(ownerVault);
+	let vaultSwitchRelease: PaneRelease | null = null;
 	let stateReady = false;
 	let restoringNote = false;
 	let disposed = false;
-	let navigationToken = 0;
+	const navigationIntents = new Set<PaneNavigation>();
 	let persistTimer: ReturnType<typeof setTimeout> | null = null;
 	let removePopstateListener: (() => void) | null = null;
 	const backupListeners = new Set<() => void>();
@@ -201,12 +212,17 @@
 		return !disposed && (get(appConfig)?.active_vault ?? null) === ownerVault;
 	}
 
-	function beginNavigation() {
-		return navigationToken = beginNoteNavigation();
+	function beginNavigation(path?: string) {
+		const token = workspace.captureForPath(path);
+		for (const older of navigationIntents) {
+			if (older.paneId === token.paneId || !older.isCurrent()) navigationIntents.delete(older);
+		}
+		navigationIntents.add(token);
+		return token;
 	}
 
-	function navigationIsCurrent(token: number) {
-		return ownerIsCurrent() && isCurrentNoteNavigation(token);
+	function navigationIsCurrent(token: PaneNavigation) {
+		return ownerIsCurrent() && token.isCurrent();
 	}
 
 	function scheduleFileRefresh(lists: boolean) {
@@ -301,7 +317,7 @@
 	}
 
 	async function checkScheduledBackup() {
-		if (!ownerIsCurrent() || backupInFlight) return;
+		if (!ownerIsCurrent() || backupInFlight || workspace.isBlocked()) return;
 		const config = get(appConfig);
 		const vault = activeVaultConfig(config);
 		if (!config?.backup_enabled || !vault) return;
@@ -339,21 +355,7 @@
 	// Track note navigation in history stack
 	async function handlePathsMoved(oldPath: string, newPath: string) {
 		if (!ownerIsCurrent()) return;
-		navHistory.remap(oldPath, newPath);
-		const path = $activeNotePath;
-		if (!path || (path !== oldPath && !path.startsWith(oldPath + '/') && !path.startsWith(oldPath + '\\'))) return;
-		const migrated = newPath + path.slice(oldPath.length);
-		const previous = $activeNote;
-		let content = previous ? { ...previous, path: migrated } : null;
-		try {
-			content = await readNote(ownerVault!, migrated);
-		} catch (error) {
-			console.error('Failed to reload relocated note:', error);
-		}
-		if (!ownerIsCurrent() || $activeNotePath !== path || $activeNote !== previous || !content) return;
-		$activeNote = content;
-		$activeNotePath = migrated;
-		editor?.loadNote(migrated, content.content);
+		workspace.remapPaths(oldPath, newPath);
 	}
 
 	$effect(() => {
@@ -365,52 +367,53 @@
 	});
 
 	$effect(() => {
-		if (!$editorDirty && stateReady && ownerIsCurrent()) untrack(drainPendingOpenFiles);
+		if (!$workspaceBusy && !$anyDirty && stateReady && ownerIsCurrent()) untrack(drainPendingOpenFiles);
 	});
 
 	async function navigateHistory(direction: -1 | 1) {
 		const token = beginNavigation();
 		if (!navigationIsCurrent(token)) return;
-		if (editor && !(await editor.flushSave())) return;
+		if (editorFor(token) && !(await editorFor(token)!.flushSave())) return;
 		if (!navigationIsCurrent(token)) return;
-		const history = get(navHistory);
+		const history = get(token.context.navHistory);
 		const path = history.stack[history.index + direction];
-		if (!path || activateOpenNote(path)) return;
-		navHistory.go(direction);
+		if (!path || activateOpenNote(path, token)) return;
+		token.context.navHistory.go(direction);
 		try {
 			const content = await readNote(ownerVault!, path);
 			if (!navigationIsCurrent(token)) return;
-			if (editor && !(await editor.flushSave())) return;
+			if (editorFor(token) && !(await editorFor(token)!.flushSave())) return;
 			if (!navigationIsCurrent(token)) return;
-			$activeNote = content;
-			$activeNotePath = path;
-			$editorDirty = false;
-			editor?.loadNote(path, content.content);
+			if (activateOpenNote(path, token)) return;
+			token.context.activeNote.set(content);
+			token.context.activeNotePath.set(path);
+			token.context.editorDirty.set(false);
+			editorFor(token)?.loadNote(path, content.content);
 		} catch (e) {
 			console.error('Failed to navigate history:', e);
 		}
 	}
 
-	async function handleOpenFile(filePath: string, token = beginNavigation()): Promise<boolean> {
+	async function handleOpenFile(filePath: string, token = beginNavigation(filePath)): Promise<boolean> {
 		if (!navigationIsCurrent(token) || !filePath || !filePath.endsWith('.md')) return false;
-		if (activateOpenNote(filePath)) return true; // Never replace an open draft with a stale disk read.
+		if (activateOpenNote(filePath, token)) return true; // Never replace an open draft with a stale disk read.
 		const isExternal = !isPathInDirectory(filePath, ownerVault);
 		if (isExternal && isAndroid) return false;
-		if (editor && !(await editor.flushSave())) return false;
+		if (editorFor(token) && !(await editorFor(token)!.flushSave())) return false;
 		if (!navigationIsCurrent(token)) return false;
 		try {
 			const content = await readNote(ownerVault!, filePath);
 			if (!navigationIsCurrent(token)) return false;
-			if (activateOpenNote(filePath)) return true;
-			$viewerNote = isExternal ? { path: filePath, content: content.content } : null;
-			$activeNote = content;
-			$activeNotePath = filePath;
-			$editorDirty = false;
+			if (activateOpenNote(filePath, token)) return true;
+			token.context.viewerNote.set(isExternal ? { path: filePath, content: content.content } : null);
+			token.context.activeNote.set(content);
+			token.context.activeNotePath.set(filePath);
+			token.context.editorDirty.set(false);
 			if (isExternal) {
-				$readOnly = true;
+				token.context.readOnly.set(true);
 				$focusMode = true;
 			}
-			editor?.loadNote(filePath, content.content);
+			editorFor(token)?.loadNote(filePath, content.content);
 			return true;
 		} catch (error) {
 			console.error('Failed to open file:', error);
@@ -420,7 +423,7 @@
 
 	function drainPendingOpenFiles() {
 		if (pendingOpenDrain) { pendingOpenNotification = true; return; }
-		if (!stateReady || !ownerIsCurrent()) return;
+		if (!stateReady || !ownerIsCurrent() || workspace.isBlocked()) return;
 		pendingOpenDrain = (async () => {
 			try {
 				while (ownerIsCurrent()) {
@@ -442,8 +445,8 @@
 		})();
 	}
 
-	async function restoreLastNote(path: string, token: number) {
-		const canRestore = () => navigationIsCurrent(token) && !$activeNotePath && !$editorDirty && !$viewerNote;
+	async function restoreLastNote(path: string, token: PaneNavigation) {
+		const canRestore = () => navigationIsCurrent(token) && !get(token.context.activeNotePath) && !get(token.context.editorDirty) && !get(token.context.viewerNote);
 		if (!canRestore() || isTrashedNote(path, ownerVault)) return;
 		const isExternal = !isPathInDirectory(path, ownerVault);
 		if (isExternal && isAndroid) return;
@@ -451,15 +454,16 @@
 		try {
 			const content = await readNote(ownerVault!, path);
 			if (!canRestore()) return;
-			$activeNote = content;
-			$activeNotePath = path;
-			$editorDirty = false;
+			if (activateOpenNote(path, token)) return;
+			token.context.activeNote.set(content);
+			token.context.activeNotePath.set(path);
+			token.context.editorDirty.set(false);
 			if (isExternal) {
-				$viewerNote = { path, content: content.content };
-				$readOnly = true;
+				token.context.viewerNote.set({ path, content: content.content });
+				token.context.readOnly.set(true);
 				$focusMode = true;
 			}
-			editor?.loadNote(path, content.content);
+			editorFor(token)?.loadNote(path, content.content);
 		} catch (_) {
 		} finally {
 			restoringNote = false;
@@ -505,11 +509,18 @@
 	}
 
 	async function prepareVaultSwitch(): Promise<boolean> {
-		const token = beginNavigation();
-		if (!(await flushWorkspace())) return false;
-		if (!navigationIsCurrent(token)) return false;
-		await persistVaultState();
-		return navigationIsCurrent(token);
+		const release = await beginPaneMutation();
+		if (!release) return false;
+		try {
+			await persistVaultState();
+			if (!ownerIsCurrent()) { await release(); return false; }
+			vaultSwitchRelease = release;
+			return true;
+		} catch (error) {
+			await release();
+			console.error('Failed to prepare vault switch:', error);
+			return false;
+		}
 	}
 
 	function handleSidebarResize(delta: number) {
@@ -538,33 +549,31 @@
 	// Tasks view: the editor pane shows a placeholder until a task is opened from the list.
 	let taskNoteOpened = $state(false);
 
-	function handleNoteSelected(path: string, content: string, task?: TaskItem) {
-		if (!ownerIsCurrent()) return;
-		// Selecting a real vault note exits viewer mode
-		$viewerNote = null;
+	function handleNoteSelected(path: string, content: string, task?: TaskItem, token = beginNavigation()) {
+		if (!navigationIsCurrent(token)) return;
+		token.context.viewerNote.set(null);
 		taskNoteOpened = true;
-
-		editor?.loadNote(path, content, task);
+		editorFor(token)?.loadNote(path, content, task);
 		if (isMobile) $mobileView = 'editor';
 	}
 
-	async function selectNoteFromSwitcher(path: string, token = beginNavigation(), canSelect?: () => boolean): Promise<boolean> {
+	async function selectNoteFromSwitcher(path: string, token = beginNavigation(path), canSelect?: () => boolean): Promise<boolean> {
 		const current = () => navigationIsCurrent(token) && (canSelect?.() ?? true);
 		if (!current()) return false;
-		if (activateOpenNote(path)) return true;
-		if (editor && !(await editor.flushSave())) return false;
+		if (activateOpenNote(path, token)) return true;
+		if (editorFor(token) && !(await editorFor(token)!.flushSave())) return false;
 		if (!current()) return false;
 		try {
 			const content = await readNote(ownerVault!, path);
 			if (!current()) return false;
-			if (editor && !(await editor.flushSave())) return false;
+			if (editorFor(token) && !(await editorFor(token)!.flushSave())) return false;
 			if (!current()) return false;
-			if (activateOpenNote(path)) return true;
-			$viewerNote = null;
-			$activeNote = content;
-			$activeNotePath = path;
-			$editorDirty = false;
-			handleNoteSelected(path, content.content);
+			if (activateOpenNote(path, token)) return true;
+			token.context.viewerNote.set(null);
+			token.context.activeNote.set(content);
+			token.context.activeNotePath.set(path);
+			token.context.editorDirty.set(false);
+			handleNoteSelected(path, content.content, undefined, token);
 			return true;
 		} catch (e) {
 			console.error('Failed to switch note:', e);
@@ -574,8 +583,9 @@
 
 	async function selectNoteFromSearch(result: SearchResult, notebook: NotebookEntry | null, canSelect: () => boolean): Promise<boolean> {
 		const { path } = result;
-		const token = beginNavigation();
+		const token = beginNavigation(path);
 		if (!(await selectNoteFromSwitcher(path, token, canSelect)) || !navigationIsCurrent(token) || !canSelect()) return false;
+		if (get(token.context.activeNotePath) !== path) return true;
 		const mode = notebook ? 'notebook' : 'all';
 		if ($viewMode !== mode || $activeNotebook?.path !== notebook?.path || $activeTag !== null) {
 			$activeNotebook = notebook;
@@ -588,7 +598,7 @@
 		if (isMobile) $mobileView = 'editor';
 		await tick();
 		if (!navigationIsCurrent(token) || !canSelect()) return false;
-		await editor?.revealSearchTarget(result.match_target, () => navigationIsCurrent(token) && canSelect());
+		await editorFor(token)?.revealSearchTarget(result.match_target, () => navigationIsCurrent(token) && canSelect() && $workspace.activePaneId === token.paneId);
 		return navigationIsCurrent(token) && canSelect();
 	}
 
@@ -600,7 +610,7 @@
 		// may refresh and reveal it. Do not subscribe this effect to list internals.
 		void untrack(async () => {
 			const current = () => pendingSearchReveal === request && noteList === list
-				&& navigationIsCurrent(request.token) && $activeNotePath === request.path;
+				&& navigationIsCurrent(request.token) && get(request.token.context.activeNotePath) === request.path;
 			try {
 				if (!current()) return;
 				await list.refresh();
@@ -615,7 +625,7 @@
 				console.error('Failed to reveal search result:', error);
 			} finally {
 				if (pendingSearchReveal === request && (noteList === list
-					|| !navigationIsCurrent(request.token) || $activeNotePath !== request.path)) pendingSearchReveal = null;
+					|| !navigationIsCurrent(request.token) || get(request.token.context.activeNotePath) !== request.path)) pendingSearchReveal = null;
 			}
 		});
 	});
@@ -659,15 +669,11 @@
 	// briefly becomes read-only while the native command changes the disk note.
 	async function changeTask(task: TaskItem, operation: () => Promise<void>) {
 		if (!ownerIsCurrent()) return;
-		try {
-			if (task.note_path === $activeNotePath && editor) {
-				await editor.applyNativeTaskChange(task.note_path, operation);
-			} else {
-				await operation();
-			}
-		} catch (error) {
-			console.error('Failed to update task:', error);
-		}
+		const release = await beginPaneMutation([task.note_path]);
+		if (!release) return;
+		try { if (ownerIsCurrent()) await operation(); }
+		catch (error) { console.error('Failed to update task:', error); }
+		finally { await release(); }
 	}
 
 	async function toggleTask(task: TaskItem) {
@@ -686,19 +692,20 @@
 		const token = beginNavigation();
 		if (!navigationIsCurrent(token)) return;
 		try {
-			if (editor && !(await editor.flushSave())) return;
+			if (editorFor(token) && !(await editorFor(token)!.flushSave())) return;
 			if (!navigationIsCurrent(token)) return;
 			const entry = await createDailyNote(ownerVault!);
 			if (!navigationIsCurrent(token)) return;
-			if (activateOpenNote(entry.path)) return;
+			if (activateOpenNote(entry.path, token)) return;
 			const content = await readNote(ownerVault!, entry.path);
 			if (!navigationIsCurrent(token)) return;
-			if (editor && !(await editor.flushSave())) return;
+			if (editorFor(token) && !(await editorFor(token)!.flushSave())) return;
 			if (!navigationIsCurrent(token)) return;
-			$activeNote = content;
-			$activeNotePath = entry.path;
-			$editorDirty = false;
-			editor?.loadNote(entry.path, content.content);
+			if (activateOpenNote(entry.path, token)) return;
+			token.context.activeNote.set(content);
+			token.context.activeNotePath.set(entry.path);
+			token.context.editorDirty.set(false);
+			editorFor(token)?.loadNote(entry.path, content.content);
 			$viewMode = 'daily';
 			noteList?.refresh(true);
 			sidebar?.refresh();
@@ -773,26 +780,17 @@
 	}
 
 	async function trashOpenNote(path: string): Promise<boolean> {
-		if (path !== $activeNotePath || $viewerNote || $viewMode === 'trash') return false;
+		if (!ownerIsCurrent()) return false;
+		const release = await beginPaneMutation([path]);
+		if (!release) return false;
 		try {
-			await deleteNote(ownerVault!, path);
 			if (!ownerIsCurrent()) return false;
-			if (Object.hasOwn($noteOrder, path)) {
-				const { [path]: _, ...rest } = $noteOrder;
-				$noteOrder = rest;
-			}
-			$notes = $notes.filter((note) => note.path !== path);
-			if ($activeNotePath === path) {
-				$activeNote = null;
-				$activeNotePath = null;
-			}
-			noteList?.refresh(true).catch((error) => console.error('Failed to refresh notes after trashing:', error));
-			if (isMobile && !$activeNotePath) $mobileView = 'notelist';
+			await deleteNote(ownerVault!, path);
+			$notes = $notes.filter(note => note.path !== path);
+			noteList?.refresh(true).catch(error => console.error('Failed to refresh notes:', error));
 			return true;
-		} catch (error) {
-			console.error('Failed to move open note to Trash:', error);
-			return false;
-		}
+		} catch (error) { console.error('Failed to trash note:', error); return false; }
+		finally { await release(); }
 	}
 
 	function handleMouseDown(e: MouseEvent) {
@@ -943,32 +941,46 @@
 		persistState();
 	});
 
-	let activeRefreshRequest = 0;
-	async function refreshActiveNote(path: string, restored = false) {
-		if (path !== $activeNotePath || !$activeNote || !ownerIsCurrent()) return;
-		const request = ++activeRefreshRequest;
-		const openingNote = $activeNote;
+	const refreshRequests = new Map<PaneId, number>();
+	workspace.onReconcile(async (owners) => {
+		for (const pane of owners) await refreshPane(pane, true, true);
+		if (ownerIsCurrent()) scheduleFileRefresh(true);
+	});
+	async function refreshPane(pane: WorkspacePane, restored = false, locked = false) {
+		const context = pane.context;
+		const path = get(context.activeNotePath);
+		const openingNote = get(context.activeNote);
+		if (!path || !openingNote || !ownerIsCurrent() || (workspace.isBlocked() && !locked)) return;
+		const request = (refreshRequests.get(pane.id) ?? 0) + 1;
+		refreshRequests.set(pane.id, request);
+		const current = () => ownerIsCurrent() && refreshRequests.get(pane.id) === request
+			&& get(context.activeNotePath) === path;
+		const instance = workspace.editor(pane.id);
 		try {
 			const content = await readNote(ownerVault!, path);
-			if (!ownerIsCurrent() || request !== activeRefreshRequest || $activeNotePath !== path) return;
-			if ($editorDirty) {
-				if (restored && content.raw !== editor?.getAcceptedRaw()) editor?.flagExternalConflict();
+			if (!current()) return;
+			if (get(context.editorDirty)) {
+				if (restored && content.raw !== instance?.getAcceptedRaw()) instance?.flagExternalConflict();
 				return;
 			}
-			if ($activeNote !== openingNote || content.raw === openingNote.raw) return;
-			$activeNote = content;
-			if ($viewerNote?.path === path) $viewerNote = { path, content: content.content };
-			editor?.loadNote(path, content.content);
+			if (get(context.activeNote) !== openingNote || content.raw === openingNote.raw) return;
+			context.activeNote.set(content);
+			if (get(context.viewerNote)?.path === path) context.viewerNote.set({ path, content: content.content });
+			instance?.loadNote(path, content.content);
 		} catch (error) {
-			if (restored && ownerIsCurrent() && request === activeRefreshRequest && $activeNotePath === path) {
-				if ($editorDirty) editor?.flagExternalConflict();
-				else {
-					$activeNotePath = null;
-					$activeNote = null;
-					$viewerNote = null;
-				}
-			} else if (!restored) console.error('Failed to refresh active note:', error);
+			if (!current()) return;
+			if (get(context.editorDirty)) { instance?.flagExternalConflict(); return; }
+			if (restored && /not found|no such|does not exist|query returned no rows/i.test(String(error))) {
+				context.activeNotePath.set(null);
+				context.activeNote.set(null);
+				context.viewerNote.set(null);
+			} else console.error('Failed to refresh pane:', error);
 		}
+	}
+
+	async function refreshActiveNote(path: string, restored = false) {
+		await Promise.all($workspace.panes.filter(p => get(p.context.activeNotePath) === path)
+			.map(p => refreshPane(p, restored)));
 	}
 
 	onMount(async () => {
@@ -976,7 +988,7 @@
 		const startupToken = beginNavigation();
 		if (isMobile) {
 			const flush = () => {
-				if (ownerIsCurrent()) void editor?.flushSave();
+				if (ownerIsCurrent()) void flushWorkspace();
 			};
 			const onVisibilityChange = () => {
 				if (document.visibilityState === 'hidden') flush();
@@ -996,11 +1008,14 @@
 				event.preventDefault();
 				if (!ownerIsCurrent()) { await cancelWindowClose(); return; }
 				try {
-					if (!(await flushWorkspace())) { await cancelWindowClose(); return; }
+					const release = await beginPaneMutation();
+					if (!release) { await cancelWindowClose(); return; }
+					try {
 					if (!ownerIsCurrent()) { await cancelWindowClose(); return; }
 					await persistVaultState();
 					if (!ownerIsCurrent()) { await cancelWindowClose(); return; }
 					await completeWindowClose();
+					} finally { await release(); }
 				} catch (error) {
 					console.error('Failed to close window:', error);
 					try { await cancelWindowClose(); } catch (cancelError) { console.error('Failed to cancel window close:', cancelError); }
@@ -1029,7 +1044,7 @@
 			// Body/modified/preview changes do not change notebook counts or the tag index.
 			if (!previous) scheduleFileRefresh(true);
 			else if (!sameNoteTags(previous, note)) scheduleFileRefresh(false);
-			if (payload.path === $activeNotePath) void refreshActiveNote(payload.path);
+			void refreshActiveNote(payload.path);
 		});
 		if (!ownerIsCurrent()) { unlistenFileChange(); return; }
 		unlistenPendingOpen = await listen('open-file-pending', () => {
@@ -1038,8 +1053,11 @@
 		if (!ownerIsCurrent()) { unlistenPendingOpen(); return; }
 		unlistenVaultRestored = await listen<{ vault_path: string }>('vault-restored', ({ payload }) => {
 			if (!ownerIsCurrent() || payload.vault_path !== ownerVault) return;
-			const path = $activeNotePath;
-			if (path && isPathInDirectory(path, ownerVault)) void refreshActiveNote(path, true);
+			// Our restore already owns a lease; its release reconciles all pane buffers.
+			if (!workspace.isBlocked()) void (async () => {
+				const release = await beginPaneMutation();
+				if (release) await release();
+			})();
 			scheduleFileRefresh(true);
 		});
 		if (!ownerIsCurrent()) { unlistenVaultRestored(); return; }
@@ -1134,7 +1152,9 @@
 
 	onDestroy(() => {
 		disposed = true;
-		cancelNoteNavigation(navigationToken);
+		for (const intent of navigationIntents) intent.cancel();
+		workspace.dispose();
+		void vaultSwitchRelease?.();
 		if (persistTimer) clearTimeout(persistTimer);
 		removePopstateListener?.();
 		backupListeners.forEach((unlisten) => unlisten());
@@ -1196,7 +1216,7 @@
 							<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
 						</svg>
 					</button>
-					<button class="mobile-header-btn" class:active={$activeNote?.meta.pinned} onclick={() => { if ($activeNote) { $activeNote.meta.pinned = !$activeNote.meta.pinned; editor?.markEdited(); } }} title="Pin">
+					<button class="mobile-header-btn" class:active={$activeNote?.meta.pinned} onclick={() => { if ($activeNote) void updateActiveNoteMetadata({ pinned: !$activeNote.meta.pinned, tags: [...$activeNote.meta.tags] }); }} title="Pin">
 						<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<path d="M12 17v5"/><path d="M9 2h6l-1 7h4l-2 4H8l-2-4h4L9 2z"/>
 						</svg>
@@ -1272,10 +1292,10 @@
 		<!-- Mobile Content -->
 		<div class="mobile-content">
 			<div class="mobile-panel" class:active={$mobileView === 'sidebar'}>
-				<Sidebar bind:this={sidebar} onViewChanged={handleViewChanged} onBeforeNoteChange={() => editor?.flushSave() ?? Promise.resolve(true)} onBeforePathMutation={() => editor?.beginPathMutation() ?? Promise.resolve(() => {})} onPathsMoved={handlePathsMoved} />
+				<Sidebar bind:this={sidebar} onViewChanged={handleViewChanged} onBeforeNoteChange={flushWorkspace} onBeforePathMutation={beginPaneMutation} onPathsMoved={handlePathsMoved} />
 			</div>
 			<div class="mobile-panel" class:active={$mobileView === 'notelist'}>
-				<NoteList bind:this={noteList} onNoteSelected={handleNoteSelected} onActivateOpenNote={activateOpenNote} onBeforeNoteSwitch={() => editor?.flushSave() ?? Promise.resolve(true)} onBeforeNoteDuplicate={() => editor?.forceSave() ?? Promise.resolve(true)} onBeforePathMutation={() => editor?.beginPathMutation() ?? Promise.resolve(() => {})} onPathsMoved={handlePathsMoved} onUpdateActiveNote={updateActiveNoteMetadata} onTagsChanged={handleTagsChanged} onRefreshTags={() => { if (!isMobile) void sidebar?.refreshTags(); }} onNoteMoved={() => sidebar?.refresh()} onNoteCreated={(token) => { editor?.focusTitle(token); }} onToggleTask={toggleTask} onSetTaskPriority={changeTaskPriority} onSetTaskDue={changeTaskDue} />
+				<NoteList bind:this={noteList} onNoteSelected={handleNoteSelected} onActivateOpenNote={activateOpenNote} onBeforeNoteSwitch={flushDestination} onBeforeNoteDuplicate={flushWorkspace} onBeforePathMutation={beginPaneMutation} onPathsMoved={handlePathsMoved} onUpdateActiveNote={updateActiveNoteMetadata} onTagsChanged={handleTagsChanged} onRefreshTags={() => { if (!isMobile) void sidebar?.refreshTags(); }} onNoteMoved={() => sidebar?.refresh()} onNoteCreated={(token) => { if (navigationIsCurrent(token) && $workspace.activePaneId === token.paneId) editorFor(token)?.focusTitle(token.generation); }} onToggleTask={toggleTask} onSetTaskPriority={changeTaskPriority} onSetTaskDue={changeTaskDue} />
 			</div>
 			<div class="mobile-panel" class:active={$mobileView === 'editor'}>
 				<Editor bind:this={mobileEditor} onMoveToTrash={trashOpenNote} onOutlineChange={handleOutlineChange} onShowTag={showTagNotes} />
@@ -1327,7 +1347,7 @@
 		<div class="app-layout">
 			{#if !$focusMode}
 				<div class="sidebar-panel" style="width: {$sidebarCollapsed ? 44 : $sidebarWidth}px">
-					<Sidebar bind:this={sidebar} onViewChanged={handleViewChanged} onBeforeNoteChange={() => editor?.flushSave() ?? Promise.resolve(true)} onBeforePathMutation={() => editor?.beginPathMutation() ?? Promise.resolve(() => {})} onPathsMoved={handlePathsMoved} />
+					<Sidebar bind:this={sidebar} onViewChanged={handleViewChanged} onBeforeNoteChange={flushWorkspace} onBeforePathMutation={beginPaneMutation} onPathsMoved={handlePathsMoved} />
 				</div>
 
 				{#if !$sidebarCollapsed}
@@ -1336,7 +1356,7 @@
 
 				{#if !$notelistCollapsed}
 					<div class="notelist-panel" style="width: {$notelistWidth}px">
-						<NoteList bind:this={noteList} onNoteSelected={handleNoteSelected} onActivateOpenNote={activateOpenNote} onBeforeNoteSwitch={() => editor?.flushSave() ?? Promise.resolve(true)} onBeforeNoteDuplicate={() => editor?.forceSave() ?? Promise.resolve(true)} onBeforePathMutation={() => editor?.beginPathMutation() ?? Promise.resolve(() => {})} onPathsMoved={handlePathsMoved} onUpdateActiveNote={updateActiveNoteMetadata} onTagsChanged={handleTagsChanged} onRefreshTags={() => { if (!isMobile) void sidebar?.refreshTags(); }} onNoteMoved={() => sidebar?.refresh()} onNoteCreated={(token) => { editor?.focusTitle(token); }} onToggleTask={toggleTask} onSetTaskPriority={changeTaskPriority} onSetTaskDue={changeTaskDue} />
+						<NoteList bind:this={noteList} onNoteSelected={handleNoteSelected} onActivateOpenNote={activateOpenNote} onBeforeNoteSwitch={flushDestination} onBeforeNoteDuplicate={flushWorkspace} onBeforePathMutation={beginPaneMutation} onPathsMoved={handlePathsMoved} onUpdateActiveNote={updateActiveNoteMetadata} onTagsChanged={handleTagsChanged} onRefreshTags={() => { if (!isMobile) void sidebar?.refreshTags(); }} onNoteMoved={() => sidebar?.refresh()} onNoteCreated={(token) => { if (navigationIsCurrent(token) && $workspace.activePaneId === token.paneId) editorFor(token)?.focusTitle(token.generation); }} onToggleTask={toggleTask} onSetTaskPriority={changeTaskPriority} onSetTaskDue={changeTaskDue} />
 					</div>
 
 					<ResizeHandle onResize={handleNotelistResize} />
@@ -1357,7 +1377,7 @@
 			<div class="editor-panel">
 				<div class="workspace-toolbar">
 					<span>{$workspace.panes.length === 2 ? 'Split view' : 'Editor'}</span>
-					<button class:active={$workspace.panes.length === 2} disabled={splitBusy}
+					<button class:active={$workspace.panes.length === 2} disabled={splitBusy || $workspaceBusy}
 						onclick={toggleSplit} aria-pressed={$workspace.panes.length === 2}
 						title={$workspace.panes.length === 2 ? 'Close second pane' : 'Open second pane'}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M12 4v16" /></svg>
@@ -1382,7 +1402,7 @@
 							{#if $workspace.panes.length === 2}
 								<button class="pane-label" aria-pressed={$workspace.activePaneId === pane.id} onclick={() => activatePane(pane.id)}>Pane {index + 1}</button>
 							{/if}
-							<EditorPaneHost pane={pane.context} onEditorChange={(instance) => { editorInstances = { ...editorInstances, [pane.id]: instance }; }}
+							<EditorPaneHost pane={pane.context} paneId={pane.id} onEditorChange={(instance) => { editorInstances = { ...editorInstances, [pane.id]: instance }; workspace.registerEditor(pane.id, instance); }}
 								onMoveToTrash={trashOpenNote} onShowTag={showTagNotes} showTaskPlaceholder={$viewMode === 'tasks' && !taskNoteOpened} />
 						</section>
 					{/each}
@@ -1394,7 +1414,7 @@
 
 <SearchPanel onSelectNote={selectNoteFromSearch} />
 <CommandPalette onNavigate={handleViewChanged} />
-<SettingsPanel onBeforeVaultSwitch={prepareVaultSwitch} />
+<SettingsPanel onBeforeVaultSwitch={prepareVaultSwitch} onBeginMaintenance={() => beginPaneMutation()} />
 <InfoPanel />
 
 <style>
