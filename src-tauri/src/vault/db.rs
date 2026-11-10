@@ -236,6 +236,10 @@ impl VaultDb {
         .map_err(|e| e.to_string())?;
         if version == 1 {
             tx.execute_batch(r#"
+                -- v1 deletions could leave tag links behind with FK enforcement off.
+                -- Only links to absent notes are safe to discard; retain trashed notes.
+                DELETE FROM note_tags
+                    WHERE NOT EXISTS (SELECT 1 FROM notes WHERE notes.id = note_tags.note_id);
                 CREATE TEMP TABLE attachment_owners AS SELECT note_id, id FROM attachments;
                 CREATE TABLE attachments_v2 (
                     id TEXT PRIMARY KEY, filename TEXT NOT NULL, mime_type TEXT NOT NULL,
@@ -267,13 +271,31 @@ impl VaultDb {
                     SELECT v.note_id, a.id FROM versions v JOIN attachments a ON instr(v.content, a.id) > 0;
             "#).map_err(|e| e.to_string())?;
         }
-        let invalid: bool = tx
-            .prepare("PRAGMA foreign_key_check")
-            .map_err(|e| e.to_string())?
-            .exists([])
-            .map_err(|e| e.to_string())?;
-        if invalid {
-            return Err("Vault foreign-key validation failed".into());
+        let violations = {
+            let mut statement = tx
+                .prepare("PRAGMA foreign_key_check")
+                .map_err(|e| e.to_string())?;
+            let rows = statement
+                .query_map([], |row| {
+                    let table: String = row.get(0)?;
+                    let rowid: Option<i64> = row.get(1)?;
+                    let parent: String = row.get(2)?;
+                    let foreign_key: i64 = row.get(3)?;
+                    let rowid = rowid.map_or_else(|| "NULL".to_string(), |id| id.to_string());
+                    Ok(format!(
+                        "table={table}, rowid={rowid}, parent={parent}, foreign_key={foreign_key}"
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        if !violations.is_empty() {
+            return Err(format!(
+                "Vault foreign-key validation failed: {} violation(s): {}",
+                violations.len(),
+                violations.join("; ")
+            ));
         }
         tx.execute("INSERT INTO meta(key, value) VALUES('schema_version', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![SCHEMA_VERSION.to_string()]).map_err(|e| e.to_string())?;
@@ -1146,6 +1168,121 @@ mod tests {
             .get_attachment_data("asset-id")
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn v1_migration_sweeps_orphaned_note_tags_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-tags.rn");
+        let conn = Connection::open(&path).unwrap();
+        legacy_fixture(&conn);
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute_batch(
+            "INSERT INTO tags VALUES('kept');
+             INSERT INTO note_tags VALUES('a', 'kept'), ('b', 'kept');
+             INSERT INTO note_tags VALUES('deleted-1', 'kept'), ('deleted-2', 'kept'),
+                 ('deleted-3', 'kept'), ('deleted-4', 'kept'), ('deleted-5', 'kept');",
+        )
+        .unwrap();
+        let violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 5);
+        drop(conn);
+
+        let db = VaultDb::open(&path).unwrap();
+        assert_eq!(
+            db.get_attachment_data("asset-id").unwrap().unwrap().1,
+            vec![0, 1, 255]
+        );
+        drop(db);
+        let db = VaultDb::open(&path).unwrap();
+        let version: String = db
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "2");
+        let mut statement = db
+            .conn
+            .prepare("SELECT note_id FROM note_tags ORDER BY note_id")
+            .unwrap();
+        let note_ids = statement
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            note_ids,
+            vec!["a", "b"],
+            "retain live and trashed note tags"
+        );
+        assert!(!db
+            .conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap());
+    }
+
+    #[test]
+    fn v1_migration_reports_remaining_fk_rows_and_rolls_back_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid-tags.rn");
+        let conn = Connection::open(&path).unwrap();
+        legacy_fixture(&conn);
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute_batch(
+            "INSERT INTO tags VALUES('kept');
+             INSERT INTO note_tags(rowid, note_id, tag) VALUES
+                 (11, 'deleted', 'kept'), (21, 'a', 'missing-tag'), (22, 'b', 'missing-tag');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = VaultDb::open(&path)
+            .err()
+            .expect("migration must reject invalid tags");
+        assert!(
+            error.contains("foreign-key validation failed: 2 violation(s)"),
+            "{error}"
+        );
+        for rowid in [21, 22] {
+            assert!(
+                error.contains(&format!("table=note_tags, rowid={rowid}, parent=tags")),
+                "{error}"
+            );
+        }
+        let conn = Connection::open(&path).unwrap();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "1");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM note_tags WHERE rowid=11", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "failed validation must roll back the orphan sweep"
+        );
+        let owner: String = conn
+            .query_row("SELECT note_id FROM attachments", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            owner, "a",
+            "failed validation must roll back attachment migration"
+        );
     }
 
     #[test]
