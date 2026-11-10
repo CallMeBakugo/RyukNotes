@@ -1,4 +1,5 @@
 import { getContext, setContext } from 'svelte';
+import { editorFocus } from '../utils/editor-events';
 import { derived, get, readable, writable } from 'svelte/store';
 import { createEditorPane, defaultEditorPane, type EditorPane } from './editor-pane';
 
@@ -8,6 +9,7 @@ export interface PaneNavigation {
   readonly context: EditorPane;
   readonly generation: number;
   isCurrent(): boolean;
+  focusIsCurrent(): boolean;
   cancel(): void;
 }
 export interface PaneEditorHandle {
@@ -99,11 +101,13 @@ export function createEditorWorkspace(first: EditorPane = createEditorPane()) {
       const pane = get(state).panes.find(p => p.context === context);
       const generation = destination.beginNoteNavigation();
       const epoch = barrierEpoch;
+      const focusCurrent = editorFocus.capture();
       return {
         paneId: pane?.id ?? '', context: destination, generation,
         isCurrent: () => live && !barrier && epoch === barrierEpoch && !!pane
           && get(state).panes.some(p => p.id === pane.id)
           && destination.isCurrentNoteNavigation(generation),
+        focusIsCurrent: () => focusCurrent() && live && get(state).activePaneId === pane?.id,
         cancel: () => destination.cancelNoteNavigation(generation),
       };
     },
@@ -165,6 +169,7 @@ export function createEditorWorkspace(first: EditorPane = createEditorPane()) {
     },
     dispose() { live = false; barrierEpoch++; },
     activate(id: PaneId) {
+      if (get(state).activePaneId !== id && get(state).panes.some(p => p.id === id)) editorFocus.invalidate();
       state.update(s => s.activePaneId !== id && s.panes.some(p => p.id === id)
         ? { ...s, activePaneId: id } : s);
     },
@@ -182,6 +187,7 @@ export function createEditorWorkspace(first: EditorPane = createEditorPane()) {
       state.update(s => {
         if (s.panes.length === 2) return s;
         const pane = { id: `pane-${nextId++}`, context: createEditorPane() };
+        editorFocus.invalidate();
         return { ...s, panes: [...s.panes, pane], activePaneId: pane.id };
       });
     },
@@ -196,6 +202,7 @@ export function createEditorWorkspace(first: EditorPane = createEditorPane()) {
       }
       // A delayed close must not cross a maintenance barrier or remove a replacement.
       if (barrier || !live || get(state).panes[1]?.id !== second.id) return false;
+      editorFocus.invalidate();
       state.update(s => ({ ...s, panes: [s.panes[0]], activePaneId: s.panes[0].id }));
       return true;
     },

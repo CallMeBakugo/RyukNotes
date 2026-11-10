@@ -1295,7 +1295,7 @@
 				<Sidebar bind:this={sidebar} onViewChanged={handleViewChanged} onBeforeNoteChange={flushWorkspace} onBeforePathMutation={beginPaneMutation} onPathsMoved={handlePathsMoved} />
 			</div>
 			<div class="mobile-panel" class:active={$mobileView === 'notelist'}>
-				<NoteList bind:this={noteList} onNoteSelected={handleNoteSelected} onActivateOpenNote={activateOpenNote} onBeforeNoteSwitch={flushDestination} onBeforeNoteDuplicate={flushWorkspace} onBeforePathMutation={beginPaneMutation} onPathsMoved={handlePathsMoved} onUpdateActiveNote={updateActiveNoteMetadata} onTagsChanged={handleTagsChanged} onRefreshTags={() => { if (!isMobile) void sidebar?.refreshTags(); }} onNoteMoved={() => sidebar?.refresh()} onNoteCreated={(token) => { if (navigationIsCurrent(token) && $workspace.activePaneId === token.paneId) editorFor(token)?.focusTitle(token.generation); }} onToggleTask={toggleTask} onSetTaskPriority={changeTaskPriority} onSetTaskDue={changeTaskDue} />
+				<NoteList bind:this={noteList} onNoteSelected={handleNoteSelected} onActivateOpenNote={activateOpenNote} onBeforeNoteSwitch={flushDestination} onBeforeNoteDuplicate={flushWorkspace} onBeforePathMutation={beginPaneMutation} onPathsMoved={handlePathsMoved} onUpdateActiveNote={updateActiveNoteMetadata} onTagsChanged={handleTagsChanged} onRefreshTags={() => { if (!isMobile) void sidebar?.refreshTags(); }} onNoteMoved={() => sidebar?.refresh()} onNoteCreated={(token) => { if (navigationIsCurrent(token) && $workspace.activePaneId === token.paneId) editorFor(token)?.focusTitle(token.generation, token.focusIsCurrent); }} onToggleTask={toggleTask} onSetTaskPriority={changeTaskPriority} onSetTaskDue={changeTaskDue} />
 			</div>
 			<div class="mobile-panel" class:active={$mobileView === 'editor'}>
 				<Editor bind:this={mobileEditor} onMoveToTrash={trashOpenNote} onOutlineChange={handleOutlineChange} onShowTag={showTagNotes} />
@@ -1356,7 +1356,7 @@
 
 				{#if !$notelistCollapsed}
 					<div class="notelist-panel" style="width: {$notelistWidth}px">
-						<NoteList bind:this={noteList} onNoteSelected={handleNoteSelected} onActivateOpenNote={activateOpenNote} onBeforeNoteSwitch={flushDestination} onBeforeNoteDuplicate={flushWorkspace} onBeforePathMutation={beginPaneMutation} onPathsMoved={handlePathsMoved} onUpdateActiveNote={updateActiveNoteMetadata} onTagsChanged={handleTagsChanged} onRefreshTags={() => { if (!isMobile) void sidebar?.refreshTags(); }} onNoteMoved={() => sidebar?.refresh()} onNoteCreated={(token) => { if (navigationIsCurrent(token) && $workspace.activePaneId === token.paneId) editorFor(token)?.focusTitle(token.generation); }} onToggleTask={toggleTask} onSetTaskPriority={changeTaskPriority} onSetTaskDue={changeTaskDue} />
+						<NoteList bind:this={noteList} onNoteSelected={handleNoteSelected} onActivateOpenNote={activateOpenNote} onBeforeNoteSwitch={flushDestination} onBeforeNoteDuplicate={flushWorkspace} onBeforePathMutation={beginPaneMutation} onPathsMoved={handlePathsMoved} onUpdateActiveNote={updateActiveNoteMetadata} onTagsChanged={handleTagsChanged} onRefreshTags={() => { if (!isMobile) void sidebar?.refreshTags(); }} onNoteMoved={() => sidebar?.refresh()} onNoteCreated={(token) => { if (navigationIsCurrent(token) && $workspace.activePaneId === token.paneId) editorFor(token)?.focusTitle(token.generation, token.focusIsCurrent); }} onToggleTask={toggleTask} onSetTaskPriority={changeTaskPriority} onSetTaskDue={changeTaskDue} />
 					</div>
 
 					<ResizeHandle onResize={handleNotelistResize} />

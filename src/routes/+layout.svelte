@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { getCurrentWindow } from '@tauri-apps/api/window';
+	import { nativeEditorDrops, trackEditorFocus } from '$lib/utils/editor-events';
 	import '../app.css';
 	import { resolvedTheme, appConfig, activeNotePath, installType, platformIsMobile, customThemes } from '$lib/stores/app';
 	import { openFile, openUrl, getInstallType, isMobilePlatform } from '$lib/api';
@@ -102,6 +104,19 @@
 			}
 		}
 	}
+
+	onMount(() => {
+		const stopFocus = trackEditorFocus(document, window);
+		let disposed = false;
+		let unlisten: (() => void) | undefined;
+		getCurrentWindow().onDragDropEvent(({ payload }) => {
+			if (!disposed && payload.type === 'drop') {
+				nativeEditorDrops.dispatch(payload.paths, payload.position, window.devicePixelRatio, document);
+			}
+		}).then(stop => { if (disposed) stop(); else unlisten = stop; })
+			.catch(error => console.error('Failed to listen for native drops:', error));
+		return () => { disposed = true; unlisten?.(); stopFocus(); };
+	});
 
 	// Detect platform and install type on startup
 	onMount(() => {

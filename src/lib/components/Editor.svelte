@@ -31,11 +31,10 @@
 	import { DOMParser as PMDOMParser, DOMSerializer, type Node as ProseMirrorNode } from '@tiptap/pm/model';
 	import { convertFileSrc } from '@tauri-apps/api/core';
 	import { isDbVault } from '$lib/api-db';
-	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { readFile } from '@tauri-apps/plugin-fs';
 	import { openFile, openUrl, copyFileTo, copyImageToClipboard as copyImageToClipboardCmd, writeBytesTo, copyPngToClipboard, copyTextToClipboard } from '$lib/api';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
-	import { appConfig, focusMode, quickAccessPaths, notes, viewMode, notebooks, outlineWidth } from '$lib/stores/app';
+	import { appConfig, focusMode, quickAccessPaths, notes, viewMode, notebooks, outlineWidth, showSettings, showSearch as showAppSearch, showCommandPalette, showInfo as showAppInfo } from '$lib/stores/app';
 	import { saveNote, importNote, createNote, saveImage, resolveAttachmentImage, saveAttachment, readClipboardImage, readClipboardContents, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout, spawnRyukTerminal } from '$lib/api';
 	import type { NoteContent, VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord, FileEvent, SearchTarget, ToolbarLayout } from '$lib/types';
 	import { listen } from '@tauri-apps/api/event';
@@ -48,6 +47,7 @@
 	import { isCurrentVaultEvent } from '$lib/utils/note-list-updates';
 	import { getEditorPane } from '$lib/stores/editor-pane';
 	import { getEditorWorkspace } from '$lib/stores/editor-workspace';
+	import { editorDomIds, editorFocus, restoreEditorFocus, editorOpenNotes, openNoteRequest, nativeEditorDrops, hasEditorOverlay, ownsEditorSearch } from '$lib/utils/editor-events';
 	import { encryptSecretText, decryptSecretText, readSecretTitle } from '$lib/utils/secrets';
 	import { WrapSelectedText } from '$lib/editor/extensions/wrapSelectedText';
 	import { CodeBlockInputScroll } from '$lib/editor/extensions/codeBlockInputScroll';
@@ -87,6 +87,21 @@
 		navHistory, canGoBack, canGoForward, beginNoteNavigation, isCurrentNoteNavigation,
 		cancelNoteNavigation } = paneContext;
 	const componentId = $props.id();
+	const domIds = editorDomIds(componentId);
+	let editorRoot = $state<HTMLDivElement | null>(null);
+	function overlayOwnsInput() {
+		return $showSettings || $showAppSearch || $showCommandPalette || $showAppInfo || hasEditorOverlay();
+	}
+	function ownsNoteSearch() {
+		return !editorDisposed && !externalOperationBusy && !workspace?.isBlocked()
+			&& !overlayOwnsInput() && ownsEditorSearch(editorRoot, paneIsActive());
+	}
+	function captureFocusIntent() {
+		const current = editorFocus.capture();
+		const active = paneIsActive() && document.hasFocus();
+		return () => active && current() && !editorDisposed && !externalOperationBusy && !workspace?.isBlocked()
+			&& paneIsActive() && !overlayOwnsInput();
+	}
 	const outlinePanelId = `${componentId}-outline`;
 	let { onMoveToTrash, onOutlineChange, onShowTag }: {
 		onMoveToTrash?: (path: string) => Promise<boolean>;
@@ -725,7 +740,7 @@
 			{ label: 'Collapsible Section', aliases: ['details', 'accordion', 'collapse', 'toggle', 'summary'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><polyline points="10 8 14 12 10 16"/></svg>', action: () => insertDetails() },
 			{ label: 'Callout', aliases: ['callout', 'admonition', 'note', 'info', 'tip', 'warning', 'caution', 'danger', 'success', 'question', 'quote', 'aside', 'box'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><line x1="7" y1="5" x2="7" y2="19"/></svg>', action: () => insertCallout('note') },
 			{ label: 'Table', aliases: ['table', 'grid'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="3" x2="9" y2="21"/><line x1="15" y1="3" x2="15" y2="21"/></svg>', action: () => { slashTablePicker = true; slashTableHover = { rows: 0, cols: 0 }; } },
-			{ label: 'Image Grid', aliases: ['imagegrid', 'image-grid', 'imggrid', 'gallery', 'masonry', 'images', 'side-by-side'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>', action: () => openAssetPicker('insert-grid-input') },
+			{ label: 'Image Grid', aliases: ['imagegrid', 'image-grid', 'imggrid', 'gallery', 'masonry', 'images', 'side-by-side'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>', action: () => openAssetPicker(domIds.grid) },
 			{ label: 'Horizontal Rule', aliases: ['hr', 'divider', 'line', 'separator', 'rule'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="2" y1="12" x2="22" y2="12"/></svg>', action: () => editor?.chain().focus().setHorizontalRule().run() },
 			{ label: 'Page Break', aliases: ['pagebreak', 'page', 'break', 'newpage', 'print'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="2" y1="9" x2="22" y2="9" stroke-dasharray="4 2"/><line x1="2" y1="15" x2="22" y2="15" stroke-dasharray="4 2"/><path d="M6 5v4M18 5v4M6 15v4M18 15v4"/></svg>', action: () => editor?.chain().focus().insertContent({ type: 'pageBreak' }).run() },
 			{ label: 'Math Block', aliases: ['math', 'latex', 'equation', 'formula', 'tex', 'katex'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h6l4 14h6"/><path d="M7 19l10-14"/></svg>', action: () => openMathInsert('block') },
@@ -2429,7 +2444,7 @@
 		if (!slashMenu || slashSelectedIndex < 0) return;
 		slashSelectedIndex; // track
 		tick().then(() => {
-			document.querySelector('.slash-menu .slash-menu-item.selected')?.scrollIntoView({ block: 'nearest' });
+			ownedOverlayElement('.slash-menu .slash-menu-item.selected')?.scrollIntoView({ block: 'nearest' });
 		});
 	});
 
@@ -2437,7 +2452,7 @@
 		if (!wikiLinkMenu || wikiLinkSelectedIndex < 0) return;
 		wikiLinkSelectedIndex; // track
 		tick().then(() => {
-			document.querySelector('.wiki-link-menu .wiki-link-item.selected')?.scrollIntoView({ block: 'nearest' });
+			ownedOverlayElement('.wiki-link-menu .wiki-link-item.selected')?.scrollIntoView({ block: 'nearest' });
 		});
 	});
 
@@ -3906,16 +3921,17 @@
 		editor.view.updateState(newState);
 	}
 
-	export function focusTitle(navigationToken: number) {
+	export function focusTitle(navigationToken: number, originFocus: () => boolean = () => true) {
+		const focusCurrent = captureFocusIntent();
 		const vault = $appConfig?.active_vault;
 		const path = $activeNotePath;
 		tick().then(() => {
-			if (editorDisposed || !paneIsActive() || !isCurrentNoteNavigation(navigationToken)
+			if (!originFocus() || !focusCurrent() || !isCurrentNoteNavigation(navigationToken)
 				|| vault !== $appConfig?.active_vault || path !== $activeNotePath) return;
-			if (titleInput) {
-				titleInput.focus();
-				titleInput.select();
-			}
+			if (titleInput) restoreEditorFocus(() => originFocus() && focusCurrent(), () => {
+				titleInput!.focus();
+				titleInput!.select();
+			});
 		});
 	}
 
@@ -4852,7 +4868,7 @@
 	}
 
 	function handleFormattingEscape(event: KeyboardEvent) {
-		if (event.key !== 'Escape' || event.isComposing || (!moreOpen && !anyDropdownOpen)) return;
+		if (!paneIsActive() || event.defaultPrevented || event.key !== 'Escape' || event.isComposing || (!moreOpen && !anyDropdownOpen)) return;
 		const target = event.target instanceof Element ? event.target : null;
 		if (target && !formattingBar?.contains(target)
 			&& target.closest('[role="dialog"], [role="menu"], .note-search-bar')) return;
@@ -5062,9 +5078,10 @@
 		if (!editor || !noteSearchResults.length) return;
 		if (noteSearchFrame !== null) cancelAnimationFrame(noteSearchFrame);
 		const generation = noteSearchGeneration;
+		const focusCurrent = captureFocusIntent();
 		noteSearchFrame = requestAnimationFrame(() => {
 			noteSearchFrame = null;
-			if (!noteSearchOpen || generation !== noteSearchGeneration || $sourceMode) return;
+			if (!noteSearchOpen || !focusCurrent() || !ownsNoteSearch() || generation !== noteSearchGeneration || $sourceMode) return;
 			const el = editor?.view.dom.querySelector<HTMLElement>('.note-search-active');
 			if (!el) return;
 			for (let parent = el.parentElement; parent; parent = parent.parentElement) {
@@ -5078,7 +5095,8 @@
 	}
 
 	function navigateNoteSearch(direction: number) {
-		if (!noteSearchOpen) return;
+		if (!noteSearchOpen || !ownsNoteSearch()) return;
+		noteSearchInput?.focus({ preventScroll: true });
 		const pending = noteSearchPending;
 		cancelNoteSearchWork();
 		if (pending) scanNoteSearch();
@@ -5088,13 +5106,14 @@
 			if (!$sourceMode) applySearchDecorations();
 			revealNoteSearchMatch();
 		}
-		noteSearchInput?.focus({ preventScroll: true });
 	}
 
 	function noteSearchNext() { navigateNoteSearch(1); }
 	function noteSearchPrev() { navigateNoteSearch(-1); }
 
 	export function openNoteSearch(replace = false) {
+		if (!ownsNoteSearch()) return;
+		const focusCurrent = captureFocusIntent();
 		++targetRevealRequest;
 		clearTargetReveal();
 		// Asking for replace while find is already showing moves on to the replace field.
@@ -5102,7 +5121,7 @@
 		noteSearchOpen = true;
 		if (replace) noteReplaceOpen = true;
 		tick().then(() => {
-			if (!noteSearchOpen || editorDisposed) return;
+			if (!noteSearchOpen || !focusCurrent() || !ownsNoteSearch()) return;
 			if (toReplace) noteReplaceInput?.focus({ preventScroll: true });
 			else noteSearchInput?.focus({ preventScroll: true });
 		});
@@ -5215,15 +5234,16 @@
 		if (editor && !editor.isDestroyed) {
 			editor.view.dispatch(editor.state.tr.setMeta(noteSearchPluginKey, DecorationSet.empty));
 		}
-		if (restoreFocus) {
+		if (restoreFocus && paneIsActive() && !overlayOwnsInput()) {
 			if ($sourceMode) source.focus();
 			else editor?.commands.focus(undefined, { scrollIntoView: false });
 		}
 	}
 
 	function handleNoteSearchKey(event: KeyboardEvent) {
-		if (!noteSearchOpen || event.isComposing || event.key !== 'F3' || event.ctrlKey || event.metaKey || event.altKey) return;
+		if (event.defaultPrevented || !ownsNoteSearch() || !noteSearchOpen || event.isComposing || event.key !== 'F3' || event.ctrlKey || event.metaKey || event.altKey) return;
 		event.preventDefault();
+		event.stopImmediatePropagation();
 		event.shiftKey ? noteSearchPrev() : noteSearchNext();
 	}
 
@@ -6378,16 +6398,25 @@
 		editor.chain().focus().wrapIn('callout', { type, title: '', foldable: false, folded: false }).run();
 	}
 
+	let closeOwnedCalloutMenu: (() => void) | null = null;
 	function openCalloutTypeMenu(anchor: HTMLElement, onPick: (type: string) => void) {
-		document.querySelectorAll('.callout-type-menu').forEach((el) => el.remove());
+		closeOwnedCalloutMenu?.();
 		const menu = document.createElement('div');
 		menu.className = 'callout-type-menu';
+		menu.dataset.editorOverlay = componentId;
+		let closed = false;
+		let setupTimer: ReturnType<typeof setTimeout> | undefined;
 		const close = () => {
+			if (closed) return;
+			closed = true;
+			clearTimeout(setupTimer);
+			if (closeOwnedCalloutMenu === close) closeOwnedCalloutMenu = null;
 			menu.remove();
 			document.removeEventListener('mousedown', onDoc, true);
 			document.removeEventListener('keydown', onKey, true);
 			window.removeEventListener('scroll', close, true);
 		};
+		closeOwnedCalloutMenu = close;
 		const onDoc = (e: MouseEvent) => { if (!menu.contains(e.target as Node)) close(); };
 		const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
 		for (const item of CALLOUT_MENU) {
@@ -6431,7 +6460,8 @@
 		const r = anchor.getBoundingClientRect();
 		menu.style.top = `${Math.min(r.bottom + 4, window.innerHeight - menu.offsetHeight - 8)}px`;
 		menu.style.left = `${Math.min(r.left, window.innerWidth - menu.offsetWidth - 8)}px`;
-		setTimeout(() => {
+		setupTimer = setTimeout(() => {
+			if (closed) return;
 			document.addEventListener('mousedown', onDoc, true);
 			document.addEventListener('keydown', onKey, true);
 			window.addEventListener('scroll', close, true);
@@ -7124,6 +7154,15 @@
 
 	const assetPickerOrigins = new WeakMap<HTMLInputElement, EditorOrigin>();
 
+	function ownedOverlayElement(selector: string): Element | null {
+		for (const overlay of document.querySelectorAll<HTMLElement>('[data-editor-overlay]')) {
+			if (overlay.dataset.editorOverlay !== componentId) continue;
+			const match = overlay.querySelector(selector);
+			if (match) return match;
+		}
+		return null;
+	}
+
 	function openAssetPicker(id: string) {
 		insertDropdown = false;
 		const input = document.getElementById(id) as HTMLInputElement | null;
@@ -7177,6 +7216,7 @@
 	// Source mode toggle - only react to explicit user toggle, not note switches
 	$effect(() => {
 		const isSource = $sourceMode;
+		const focusCurrent = captureFocusIntent();
 		// Only act if we have a loaded note, or one the rich editor could not display
 		const failedLoad = loadFailure !== null && loadFailure === $activeNotePath;
 		if (!loadedPath && !failedLoad) return;
@@ -7208,8 +7248,8 @@
 			tick().then(() => {
 				if (!isCurrent() || !source.view) return;
 				if (noteSearchOpen) return;
-				source.select(anchor, head, true);
-				if (!isMobile && paneIsActive()) source.focus();
+				source.select(anchor, head, focusCurrent());
+				if (!isMobile) restoreEditorFocus(focusCurrent, () => source.focus());
 			});
 		} else if (!isSource && lastSourceMode) {
 			clearOutline();
@@ -7226,9 +7266,12 @@
 				const anchor = positionAt(selection.anchor);
 				const head = selection.empty ? anchor : positionAt(selection.head);
 				const sel = TextSelection.between(editor.state.doc.resolve(anchor), editor.state.doc.resolve(head));
-				editor.view.dispatch(editor.state.tr.setSelection(sel).scrollIntoView());
-				if (!isMobile && paneIsActive()) editor.view.focus();
-				requestAnimationFrame(() => { if (isCurrent()) editor?.commands.scrollIntoView(); });
+				const tr = editor.state.tr.setSelection(sel);
+				const restoreFocus = focusCurrent();
+				editor.view.dispatch(restoreFocus ? tr.scrollIntoView() : tr);
+				if (!isMobile && restoreFocus) restoreEditorFocus(focusCurrent, () => editor?.view.focus());
+				const scrollCurrent = captureFocusIntent();
+				requestAnimationFrame(() => { if (restoreFocus && isCurrent() && scrollCurrent()) editor?.commands.scrollIntoView(); });
 			};
 			if (isMobile) {
 				// A source-only first load has no rich editor yet.
@@ -7258,30 +7301,26 @@
 		}
 	});
 
-	// Tauri drag-drop listener for OS file drops (browser DragEvent doesn't have files in Tauri)
-	$effect(() => {
-		let disposed = false;
-		let unlisten: (() => void) | undefined;
-		getCurrentWindow().onDragDropEvent((event) => {
-			if (event.payload.type !== 'drop') return;
+	// The layout owns the native listener and hit-tests its physical coordinates once.
+	$effect(() => nativeEditorDrops.register(componentId, {
+		element: () => editorRoot?.closest<HTMLElement>('.editor-pane') ?? editorRoot,
+		insert: (paths) => {
 			const origin = captureOrigin();
-			if (!canInsert(origin)) return;
-			for (const filePath of event.payload.paths) {
+			if (overlayOwnsInput() || !canInsert(origin) || workspace?.isBlocked()) return;
+			const owner = workspace ? get(workspace).panes.find(p => p.context === paneContext) : null;
+			if (owner) workspace?.activate(owner.id);
+			for (const filePath of paths) {
 				const name = filePath.replace(/\\/g, '/').split('/').pop() || 'file';
 				const ext = name.split('.').pop()?.toLowerCase() || '';
 				const kind: AssetKind = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico'].includes(ext)
 					? 'image' : ext === 'pdf' ? 'pdf' : 'file';
 				void readFile(filePath).then(async (data) => {
-					if (disposed || !canInsert(origin)) return;
+					if (!canInsert(origin)) return;
 					await uploadAsset(origin, name, Array.from(data), kind);
-				}).catch((e) => console.error('Failed to drop file:', e));
+				}).catch(error => console.error('Failed to drop file:', error));
 			}
-		}).then((fn) => {
-			if (disposed) fn();
-			else unlisten = fn;
-		}).catch((e) => console.error('Failed to listen for file drops:', e));
-		return () => { disposed = true; unlisten?.(); };
-	});
+		},
+	}));
 
 	// Note events update one cached title; only structural changes need a vault scan.
 	let unlistenFileChange: (() => void) | null = null;
@@ -7423,18 +7462,18 @@
 	}).catch(e => console.error('Failed to listen for toolbar changes:', e));
 
 	function handleOpenNote(event: Event) {
-		const detail = (event as CustomEvent<string | { path: string; paneId?: string }>).detail;
-		const path = typeof detail === 'string' ? detail : detail.path;
-		if (workspace) {
-			const state = get(workspace);
-			const id = typeof detail === 'string' ? state.activePaneId : detail.paneId ?? state.activePaneId;
-			if (!state.panes.some(p => p.id === id && p.context === paneContext)) return;
-		}
-		if (typeof path === 'string' && path) void navigateToWikiLink(path, '');
+		const request = openNoteRequest((event as CustomEvent<unknown>).detail);
+		if (!request || editorDisposed || workspace?.isBlocked()) return;
+		const state = workspace ? get(workspace) : null;
+		const owner = state?.panes.find(p => p.context === paneContext)?.id ?? componentId;
+		const destination = request.paneId ?? state?.activePaneId ?? owner;
+		if (!editorOpenNotes.claim(event, destination, owner)) return;
+		void navigateToWikiLink(request.path, '');
 	}
 	window.addEventListener('ryuknotes-open-note', handleOpenNote);
 
 	onDestroy(() => {
+		closeOwnedCalloutMenu?.();
 		cancelProgressiveLoad();
 		void flushSave();
 		closeAiMenu();
@@ -7488,17 +7527,17 @@
 			</button>
 			{#if insertDropdown}
 				<div class="fmt-dropdown insert-dropdown" role="dialog" aria-label="Formatting options" use:positionFormattingPopup>
-					<button onclick={() => openAssetPicker('insert-image-input')}>
+					<button onclick={() => openAssetPicker(domIds.image)}>
 						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 00-2.828 0L6 21"/></svg>
 						Image
 					</button>
 					{#if isAndroid}
-						<button onclick={() => openAssetPicker('insert-camera-input')}>
+						<button onclick={() => openAssetPicker(domIds.camera)}>
 							<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 00-2 2v9a2 2 0 002 2h16a2 2 0 002-2V9a2 2 0 00-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>
 							Take Photo
 						</button>
 					{/if}
-					<button onclick={() => openAssetPicker('insert-file-input')}>
+					<button onclick={() => openAssetPicker(domIds.file)}>
 						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22a2 2 0 01-2-2V4a2 2 0 012-2h8a2.4 2.4 0 011.704.706l3.588 3.588A2.4 2.4 0 0120 8v12a2 2 0 01-2 2z"/><path d="M14 2v5a1 1 0 001 1h5"/></svg>
 						File
 					</button>
@@ -7800,7 +7839,7 @@
 <svelte:window onkeydown={handleNoteSearchKey} />
 
 
-<div class="editor-container" class:mobile={isMobile} inert={externalOperationBusy}>
+<div class="editor-container" bind:this={editorRoot} data-editor-id={componentId} class:mobile={isMobile} inert={externalOperationBusy}>
 	{#if !$activeNote}
 		<div class="empty-editor">
 			<div class="empty-icon">
@@ -8255,8 +8294,8 @@
 						<div class="history-empty">No versions yet. Versions are created automatically as you edit (at least 5 minutes apart).</div>
 					{:else}
 						<div class="history-picker">
-							<label for="history-version-picker">Version</label>
-							<select id="history-version-picker" aria-label="Select snapshot version"
+							<label for={domIds.history}>Version</label>
+							<select id={domIds.history} aria-label="Select snapshot version"
 								value={historySelected?.timestamp ?? ''}
 								onchange={(event) => { const version = historyVersions.find((v) => v.timestamp === event.currentTarget.value); if (version) void previewVersion(version); }}>
 								{#each historyVersions as version (version.timestamp)}
@@ -8531,17 +8570,17 @@
 	{/if}
 
 	<!-- Hidden file inputs for Insert dropdown -->
-	<input type="file" id="insert-image-input" accept="image/*" style="display:none" onchange={handleAssetInput} />
-	<input type="file" id="insert-grid-input" accept="image/*" multiple style="display:none" onchange={handleGridInput} />
+	<input type="file" id={domIds.image} accept="image/*" style="display:none" onchange={handleAssetInput} />
+	<input type="file" id={domIds.grid} accept="image/*" multiple style="display:none" onchange={handleGridInput} />
 	{#if isAndroid}
-		<input type="file" id="insert-camera-input" accept="image/*" capture="environment" style="display:none" onchange={handleAssetInput} />
+		<input type="file" id={domIds.camera} accept="image/*" capture="environment" style="display:none" onchange={handleAssetInput} />
 	{/if}
-	<input type="file" id="insert-file-input" style="display:none" onchange={handleAssetInput} />
+	<input type="file" id={domIds.file} style="display:none" onchange={handleAssetInput} />
 </div>
 
 {#if linkContextMenu}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="link-context-overlay" onclick={(e) => closeFromOverlay(e, closeLinkContextMenu)} onkeydown={(e) => closeOnEscape(e, closeLinkContextMenu)}>
+	<div class="link-context-overlay" data-editor-overlay={componentId} onclick={(e) => closeFromOverlay(e, closeLinkContextMenu)} onkeydown={(e) => closeOnEscape(e, closeLinkContextMenu)}>
 		<div class="link-context-menu" style="left: {linkContextMenu.x}px; top: {linkContextMenu.y}px">
 			<div class="link-context-url">{linkContextMenu.href}</div>
 			<button onclick={linkMenuOpen}>
@@ -8587,7 +8626,7 @@
 
 {#if textContextMenu}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="text-ctx-overlay" onclick={(e) => closeFromOverlay(e, closeTextContextMenu)} onkeydown={(e) => closeOnEscape(e, closeTextContextMenu)}>
+	<div class="text-ctx-overlay" data-editor-overlay={componentId} onclick={(e) => closeFromOverlay(e, closeTextContextMenu)} onkeydown={(e) => closeOnEscape(e, closeTextContextMenu)}>
 		<div class="text-ctx-menu" style="left: {textContextMenu.x}px; top: {textContextMenu.y}px">
 			<button onclick={ctxCut}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>
@@ -8716,7 +8755,7 @@
 
 {#if tableContextMenu}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="table-ctx-overlay" onclick={(e) => closeFromOverlay(e, closeTableContextMenu)} onkeydown={(e) => closeOnEscape(e, closeTableContextMenu)}>
+	<div class="table-ctx-overlay" data-editor-overlay={componentId} onclick={(e) => closeFromOverlay(e, closeTableContextMenu)} onkeydown={(e) => closeOnEscape(e, closeTableContextMenu)}>
 		<div class="table-ctx-menu" style="left: {tableContextMenu.x}px; top: {tableContextMenu.y}px; max-height: calc(100vh - {tableContextMenu.y}px - 8px); overflow-y: auto;">
 			<button onclick={tblAddRowBefore}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M3 12h18M3 18h18"/><path d="M12 3v3"/><polyline points="9 4.5 12 2 15 4.5"/></svg>
@@ -8791,7 +8830,7 @@
 
 {#if imageToolbar}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="img-toolbar-overlay" onclick={(e) => closeFromOverlay(e, () => (imageToolbar = null))} onkeydown={(e) => closeOnEscape(e, () => (imageToolbar = null))}>
+	<div class="img-toolbar-overlay" data-editor-overlay={componentId} onclick={(e) => closeFromOverlay(e, () => (imageToolbar = null))} onkeydown={(e) => closeOnEscape(e, () => (imageToolbar = null))}>
 		<div class="img-toolbar" class:mobile-viewer-toolbar={isAndroid} style="left: {imageToolbar.x}px; top: {imageToolbar.y}px">
 			<button class:active={imageToolbar.size === 'small'} onclick={() => setImageSize('small')} title="Small (33%)">S</button>
 			<button class:active={imageToolbar.size === 'medium'} onclick={() => setImageSize('medium')} title="Medium (50%)">M</button>
@@ -8831,7 +8870,7 @@
 
 {#if imageTitleModal}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="math-modal-overlay" onclick={(e) => closeFromOverlay(e, cancelImageTitleModal)} onkeydown={(e) => closeOnEscape(e, cancelImageTitleModal)}>
+	<div class="math-modal-overlay" data-editor-overlay={componentId} onclick={(e) => closeFromOverlay(e, cancelImageTitleModal)} onkeydown={(e) => closeOnEscape(e, cancelImageTitleModal)}>
 		<div class="math-modal" role="dialog" aria-modal="true" aria-label="Image hover text" tabindex="-1">
 			<div class="math-modal-header">
 				<span>Image hover text</span>
@@ -8879,7 +8918,7 @@
 
 {#if mathModal}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="math-modal-overlay" onclick={(e) => closeFromOverlay(e, cancelMathModal)} onkeydown={(e) => closeOnEscape(e, cancelMathModal)}>
+	<div class="math-modal-overlay" data-editor-overlay={componentId} onclick={(e) => closeFromOverlay(e, cancelMathModal)} onkeydown={(e) => closeOnEscape(e, cancelMathModal)}>
 		<div class="math-modal" role="dialog" aria-modal="true" aria-label="Math editor" tabindex="-1">
 			<div class="math-modal-header">
 				<span>{mathModal.editPos !== null ? 'Edit' : 'Insert'} {mathModal.kind === 'block' ? 'Math Block' : 'Inline Math'}</span>
@@ -8919,7 +8958,7 @@
 
 {#if secretModal}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="math-modal-overlay" onclick={(e) => closeFromOverlay(e, cancelSecretModal)} onkeydown={(e) => closeOnEscape(e, cancelSecretModal)}>
+	<div class="math-modal-overlay" data-editor-overlay={componentId} onclick={(e) => closeFromOverlay(e, cancelSecretModal)} onkeydown={(e) => closeOnEscape(e, cancelSecretModal)}>
 		<div class="math-modal secret-modal" role="dialog" aria-modal="true" aria-label="Encrypted secret editor" tabindex="-1">
 			<div class="math-modal-header">
 				<span>Insert Secret</span>
@@ -8987,7 +9026,7 @@
 
 {#if viewerImportPickerOpen}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="viewer-import-overlay" onclick={(e) => closeFromOverlay(e, () => (viewerImportPickerOpen = false))} onkeydown={(e) => closeOnEscape(e, () => (viewerImportPickerOpen = false))}>
+	<div class="viewer-import-overlay" data-editor-overlay={componentId} onclick={(e) => closeFromOverlay(e, () => (viewerImportPickerOpen = false))} onkeydown={(e) => closeOnEscape(e, () => (viewerImportPickerOpen = false))}>
 		<div class="viewer-import-picker" role="dialog" aria-modal="true" aria-label="Import image to folder" tabindex="-1">
 			<div class="viewer-import-header">
 				<span>Import to folder</span>
@@ -9013,7 +9052,7 @@
 
 {#if tagMenu && $activeNote}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="tag-menu-overlay" onclick={(e) => closeFromOverlay(e, () => (tagMenu = null))} onkeydown={(e) => closeOnEscape(e, () => (tagMenu = null))}>
+	<div class="tag-menu-overlay" data-editor-overlay={componentId} onclick={(e) => closeFromOverlay(e, () => (tagMenu = null))} onkeydown={(e) => closeOnEscape(e, () => (tagMenu = null))}>
 		<div class="tag-menu" style="left: {tagMenu.x}px; top: {tagMenu.y}px">
 			{#if $activeNote.meta.tags.length > 0}
 				<div class="tag-menu-list">
@@ -9039,7 +9078,7 @@
 
 {#if codeLangDropdown}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="code-lang-overlay" onclick={(e) => closeFromOverlay(e, closeCodeLangDropdown)} onkeydown={(e) => closeOnEscape(e, closeCodeLangDropdown)}>
+	<div class="code-lang-overlay" data-editor-overlay={componentId} onclick={(e) => closeFromOverlay(e, closeCodeLangDropdown)} onkeydown={(e) => closeOnEscape(e, closeCodeLangDropdown)}>
 		<div class="code-lang-dropdown" style="left: {codeLangDropdown.x}px; top: {codeLangDropdown.y}px">
 			<input class="code-lang-search" type="text" placeholder="Search..." bind:this={codeLangInput} bind:value={codeLangSearch} onkeydown={(e) => {
 				if (e.key === 'Enter' && codeLangFiltered.length > 0) { e.preventDefault(); e.stopPropagation(); selectCodeLang(codeLangFiltered[0]); }
@@ -9068,7 +9107,7 @@
 
 {#if slashMenu}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="slash-menu-overlay" onclick={(e) => closeFromOverlay(e, closeSlashMenu)} onkeydown={(e) => closeOnEscape(e, closeSlashMenu)}>
+	<div class="slash-menu-overlay" data-editor-overlay={componentId} onclick={(e) => closeFromOverlay(e, closeSlashMenu)} onkeydown={(e) => closeOnEscape(e, closeSlashMenu)}>
 		<div class="slash-menu" style="left: {slashMenu.x}px; top: {slashMenu.y}px">
 			{#if slashTablePicker}
 				<div class="slash-table-picker">
@@ -9131,7 +9170,7 @@
 
 {#if taskMetaMenu}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="slash-menu-overlay" onclick={(e) => closeFromOverlay(e, closeTaskMetaMenu)} onkeydown={(e) => closeOnEscape(e, closeTaskMetaMenu)}>
+	<div class="slash-menu-overlay" data-editor-overlay={componentId} onclick={(e) => closeFromOverlay(e, closeTaskMetaMenu)} onkeydown={(e) => closeOnEscape(e, closeTaskMetaMenu)}>
 		<div class="slash-menu" style="left: {taskMetaMenu.x}px; top: {taskMetaMenu.y}px">
 			{#if taskMetaFiltered.length === 0}
 				<div class="slash-menu-empty">No match</div>
@@ -9154,7 +9193,7 @@
 
 {#if taskDuePicker}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="slash-menu-overlay" onclick={(e) => closeFromOverlay(e, () => { taskDuePicker = null; editor?.commands.focus(); })} onkeydown={(e) => closeOnEscape(e, () => { taskDuePicker = null; editor?.commands.focus(); })}>
+	<div class="slash-menu-overlay" data-editor-overlay={componentId} onclick={(e) => closeFromOverlay(e, () => { taskDuePicker = null; editor?.commands.focus(); })} onkeydown={(e) => closeOnEscape(e, () => { taskDuePicker = null; editor?.commands.focus(); })}>
 		<input
 			type="date"
 			class="task-due-input"
@@ -9168,7 +9207,7 @@
 
 {#if wikiLinkMenu}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="wiki-link-overlay" onclick={(e) => closeFromOverlay(e, closeWikiLinkMenu)} onkeydown={(e) => closeOnEscape(e, closeWikiLinkMenu)}>
+	<div class="wiki-link-overlay" data-editor-overlay={componentId} onclick={(e) => closeFromOverlay(e, closeWikiLinkMenu)} onkeydown={(e) => closeOnEscape(e, closeWikiLinkMenu)}>
 		<div class="wiki-link-menu" style="left: {wikiLinkMenu.x}px; top: {wikiLinkMenu.y}px">
 			{#if wikiLinkFiltered.length === 0}
 				<div class="wiki-link-empty">
@@ -9198,7 +9237,7 @@
 
 {#if wikiLinkNavDisambig}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="wiki-link-overlay" onclick={(e) => closeFromOverlay(e, () => wikiLinkNavDisambig = null)} onkeydown={(e) => closeOnEscape(e, () => wikiLinkNavDisambig = null)}>
+	<div class="wiki-link-overlay" data-editor-overlay={componentId} onclick={(e) => closeFromOverlay(e, () => wikiLinkNavDisambig = null)} onkeydown={(e) => closeOnEscape(e, () => wikiLinkNavDisambig = null)}>
 		<div class="wiki-link-menu" style="left: {wikiLinkNavDisambig.x}px; top: {wikiLinkNavDisambig.y}px">
 			<div class="wiki-link-disambig-header">Multiple notes found - choose one:</div>
 			{#each wikiLinkNavDisambig.entries as entry, i}
@@ -9221,7 +9260,7 @@
 
 {#if aiMenu}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="ai-menu-overlay" class:mobile={isMobile} onclick={(e) => closeFromOverlay(e, closeAiMenu)} onkeydown={(e) => closeOnEscape(e, closeAiMenu)}>
+	<div class="ai-menu-overlay" data-editor-overlay={componentId} class:mobile={isMobile} onclick={(e) => closeFromOverlay(e, closeAiMenu)} onkeydown={(e) => closeOnEscape(e, closeAiMenu)}>
 		<div class="ai-menu" class:mobile={isMobile} style={isMobile ? '' : `left: ${aiMenu.x}px; top: ${aiMenu.y}px`}>
 			{#if aiResult !== null || aiLoading}
 				<!-- Result view -->
@@ -9361,7 +9400,7 @@
 
 {#if linkModal}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="link-modal-overlay" onclick={(e) => closeFromOverlay(e, linkModalCancel)} onkeydown={(e) => closeOnEscape(e, linkModalCancel)}>
+	<div class="link-modal-overlay" data-editor-overlay={componentId} onclick={(e) => closeFromOverlay(e, linkModalCancel)} onkeydown={(e) => closeOnEscape(e, linkModalCancel)}>
 		<div class="link-modal" role="dialog" aria-modal="true" aria-label="Insert link" tabindex="-1">
 			<div class="link-modal-header">
 				<img src="/ryuk-logo.png" alt="Ryuk's Notebook" width="28" height="28" />

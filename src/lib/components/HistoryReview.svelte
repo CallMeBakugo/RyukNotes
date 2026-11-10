@@ -1,5 +1,8 @@
 <script lang="ts">
 	import { tick } from 'svelte';
+	import { historyDomIds, editorFocus } from '$lib/utils/editor-events';
+	const componentId = $props.id();
+	const ids = historyDomIds(componentId);
 	import SnapshotDocument from './SnapshotDocument.svelte';
 	import { comparableBody, compareHistory, splitSnapshot, type HistoryComparison, type HistoryRow } from '$lib/utils/history-comparison';
 
@@ -55,9 +58,10 @@
 	async function navigateTabs(event: KeyboardEvent) {
 		if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
 		event.preventDefault();
+		const focusCurrent = editorFocus.capture();
 		view = event.key === 'Home' ? 'changes' : event.key === 'End' ? 'snapshot' : view === 'changes' ? 'snapshot' : 'changes';
 		await tick();
-		document.getElementById(`history-tab-${view}`)?.focus();
+		if (focusCurrent()) document.getElementById(view === 'changes' ? ids.changesTab : ids.snapshotTab)?.focus();
 	}
 </script>
 
@@ -79,8 +83,8 @@
 			<span>Read-only. Your current note stays unchanged.</span>
 		</div>
 		<div class="review-tabs" role="tablist" aria-label="Version view" tabindex="-1" onkeydown={navigateTabs}>
-			<button id="history-tab-changes" role="tab" aria-selected={view === 'changes'} aria-controls="history-changes" tabindex={view === 'changes' ? 0 : -1} onclick={() => view = 'changes'}>Changes</button>
-			<button id="history-tab-snapshot" role="tab" aria-selected={view === 'snapshot'} aria-controls="history-snapshot" tabindex={view === 'snapshot' ? 0 : -1} onclick={() => view = 'snapshot'}>Snapshot</button>
+			<button id={ids.changesTab} role="tab" aria-selected={view === 'changes'} aria-controls={ids.changesPanel} tabindex={view === 'changes' ? 0 : -1} onclick={() => view = 'changes'}>Changes</button>
+			<button id={ids.snapshotTab} role="tab" aria-selected={view === 'snapshot'} aria-controls={ids.snapshotPanel} tabindex={view === 'snapshot' ? 0 : -1} onclick={() => view = 'snapshot'}>Snapshot</button>
 		</div>
 	</div>
 
@@ -91,7 +95,7 @@
 	{:else if raw === null}
 		<p class="review-status">Select a version to review.</p>
 	{:else if view === 'changes'}
-		<div id="history-changes" class="review-panel" role="tabpanel" aria-labelledby="history-tab-changes" tabindex="0">
+		<div id={ids.changesPanel} class="review-panel" role="tabpanel" aria-labelledby={ids.changesTab} tabindex="0">
 			<div class="comparison-heading">
 				<span>Current note → selected version</span>
 				{#if comparison}<span class="comparison-count"><span class="added-count">+{comparison.added}</span> <span class="removed-count">−{comparison.removed}</span> lines</span>{/if}
@@ -117,7 +121,7 @@
 			{/if}
 		</div>
 	{:else}
-		<div id="history-snapshot" class="review-panel" role="tabpanel" aria-labelledby="history-tab-snapshot" tabindex="0">
+		<div id={ids.snapshotPanel} class="review-panel" role="tabpanel" aria-labelledby={ids.snapshotTab} tabindex="0">
 			<div class="snapshot-heading"><span>Selected snapshot</span><button class="source-toggle" aria-pressed={source} onclick={() => source = !source}>{source ? 'Rendered view' : 'View source'}</button></div>
 			{#if snapshot.body === ''}
 				<p class="review-status">This snapshot is empty.</p>

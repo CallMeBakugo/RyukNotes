@@ -4,6 +4,7 @@ import test from 'node:test';
 import { runInNewContext } from 'node:vm';
 import * as stores from 'svelte/store';
 import ts from 'typescript';
+import * as editorEvents from '../src/lib/utils/editor-events.ts';
 import * as navigation from '../src/lib/utils/note-navigation.ts';
 import * as naturalSort from '../src/lib/utils/natural-sort.ts';
 
@@ -122,6 +123,7 @@ const workspaceModule = load(await readFile(new URL('../src/lib/stores/editor-wo
     setContext: (key, value) => { context.set(key, value); return value; },
   },
   './editor-pane': pane,
+  '../utils/editor-events': editorEvents,
 });
 
 test('workspace keeps stable contexts, opens one empty second pane and never exceeds two', async () => {
@@ -451,4 +453,19 @@ test('shared-control selection of an already-open note preserves its unsaved buf
   assert.equal(stores.get(f.right.context.activeNote), draft);
   assert.equal(stores.get(f.right.context.editorDirty), true);
   assert.equal(f.reads.size, 0);
+});
+
+test('focus intent captured with navigation expires on away-and-back without cancelling the load', () => {
+  const workspace = workspaceModule.createEditorWorkspace();
+  const first = stores.get(workspace).panes[0];
+  const intent = workspace.captureNavigation();
+  assert.equal(intent.focusIsCurrent(), true);
+  workspace.openSplit();
+  workspace.activate(first.id);
+  assert.equal(intent.isCurrent(), true);
+  assert.equal(intent.focusIsCurrent(), false);
+  const latest = workspace.captureNavigation();
+  editorEvents.editorFocus.invalidate();
+  assert.equal(latest.isCurrent(), true);
+  assert.equal(latest.focusIsCurrent(), false);
 });
