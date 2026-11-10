@@ -553,8 +553,9 @@ export async function openUrl(url: string): Promise<void> {
   return invoke("open_url", { url });
 }
 
-export async function spawnRyukTerminal(args: string[]): Promise<void> {
-  return invoke("spawn_ryuk_terminal", { args });
+export async function spawnRyukTerminal(args: string[], vault: string | null | undefined): Promise<void> {
+  if (!vault) throw new Error("Cannot launch Ryuk without the displayed vault");
+  return invoke("spawn_ryuk_terminal", { args: ["--vault", vault, ...args] });
 }
 
 export async function copyFileTo(

@@ -337,26 +337,40 @@ fn session_import(vault_flag: &Option<String>, tail: &[String]) -> Result<(), St
 }
 
 fn session_restore(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String> {
+    let extra_ids = flag_values(tail, "--notes");
+    let prompt = flag_values(tail, "--prompt").first().cloned();
     let session_id = positional(tail, &[])
         .first()
         .cloned()
         .ok_or("session restore <session-id>")?;
     // Restoring by session id: refresh the grounding of the note this session
     // is linked to (if any) so the resumed session re-reads the live note.
-    let db = open_vault(vault_flag.as_deref()).ok();
+    let db = match open_vault(vault_flag.as_deref()) {
+        Ok(db) => Some(db),
+        Err(error) if vault_flag.is_some() => return Err(error),
+        Err(_) => None,
+    };
     let note = db
         .as_ref()
-        .and_then(|db| db.get_note_for_session(&session_id).ok())
+        .map(|db| db.get_note_for_session(&session_id))
+        .transpose()?
         .flatten();
     let exit = match (db.as_ref(), note) {
-        (Some(db), Some(note_id)) => {
-            resume_with_fresh_grounding(db, &note_id, &session_id, vault_flag.as_deref())?
-        }
+        (Some(db), Some(note_id)) => resume_with_fresh_grounding(
+            db,
+            &note_id,
+            &session_id,
+            vault_flag.as_deref(),
+            &extra_ids,
+            prompt.as_deref(),
+        )?,
         _ => {
-            // No vault or no linked note: plain resume.
-            let status = Command::new("hermes")
-                .arg("--resume")
-                .arg(&session_id)
+            // Without a linked home there is nowhere to ground supplied notes.
+            if !extra_ids.is_empty() {
+                return Err("cannot ground extra notes without a linked home note; use session start --notes".into());
+            }
+            // No vault or no linked note: plain resume retains a supplied prompt.
+            let status = resume_command(&session_id, prompt.as_deref())
                 .status()
                 .map_err(|e| format!("launching hermes: {e}"))?;
             status.code().unwrap_or(1)
@@ -375,7 +389,7 @@ fn session_restore(vault_flag: &Option<String>, tail: &[String]) -> Result<(), S
 /// the dir's `.hermes.md` even though the process cwd may not move there.
 ///
 /// `extras` are additional notes folded into the grounding: each lands in the
-/// context file as its own `## <title>` section (skipped when unreadable —
+/// context file as its own `# Additional context: <title>` section (skipped when unreadable —
 /// the home note is the session's home; extras are best-effort context).
 fn write_session_context(
     dir: &std::path::Path,
@@ -427,40 +441,82 @@ fn write_session_context(
     Ok(context_file)
 }
 
-/// Refreshes the grounding context for a note (latest vault content) and
-/// resumes the linked Hermes session from the note's context directory, so
-/// resumed sessions re-read the note as their basis instead of relying on the
-/// launch-time snapshot. Returns the hermes exit status.
+/// Read best-effort extra grounding from the same live vault as the home note.
+fn read_extra_context(db: &VaultDb, ids: &[String]) -> Vec<(String, String, String)> {
+    ids.iter()
+        .filter_map(|id| match db.get_note_full(id) {
+            Ok(Some(note)) => Some((
+                id.clone(),
+                note["title"].as_str().unwrap_or("").to_string(),
+                note["content"].as_str().unwrap_or("").to_string(),
+            )),
+            _ => {
+                eprintln!("warning: no readable note with id {id}; skipped");
+                None
+            }
+        })
+        .collect()
+}
+
+// Shared by all resume entry points. Prepare before launching so grounding
+// errors cannot silently send Hermes stale context. Extras remain best-effort.
+fn grounded_resume_command(
+    db: &VaultDb,
+    note_id: &str,
+    session_id: &str,
+    vault_path: &std::path::Path,
+    context_dir: &std::path::Path,
+    extra_ids: &[String],
+    prompt: Option<&str>,
+) -> Result<Command, String> {
+    let note = db
+        .get_note_full(note_id)?
+        .ok_or_else(|| format!("no note with id {note_id}"))?;
+    let extras = read_extra_context(db, extra_ids);
+    write_session_context(
+        context_dir,
+        note_id,
+        note["title"].as_str().unwrap_or(""),
+        note["content"].as_str().unwrap_or(""),
+        vault_path,
+        &extras,
+    )?;
+    let mut cmd = resume_command(session_id, prompt);
+    cmd.arg("--in").arg(context_dir);
+    Ok(cmd)
+}
+
+fn resume_command(session_id: &str, prompt: Option<&str>) -> Command {
+    let mut cmd = Command::new("hermes");
+    cmd.arg("--resume").arg(session_id);
+    if let Some(prompt) = prompt {
+        cmd.arg("-z").arg(prompt);
+    }
+    cmd
+}
+
 fn resume_with_fresh_grounding(
     db: &VaultDb,
     note_id: &str,
     session_id: &str,
     vault_flag: Option<&str>,
+    extra_ids: &[String],
+    prompt: Option<&str>,
 ) -> Result<i32, String> {
     let vault_path = resolve_vault(vault_flag)?;
-    if let Ok(Some(note)) = db.get_note_full(note_id) {
-        let title = String::from(note["title"].as_str().unwrap_or(""));
-        let content = String::from(note["content"].as_str().unwrap_or(""));
-        let context_dir = std::env::temp_dir().join("ryuk-sessions").join(note_id);
-        let _ = write_session_context(&context_dir, note_id, &title, &content, &vault_path, &[]);
-        println!("grounding refreshed: {}", context_dir.display());
-        let status = Command::new("hermes")
-            .arg("--resume")
-            .arg(session_id)
-            .arg("--in")
-            .arg(&context_dir)
-            .status()
-            .map_err(|e| format!("launching hermes: {e}"))?;
-        Ok(status.code().unwrap_or(0))
-    } else {
-        // No note (or unreadable): plain resume, no grounding to refresh.
-        let status = Command::new("hermes")
-            .arg("--resume")
-            .arg(session_id)
-            .status()
-            .map_err(|e| format!("launching hermes: {e}"))?;
-        Ok(status.code().unwrap_or(0))
-    }
+    let context_dir = std::env::temp_dir().join("ryuk-sessions").join(note_id);
+    let status = grounded_resume_command(
+        db,
+        note_id,
+        session_id,
+        &vault_path,
+        &context_dir,
+        extra_ids,
+        prompt,
+    )?
+    .status()
+    .map_err(|e| format!("launching hermes: {e}"))?;
+    Ok(status.code().unwrap_or(1))
 }
 
 fn session_start(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String> {
@@ -484,7 +540,14 @@ fn session_start(vault_flag: &Option<String>, tail: &[String]) -> Result<(), Str
     // content, not the launch-time snapshot.
     if let Some(session_id) = db.get_session_link(&note_id)? {
         println!("resuming linked session {session_id}");
-        let exit = resume_with_fresh_grounding(&db, &note_id, &session_id, vault_flag.as_deref())?;
+        let exit = resume_with_fresh_grounding(
+            &db,
+            &note_id,
+            &session_id,
+            vault_flag.as_deref(),
+            &extra_ids,
+            prompt.as_deref(),
+        )?;
         std::process::exit(exit);
     }
 
@@ -499,27 +562,7 @@ fn session_start(vault_flag: &Option<String>, tail: &[String]) -> Result<(), Str
     let context_dir = std::env::temp_dir().join("ryuk-sessions").join(&note_id);
     let vault_path = resolve_vault(vault_flag.as_deref())?;
     // Additional notes: best-effort extra grounding, skipped when unreadable.
-    let extras: Vec<(String, String, String)> = extra_ids
-        .iter()
-        .filter_map(|extra_id| {
-            db.get_note_full(extra_id).ok().flatten().map(|n| {
-                (
-                    extra_id.clone(),
-                    String::from(n["title"].as_str().unwrap_or("")),
-                    String::from(n["content"].as_str().unwrap_or("")),
-                )
-            })
-        })
-        .collect();
-    for (extra_id, ..) in &extras {
-        println!("extra context: {extra_id}");
-    }
-    for missing in extra_ids
-        .iter()
-        .filter(|id| !extras.iter().any(|(eid, ..)| eid == *id))
-    {
-        eprintln!("warning: no readable note with id {missing}; skipped");
-    }
+    let extras = read_extra_context(&db, &extra_ids);
     let context_file = write_session_context(
         &context_dir,
         &note_id,
@@ -531,7 +574,7 @@ fn session_start(vault_flag: &Option<String>, tail: &[String]) -> Result<(), Str
     println!("context: {}", context_file.display());
     println!("grounding: {}", context_dir.join(".hermes.md").display());
 
-    let before = newest_session_in_workspace(&note_id);
+    let before = newest_session_in_workspace(&context_dir);
     let mut cmd = Command::new("hermes");
     cmd.arg("--in").arg(context_dir.to_string_lossy().as_ref());
     cmd.arg("--pass-session-id");
@@ -549,33 +592,123 @@ fn session_start(vault_flag: &Option<String>, tail: &[String]) -> Result<(), Str
 
     // Record the linkage: the newest session in this note's workspace that
     // did not exist before we launched (before=None means a brand-new home).
-    if let Some(after) = newest_session_in_workspace(&note_id) {
-        if Some(&after) != before.as_ref() {
+    match (before, newest_session_in_workspace(&context_dir)) {
+        (Ok(before), Ok(Some(after))) if Some(&after) != before.as_ref() => {
             db.set_session_link(&note_id, &after)?;
             println!("session linked: {note_id} -> {after}");
         }
+        (Err(error), _) | (_, Err(error)) => {
+            eprintln!("warning: session linkage not recorded: {error}");
+        }
+        _ => {}
     }
     std::process::exit(exit);
 }
 
-/// Newest hermes session id for a workspace needle, via `hermes sessions
-/// list --workspace <needle> --limit 1`. None when the listing is empty or
-/// the command fails (record-link then simply doesn't happen).
-fn newest_session_in_workspace(needle: &str) -> Option<String> {
-    let out = Command::new("hermes")
-        .args(["sessions", "list", "--workspace", needle, "--limit", "1"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    let line = text.lines().rev().find(|l| {
-        // session ids look like 20261013_185649_b600fe
-        l.contains('_')
-            && l.split_whitespace()
-                .last()
-                .map(|w| w.chars().filter(|c| *c == '_').count() == 2)
-                .unwrap_or(false)
-    })?;
-    line.split_whitespace().last().map(String::from)
+/// Prefer machine-readable discovery when supported. Older Hermes releases
+/// expose only a table: accept a single strictly shaped session ID, regardless
+/// of column position, and never interpret output from failed commands.
+fn valid_session_id(id: &str) -> bool {
+    let parts: Vec<&str> = id.split('_').collect();
+    parts.len() == 3
+        && parts[0].len() == 8
+        && parts[0].bytes().all(|b| b.is_ascii_digit())
+        && parts[1].len() == 6
+        && parts[1].bytes().all(|b| b.is_ascii_digit())
+        && parts[2].len() >= 4
+        && parts[2].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn json_session_id(text: &str) -> Result<Option<String>, ()> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|_| ())?;
+    let rows = value
+        .as_array()
+        .or_else(|| value.get("sessions").and_then(|v| v.as_array()))
+        .ok_or(())?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    if rows.len() != 1 {
+        return Err(());
+    }
+    let id = rows[0]
+        .get("session_id")
+        .or_else(|| rows[0].get("id"))
+        .and_then(|v| v.as_str())
+        .filter(|id| valid_session_id(id))
+        .ok_or(())?;
+    Ok(Some(id.to_string()))
+}
+
+fn text_session_id(text: &str) -> Option<String> {
+    // Strip ANSI control sequences before tokenizing a colored table.
+    let mut plain = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.next() != Some('[') {
+                return None;
+            }
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    let mut ids = plain
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|id| valid_session_id(id));
+    let id = ids.next()?;
+    if ids.next().is_some() {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+fn newest_session_in_workspace(workspace: &std::path::Path) -> Result<Option<String>, String> {
+    discover_session(std::path::Path::new("hermes"), workspace)
+}
+
+fn discover_session(
+    program: &std::path::Path,
+    workspace: &std::path::Path,
+) -> Result<Option<String>, String> {
+    let run = |json: bool| {
+        let mut cmd = Command::new(program);
+        cmd.args(["sessions", "list", "--workspace"])
+            .arg(workspace)
+            .args(["--limit", "1"]);
+        if json {
+            cmd.arg("--json");
+        }
+        cmd.output().ok()
+    };
+    if let Some(out) = run(true) {
+        if out.status.success() {
+            if let Ok(id) = json_session_id(&String::from_utf8_lossy(&out.stdout)) {
+                return Ok(id);
+            }
+        }
+    }
+    let out = run(false).ok_or("could not run Hermes session discovery")?;
+    if !out.status.success() {
+        return Err("Hermes session discovery failed".into());
+    }
+    let text = std::str::from_utf8(&out.stdout).map_err(|e| e.to_string())?;
+    match text_session_id(text) {
+        Some(id) => Ok(Some(id)),
+        // Recognize an empty table response; unknown or ambiguous output must
+        // not masquerade as a successful empty before-list.
+        None if text.trim().is_empty()
+            || text.trim().to_ascii_lowercase().starts_with("no sessions") =>
+        {
+            Ok(None)
+        }
+        None => Err("unrecognized or ambiguous Hermes session listing".into()),
+    }
 }
 
 fn session_resume_for_note(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String> {
@@ -587,7 +720,16 @@ fn session_resume_for_note(vault_flag: &Option<String>, tail: &[String]) -> Resu
     let session_id = db
         .get_session_link(&note_id)?
         .ok_or_else(|| format!("note {note_id} has no linked session yet"))?;
-    let exit = resume_with_fresh_grounding(&db, &note_id, &session_id, vault_flag.as_deref())?;
+    let extra_ids = flag_values(tail, "--notes");
+    let prompt = flag_values(tail, "--prompt").first().cloned();
+    let exit = resume_with_fresh_grounding(
+        &db,
+        &note_id,
+        &session_id,
+        vault_flag.as_deref(),
+        &extra_ids,
+        prompt.as_deref(),
+    )?;
     std::process::exit(exit);
 }
 
@@ -710,5 +852,148 @@ mod session_link_tests {
             db.get_note_for_session("20261015_000000_aaaa").unwrap(),
             Some("note-new".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod launch_context_tests {
+    use super::*;
+
+    fn seed(db: &VaultDb, id: &str, content: &str) {
+        db.upsert_note(&NewNote {
+            id: id.into(),
+            title: format!("Title {id}"),
+            content: content.into(),
+            pinned: false,
+            tags: vec![],
+            created: "2026-10-15T00:00:00Z".into(),
+            modified: "2026-10-15T00:00:00Z".into(),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn resume_refreshes_live_home_extras_and_preserves_prompt_and_vault() {
+        let db = VaultDb::open_in_memory().unwrap();
+        seed(&db, "home", "old home");
+        seed(&db, "extra", "old extra");
+        db.set_session_link("home", "20261015_120000_abcdef")
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("ryuk-resume-{}", uuid::Uuid::new_v4()));
+        let vault = std::path::Path::new("/displayed vault.rn");
+        let extras = vec!["extra".into(), "missing".into()];
+        grounded_resume_command(
+            &db,
+            "home",
+            "20261015_120000_abcdef",
+            vault,
+            &dir,
+            &extras,
+            None,
+        )
+        .unwrap();
+        seed(&db, "home", "live home");
+        seed(&db, "extra", "live extra");
+        let cmd = grounded_resume_command(
+            &db,
+            "home",
+            &db.get_session_link("home").unwrap().unwrap(),
+            vault,
+            &dir,
+            &extras,
+            Some("new prompt with spaces"),
+        )
+        .unwrap();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--resume",
+                "20261015_120000_abcdef",
+                "-z",
+                "new prompt with spaces",
+                "--in",
+                dir.to_str().unwrap()
+            ]
+        );
+        let context = std::fs::read_to_string(dir.join("context.md")).unwrap();
+        assert!(context.contains("live home"));
+        assert!(context.contains("# Additional context: Title extra"));
+        assert!(context.contains("live extra"));
+        assert!(!context.contains("old home") && !context.contains("old extra"));
+        let grounding = std::fs::read_to_string(dir.join(".hermes.md")).unwrap();
+        assert!(grounding.contains("/displayed vault.rn"));
+        // Write errors must fail before a Hermes process is launched.
+        assert!(grounded_resume_command(
+            &db,
+            "home",
+            "s",
+            vault,
+            &dir.join("context.md"),
+            &[],
+            None
+        )
+        .is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn discovery_parses_structured_output_and_strict_legacy_tables() {
+        let id = "20261015_120000_abcdef";
+        assert_eq!(
+            json_session_id(&format!(r#"[{{"session_id":"{id}"}}]"#)),
+            Ok(Some(id.into()))
+        );
+        assert_eq!(
+            json_session_id(&format!(r#"{{"sessions":[{{"id":"{id}"}}]}}"#)),
+            Ok(Some(id.into()))
+        );
+        assert_eq!(json_session_id("[]"), Ok(None));
+        assert!(json_session_id(r#"[{"id":"not_a_session"}]"#).is_err());
+        assert_eq!(
+            text_session_id(&format!(
+                "ID | Workspace\n\x1b[32m{id}\x1b[0m | /tmp/note\n"
+            )),
+            Some(id.into())
+        );
+        assert_eq!(text_session_id("No sessions found\nfoo_bar_baz"), None);
+        assert_eq!(
+            text_session_id(&format!("{id}\n20261016_120000_abcdef")),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_probes_json_falls_back_and_ignores_failed_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ryuk-discovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("hermes");
+        let workspace = dir.join("workspace with spaces");
+        let install = |body: &str| {
+            std::fs::write(&program, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        install("test \"$1 $2 $3\" = 'sessions list --workspace' || exit 1\ntest \"$5 $6\" = '--limit 1' || exit 1\ntest \"$7\" = '--json' || exit 1\nprintf '%s' '[{\"session_id\":\"20261015_120000_abcdef\"}]'");
+        assert_eq!(
+            discover_session(&program, &workspace),
+            Ok(Some("20261015_120000_abcdef".into()))
+        );
+        install(
+            "test \"$7\" != '--json' || exit 2\nprintf '%s' '20261016_120000_abcdef | workspace'",
+        );
+        assert_eq!(
+            discover_session(&program, &workspace),
+            Ok(Some("20261016_120000_abcdef".into()))
+        );
+        install("printf '%s' '20261015_120000_abcdef'; exit 1");
+        assert!(discover_session(&program, &workspace).is_err());
+        install("test \"$7\" = '--json' || exit 1\nprintf '%s' '[]'");
+        assert_eq!(discover_session(&program, &workspace), Ok(None));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

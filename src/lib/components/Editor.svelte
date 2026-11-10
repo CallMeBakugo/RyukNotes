@@ -196,12 +196,12 @@
 	const canGenerateSession = $derived(!isSessionSummary && !!$appConfig?.active_vault?.endsWith('.rn'));
 	async function restoreSession() {
 		if (!sessionId) return;
-		try { await spawnRyukTerminal(['session', 'restore', sessionId]); }
+		try { await spawnRyukTerminal(['session', 'restore', sessionId], $appConfig?.active_vault); }
 		catch (e) { console.error('restore failed', e); }
 	}
 	async function generateSession() {
 		if (!$activeNotePath) return;
-		try { await spawnRyukTerminal(['session', 'start', '--notes', $activeNotePath]); }
+		try { await spawnRyukTerminal(['session', 'start', '--notes', $activeNotePath], $appConfig?.active_vault); }
 		catch (e) { console.error('session start failed', e); }
 	}
 	// CM retains an immutable document; edits never bind a full source string to Svelte.
