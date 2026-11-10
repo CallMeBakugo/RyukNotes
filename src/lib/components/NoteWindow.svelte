@@ -4,21 +4,16 @@
 	import { getCurrentWebview } from '@tauri-apps/api/webview';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import Editor from './Editor.svelte';
-	import {
-		appConfig,
-		activeNote,
-		activeNotePath,
-		editorDirty,
-		readOnly,
-		sourceMode,
-		tagStyles
-	} from '$lib/stores/app';
+	import { appConfig, tagStyles } from '$lib/stores/app';
 	import { completeWindowClose, cancelWindowClose, getTagStyles, readNote } from '$lib/api';
 	import { keybindings, matchAction } from '$lib/keybindings';
 	import { isMobile } from '$lib/platform';
 	import type { FileEvent } from '$lib/types';
 	import { isCurrentVaultEvent } from '$lib/utils/note-list-updates';
-	import { beginNoteNavigation, isCurrentNoteNavigation, cancelNoteNavigation } from '$lib/utils/note-navigation';
+	import { provideEditorPane } from '$lib/stores/editor-pane';
+
+	const { activeNote, activeNotePath, editorDirty, readOnly, sourceMode,
+		beginNoteNavigation, isCurrentNoteNavigation, cancelNoteNavigation } = provideEditorPane();
 
 	let { notePath, vaultPath }: { notePath: string; vaultPath: string | null } = $props();
 	const ownerVault = untrack(() => vaultPath);

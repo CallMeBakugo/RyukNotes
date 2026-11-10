@@ -35,7 +35,7 @@
 	import { readFile } from '@tauri-apps/plugin-fs';
 	import { openFile, openUrl, copyFileTo, copyImageToClipboard as copyImageToClipboardCmd, writeBytesTo, copyPngToClipboard, copyTextToClipboard } from '$lib/api';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
-	import { activeNote, activeNotePath, appConfig, editorDirty, sourceMode, focusMode, readOnly, quickAccessPaths, notes, navHistory, canGoBack, canGoForward, viewerNote, viewMode, notebooks, outlineWidth } from '$lib/stores/app';
+	import { appConfig, focusMode, quickAccessPaths, notes, viewMode, notebooks, outlineWidth } from '$lib/stores/app';
 	import { saveNote, importNote, createNote, saveImage, resolveAttachmentImage, saveAttachment, readClipboardImage, readClipboardContents, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout, spawnRyukTerminal } from '$lib/api';
 	import type { NoteContent, VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord, FileEvent, SearchTarget, ToolbarLayout } from '$lib/types';
 	import { listen } from '@tauri-apps/api/event';
@@ -46,7 +46,7 @@
 	import HistoryReview from './HistoryReview.svelte';
 	import { RevisionSaveQueue, type SaveRevision } from '$lib/utils/revision-save';
 	import { isCurrentVaultEvent } from '$lib/utils/note-list-updates';
-	import { beginNoteNavigation, isCurrentNoteNavigation, cancelNoteNavigation } from '$lib/utils/note-navigation';
+	import { getEditorPane } from '$lib/stores/editor-pane';
 	import { encryptSecretText, decryptSecretText, readSecretTitle } from '$lib/utils/secrets';
 	import { WrapSelectedText } from '$lib/editor/extensions/wrapSelectedText';
 	import { CodeBlockInputScroll } from '$lib/editor/extensions/codeBlockInputScroll';
@@ -78,6 +78,10 @@
 	import { isMobile, isAndroid } from '$lib/platform';
 	import ResizeHandle from './ResizeHandle.svelte';
 
+	// Stable instance dependencies; app/vault/list preferences remain shared above.
+	const { activeNote, activeNotePath, viewerNote, editorDirty, sourceMode, readOnly,
+		navHistory, canGoBack, canGoForward, beginNoteNavigation, isCurrentNoteNavigation,
+		cancelNoteNavigation } = getEditorPane();
 	const componentId = $props.id();
 	const outlinePanelId = `${componentId}-outline`;
 	let { onMoveToTrash, onOutlineChange, onShowTag }: {

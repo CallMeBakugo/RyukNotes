@@ -121,7 +121,7 @@ export const platformIsMobile = writable<boolean>(isMobile);
 
 // Note navigation history
 interface NavHistoryState { stack: string[]; index: number; skipping: boolean; }
-function createNavHistory() {
+export function createNavHistory() {
   const store = writable<NavHistoryState>({ stack: [], index: -1, skipping: false });
   return {
     subscribe: store.subscribe,
