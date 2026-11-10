@@ -92,6 +92,7 @@ function editorFixture(invoke, clipboard) {
   const inserted = new Promise(resolve => { complete = resolve; });
   const api = fixture(invoke);
   const editor = load(`${insertionSource}\nexport { handleFileDrop, handleFilePaste, insertClipboardImage };`, {
+    workspace: null,
     captureOrigin: () => origin,
     canInsert: candidate => candidate === current,
     readClipboardImage: clipboard,

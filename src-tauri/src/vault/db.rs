@@ -856,7 +856,7 @@ impl VaultDb {
         Ok(id)
     }
 
-    fn attachment_meta(&self, id: &str) -> Result<Option<AttachmentMeta>, String> {
+    pub(crate) fn attachment_meta(&self, id: &str) -> Result<Option<AttachmentMeta>, String> {
         let mut meta = self
             .conn
             .query_row(

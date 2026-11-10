@@ -3,6 +3,17 @@ export function dbAttachmentId(source: string): string | null {
 	return /^\.rn-attachments\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[?#].*)?$/i.exec(source)?.[1] ?? null;
 }
 
+/** A routing token for native download commands, never an on-disk BLOB path. */
+export function dbAttachmentTarget(source: string): { vault: string; id: string } | null {
+	const match = /^rnattachment:\/\/\/([^/]+)\/([^/?#]+)$/.exec(source);
+	if (!match) return null;
+	try {
+		const vault = decodeURIComponent(match[1]);
+		const id = dbAttachmentId(`.rn-attachments/${match[2]}`);
+		return vault.endsWith('.rn') && id ? { vault, id } : null;
+	} catch { return null; }
+}
+
 export function isDbAssetUrl(source: string): boolean {
 	return source.startsWith('dbasset:') || source.startsWith('http://dbasset.localhost/') || source.startsWith('https://dbasset.localhost/');
 }
@@ -68,6 +79,7 @@ export function assetUrlToLocalPath(source: string): string | null {
 
 /** The owning configured vault, never the active vault of an unrelated external note. */
 export function noteAssetRoot(notePath: string | null, activeVault: string | null, vaults: readonly string[] = []): string | null {
+	if (activeVault?.endsWith('.rn') && notePath && !/^(?:[\\/]|[A-Za-z]:)/.test(notePath)) return activeVault;
 	if (!notePath || isPathInDirectory(notePath, activeVault)) return activeVault;
 	return [...vaults].filter(root => isPathInDirectory(notePath, root)).sort((a, b) => b.length - a.length)[0] ?? null;
 }
@@ -99,6 +111,9 @@ export function resolveVaultFilePath(
 
 	const root = vaultRoot?.replace(/\\/g, '/').replace(/\/$/, '') ?? '';
 	if (root) {
+		if (dbAttachmentId(target)) return root.endsWith('.rn')
+			? `rnattachment:///${encodeURIComponent(root)}/${dbAttachmentId(target)}`
+			: `${root}/${target}`;
 		// Older imported managed links may still contain notebook-depth prefixes.
 		const managed = target.match(/^(?:\.{1,2}\/)*(\.ryuknotes\/attachments\/.*)$/);
 		if (managed) return resolvePathFromFile(`${root}/.vault-root`, managed[1]);

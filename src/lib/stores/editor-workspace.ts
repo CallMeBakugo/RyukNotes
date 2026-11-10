@@ -73,6 +73,12 @@ export function createEditorWorkspace(first: EditorPane = createEditorPane()) {
       value.panes.map(p => p.context.editorDirty), dirty => dirty.some(Boolean),
     ).subscribe(set), false),
     isBlocked: () => barrier || !live,
+    /** Async attachment reads must not survive even a completed maintenance job. */
+    captureOperation() {
+      const epoch = barrierEpoch;
+      const accepted = live && !barrier;
+      return () => accepted && live && !barrier && epoch === barrierEpoch;
+    },
     registerEditor(id: PaneId, handle: PaneEditorHandle | undefined) {
       if (handle) handles.set(id, handle);
       else handles.delete(id);

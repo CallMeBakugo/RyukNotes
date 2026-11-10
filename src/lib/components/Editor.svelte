@@ -31,11 +31,10 @@
 	import { DOMParser as PMDOMParser, DOMSerializer, type Node as ProseMirrorNode } from '@tiptap/pm/model';
 	import { convertFileSrc } from '@tauri-apps/api/core';
 	import { isDbVault } from '$lib/api-db';
-	import { readFile } from '@tauri-apps/plugin-fs';
 	import { openFile, openUrl, copyFileTo, copyImageToClipboard as copyImageToClipboardCmd, writeBytesTo, copyPngToClipboard, copyTextToClipboard } from '$lib/api';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { appConfig, focusMode, quickAccessPaths, notes, viewMode, notebooks, outlineWidth, showSettings, showSearch as showAppSearch, showCommandPalette, showInfo as showAppInfo } from '$lib/stores/app';
-	import { saveNote, importNote, createNote, saveImage, resolveAttachmentImage, saveAttachment, readClipboardImage, readClipboardContents, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout, spawnRyukTerminal } from '$lib/api';
+	import { saveNote, importNote, createNote, saveImage, resolveAttachmentImage, saveAttachment, readAttachmentFile, readClipboardImage, readClipboardContents, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout, spawnRyukTerminal } from '$lib/api';
 	import type { NoteContent, VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord, FileEvent, SearchTarget, ToolbarLayout } from '$lib/types';
 	import { listen } from '@tauri-apps/api/event';
 	import { debounce } from '$lib/utils/debounce';
@@ -1160,7 +1159,7 @@
 		renderHTML({ HTMLAttributes }) {
 			const src = HTMLAttributes.src || '';
 			const name = HTMLAttributes.name || 'file.pdf';
-			const showInline = !isMobile && ($appConfig?.pdf_preview ?? false);
+			const showInline = !src.startsWith('.rn-attachments/') && !isMobile && ($appConfig?.pdf_preview ?? false);
 			if (showInline) {
 				const root = currentNoteAssetRoot();
 				const pdfHeight = $appConfig?.pdf_height ?? 600;
@@ -5374,7 +5373,7 @@
 		html = html.replace(/<div[^>]*data-pdf-src="([^"]*)"[^>]*data-pdf-name="([^"]*)"[^>]*>[^<]*<\/div>/gi, (_, pdfSrc, name) => {
 			const root = currentNoteAssetRoot();
 			const local = resolveFileReference(pdfSrc, root ? `${root}/.vault-root` : $activeNotePath, root);
-			const showInline = !snapshot && !isMobile && ($appConfig?.pdf_preview ?? false);
+			const showInline = !pdfSrc.startsWith('.rn-attachments/') && !snapshot && !isMobile && ($appConfig?.pdf_preview ?? false);
 			const safeSrc = mdit.utils.escapeHtml(pdfSrc);
 			const safeName = mdit.utils.escapeHtml(name);
 			if (showInline) {
@@ -6293,13 +6292,14 @@
 		// cannot accept the insertion.
 		if (!editor || $readOnly || $viewerNote) { closeTextContextMenu(); return; }
 		const origin = captureOrigin();
+		const operationCurrent = workspace?.captureOperation() ?? (() => true);
 		let payload = await readWebClipboard();
-		if (!canInsert(origin) || !editor) return;
+		if (!canInsert(origin) || !operationCurrent() || !editor) return;
 		// WebKitGTK (bug #218519) often gives nothing, or only plain text, for content from other
 		// apps. Fill in text and HTML from the native clipboard so formatting survives like Ctrl+V.
 		if (needsNativeClipboard(payload)) {
 			payload = withNativeClipboard(payload, await readNativeClipboard());
-			if (!canInsert(origin) || !editor) return;
+			if (!canInsert(origin) || !operationCurrent() || !editor) return;
 		}
 		// Replaying the event runs Ctrl+V's handlers, including the WebKitGTK image fallback for a
 		// clipboard holding only an image (or a bare <img>).
@@ -7072,11 +7072,11 @@
 	function handleFilePaste(event: ClipboardEvent): boolean {
 		const items = event.clipboardData?.items;
 		if (!items) return false;
-		for (const item of Array.from(items)) {
-			const file = item.getAsFile();
-			if (!file) continue;
+		const files = Array.from(items).map(item => item.getAsFile()).filter((file): file is File => !!file);
+		if (files.length) {
 			event.preventDefault();
-			void insertFile(file);
+			const origin = captureOrigin();
+			for (const file of files) void insertFile(file, origin);
 			return true;
 		}
 		// WebKitGTK fallback (bug #218519): WebKitGTK never exposes a clipboard image
@@ -7114,11 +7114,12 @@
 	type AssetKind = 'image' | 'pdf' | 'file';
 
 	async function uploadAsset(origin: EditorOrigin, name: string, data: number[], kind: AssetKind) {
-		if (!canInsert(origin)) return;
+		if (!canInsert(origin) || workspace?.isBlocked()) return;
+		const operationCurrent = workspace?.captureOperation() ?? (() => true);
 		const relativePath = kind === 'image'
 			? await saveImage(origin.vault!, name, data, origin.noteId ?? origin.path)
-			: await saveAttachment(origin.vault!, name, data);
-		if (!canInsert(origin)) return;
+			: await saveAttachment(origin.vault!, name, data, origin.noteId ?? origin.path);
+		if (!canInsert(origin) || !operationCurrent()) return;
 		const label = `${name} (${Math.round(data.length / 1024)} kB)`;
 		// The stored name may contain #, %, spaces or parentheses; every use below is a URI or Markdown destination.
 		const destination = encodeMarkdownPath(relativePath);
@@ -7129,7 +7130,7 @@
 		} else if (editor) {
 			// Async completion may insert into its origin, but must never take focus.
 			if (kind === 'image') editor.commands.setImage({ src: resolveImageSrc(destination) });
-			else if (kind === 'pdf' && !isMobile && $appConfig?.pdf_preview) {
+			else if (kind === 'pdf' && !origin.vault?.endsWith('.rn') && !isMobile && $appConfig?.pdf_preview) {
 				editor.commands.insertContent({ type: 'pdfEmbed', attrs: { src: destination, name } });
 			} else {
 				editor.commands.insertContent([
@@ -7142,9 +7143,11 @@
 
 	async function insertFile(file: File, origin = captureOrigin()) {
 		if (!canInsert(origin)) return;
+		const operationCurrent = workspace?.captureOperation() ?? (() => true);
 		try {
+			if (origin.vault?.endsWith('.rn') && file.size > 25 * 1024 * 1024) throw new Error('Attachment exceeds the vault cap of 25 MiB');
 			const buffer = await file.arrayBuffer();
-			if (!canInsert(origin)) return;
+			if (!canInsert(origin) || !operationCurrent()) return;
 			await uploadAsset(origin, file.name, Array.from(new Uint8Array(buffer)),
 				file.type.startsWith('image/') ? 'image' : file.type === 'application/pdf' ? 'pdf' : 'file');
 		} catch (e) {
@@ -7307,6 +7310,7 @@
 		insert: (paths) => {
 			const origin = captureOrigin();
 			if (overlayOwnsInput() || !canInsert(origin) || workspace?.isBlocked()) return;
+			const operationCurrent = workspace?.captureOperation() ?? (() => true);
 			const owner = workspace ? get(workspace).panes.find(p => p.context === paneContext) : null;
 			if (owner) workspace?.activate(owner.id);
 			for (const filePath of paths) {
@@ -7314,8 +7318,8 @@
 				const ext = name.split('.').pop()?.toLowerCase() || '';
 				const kind: AssetKind = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico'].includes(ext)
 					? 'image' : ext === 'pdf' ? 'pdf' : 'file';
-				void readFile(filePath).then(async (data) => {
-					if (!canInsert(origin)) return;
+				void readAttachmentFile(filePath, origin.vault!).then(async (data) => {
+					if (!canInsert(origin) || !operationCurrent()) return;
 					await uploadAsset(origin, name, Array.from(data), kind);
 				}).catch(error => console.error('Failed to drop file:', error));
 			}

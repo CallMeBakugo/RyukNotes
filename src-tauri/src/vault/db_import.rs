@@ -10,9 +10,9 @@
 //   into the versions table
 // - the source vault is never modified; re-running is idempotent (upserts)
 //
-// Attachments (`.ryuknotes/attachments/`) are not migrated in this pass:
-// .md notes reference them by relative path, and rewiring those references
-// to attachment ids is part of the frontend switch.
+// Local attachments are imported transactionally per note and rewritten to
+// stable BLOB references. Portable DB exports additionally carry a validated
+// index for exact identities, history, ownership and logical metadata.
 
 use crate::vault::db::{NewNote, VaultDb};
 use crate::vault::frontmatter;
@@ -35,6 +35,11 @@ fn rfc3339(dt: chrono::DateTime<Utc>) -> String {
 
 /// Imports every .md file in `vault_root` into `db`.
 pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, String> {
+    let canonical_root = std::fs::canonicalize(vault_root).map_err(|e| e.to_string())?;
+    let vault_root = canonical_root.as_path();
+    if let Some(report) = super::db_export::import_export(vault_root, db)? {
+        return Ok(report);
+    }
     let mut report = ImportReport::default();
     let metadata_dir = vault_root.join(".ryuknotes");
     let trash_dir = metadata_dir.join("trash");
@@ -66,7 +71,7 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
 
         let in_trash = path.starts_with(&trash_dir);
         // A trashed note keeps its frontmatter id so history still links.
-        let note = NewNote {
+        let mut note = NewNote {
             id: meta.id,
             title: meta.title,
             content: body,
@@ -76,7 +81,21 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
             modified: rfc3339(meta.modified),
         };
         let note_id = note.id.clone();
-        if let Err(e) = db.upsert_note(&note) {
+        let imported = (|| -> Result<(), String> {
+            let tx = rusqlite::Transaction::new_unchecked(
+                &db.conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )
+            .map_err(|e| e.to_string())?;
+            VaultDb::write_note(&tx, &note, None, None)?;
+            let rewritten = super::db_attachments::import_references(
+                db, &tx, vault_root, &path, &raw, &note.id,
+            )?;
+            note.content = frontmatter::parse_note(&rewritten, &filename).1;
+            VaultDb::write_note(&tx, &note, None, None)?;
+            tx.commit().map_err(|e| e.to_string())
+        })();
+        if let Err(e) = imported {
             report
                 .warnings
                 .push(format!("failed to import {}: {e}", path.display()));
@@ -92,18 +111,38 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
 
         // History snapshots: .ryuknotes/history/<note id>/*.md (raw bodies).
         let note_history = history_dir.join(sanitize(&note_id));
-        if let Ok(entries) = std::fs::read_dir(&note_history) {
-            for entry in entries.flatten() {
-                let history_path = entry.path();
-                if history_path.extension().and_then(|e| e.to_str()) != Some("md") {
-                    continue;
-                }
-                if let Ok(snapshot) = std::fs::read_to_string(&history_path) {
-                    if db
-                        .add_version(&note_id, &snapshot, &rfc3339(Utc::now()))
-                        .is_ok()
-                    {
-                        report.versions_imported += 1;
+        if std::fs::canonicalize(&note_history).is_ok_and(|path| path.starts_with(vault_root)) {
+            if let Ok(entries) = std::fs::read_dir(&note_history) {
+                for entry in entries.flatten() {
+                    let history_path = entry.path();
+                    if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                        continue;
+                    }
+                    if history_path.extension().and_then(|e| e.to_str()) != Some("md") {
+                        continue;
+                    }
+                    if let Ok(snapshot) = std::fs::read_to_string(&history_path) {
+                        let imported = (|| -> Result<(), String> {
+                            let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+                            let snapshot = super::db_attachments::import_references(
+                                db,
+                                &tx,
+                                vault_root,
+                                &history_path,
+                                &snapshot,
+                                &note_id,
+                            )?;
+                            tx.commit().map_err(|e| e.to_string())?;
+                            db.add_version(&note_id, &snapshot, &rfc3339(Utc::now()))?;
+                            Ok(())
+                        })();
+                        match imported {
+                            Ok(()) => report.versions_imported += 1,
+                            Err(error) => report.warnings.push(format!(
+                                "failed to import history {}: {error}",
+                                history_path.display()
+                            )),
+                        }
                     }
                 }
             }
@@ -129,6 +168,15 @@ fn collect_md_files(
     if !dir.is_dir() {
         return Ok(());
     }
+    let selected_root = skip
+        .parent()
+        .ok_or_else(|| std::io::Error::other("Missing vault root"))?;
+    if !std::fs::canonicalize(dir)?.starts_with(selected_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Import directory escapes the selected vault",
+        ));
+    }
     for entry in walkdir::WalkDir::new(dir)
         .follow_links(false)
         .into_iter()
@@ -143,7 +191,7 @@ fn collect_md_files(
             Err(_) => continue,
         };
         let path = entry.path();
-        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
+        if entry.file_type().is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
             out.push(path.to_path_buf());
         }
     }
@@ -156,28 +204,11 @@ pub(crate) fn import_single(
     prepared: super::operations::PreparedNoteImport,
     notebook: Option<&str>,
 ) -> Result<String, String> {
-    use std::io::Read;
-    let mut payloads = Vec::new();
-    for (path, _) in &prepared.targets {
-        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-        let before = file.metadata().map_err(|e| e.to_string())?;
-        let mut data = Vec::new();
-        (&file)
-            .take(db.max_attachment_bytes as u64 + 1)
-            .read_to_end(&mut data)
-            .map_err(|e| e.to_string())?;
-        let after = file.metadata().map_err(|e| e.to_string())?;
-        if data.len() as i64 > db.max_attachment_bytes {
-            return Err("Attachment exceeds the vault cap".into());
-        }
-        if before.len() != data.len() as u64
-            || before.len() != after.len()
-            || before.modified().ok() != after.modified().ok()
-        {
-            return Err("Attachment changed while importing".into());
-        }
-        payloads.push(data);
-    }
+    let payloads = prepared
+        .targets
+        .iter()
+        .map(|(path, _)| super::db_attachments::read_capped(path, db.max_attachment_bytes))
+        .collect::<Result<Vec<_>, _>>()?;
     let filename = prepared
         .source
         .file_name()
@@ -222,13 +253,7 @@ pub(crate) fn import_single(
             .file_name()
             .ok_or("Attachment has no filename")?
             .to_string_lossy();
-        let mime = crate::commands::image_mime_type(&name, data).unwrap_or_else(|_| {
-            if name.ends_with(".pdf") {
-                "application/pdf"
-            } else {
-                "application/octet-stream"
-            }
-        });
+        let mime = super::db_attachments::mime_type(&name, data);
         let id =
             db.store_attachment_on(&tx, &note.id, &name, mime, data, &Utc::now().to_rfc3339())?;
         let mut href = format!(".rn-attachments/{id}{suffix}");

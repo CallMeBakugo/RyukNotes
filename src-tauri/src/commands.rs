@@ -4327,6 +4327,81 @@ pub fn db_save_image(
     })
 }
 
+/// Bound native drops before allocating or transporting the whole file.
+#[tauri::command]
+pub fn db_read_attachment_file<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    vault_path: String,
+    path: String,
+) -> Result<Vec<u8>, String> {
+    ensure_readable_path(&app, Path::new(&path))?;
+    with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        crate::vault::db_attachments::read_capped(Path::new(&path), db.max_attachment_bytes)
+    })
+}
+
+/// Non-images use downloads, never the image-serving protocol.
+#[tauri::command]
+pub fn db_save_attachment(
+    state: State<'_, AppState>,
+    vault_path: String,
+    note_id: String,
+    name: String,
+    data: Vec<u8>,
+) -> Result<String, String> {
+    with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        let mime = crate::vault::db_attachments::mime_type(&name, &data);
+        let meta = db.add_attachment(
+            &note_id,
+            &name,
+            mime,
+            &data,
+            &chrono::Utc::now().to_rfc3339(),
+        )?;
+        Ok(format!(".rn-attachments/{}", meta.id))
+    })
+}
+
+#[tauri::command]
+pub fn db_attachment_info(
+    state: State<'_, AppState>,
+    vault_path: String,
+    id: String,
+) -> Result<crate::vault::db::AttachmentMeta, String> {
+    with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        db.attachment_meta(&id)?
+            .ok_or("Attachment not found".into())
+    })
+}
+
+#[tauri::command]
+pub fn db_download_attachment<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    vault_path: String,
+    id: String,
+    destination: String,
+) -> Result<(), String> {
+    ensure_writable_path(&app, Path::new(&destination))?;
+    with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        let vault = std::fs::canonicalize(&vault_path).map_err(|e| e.to_string())?;
+        let target = Path::new(&destination);
+        if std::fs::canonicalize(target).ok().as_ref() == Some(&vault)
+            || destination == format!("{vault_path}-wal")
+            || destination == format!("{vault_path}-shm")
+        {
+            return Err("Cannot replace the open vault with an attachment".into());
+        }
+        let (_, bytes) = db.get_attachment_data(&id)?.ok_or("Attachment not found")?;
+        operations::replace_file_atomically(target, &bytes)
+    })
+}
+
 /// Shared DB fetch used by the native image transport; never opens a vault from a URL.
 pub(crate) fn db_image_data(
     state: &AppState,
@@ -4627,12 +4702,16 @@ pub fn db_create_version(
 }
 
 #[tauri::command]
-pub fn db_import_md_vault(
+pub fn db_import_md_vault<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppState>,
     md_vault_path: String,
+    vault_path: String,
 ) -> Result<crate::vault::db_import::ImportReport, String> {
+    ensure_scoped_path(&app, Path::new(&md_vault_path))?;
     let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
     let db = slot.as_ref().ok_or("No vault database is open")?;
+    validate_db_vault(db, &vault_path)?;
     crate::vault::db_import::import_md_vault(std::path::Path::new(&md_vault_path), db)
 }
 
@@ -4966,51 +5045,16 @@ pub fn db_restore_backup(
 /// importer, and the user's lock-in escape hatch. Frontmatter is written in
 /// the same shape the importer reads, so export -> import round-trips.
 #[tauri::command]
-pub fn db_export_md(state: State<'_, AppState>, out_dir: String) -> Result<u32, String> {
-    let dir = std::path::PathBuf::from(&out_dir);
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+pub fn db_export_md<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    out_dir: String,
+    vault_path: String,
+) -> Result<u32, String> {
+    ensure_writable_path(&app, Path::new(&out_dir))?;
     with_db(&state, |db| {
-        let notes = db.list_notes(true)?;
-        let mut written = 0;
-        for summary in &notes {
-            let Some(full) = db.get_note_full(&summary.id)? else {
-                continue;
-            };
-            let meta = crate::types::NoteMeta {
-                id: summary.id.clone(),
-                title: String::from(full["title"].as_str().unwrap_or("")),
-                tags: full["tags"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                pinned: summary.pinned,
-                created: crate::vault::frontmatter::parse_date_flexible(
-                    full["created"].as_str().unwrap_or(""),
-                )
-                .unwrap_or_else(chrono::Utc::now),
-                modified: crate::vault::frontmatter::parse_date_flexible(
-                    full["modified"].as_str().unwrap_or(""),
-                )
-                .unwrap_or_else(chrono::Utc::now),
-            };
-            let body = String::from(full["content"].as_str().unwrap_or(""));
-            let raw = crate::vault::frontmatter::serialize_frontmatter(&meta) + &body;
-            let mut filename = format!("{}.md", sanitize_filename(&meta.title));
-            let mut candidate = dir.join(&filename);
-            let mut n = 1;
-            while candidate.exists() {
-                n += 1;
-                filename = format!("{} ({}).md", meta.title, n);
-                candidate = dir.join(&filename);
-            }
-            std::fs::write(&candidate, raw).map_err(|e| e.to_string())?;
-            written += 1;
-        }
-        Ok(written)
+        validate_db_vault(db, &vault_path)?;
+        crate::vault::db_export::export_md_vault(Path::new(&out_dir), db)
     })
 }
 
@@ -5070,22 +5114,6 @@ pub fn db_list_backups(
 #[tauri::command]
 pub fn db_delete_backup(backup_path: String) -> Result<(), String> {
     std::fs::remove_file(&backup_path).map_err(|e| e.to_string())
-}
-
-fn sanitize_filename(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| match c {
-            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '-',
-            _ => c,
-        })
-        .collect();
-    let trimmed = cleaned.trim().trim_end_matches('.');
-    if trimmed.is_empty() {
-        "Untitled".to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 // ── Helpers ──
@@ -6134,6 +6162,12 @@ mod db_command_tests {
             .plugin(tauri_plugin_fs::init())
             .invoke_handler(tauri::generate_handler![
                 super::db_save_image,
+                super::db_save_attachment,
+                super::db_read_attachment_file,
+                super::db_attachment_info,
+                super::db_download_attachment,
+                super::db_export_md,
+                super::db_import_md_vault,
                 super::db_get_attachment,
                 super::db_import_note,
                 super::db_move_note,
@@ -6148,6 +6182,149 @@ mod db_command_tests {
             .manage(AppState::new(AppConfig::default()))
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap()
+    }
+
+    #[test]
+    fn non_image_ipc_preserves_bytes_ownership_download_scope_and_export() {
+        let app = app_with_state();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let state: tauri::State<AppState> = app.state();
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("files.rn").to_string_lossy().into_owned();
+        db_open(state.clone(), vault.clone()).unwrap();
+        app.fs_scope().allow_directory(dir.path(), true).unwrap();
+        for id in ["a", "b"] {
+            db_save_note(
+                state.clone(),
+                id.into(),
+                id.into(),
+                "".into(),
+                false,
+                vec![],
+                None,
+            )
+            .unwrap();
+        }
+        let request = |cmd: &str, body: serde_json::Value| {
+            tauri::test::get_ipc_response(
+                &webview,
+                tauri::webview::InvokeRequest {
+                    cmd: cmd.into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: "http://tauri.localhost".parse().unwrap(),
+                    body: tauri::ipc::InvokeBody::Json(body),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.into(),
+                },
+            )
+        };
+        let bytes = b"%PDF-1.7\nnot an inline image\x00".to_vec();
+        let mut refs = Vec::new();
+        for owner in ["a", "a", "b"] {
+            let reference: String = request(
+                "db_save_attachment",
+                serde_json::json!({
+                    "vaultPath": vault, "noteId": owner, "name": "report.pdf", "data": bytes,
+                }),
+            )
+            .unwrap()
+            .deserialize()
+            .unwrap();
+            refs.push(reference);
+        }
+        assert!(refs.iter().all(|r| r == &refs[0]));
+        let id = refs[0].strip_prefix(".rn-attachments/").unwrap();
+        let meta: serde_json::Value = request(
+            "db_attachment_info",
+            serde_json::json!({ "vaultPath": vault, "id": id }),
+        )
+        .unwrap()
+        .deserialize()
+        .unwrap();
+        assert_eq!(meta["noteIds"], serde_json::json!(["a", "b"]));
+        assert_eq!(meta["mimeType"], "application/pdf");
+        assert!(meta.get("data").is_none());
+        assert!(db_image_data(state.inner(), &vault, id).is_err());
+        let selected = dir.path().join("download.pdf");
+        request(
+            "db_download_attachment",
+            serde_json::json!({ "vaultPath": vault, "id": id, "destination": selected }),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&selected).unwrap(), bytes);
+        let read: Vec<u8> = request(
+            "db_read_attachment_file",
+            serde_json::json!({ "vaultPath": vault, "path": selected }),
+        )
+        .unwrap()
+        .deserialize()
+        .unwrap();
+        assert_eq!(read, bytes);
+        assert!(request(
+            "db_download_attachment",
+            serde_json::json!({ "vaultPath": vault, "id": id, "destination": vault })
+        )
+        .is_err());
+        let unselected = tempfile::tempdir().unwrap();
+        assert!(request("db_download_attachment", serde_json::json!({ "vaultPath": vault, "id": id, "destination": unselected.path().join("denied.pdf") })).is_err());
+        assert!(request("db_save_attachment", serde_json::json!({ "vaultPath": vault, "noteId": "missing", "name": "x", "data": bytes })).is_err());
+        with_db(&state, |db| {
+            assert_eq!(
+                db.conn
+                    .query_row("SELECT COUNT(*) FROM attachments", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+        let out = dir.path().join("export");
+        std::fs::create_dir_all(&out).unwrap();
+        let count: u32 = request(
+            "db_export_md",
+            serde_json::json!({ "vaultPath": vault, "outDir": out }),
+        )
+        .unwrap()
+        .deserialize()
+        .unwrap();
+        assert_eq!(count, 2);
+        let copy = dir.path().join("copy.rn").to_string_lossy().into_owned();
+        db_open(state.clone(), copy.clone()).unwrap();
+        assert!(request(
+            "db_download_attachment",
+            serde_json::json!({ "vaultPath": vault, "id": id, "destination": selected })
+        )
+        .is_err());
+        assert!(request(
+            "db_export_md",
+            serde_json::json!({ "vaultPath": vault, "outDir": out })
+        )
+        .is_err());
+        request(
+            "db_import_md_vault",
+            serde_json::json!({ "vaultPath": copy, "mdVaultPath": out }),
+        )
+        .unwrap();
+        assert_eq!(
+            db_get_attachment(state.clone(), id.into())
+                .unwrap()
+                .unwrap()["data"],
+            serde_json::json!(bytes)
+        );
+        let mut slot = state.vault_db.lock().unwrap();
+        let db = slot.as_mut().unwrap();
+        db.max_attachment_bytes = 1;
+        drop(slot);
+        assert!(request("db_save_attachment", serde_json::json!({ "vaultPath": copy, "noteId": "a", "name": "too-big", "data": [0, 1] })).is_err());
+        assert!(request(
+            "db_read_attachment_file",
+            serde_json::json!({ "vaultPath": copy, "path": selected })
+        )
+        .is_err());
     }
 
     #[test]

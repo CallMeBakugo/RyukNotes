@@ -1916,6 +1916,7 @@ pub(crate) fn prepare_note_import(
         return Err("Source attachment root does not own the note".into());
     }
     let source_attachments = source_root.join(".ryuknotes/attachments");
+    let db_attachments = source_root.join(".rn-attachments");
     let raw = fs::read_to_string(&source).map_err(|error| error.to_string())?;
     if raw != expected_raw {
         return Err("The source note changed on disk. Reopen it before importing.".into());
@@ -1951,7 +1952,10 @@ pub(crate) fn prepare_note_import(
         {
             return Err("Import attachments must be relative non-Markdown files".into());
         }
-        let base = if decoded.starts_with(".ryuknotes/attachments/") || reference.pdf {
+        let base = if decoded.starts_with(".ryuknotes/attachments/")
+            || decoded.starts_with(".rn-attachments/")
+            || reference.pdf
+        {
             source_root.as_path()
         } else {
             source.parent().ok_or("Source note has no parent")?
@@ -1959,6 +1963,8 @@ pub(crate) fn prepare_note_import(
         let target = canonicalize_path(&base.join(path), "attachment")?;
         authorize(&target)?;
         let relative_target = if let Ok(relative) = target.strip_prefix(&source_attachments) {
+            relative
+        } else if let Ok(relative) = target.strip_prefix(&db_attachments) {
             relative
         } else {
             target.strip_prefix(source.parent().ok_or("Source note has no parent")?)

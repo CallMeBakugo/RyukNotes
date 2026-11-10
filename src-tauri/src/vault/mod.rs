@@ -1,4 +1,6 @@
 pub mod db;
+pub(crate) mod db_attachments;
+pub mod db_export;
 pub mod db_import;
 pub mod db_notebooks;
 pub mod frontmatter;

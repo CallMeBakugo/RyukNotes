@@ -748,32 +748,49 @@
 	let mdExportResult = $state<string | null>(null);
 
 	async function handleImportMdFolder() {
+		const vault = maintenanceVault;
+		if (!vault || mdImportLoading) return;
 		mdImportLoading = true;
 		mdImportResult = null;
 		mdImportError = null;
+		let release: PaneRelease | null = null;
 		try {
 			const folder = await openDialog({ directory: true, multiple: false, title: 'Choose a folder of .md notes' });
 			if (!folder) return;
-			const report = await importMdFolderIntoDb(folder as string);
+			if (maintenanceVault !== vault) return;
+			release = await onBeginMaintenance();
+			if (!release) throw new Error('Save every pane before importing a vault.');
+			if (maintenanceVault !== vault) return;
+			const report = await importMdFolderIntoDb(folder as string, vault);
 			mdImportResult = `Imported ${report.notesImported} notes (${report.notesTrashed} trashed, ${report.versionsImported} history versions).`;
+			if (report.warnings.length) mdImportError = report.warnings.join('\n');
 		} catch (e) {
 			mdImportError = String(e);
 		} finally {
+			await release?.();
 			mdImportLoading = false;
 		}
 	}
 
 	async function handleExportMd() {
+		const vault = maintenanceVault;
+		if (!vault || mdExportLoading) return;
 		mdExportLoading = true;
 		mdExportResult = null;
+		let release: PaneRelease | null = null;
 		try {
 			const folder = await openDialog({ directory: true, multiple: false, title: 'Choose an export folder' });
 			if (!folder) return;
-			const count = await exportDbToMd(folder as string);
-			mdExportResult = `Exported ${count} notes as .md files.`;
+			if (maintenanceVault !== vault) return;
+			release = await onBeginMaintenance();
+			if (!release) throw new Error('Save every pane before exporting a vault.');
+			if (maintenanceVault !== vault) return;
+			const count = await exportDbToMd(folder as string, vault);
+			mdExportResult = `Exported ${count} notes with attachments and history.`;
 		} catch (e) {
 			mdExportResult = `Export failed: ${e}`;
 		} finally {
+			await release?.();
 			mdExportLoading = false;
 		}
 	}

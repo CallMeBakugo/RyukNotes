@@ -469,3 +469,24 @@ test('focus intent captured with navigation expires on away-and-back without can
   assert.equal(latest.isCurrent(), true);
   assert.equal(latest.focusIsCurrent(), false);
 });
+
+test('attachment operation leases survive pane focus changes but never cross a maintenance epoch', async () => {
+  const f = barrierFixture();
+  const captured = f.workspace.captureOperation();
+  const navigation = f.workspace.captureNavigation(f.owners[0].context);
+  f.workspace.activate(f.owners[1].id);
+  assert.equal(captured(), true);
+  assert.equal(navigation.isCurrent(), true);
+  const release = await f.workspace.acquireMutation();
+  assert.ok(release);
+  assert.equal(captured(), false);
+  const during = f.workspace.captureOperation();
+  await release();
+  assert.equal(captured(), false);
+  // Even operations captured while blocked cannot become valid on unlock.
+  assert.equal(during(), false);
+  const fresh = f.workspace.captureOperation();
+  assert.equal(fresh(), true);
+  f.workspace.dispose();
+  assert.equal(fresh(), false);
+});

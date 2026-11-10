@@ -340,8 +340,8 @@ export async function dbRestoreBackup(backupPath: string, vaultPath: string): Pr
   return invoke("db_restore_backup", { backupPath, vaultPath });
 }
 
-export async function dbExportMd(outDir: string): Promise<number> {
-  return invoke("db_export_md", { outDir });
+export async function dbExportMd(outDir: string, vaultPath: string): Promise<number> {
+  return invoke("db_export_md", { outDir, vaultPath });
 }
 
 
@@ -417,6 +417,18 @@ export async function dbSetTaskDue(noteId: string, line: number, rawLine: string
 export async function dbSaveImage(vaultPath: string, name: string, data: number[], noteId?: string | null): Promise<string> {
   if (!noteId) throw new Error("Select a note before inserting an image.");
   return invoke("db_save_image", { vaultPath, noteId, name, data });
+}
+
+export async function dbSaveAttachment(vaultPath: string, name: string, data: number[], noteId?: string | null): Promise<string> {
+  if (!noteId) throw new Error("Select a note before inserting an attachment.");
+  return invoke("db_save_attachment", { vaultPath, noteId, name, data });
+}
+
+/** Keep the original vault across the save dialog; native code revalidates it. */
+export async function dbDownloadAttachment(vaultPath: string, id: string, choose: (filename: string) => Promise<string | null>): Promise<void> {
+  const meta = await invoke<{ filename: string }>("db_attachment_info", { vaultPath, id });
+  const destination = await choose(meta.filename);
+  if (destination) await invoke("db_download_attachment", { vaultPath, id, destination });
 }
 
 

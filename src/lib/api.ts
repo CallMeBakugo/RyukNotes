@@ -1,5 +1,5 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { dbAttachmentId, isDbAssetUrl } from "./utils/paths";
+import { dbAttachmentId, dbAttachmentTarget, isDbAssetUrl } from "./utils/paths";
 import {
   isDbVault,
   looksLikeDbVault,
@@ -31,6 +31,8 @@ import {
   dbSetTaskPriority,
   dbSetTaskDue,
   dbSaveImage,
+  dbSaveAttachment,
+  dbDownloadAttachment,
   setDbMode,
   dbImportNote,
   dbMoveNote,
@@ -385,8 +387,16 @@ export async function saveAttachment(
   vaultPath: string,
   name: string,
   data: number[],
+  noteId?: string | null,
 ): Promise<string> {
+  if (looksLikeDbVault(vaultPath)) return dbSaveAttachment(vaultPath, name, data, noteId);
   return invoke("save_attachment", { vaultPath, name, data });
+}
+
+export async function readAttachmentFile(path: string, vaultPath: string): Promise<Uint8Array> {
+  if (looksLikeDbVault(vaultPath)) return new Uint8Array(await invoke<number[]>("db_read_attachment_file", { vaultPath, path }));
+  const { readFile } = await import('@tauri-apps/plugin-fs');
+  return readFile(path);
 }
 
 export async function getNotebookIcons(vaultPath: string): Promise<Record<string, string>> {
@@ -532,16 +542,21 @@ export async function importObsidian(): Promise<void> {
 }
 
 /** DB mode: import a folder of .md files into the open vault. */
-export async function importMdFolderIntoDb(folder: string): Promise<{ notesImported: number; notesTrashed: number; versionsImported: number; filesSkipped: number }> {
-  return invoke("db_import_md_vault", { mdVaultPath: folder });
+export async function importMdFolderIntoDb(folder: string, vaultPath: string): Promise<{ notesImported: number; notesTrashed: number; versionsImported: number; filesSkipped: number; warnings: string[] }> {
+  return invoke("db_import_md_vault", { mdVaultPath: folder, vaultPath });
 }
 
 /** DB mode: export the vault as a folder of .md files. */
-export async function exportDbToMd(outDir: string): Promise<number> {
-  return dbExportMd(outDir);
+export async function exportDbToMd(outDir: string, vaultPath: string): Promise<number> {
+  return dbExportMd(outDir, vaultPath);
 }
 
 export async function openFile(path: string): Promise<void> {
+  const attachment = dbAttachmentTarget(path);
+  if (attachment) return dbDownloadAttachment(attachment.vault, attachment.id, async filename => {
+    const { save } = await import('@tauri-apps/plugin-dialog');
+    return save({ defaultPath: filename, title: 'Save attachment' });
+  });
   return invoke("open_file", { path });
 }
 
@@ -562,6 +577,8 @@ export async function copyFileTo(
   source: string,
   destination: string,
 ): Promise<void> {
+  const attachment = dbAttachmentTarget(source);
+  if (attachment) return invoke("db_download_attachment", { vaultPath: attachment.vault, id: attachment.id, destination });
   return invoke("copy_file_to", { source, destination });
 }
 
