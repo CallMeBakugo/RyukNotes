@@ -490,3 +490,58 @@ test('attachment operation leases survive pane focus changes but never cross a m
   f.workspace.dispose();
   assert.equal(fresh(), false);
 });
+
+test('a refusing cross-window recovery barrier releases local locks and leaves all panes mounted', async () => {
+  const workspace = workspaceModule.createEditorWorkspace();
+  workspace.openSplit();
+  const owners = stores.get(workspace).panes;
+  let released = 0;
+  let barrierCalls = 0;
+  for (const owner of owners) workspace.registerEditor(owner.id, {
+    async beginPathMutation() { return () => released++; },
+    async flushSave() { return true; },
+  });
+  workspace.onBarrier(async roots => { barrierCalls++; return false; });
+  assert.equal(await workspace.acquireMutation(), null);
+  assert.equal(released, 2);
+  assert.equal(barrierCalls, 1);
+  assert.equal(workspace.isBlocked(), false);
+  assert.equal(stores.get(workspace).panes[0], owners[0]);
+  assert.equal(stores.get(workspace).panes[1], owners[1]);
+  // Individual window close is local, so another unresolved window does not
+  // create a mutual-close deadlock; its own native owner must still acknowledge.
+  const close = await workspace.acquireMutation(undefined, true);
+  assert.equal(typeof close, 'function');
+  await close();
+  assert.equal(barrierCalls, 1);
+});
+
+test('a conflicted owner refusing pause blocks close, restore and vault switch without calling the cross-window gate', async () => {
+  const workspace = workspaceModule.createEditorWorkspace();
+  const first = stores.get(workspace).panes[0];
+  first.context.activeNotePath.set('note');
+  first.context.editorDirty.set(true);
+  let nativeCalls = 0;
+  workspace.registerEditor(first.id, { async beginPathMutation() { return null; }, async flushSave() { return false; } });
+  workspace.onBarrier(async () => { nativeCalls++; return true; });
+  assert.equal(await workspace.acquireMutation(undefined, true), null);
+  assert.equal(await workspace.acquireMutation(), null);
+  assert.equal(await workspace.acquireMutation(['note']), null);
+  assert.equal(await workspace.flushAll(), false);
+  assert.equal(nativeCalls, 0);
+  assert.equal(stores.get(first.context.editorDirty), true);
+  assert.equal(stores.get(workspace).panes[0], first);
+});
+
+test('native mutation lease ends after the action and before reconciliation/unpausing', async () => {
+  const workspace = workspaceModule.createEditorWorkspace();
+  const first = stores.get(workspace).panes[0];
+  const order = [];
+  workspace.registerEditor(first.id, { async beginPathMutation() { order.push('pause'); return () => order.push('resume'); }, async flushSave() { return true; } });
+  workspace.onBarrier(async () => { order.push('native lease'); return async () => { order.push('native release'); }; });
+  workspace.onReconcile(async () => { order.push('reconcile'); });
+  const release = await workspace.acquireMutation();
+  order.push('action');
+  await release();
+  assert.deepEqual(order, ['pause', 'native lease', 'action', 'native release', 'reconcile', 'resume']);
+});

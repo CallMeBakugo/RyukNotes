@@ -218,3 +218,34 @@ test('explicit saves and note switches cancel both pending autosave deadlines', 
   t.mock.timers.tick(3_000);
   assert.deepEqual(writes, ['current note']);
 });
+
+test('conflict fencing cancels both timers and queued callbacks without acknowledging raw', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const saves = new RevisionSaveQueue();
+  saves.startSession('base');
+  saves.markChanged();
+  const gate = deferred();
+  const started = deferred();
+  const first = saves.save(saves.capture(), async () => { started.resolve(); await gate.promise; return 'in flight'; });
+  await started.promise;
+  saves.markChanged();
+  let queuedWrites = 0;
+  const queued = saves.save(saves.capture(), async () => { queuedWrites++; return 'queued'; });
+  saves.schedule(() => queuedWrites++);
+  saves.fence();
+  gate.resolve();
+  assert.equal(await first, false);
+  assert.equal(await queued, false);
+  t.mock.timers.tick(20_000);
+  assert.equal(queuedWrites, 0);
+  assert.equal(saves.raw, 'base');
+  assert.equal(saves.dirty, true);
+  saves.markChanged();
+  saves.schedule(() => queuedWrites++);
+  t.mock.timers.tick(20_000);
+  assert.equal(await saves.save(saves.capture(), async () => { queuedWrites++; }), false);
+  assert.equal(queuedWrites, 0);
+  saves.startSession('explicit reload');
+  saves.markChanged();
+  assert.equal(await saves.save(saves.capture(), async () => 'resolved'), true);
+});

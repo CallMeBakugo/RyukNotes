@@ -61,6 +61,7 @@ export function createEditorWorkspace(first: EditorPane = createEditorPane()) {
   const busy = writable(false);
   let barrierEpoch = 0;
   let live = true;
+  let crossWindowBarrier: (roots?: readonly string[]) => Promise<boolean | (() => Promise<void>)> = async () => true;
   let reconcile: (panes: WorkspacePane[]) => Promise<void> = async () => {};
   const state = writable<EditorWorkspaceState>({
     panes: [firstPane], activePaneId: firstPane.id, splitRatio: 0.5,
@@ -84,6 +85,7 @@ export function createEditorWorkspace(first: EditorPane = createEditorPane()) {
       else handles.delete(id);
     },
     editor(id: PaneId) { return handles.get(id); },
+    onBarrier(callback: typeof crossWindowBarrier) { crossWindowBarrier = callback; },
     onReconcile(callback: typeof reconcile) { reconcile = callback; },
     remapPaths(oldPath: string, newPath: string) {
       for (const pane of get(state).panes) {
@@ -118,7 +120,7 @@ export function createEditorWorkspace(first: EditorPane = createEditorPane()) {
       };
     },
     /** Resolve owners before the first await; reject overlapping destructive operations. */
-    async acquireMutation(roots?: readonly string[]): Promise<PaneRelease | null> {
+    async acquireMutation(roots?: readonly string[], localOnly = false): Promise<PaneRelease | null> {
       if (barrier || !live) return null;
       barrier = true;
       busy.set(true);
@@ -128,12 +130,15 @@ export function createEditorWorkspace(first: EditorPane = createEditorPane()) {
         return !roots || (!!path && pathMatches(path, roots));
       });
       const releases: (() => void)[] = [];
+      let releaseNative: (() => Promise<void>) | undefined;
       let released = false;
       let finishing: Promise<void> | null = null;
-      const unlock = () => {
+      const unlock = async () => {
         if (released) return;
         released = true;
         let failure: unknown;
+        try { await releaseNative?.(); } catch (error) { failure = error; }
+        releaseNative = undefined;
         for (const release of releases.reverse()) {
           try { release(); } catch (error) { failure ??= error; }
         }
@@ -145,23 +150,31 @@ export function createEditorWorkspace(first: EditorPane = createEditorPane()) {
         for (const owner of owners) {
           const handle = handles.get(owner.id);
           if (!handle) {
-            if (get(owner.context.activeNotePath) || get(owner.context.editorDirty)) { unlock(); return null; }
+            if (get(owner.context.activeNotePath) || get(owner.context.editorDirty)) { await unlock(); return null; }
             continue;
           }
           const release = await handle.beginPathMutation();
-          if (!release) { unlock(); this.activate(owner.id); return null; }
+          if (!release) { await unlock(); this.activate(owner.id); return null; }
           releases.push(release);
         }
-        if (!live || owners.some(p => get(p.context.editorDirty))) { unlock(); return null; }
+        if (!live || owners.some(p => get(p.context.editorDirty))) { await unlock(); return null; }
+        if (!localOnly) {
+          const lease = await crossWindowBarrier(roots);
+          if (!lease) { await unlock(); return null; }
+          if (typeof lease === 'function') releaseNative = lease;
+        }
+        if (!live || owners.some(p => get(p.context.editorDirty))) { await unlock(); return null; }
         return async () => {
           if (released) return;
           finishing ??= (async () => {
-            try { if (live) await reconcile(owners); }
-            finally { unlock(); }
+            try {
+              await releaseNative?.(); releaseNative = undefined;
+              if (live) await reconcile(owners);
+            } finally { await unlock(); }
           })();
           await finishing;
         };
-      } catch (error) { unlock(); throw error; }
+      } catch (error) { await unlock(); throw error; }
     },
     async flushAll(): Promise<boolean> {
       const owners = [...get(state).panes];

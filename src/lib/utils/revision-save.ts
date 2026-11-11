@@ -2,6 +2,8 @@ interface SaveSession {
   revision: number;
   savedRevision: number;
   raw: string;
+  fenced: boolean;
+  epoch: number;
 }
 
 export interface SaveRevision {
@@ -11,26 +13,35 @@ export interface SaveRevision {
 
 /** Serializes immutable save snapshots without letting an old completion mark newer edits clean. */
 export class RevisionSaveQueue {
-  private session: SaveSession = { revision: 0, savedRevision: 0, raw: '' };
+  private session: SaveSession = { revision: 0, savedRevision: 0, raw: '', fenced: false, epoch: 0 };
   private tail: Promise<void> = Promise.resolve();
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private maxWaitTimer: ReturnType<typeof setTimeout> | null = null;
 
   startSession(raw = ''): void {
     this.cancelScheduled();
-    this.session = { revision: 0, savedRevision: 0, raw };
+    this.session = { revision: 0, savedRevision: 0, raw, fenced: false, epoch: 0 };
   }
 
   markChanged(): void {
     this.session.revision++;
   }
 
+  fence(): void {
+    this.session.fenced = true;
+    this.session.epoch++;
+    this.cancelScheduled();
+  }
+
+  get fenced(): boolean { return this.session.fenced; }
+
   schedule(save: () => void): void {
+    if (this.session.fenced) return;
     if (this.idleTimer !== null) clearTimeout(this.idleTimer);
     const session = this.session;
     const run = () => {
       this.cancelScheduled();
-      if (session === this.session) save();
+      if (session === this.session && !session.fenced) save();
     };
     this.idleTimer = setTimeout(run, 3_000);
     if (this.maxWaitTimer === null) this.maxWaitTimer = setTimeout(run, 10_000);
@@ -71,10 +82,13 @@ export class RevisionSaveQueue {
   }
 
   save(snapshot: SaveRevision, persist: (expectedRaw: string) => Promise<string | void>): Promise<boolean> {
+    const epoch = snapshot.session.epoch;
     const queued = this.tail.then(async () => {
+      if (snapshot.session.fenced || snapshot.session.epoch !== epoch) return false;
       // An explicit flush may capture the same revision as an already queued autosave.
       if (snapshot.revision > snapshot.session.savedRevision) {
         const nextRaw = await persist(snapshot.session.raw);
+        if (snapshot.session.fenced || snapshot.session.epoch !== epoch) return false;
         if (typeof nextRaw === 'string') snapshot.session.raw = nextRaw;
         snapshot.session.savedRevision = snapshot.revision;
       }

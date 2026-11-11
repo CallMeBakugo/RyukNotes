@@ -30,7 +30,9 @@
 	import { Decoration, DecorationSet } from '@tiptap/pm/view';
 	import { DOMParser as PMDOMParser, DOMSerializer, type Node as ProseMirrorNode } from '@tiptap/pm/model';
 	import { convertFileSrc } from '@tauri-apps/api/core';
-	import { isDbVault } from '$lib/api-db';
+	import { isDbVault, dbContentFromReceipt } from '$lib/api-db';
+	import { createRecoveryOwner, isRecoveryConflict } from '$lib/utils/note-recovery';
+	import { invoke } from '@tauri-apps/api/core';
 	import { openFile, openUrl, copyFileTo, copyImageToClipboard as copyImageToClipboardCmd, writeBytesTo, copyPngToClipboard, copyTextToClipboard } from '$lib/api';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { appConfig, focusMode, quickAccessPaths, notes, viewMode, notebooks, outlineWidth, showSettings, showSearch as showAppSearch, showCommandPalette, showInfo as showAppInfo } from '$lib/stores/app';
@@ -3464,6 +3466,57 @@
 	const saves = new RevisionSaveQueue();
 	let savedBlobImages = new Map<string, string>();
 	let saveError = $state<{ message: string; path: string; vault: string; conflict: boolean } | null>(null);
+	let recoveryOwner: ReturnType<typeof createRecoveryOwner> | null = null;
+	let recoveryReady: Promise<void> = Promise.resolve();
+	let recoveryBase: NoteContent | null = null;
+	let recoveryNotice = $state('');
+	let stopRecoveryWatch: (() => void) | null = null;
+	function beginRecovery(path: string, accepted: NoteContent | null) {
+		stopRecoveryWatch?.();
+		const previous = recoveryOwner;
+		recoveryOwner = null;
+		void previous?.release().catch(() => {});
+		recoveryBase = accepted;
+		recoveryNotice = '';
+		const base = recoveryBase;
+		const vault = $appConfig?.active_vault;
+		const session = saves.capture();
+		if (!base || !vault || $viewerNote || trashPreview) return;
+		recoveryReady = (async () => {
+			const identity = base.meta.accepted?.vault ?? await invoke<{path: string; file: string}>('recovery_origin', { vaultPath: vault });
+			if (!saves.isCurrentSession(session) || editorDisposed) return;
+			const owner = createRecoveryOwner(identity, path, () => ({ revision: saves.capture().revision,
+				base: recoveryBase!, body: getCurrentBody(), meta: { ...$activeNote!.meta, tags: [...$activeNote!.meta.tags] } }),
+				message => { if (saves.isCurrentSession(session)) recoveryNotice = message; });
+			recoveryOwner = owner;
+			if ($editorDirty) owner.edit();
+			stopRecoveryWatch = owner.watch(async () => {
+				// A commit hint may beat this owner's IPC receipt. Await its exact
+				// acknowledgment before comparing, so its own save is not a conflict.
+				await saves.idle();
+				if (!saves.isCurrentSession(session) || externalOperationBusy || pathMigrationPending || editorDisposed) return;
+				const before = saves.capture();
+				const baseline = recoveryBase;
+				try {
+					const remote = await readNote(vault, path);
+					if (!saves.isCurrentSession(session) || recoveryBase !== baseline || externalOperationBusy || editorDisposed) return;
+					const changed = baseline?.meta.accepted && remote.meta.accepted
+						? baseline.meta.accepted.token !== remote.meta.accepted.token : baseline?.raw !== remote.raw;
+					if (!changed) return;
+					if ($editorDirty || !saves.isCurrent(before)) { flagExternalConflict(); return; }
+					$activeNote = remote;
+					loadNote(path, remote.content);
+				} catch { if (saves.isCurrentSession(session) && $editorDirty) flagExternalConflict(); }
+			});
+		})().catch(() => { recoveryNotice = 'Recovery registration failed. Keep this editor open.'; });
+	}
+	$effect(() => {
+		if (!$activeNotePath && !$editorDirty) untrack(() => {
+			stopRecoveryWatch?.(); stopRecoveryWatch = null;
+			void recoveryOwner?.release().catch(() => {});
+			recoveryOwner = null; recoveryBase = null;
+		});
+	});
 	let saveAttempt = 0;
 	let retryingSave = $state(false);
 
@@ -3495,6 +3548,7 @@
 	export function markEdited(): void {
 		saves.markChanged();
 		$editorDirty = true;
+		recoveryOwner?.edit();
 		saves.schedule(() => { void forceSave(); });
 	}
 
@@ -3504,10 +3558,11 @@
 	}
 
 	function reportSaveError(error: unknown, origin: EditorOrigin, attempt: number): false {
-		console.error('Save failed:', error);
+		console.error('Save failed:', error instanceof Error ? error.message : 'Native save failed');
 		if (origin.path && origin.vault && isCurrentSaveAttempt(origin, attempt)) {
 			const message = error instanceof Error ? error.message : String(error);
-			saveError = { message: message.trim() || 'The note could not be saved.', path: origin.path, vault: origin.vault, conflict: /conflict|modified outside/i.test(message) };
+			if (isRecoveryConflict(error) && !saves.fenced) { saves.fence(); recoveryOwner?.conflict(); }
+			saveError = { message: message.trim() || 'The note could not be saved.', path: origin.path, vault: origin.vault, conflict: isRecoveryConflict(error) };
 		}
 		return false;
 	}
@@ -3524,47 +3579,36 @@
 	}
 
 	async function saveConflictCopy() {
-		if (!saveError?.conflict || !$activeNote || !$activeNotePath || !$appConfig?.active_vault || retryingSave) return;
-		const isCurrent = beginEditorNoteNavigation();
+		if (!saveError?.conflict || !$activeNote || retryingSave) return;
 		const origin = captureOrigin();
-		const vault = origin.vault!;
-		const originalPath = origin.path!;
-		let body = getCurrentBody();
-		const meta = { ...$activeNote.meta, tags: [...$activeNote.meta.tags] };
 		retryingSave = true;
 		try {
+			await recoveryReady;
 			await saves.idle();
-			if (!isCurrent() || !isOriginCurrent(origin, true)) return;
-			const parent = originalPath.slice(vault.length + 1).replace(/[/\\][^/\\]+$/, '');
-			const notebook = parent === originalPath.slice(vault.length + 1) ? null : parent.replace(/\\/g, '/');
-			const entry = await createNote(vault, notebook, `${meta.title} (conflict copy)`);
-			for (const match of body.matchAll(/blob:[^)\s"']+/g)) {
-				const url = match[0];
-				let relativePath = savedBlobImages.get(url);
-				if (!relativePath) {
-					relativePath = await saveBlobImage(vault, url, entry.path);
-					savedBlobImages.set(url, relativePath);
-				}
-				body = body.replaceAll(url, relativePath);
+			if (!recoveryOwner || !isOriginCurrent(origin, true)) return;
+			const owner = recoveryOwner;
+			const result = await owner.fork();
+			// Edits during a fork remain in the original live buffer. Keep the
+			// acknowledged copy, but never clear or navigate a newer revision.
+			if (!isOriginCurrent(origin, true)) {
+				recoveryNotice = 'The captured draft was copied. Newer edits are still here; Keep both again to preserve them.';
+				return;
 			}
-			const copy = await readNote(vault, entry.path);
-			await saveNote(vault, entry.path, { ...copy.meta, pinned: meta.pinned, tags: meta.tags }, body, copy.raw);
-			if (!isCurrent() || !isOriginCurrent(origin, true)) return;
-			const current = await readNote(vault, entry.path);
-			if (!isCurrent() || !isOriginCurrent(origin, true)) return;
-			$activeNotePath = entry.path;
+			if (!(await owner.discard(result.revision)) || !isOriginCurrent(origin, true)) return;
+			const current = isDbVault() ? dbContentFromReceipt(result.note) : result.note as unknown as NoteContent;
+			$activeNotePath = current.path;
 			$activeNote = current;
-			loadNote(entry.path, current.content);
-		} catch (error) {
-			console.error('Failed to save conflict copy:', error);
-		} finally {
-			retryingSave = false;
-		}
+			$editorDirty = false;
+			loadNote(current.path, current.content);
+		} catch {
+			recoveryNotice = 'Keep both could not finish. Your draft is still here; retry to reuse the same operation.';
+		} finally { retryingSave = false; }
 	}
 
 	async function reloadConflictedNote() {
 		if (!saveError?.conflict || !$activeNotePath || !$appConfig?.active_vault) return;
-		if (!window.confirm('Discard your unsaved draft and reload this note from disk? Choose Save a copy to keep the draft.')) return;
+		if (!paneIsActive() || !document.hasFocus()) return;
+		if (!window.confirm('Discard your unsaved draft and reload the saved version? Choose Keep both to preserve your draft.')) return;
 		const isCurrent = beginEditorNoteNavigation();
 		const origin = captureOrigin();
 		try {
@@ -3572,15 +3616,19 @@
 			if (!isCurrent() || !isOriginCurrent(origin, true)) return;
 			const content = await readNote(origin.vault!, origin.path!);
 			if (!isCurrent() || !isOriginCurrent(origin, true)) return;
+			await recoveryReady;
+			if (!recoveryOwner || !(await recoveryOwner.discard(origin.snapshot.revision)) || !isOriginCurrent(origin, true)) return;
 			$activeNote = content;
+			$editorDirty = false;
 			loadNote(origin.path!, content.content);
 		} catch (error) {
-			console.error('Failed to reload conflicted note:', error);
+			recoveryNotice = 'The saved version could not be loaded. Your draft is still here; use Keep both to preserve it.';
 		}
 	}
 
 	export function forceSave(allowWhileTrashing = false): Promise<boolean> {
 		saves.cancelScheduled();
+		if (saves.fenced) { void recoveryReady.then(() => recoveryOwner?.checkpoint()).catch(() => {}); return Promise.resolve(false); }
 		if (externalOperationBusy || pathMigrationPending) return Promise.resolve(false);
 		if (get(viewerNote) || !$activeNote || !$activeNotePath) return Promise.resolve(true);
 		if ((renamingNote && saves.isCurrentSession(renamingNote)) || (trashingNote && !allowWhileTrashing)) return Promise.resolve(false);
@@ -3616,6 +3664,9 @@
 			const blobImages = savedBlobImages;
 			let savedContent: NoteContent | null = null;
 			return saves.save(snapshot, async (expectedRaw) => {
+				await recoveryReady;
+				if (!recoveryOwner || !(await recoveryOwner.ready())) throw new Error('Recovery owner is not ready. Your draft has not been written.');
+				if (saves.fenced) throw new Error('Save conflict: this draft needs recovery.');
 				for (const url of blobUrls) {
 					let relativePath = blobImages.get(url);
 					if (!relativePath) {
@@ -3625,11 +3676,23 @@
 					body = body.replaceAll(url, relativePath);
 					replaceSavedBlob(origin, url, relativePath);
 				}
-				savedContent = await saveNote(vault, path, meta, body, expectedRaw);
+				if (saves.fenced) throw new Error('Save conflict: this draft needs recovery.');
+				try { savedContent = await saveNote(vault, path, meta, body, expectedRaw); }
+				catch (error) {
+					if (isRecoveryConflict(error)) {
+						if (saves.isCurrentSession(snapshot) && path === $activeNotePath) flagExternalConflict();
+					}
+					throw error;
+				}
+				if (saves.isCurrentSession(snapshot) && !saves.fenced) recoveryBase = structuredClone(savedContent);
 				return savedContent.raw;
-			}).then((current) => {
+			}).then(async (current) => {
+				if (saves.fenced) return false;
 				if (isCurrentSaveAttempt(origin, attempt)) saveError = null;
 				if (!current || !isOriginCurrent(origin, true)) return false;
+				await recoveryReady;
+				await recoveryOwner?.saved(snapshot.revision);
+				if (!isOriginCurrent(origin, true) || saves.fenced) return false;
 				if (savedContent) $activeNote = savedContent;
 				$editorDirty = false;
 				return true;
@@ -3668,7 +3731,9 @@
 	}
 
 	export function flagExternalConflict() {
-		if (!$editorDirty || !$activeNotePath || !$appConfig?.active_vault) return;
+		if (!$editorDirty || !$activeNotePath || !$appConfig?.active_vault || saves.fenced) return;
+		saves.fence();
+		recoveryOwner?.conflict();
 		saveError = { path: $activeNotePath, vault: $appConfig.active_vault,
 			message: 'The file changed on disk. Save a copy of your draft or explicitly reload the disk version.',
 			conflict: true };
@@ -3956,7 +4021,14 @@
 
 	/** Capture and queue unsaved content before changing active-note stores.
 	 * A false result means the save failed or newer edits still need saving. */
-	export function flushSave(): Promise<boolean> {
+	export async function flushSave(): Promise<boolean> {
+		await recoveryReady;
+		if ($editorDirty) {
+			// A lifecycle flush requests preservation immediately, including when
+			// timers may be suspended. Journal failure never disposes memory or
+			// prevents a still-valid authoritative note save from preserving it.
+			try { await recoveryOwner?.checkpoint(); } catch { /* Keep the buffer. */ }
+		}
 		return forceSave();
 	}
 
@@ -3990,13 +4062,25 @@
 	export async function beginPathMutation(): Promise<(() => void) | null> {
 		if (externalOperationBusy) return null;
 		const path = $activeNotePath;
-		if ($editorDirty && !(await forceSave(true))) return null;
+		if ($editorDirty && !(await flushSave())) return null;
 		await saves.idle();
-		if ($editorDirty || externalOperationBusy || path !== $activeNotePath) return null;
+		if ($editorDirty || saves.fenced || externalOperationBusy || path !== $activeNotePath) return null;
 		externalOperationBusy = true;
 		source.configure(true, !isMobile && ($appConfig?.show_line_numbers ?? false));
 		editor?.setEditable(false);
+		try {
+			await recoveryReady;
+			if (recoveryOwner && !(await recoveryOwner.pause())) throw new Error('Unresolved recovery');
+			if ($editorDirty || saves.fenced || path !== $activeNotePath) throw new Error('Owner changed while pausing');
+		} catch {
+			recoveryOwner?.resume();
+			externalOperationBusy = false;
+			source.configure($readOnly || !!$viewerNote, !isMobile && ($appConfig?.show_line_numbers ?? false));
+			editor?.setEditable(!$readOnly && !$viewerNote);
+			return null;
+		}
 		return () => {
+			recoveryOwner?.resume();
 			externalOperationBusy = false;
 			source.configure($readOnly || !!$viewerNote, !isMobile && ($appConfig?.show_line_numbers ?? false));
 			editor?.setEditable(!$readOnly && !$viewerNote);
@@ -4060,6 +4144,9 @@
 		closeNoteSearch(false);
 		saves.startSession($activeNote?.raw ?? content);
 		saveError = null;
+		const recoverySession = saves.capture();
+		const recoveryAccepted = $activeNote ? structuredClone($activeNote) : null;
+		queueMicrotask(() => { if (saves.isCurrentSession(recoverySession) && !editorDisposed) beginRecovery(path, recoveryAccepted); });
 		retryingSave = false;
 		closeAiMenu();
 		closeHistory();
@@ -7479,12 +7566,15 @@
 	onDestroy(() => {
 		closeOwnedCalloutMenu?.();
 		cancelProgressiveLoad();
-		void flushSave();
+		stopRecoveryWatch?.();
+		if ($editorDirty || saves.fenced) void recoveryOwner?.checkpoint().catch(() => {});
+		void recoveryOwner?.release().catch(() => {});
 		closeAiMenu();
 		endToolbarCustomization();
 		editorDisposed = true;
 		if (editorNavigationToken !== null) cancelNoteNavigation(editorNavigationToken);
-		saves.startSession();
+		if (!$editorDirty && !saves.fenced) saves.startSession();
+		else saves.fence();
 		cancelCounts();
 		clearOutline();
 		cancelNoteSearchWork();
@@ -8132,10 +8222,10 @@
 		{/if}
 		{#if saveError && $editorDirty && !$viewerNote && saveError.path === $activeNotePath && saveError.vault === $appConfig?.active_vault}
 			<div class="save-error" role="alert">
-				<span><strong>Save failed.</strong> {saveError.message}</span>
+				<span>{saveError.conflict ? "This note changed elsewhere. Your draft is still here." : `Save failed. ${saveError.message}`}</span>
 				{#if saveError.conflict}
-					<button type="button" onclick={saveConflictCopy} disabled={retryingSave} aria-label="Save draft as a copy">Save a copy</button>
-					<button type="button" onclick={reloadConflictedNote} disabled={retryingSave} aria-label="Discard draft and reload note">Reload from disk</button>
+					<button type="button" onclick={saveConflictCopy} disabled={retryingSave} aria-label="Keep both notes">Keep both</button>
+					<button type="button" onclick={reloadConflictedNote} disabled={retryingSave} aria-label="Discard draft and reload saved version">Reload saved version</button>
 				{:else}
 					<button type="button" onclick={retrySave} disabled={retryingSave} aria-label="Retry saving note">
 						{retryingSave ? 'Saving…' : 'Retry'}
@@ -8143,6 +8233,7 @@
 				{/if}
 			</div>
 		{/if}
+		{#if recoveryNotice}<div class="save-error" role="status">{recoveryNotice}</div>{/if}
 		{#if loadFailure && loadFailure === $activeNotePath && !$sourceMode}
 			<div class="save-error" role="alert">
 				<span><strong>This note could not be opened in the editor.</strong> It is shown empty and nothing will be saved from here; the file on disk is unchanged. Switch to source mode to view or edit it.</span>

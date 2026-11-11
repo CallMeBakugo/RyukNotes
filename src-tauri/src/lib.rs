@@ -4,6 +4,7 @@ mod backup;
 mod commands;
 mod history;
 mod image_proxy;
+mod recovery;
 mod search;
 mod state;
 mod types;
@@ -56,6 +57,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                recovery::window_gone(&window.app_handle().state::<AppState>(), window.label());
+                let _ = window.app_handle().emit("recovery-available", ());
+            }
+        })
         .on_webview_event(|webview, event| {
             if let tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
                 let scope = webview.fs_scope();
@@ -77,6 +84,10 @@ pub fn run() {
             let _ = (webview, payload);
         })
         .setup(move |app| {
+            *app.state::<AppState>()
+                .recovery_events
+                .lock()
+                .map_err(|e| e.to_string())? = Some(app.handle().clone());
             #[cfg(target_os = "ios")]
             app.handle().plugin(tauri_plugin_ios_vault_access::init())?;
 
@@ -254,6 +265,18 @@ pub fn run() {
             commands::db_is_open,
             commands::db_list_notes,
             commands::db_get_note,
+            recovery::recovery_origin,
+            recovery::recovery_barrier,
+            recovery::recovery_release_barrier,
+            recovery::recovery_register,
+            recovery::recovery_status,
+            recovery::recovery_checkpoint,
+            recovery::recovery_resolve,
+            recovery::recovery_unregister,
+            recovery::recovery_list,
+            recovery::recovery_claim,
+            recovery::recovery_poll,
+            recovery::recovery_fork,
             commands::db_writer_identity,
             commands::db_save_note,
             commands::db_search_notes,

@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { invoke } from '@tauri-apps/api/core';
+	import RecoveryInbox from './RecoveryInbox.svelte';
 	import { onMount, onDestroy, untrack } from 'svelte';
 	import { listen } from '@tauri-apps/api/event';
 	import { getCurrentWebview } from '@tauri-apps/api/webview';
@@ -28,6 +30,17 @@
 	const isMac = navigator.platform.startsWith('Mac');
 	let editor = $state<Editor>(null!);
 	$effect(() => { workspace.registerEditor('pane-1', editor); });
+	let recoveryBarrierNotice = $state('');
+	workspace.onBarrier(async roots => {
+		try {
+			const token = await invoke<string>('recovery_barrier', { vault: ownerVault, roots: roots ? [...roots] : null });
+			recoveryBarrierNotice = '';
+			return async () => { await invoke('recovery_release_barrier', { token }); };
+		} catch {
+			recoveryBarrierNotice = 'Resolve recovered drafts and close affected detached note windows before continuing.';
+			return false;
+		}
+	});
 	workspace.onReconcile(async (owners) => {
 		for (const owner of owners) {
 			const path = get(owner.context.activeNotePath);
@@ -148,7 +161,7 @@
 					event.preventDefault();
 					if (!isCurrentOwner()) { await cancelWindowClose(); return; }
 					try {
-						const release = await workspace.acquireMutation();
+						const release = await workspace.acquireMutation(undefined, true);
 						if (!release) { await cancelWindowClose(); return; }
 						try {
 						if (!isCurrentOwner()) { await cancelWindowClose(); return; }
@@ -277,6 +290,8 @@
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
+
+<RecoveryInbox notice={recoveryBarrierNotice} />
 
 <div class="note-window">
 	<!-- svelte-ignore a11y_no_static_element_interactions -->

@@ -3,7 +3,7 @@ use crate::types::AppConfig;
 use crate::vault::db::VaultDb;
 use crate::vault::watcher::VaultWatcher;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, Weak};
 use tauri::AppHandle;
 #[cfg(desktop)]
@@ -36,6 +36,8 @@ struct PendingOpenFiles {
 }
 
 pub struct AppState {
+    pub recovery: Mutex<crate::recovery::Recovery>,
+    pub recovery_events: Mutex<Option<AppHandle>>,
     pub config: Mutex<AppConfig>,
     pub search_index: Mutex<Option<Arc<SearchIndex>>>,
     search_indexes: Mutex<HashMap<String, CachedSearchIndex>>,
@@ -46,6 +48,7 @@ pub struct AppState {
     pub importing: AtomicBool,
     /// The SQLite vault database, when the active vault is DB-backed.
     pub vault_db: Mutex<Option<VaultDb>>,
+    pub vault_db_epoch: AtomicU64,
     #[cfg(desktop)]
     pub quitting: AtomicBool,
     pending_open_files: Mutex<PendingOpenFiles>,
@@ -232,6 +235,8 @@ impl AppState {
 
     pub fn new(config: AppConfig) -> Self {
         Self {
+            recovery: Mutex::new(crate::recovery::Recovery::default()),
+            recovery_events: Mutex::new(None),
             config: Mutex::new(config),
             search_index: Mutex::new(None),
             search_indexes: Mutex::new(HashMap::new()),
@@ -241,6 +246,7 @@ impl AppState {
             note_save: Arc::new(tokio::sync::Mutex::new(())),
             importing: AtomicBool::new(false),
             vault_db: Mutex::new(None),
+            vault_db_epoch: AtomicU64::new(0),
             #[cfg(desktop)]
             quitting: AtomicBool::new(false),
             pending_open_files: Mutex::new(PendingOpenFiles::default()),

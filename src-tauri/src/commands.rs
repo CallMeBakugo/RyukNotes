@@ -146,6 +146,11 @@ fn open_vault_path(
     path: String,
     external: Option<(String, String)>,
 ) -> Result<std::sync::Arc<SearchIndex>, String> {
+    state
+        .recovery
+        .lock()
+        .map_err(|e| e.to_string())?
+        .assert_quiet(None, None)?;
     operations::ensure_vault_structure(&path)?;
 
     // Stage the search index and watcher before replacing the active runtime.
@@ -489,13 +494,16 @@ pub fn complete_window_close<R: Runtime>(
     window: tauri::Window<R>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    crate::recovery::close_window(&state, window.label())?;
     if state.should_hide_to_tray(
         window.label(),
         window.app_handle().tray_by_id("ryuknotes").is_some(),
     )? {
         return window.hide().map_err(|error| error.to_string());
     }
-    window.destroy().map_err(|error| error.to_string())
+    window.destroy().map_err(|error| error.to_string())?;
+    crate::recovery::forget_window(&state, window.label());
+    Ok(())
 }
 
 #[tauri::command]
@@ -2909,6 +2917,11 @@ pub async fn trash_orphaned_attachments(
 }
 
 fn ensure_cleanup_idle(state: &AppState) -> Result<(), String> {
+    state
+        .recovery
+        .lock()
+        .map_err(|e| e.to_string())?
+        .assert_quiet(None, None)?;
     use std::sync::atomic::Ordering;
     if state.importing.load(Ordering::Acquire) {
         Err("Attachment cleanup is unavailable while import is running".to_string())
@@ -3705,6 +3718,11 @@ pub fn create_backup(app: AppHandle, vault_path: String) -> Result<(), String> {
     let (backup_dir, include_attachments, max_count, bookmark_id) = {
         let state = app.state::<AppState>();
         state.validate_vault(&vault_path)?;
+        state
+            .recovery
+            .lock()
+            .map_err(|e| e.to_string())?
+            .assert_quiet(Some(&vault_path), None)?;
         let config = state.config.lock().map_err(|e| e.to_string())?;
         let bookmark_id = config
             .vaults
@@ -3796,6 +3814,11 @@ pub fn restore_backup(
     let backup_dir = {
         let state = app.state::<AppState>();
         state.validate_vault(&vault_path)?;
+        state
+            .recovery
+            .lock()
+            .map_err(|e| e.to_string())?
+            .assert_quiet(Some(&vault_path), None)?;
         let config = state.config.lock().map_err(|e| e.to_string())?;
         crate::backup::get_backup_dir(&config.backup_location)?
     };
@@ -4180,16 +4203,32 @@ pub fn ai_ask(
 
 #[tauri::command]
 pub fn db_open(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    state
+        .recovery
+        .lock()
+        .map_err(|e| e.to_string())?
+        .assert_quiet(None, None)?;
     let db = crate::vault::db::VaultDb::open(std::path::Path::new(&path))?;
     let mut slot = state.vault_db.lock().map_err(|e| e.to_string())?;
     *slot = Some(db);
+    state
+        .vault_db_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
     Ok(())
 }
 
 #[tauri::command]
 pub fn db_close(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .recovery
+        .lock()
+        .map_err(|e| e.to_string())?
+        .assert_quiet(None, None)?;
     let mut slot = state.vault_db.lock().map_err(|e| e.to_string())?;
     *slot = None;
+    state
+        .vault_db_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
     Ok(())
 }
 
@@ -4269,7 +4308,10 @@ pub fn db_save_note(
             None,
         )
     })?;
-    db.write_authoritative(&request, limit)
+    let receipt = db.write_authoritative(&request, limit)?;
+    drop(slot);
+    crate::recovery::notify(&state);
+    Ok(receipt)
 }
 
 #[tauri::command]
@@ -4468,16 +4510,31 @@ pub fn db_get_attachment(
 
 #[tauri::command]
 pub fn db_trash_note(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state
+        .recovery
+        .lock()
+        .map_err(|e| e.to_string())?
+        .assert_quiet(None, Some(std::slice::from_ref(&id)))?;
     with_db(&state, |db| db.set_note_trashed(&id, true))
 }
 
 #[tauri::command]
 pub fn db_restore_note(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state
+        .recovery
+        .lock()
+        .map_err(|e| e.to_string())?
+        .assert_quiet(None, Some(std::slice::from_ref(&id)))?;
     with_db(&state, |db| db.set_note_trashed(&id, false))
 }
 
 #[tauri::command]
 pub fn db_delete_note(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state
+        .recovery
+        .lock()
+        .map_err(|e| e.to_string())?
+        .assert_quiet(None, Some(std::slice::from_ref(&id)))?;
     with_db(&state, |db| db.delete_note(&id))
 }
 
@@ -4751,6 +4808,11 @@ pub fn db_list_versions(
 #[tauri::command]
 pub async fn db_open_vault(state: State<'_, AppState>, path: String) -> Result<(), String> {
     let _transition = state.vault_transition.lock().await;
+    state
+        .recovery
+        .lock()
+        .map_err(|e| e.to_string())?
+        .assert_quiet(None, None)?;
     if !path.ends_with(".rn") {
         return Err(format!(
             "'{path}' is not a RyukNotes database (expected a .rn file)"
@@ -4763,6 +4825,9 @@ pub async fn db_open_vault(state: State<'_, AppState>, path: String) -> Result<(
     {
         let mut slot = state.vault_db.lock().map_err(|e| e.to_string())?;
         *slot = Some(db);
+        state
+            .vault_db_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
     // Register in config (same semantics as open_vault_path's directory case).
     let mut config = state.config.lock().map_err(|e| e.to_string())?;
@@ -4861,6 +4926,11 @@ pub fn db_vault_stats(state: State<'_, AppState>) -> Result<crate::types::VaultS
 /// DB-mode empty trash: permanently delete every trashed note.
 #[tauri::command]
 pub fn db_empty_trash(state: State<'_, AppState>) -> Result<u32, String> {
+    state
+        .recovery
+        .lock()
+        .map_err(|e| e.to_string())?
+        .assert_quiet(None, None)?;
     with_db(&state, |db| {
         let ids: Vec<String> = {
             let mut stmt = db
@@ -5041,10 +5111,18 @@ pub fn db_restore_backup(
     backup_path: String,
     vault_path: String,
 ) -> Result<(), String> {
+    state
+        .recovery
+        .lock()
+        .map_err(|e| e.to_string())?
+        .assert_quiet(Some(&vault_path), None)?;
     // Close the DB so we are not copying over an open handle.
     {
         let mut slot = state.vault_db.lock().map_err(|e| e.to_string())?;
         *slot = None;
+        state
+            .vault_db_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
     let temp = std::path::Path::new(&vault_path).with_extension("rn.restoring");
     std::fs::copy(&backup_path, &temp).map_err(|e| e.to_string())?;
@@ -5052,6 +5130,9 @@ pub fn db_restore_backup(
     let db = crate::vault::db::VaultDb::open(std::path::Path::new(&vault_path))?;
     let mut slot = state.vault_db.lock().map_err(|e| e.to_string())?;
     *slot = Some(db);
+    state
+        .vault_db_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
     Ok(())
 }
 

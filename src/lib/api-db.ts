@@ -106,6 +106,8 @@ export async function dbReadNote(path: string, vaultPath?: string): Promise<Note
   return toContent(note);
 }
 
+export function dbContentFromReceipt(note: Record<string, unknown>): NoteContent { return toContent(note); }
+
 function toContent(note: Record<string, unknown>, chain?: AcceptanceChain): NoteContent {
   const path = String(note.id);
   const content = String(note.content ?? '');
