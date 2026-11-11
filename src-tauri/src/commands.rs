@@ -4220,43 +4220,56 @@ pub fn db_list_notes(
 pub fn db_get_note(
     state: State<'_, AppState>,
     id: String,
-) -> Result<Option<serde_json::Value>, String> {
-    with_db(&state, |db| db.get_note_full(&id))
+    vault_path: Option<String>,
+) -> Result<Option<serde_json::Value>, crate::vault::writer::WriteError> {
+    let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+    let db = slot.as_ref().ok_or_else(|| {
+        crate::vault::writer::WriteError::conflict(
+            crate::vault::writer::WriteErrorKind::VaultReplaced,
+            "The originating vault is no longer open.",
+            None,
+        )
+    })?;
+    db.validate_writer_path(vault_path.as_deref())?;
+    db.accepted_note(&id)
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
+pub fn db_writer_identity(
+    state: State<'_, AppState>,
+    vault_path: Option<String>,
+) -> Result<crate::vault::writer::VaultIdentity, crate::vault::writer::WriteError> {
+    let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+    let db = slot.as_ref().ok_or_else(|| {
+        crate::vault::writer::WriteError::conflict(
+            crate::vault::writer::WriteErrorKind::VaultReplaced,
+            "The originating vault is no longer open.",
+            None,
+        )
+    })?;
+    db.validate_writer_path(vault_path.as_deref())?;
+    Ok(db.identity())
+}
+
+#[tauri::command]
 pub fn db_save_note(
     state: State<'_, AppState>,
-    id: String,
-    title: String,
-    content: String,
-    pinned: bool,
-    tags: Vec<String>,
-    expected_raw: Option<String>,
-) -> Result<(), String> {
-    let max_versions = state
+    request: crate::vault::writer::NoteWrite,
+) -> Result<serde_json::Value, crate::vault::writer::WriteError> {
+    let limit = state
         .config
         .lock()
         .map_err(|e| e.to_string())?
         .max_versions_per_note;
-    let now = chrono::Utc::now().to_rfc3339();
-    with_db(&state, |db| {
-        let created = db.get_note_created(&id)?.unwrap_or_else(|| now.clone());
-        db.upsert_note_with_history(
-            &crate::vault::db::NewNote {
-                id,
-                title,
-                content,
-                pinned,
-                tags,
-                created,
-                modified: now,
-            },
-            expected_raw.as_deref(),
-            Some(max_versions),
+    let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+    let db = slot.as_ref().ok_or_else(|| {
+        crate::vault::writer::WriteError::conflict(
+            crate::vault::writer::WriteErrorKind::VaultReplaced,
+            "The originating vault is no longer open.",
+            None,
         )
-    })
+    })?;
+    db.write_authoritative(&request, limit)
 }
 
 #[tauri::command]
@@ -4277,7 +4290,8 @@ fn validate_db_vault(db: &crate::vault::db::VaultDb, vault_path: &str) -> Result
             "The operation belongs to a different vault; retry in its original note.".into(),
         );
     }
-    Ok(())
+    db.validate_writer_vault(&db.identity())
+        .map_err(|e| e.to_string())
 }
 
 pub(crate) fn image_mime_type(name: &str, data: &[u8]) -> Result<&'static str, String> {
@@ -4484,10 +4498,7 @@ pub fn db_import_note<R: Runtime>(
         })?;
     with_db(&state, |db| {
         validate_db_vault(db, &vault_path)?;
-        let id =
-            crate::vault::db_import::import_single(db, prepared, notebook_relative.as_deref())?;
-        db.get_note_full(&id)?
-            .ok_or("Imported note disappeared".into())
+        crate::vault::db_import::import_single_receipt(db, prepared, notebook_relative.as_deref())
     })
 }
 
@@ -4519,12 +4530,15 @@ pub fn db_create_note(
             created: now.clone(),
             modified: now,
         };
-        crate::vault::db::VaultDb::write_note(&tx, &note, None, None)?;
+        crate::vault::writer::create_on(db, &tx, &note)?;
         layout.assign(&note.id, &relative)?;
         layout.save(&tx)?;
+        let receipt = db
+            .accepted_note(&note.id)
+            .map_err(|e| e.to_string())?
+            .ok_or("Created note disappeared")?;
         tx.commit().map_err(|e| e.to_string())?;
-        db.get_note_full(&note.id)?
-            .ok_or("Created note disappeared".into())
+        Ok(receipt)
     })
 }
 
@@ -6161,6 +6175,9 @@ mod db_command_tests {
         tauri::test::mock_builder()
             .plugin(tauri_plugin_fs::init())
             .invoke_handler(tauri::generate_handler![
+                super::db_writer_identity,
+                super::db_save_note,
+                super::db_get_note,
                 super::db_save_image,
                 super::db_save_attachment,
                 super::db_read_attachment_file,
@@ -6182,6 +6199,125 @@ mod db_command_tests {
             .manage(AppState::new(AppConfig::default()))
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap()
+    }
+
+    fn db_get_note(
+        state: State<'_, AppState>,
+        id: String,
+    ) -> Result<Option<serde_json::Value>, String> {
+        super::db_get_note(state, id, None)
+            .map_err(|e| e.to_string())
+            .map(|value| {
+                value.map(|mut n| {
+                    n.as_object_mut().unwrap().remove("accepted");
+                    n
+                })
+            })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn db_save_note(
+        state: State<'_, AppState>,
+        id: String,
+        title: String,
+        content: String,
+        pinned: bool,
+        tags: Vec<String>,
+        expected_raw: Option<String>,
+    ) -> Result<(), String> {
+        use crate::vault::writer::{NoteWrite, WritePolicy};
+        let request = with_db(&state, |db| {
+            let current = db.accepted_note(&id).map_err(|e| e.to_string())?;
+            let policy = if current.is_some() || expected_raw.is_some() {
+                let mut expected =
+                    current.unwrap_or_else(|| serde_json::json!({ "id": id, "content": "" }));
+                if let Some(raw) = expected_raw {
+                    expected["content"] = serde_json::json!(raw);
+                }
+                WritePolicy::Update {
+                    expected_token: db.state_token(&expected),
+                }
+            } else {
+                WritePolicy::Create
+            };
+            Ok(NoteWrite {
+                vault: db.identity(),
+                vault_path: None,
+                id,
+                title,
+                content,
+                pinned,
+                tags,
+                policy,
+            })
+        })?;
+        super::db_save_note(state, request)
+            .map(|_| ())
+            .map_err(|e| format!("Save conflict: {e}"))
+    }
+
+    #[test]
+    fn writer_ipc_requires_explicit_policy_and_returns_receipts_and_typed_conflicts() {
+        let app = app_with_state();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let state: tauri::State<AppState> = app.state();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer.rn").to_string_lossy().into_owned();
+        db_open(state.clone(), path.clone()).unwrap();
+        let request = |cmd: &str, body: serde_json::Value| {
+            tauri::test::get_ipc_response(
+                &webview,
+                tauri::webview::InvokeRequest {
+                    cmd: cmd.into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: "http://tauri.localhost".parse().unwrap(),
+                    body: tauri::ipc::InvokeBody::Json(body),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.into(),
+                },
+            )
+        };
+        let identity: serde_json::Value =
+            request("db_writer_identity", serde_json::json!({"vaultPath":path}))
+                .unwrap()
+                .deserialize()
+                .unwrap();
+        let mut write = serde_json::json!({"vault":identity,"vaultPath":path,"id":"n","title":"Title",
+            "content":"base","pinned":false,"tags":[],"policy":{"kind":"create"}});
+        let base: serde_json::Value = request("db_save_note", serde_json::json!({"request":write}))
+            .unwrap()
+            .deserialize()
+            .unwrap();
+        assert_eq!(base["content"], "base");
+        assert!(base["accepted"]["token"].is_string());
+        write["policy"] =
+            serde_json::json!({"kind":"update","expectedToken":base["accepted"]["token"]});
+        write["content"] = serde_json::json!("winner");
+        let receipt: serde_json::Value =
+            request("db_save_note", serde_json::json!({"request":write}))
+                .unwrap()
+                .deserialize()
+                .unwrap();
+        assert_eq!(receipt["content"], "winner");
+        write["content"] = serde_json::json!("stale");
+        let error = request("db_save_note", serde_json::json!({"request":write})).unwrap_err();
+        assert_eq!(error["kind"], "changed");
+        assert_eq!(
+            error["current"]["accepted"]["token"],
+            receipt["accepted"]["token"]
+        );
+        let read: serde_json::Value = request(
+            "db_get_note",
+            serde_json::json!({"id":"n","vaultPath":path}),
+        )
+        .unwrap()
+        .deserialize()
+        .unwrap();
+        assert_eq!(read, receipt);
+        write.as_object_mut().unwrap().remove("policy");
+        assert!(request("db_save_note", serde_json::json!({"request":write})).is_err());
     }
 
     #[test]

@@ -1,4 +1,18 @@
+/** Adapter-owned acceptance snapshot; preserved by metadata spreads, never edited by UI. */
+export interface DbAcceptedState {
+  readonly vault: { readonly path: string; readonly file: string };
+  readonly token: string;
+  readonly body: string;
+  readonly title: string;
+  readonly tags: readonly string[];
+  readonly pinned: boolean;
+  readonly trashed: boolean;
+  readonly created: string;
+  readonly modified: string;
+}
+
 export interface NoteMeta {
+  accepted?: DbAcceptedState;
   id: string;
   title: string;
   tags: string[];

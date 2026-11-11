@@ -11,6 +11,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   NoteContent,
+  DbAcceptedState,
   NoteEntry,
   NoteMeta,
   SearchPage,
@@ -73,138 +74,108 @@ export async function dbGetNotes(notebookPath: string | null): Promise<NoteEntry
   return notes.map(toEntry);
 }
 
+export type DbWriteErrorKind = 'changed' | 'deleted' | 'trashed' | 'vault_replaced' | 'invalid_policy' | 'io';
+export class DbWriteError extends Error {
+  constructor(public readonly kind: DbWriteErrorKind, message: string, public readonly current?: unknown) {
+    // Narrow compatibility boundary: Editor still displays Error.message and
+    // recognizes its existing prefix. Native classification never parses text.
+    super((['changed', 'deleted', 'trashed', 'vault_replaced'].includes(kind) ? 'Save conflict: ' : '') + message);
+    this.name = 'DbWriteError';
+  }
+}
+function writeError(error: unknown): never {
+  if (error && typeof error === 'object' && 'kind' in error && 'message' in error) {
+    const typed = error as { kind: DbWriteErrorKind; message: string; current?: unknown };
+    if (['changed', 'deleted', 'trashed', 'vault_replaced', 'invalid_policy', 'io'].includes(typed.kind)) {
+      throw new DbWriteError(typed.kind, typed.message, typed.current);
+    }
+  }
+  throw error;
+}
+interface AcceptanceChain { current: DbAcceptedState }
+// A read owns a lineage. Unrelated reads (including task/list reads) cannot
+// promote a dirty editor's baseline. Weak keys keep inactive live buffers valid.
+const acceptedChains = new WeakMap<DbAcceptedState, AcceptanceChain>();
+
 export async function dbReadNote(path: string, vaultPath?: string): Promise<NoteContent> {
-  const note = await invoke<Record<string, unknown> | null>("db_get_note", { id: path });
+  const note = await invoke<Record<string, unknown> | null>('db_get_note', { id: path, vaultPath }).catch(writeError);
   if (!note && vaultPath && /^(?:\/|[A-Za-z]:[\\/])/.test(path) && path.endsWith('.md')) {
-    return invoke("read_note", { vaultPath, path }); // Native scope checks still govern external viewers.
+    return invoke('read_note', { vaultPath, path });
   }
   if (!note) throw new Error(`No note with id ${path}`);
   return toContent(note);
 }
 
-function toContent(note: Record<string, unknown>): NoteContent {
+function toContent(note: Record<string, unknown>, chain?: AcceptanceChain): NoteContent {
   const path = String(note.id);
-  const meta: NoteMeta = {
-    id: String(note.id),
-    title: String(note.title),
-    tags: (note.tags as string[]) ?? [],
-    pinned: !!note.pinned,
-    created: String(note.created),
-    modified: String(note.modified),
-  };
-  const content = String(note.content ?? "");
+  const content = String(note.content ?? '');
+  const meta: NoteMeta = { id: path, title: String(note.title), tags: [...((note.tags as string[]) ?? [])],
+    pinned: !!note.pinned, created: String(note.created), modified: String(note.modified) };
+  const receipt = note.accepted as { vault: DbAcceptedState['vault']; token: string } | undefined;
+  if (receipt) {
+    const accepted: DbAcceptedState = Object.freeze({ vault: Object.freeze({ ...receipt.vault }), token: receipt.token,
+      body: content, title: meta.title, tags: Object.freeze([...meta.tags]), pinned: meta.pinned, trashed: !!note.trashed,
+      created: meta.created, modified: meta.modified });
+    meta.accepted = accepted;
+    chain ??= { current: accepted };
+    chain.current = accepted;
+    acceptedChains.set(accepted, chain);
+  }
   return { path, meta, content, raw: content };
 }
 
-export async function dbSaveNote(
-  path: string,
-  meta: NoteMeta,
-  body: string,
-  expectedRaw: string,
-): Promise<NoteContent> {
-  await invoke("db_save_note", {
-    id: meta.id ?? path,
-    title: meta.title,
-    content: body,
-    expectedRaw,
-    pinned: meta.pinned ?? false,
-    tags: meta.tags ?? [],
-  });
-  return dbReadNote(path);
-}
-
-export async function dbCreateNote(title: string, notebookRelative: string | null = null, vaultPath?: string): Promise<NoteEntry> {
-  if (vaultPath) {
-    const full = await invoke<Record<string, unknown>>("db_create_note", { vaultPath, notebookRelative, title });
-    const note = toContent(full);
-    return { path: note.path, relative_path: note.meta.title, meta: note.meta, preview: note.content.slice(0, 120) };
+export async function dbSaveNote(path: string, meta: NoteMeta, body: string, expectedRaw: string, vaultPath?: string): Promise<NoteContent> {
+  const chain = meta.accepted && acceptedChains.get(meta.accepted);
+  if (!chain || chain.current.body !== expectedRaw || meta.id !== path) {
+    throw new DbWriteError('invalid_policy', 'A captured accepted state is required before updating this note.');
   }
-  const id = crypto.randomUUID();
-  const now = new Date().toISOString();
-  await invoke("db_save_note", {
-    id,
-    title,
-    content: "",
-    pinned: false,
-    tags: [],
-  });
-  return {
-    path: id,
-    relative_path: title,
-    meta: {
-      id,
-      title,
-      tags: [],
-      pinned: false,
-      created: now,
-      modified: now,
-    },
-    preview: "",
-  };
+  const accepted = chain.current;
+  const full = await invoke<Record<string, unknown>>('db_save_note', { request: {
+    vault: accepted.vault, vaultPath, id: path, title: meta.title, content: body,
+    pinned: meta.pinned ?? false, tags: meta.tags ?? [],
+    policy: { kind: 'update', expectedToken: accepted.token },
+  } }).catch(writeError);
+  // Only this transaction's receipt can advance this lineage. No read-back.
+  return toContent(full, chain);
 }
-
-export async function dbCreateDailyNote(date?: string): Promise<NoteEntry> {
+async function createExplicit(id: string, title: string, content: string, tags: string[], vaultPath?: string): Promise<NoteEntry> {
+  const vault = await invoke<DbAcceptedState['vault']>('db_writer_identity', { vaultPath }).catch(writeError);
+  const full = await invoke<Record<string, unknown>>('db_save_note', { request: {
+    vault, vaultPath, id, title, content, pinned: false, tags, policy: { kind: 'create' },
+  } }).catch(writeError);
+  const note = toContent(full);
+  return { path: note.path, relative_path: note.meta.title, meta: note.meta, preview: content.slice(0, 120) };
+}
+export async function dbCreateNote(title: string, notebookRelative: string | null = null, vaultPath?: string): Promise<NoteEntry> {
+  if (!vaultPath) return createExplicit(crypto.randomUUID(), title, '', []);
+  const full = await invoke<Record<string, unknown>>('db_create_note', { vaultPath, notebookRelative, title }).catch(writeError);
+  const note = toContent(full);
+  return { path: note.path, relative_path: note.meta.title, meta: note.meta, preview: note.content.slice(0, 120) };
+}
+export async function dbCreateDailyNote(date?: string, vaultPath?: string): Promise<NoteEntry> {
   const iso = date ?? new Date().toISOString().slice(0, 10);
   const id = `daily-${iso}`;
-  const existing = await invoke<Record<string, unknown> | null>("db_get_note", { id });
+  const existing = await invoke<Record<string, unknown> | null>('db_get_note', { id, vaultPath }).catch(writeError);
   if (existing) {
-    return {
-      path: id,
-      relative_path: String(existing.title),
-      meta: {
-        id,
-        title: String(existing.title),
-        tags: (existing.tags as string[]) ?? [],
-        pinned: !!existing.pinned,
-        created: String(existing.created),
-        modified: String(existing.modified),
-      },
-      preview: String(existing.content ?? "").slice(0, 120),
-    };
+    const note = toContent(existing);
+    return { path: id, relative_path: note.meta.title, meta: note.meta, preview: note.content.slice(0, 120) };
   }
-  const entry = await dbCreateNote(iso);
-  // Rewrite the id to the deterministic daily id.
-  await invoke("db_delete_note", { id: entry.path });
-  await invoke("db_save_note", {
-    id,
-    title: iso,
-    content: "",
-    pinned: false,
-    tags: [],
-  });
-  return { ...entry, path: id, relative_path: iso, meta: { ...entry.meta, id, title: iso } };
+  try { return await createExplicit(id, iso, '', [], vaultPath); }
+  catch (error) {
+    if (!(error instanceof DbWriteError) || error.kind !== 'changed') throw error;
+    // Another window created today's note first. Select it; never delete/rewrite it.
+    const note = await dbReadNote(id, vaultPath);
+    return { path: id, relative_path: note.meta.title, meta: note.meta, preview: note.content.slice(0, 120) };
+  }
 }
-
-export async function dbRenameNote(path: string, newTitle: string): Promise<string> {
-  const note = await dbReadNote(path);
-  await invoke("db_save_note", {
-    id: path,
-    title: newTitle,
-    content: note.content,
-    pinned: note.meta.pinned,
-    tags: note.meta.tags,
-  });
+export async function dbRenameNote(path: string, newTitle: string, vaultPath?: string): Promise<string> {
+  const note = await dbReadNote(path, vaultPath);
+  await dbSaveNote(path, { ...note.meta, title: newTitle }, note.content, note.raw, vaultPath);
   return path;
 }
-
-export async function dbDuplicateNote(path: string): Promise<NoteEntry> {
-  const note = await dbReadNote(path);
-  const id = crypto.randomUUID();
-  const title = `${note.meta.title} (copy)`;
-  await invoke("db_save_note", {
-    id,
-    title,
-    content: note.content,
-    pinned: false,
-    tags: note.meta.tags,
-  });
-  const now = new Date().toISOString();
-  return {
-    path: id,
-    relative_path: title,
-    meta: { id, title, tags: note.meta.tags, pinned: false, created: now, modified: now },
-    preview: note.content.slice(0, 120),
-  };
+export async function dbDuplicateNote(path: string, vaultPath?: string): Promise<NoteEntry> {
+  const note = await dbReadNote(path, vaultPath);
+  return createExplicit(crypto.randomUUID(), `${note.meta.title} (copy)`, note.content, note.meta.tags, note.meta.accepted?.vault.path);
 }
 
 export async function dbSearchNotes(query: string): Promise<SearchPage> {
@@ -349,25 +320,12 @@ export async function dbExportMd(outDir: string, vaultPath: string): Promise<num
 // Line numbers are 0-based indices into the note body, as produced by the
 // task parser; the raw line guards against drift.
 
-async function readNoteLines(id: string): Promise<{ title: string; lines: string[]; pinned: boolean; tags: string[] }> {
-  const note = await invoke<Record<string, unknown> | null>("db_get_note", { id });
-  if (!note) throw new Error(`No note with id ${id}`);
-  return {
-    title: String(note.title),
-    lines: String(note.content ?? "").split("\n"),
-    pinned: !!note.pinned,
-    tags: (note.tags as string[]) ?? [],
-  };
+async function readNoteLines(id: string, vaultPath?: string): Promise<{ note: NoteContent; lines: string[] }> {
+  const note = await dbReadNote(id, vaultPath);
+  return { note, lines: note.content.split('\n') };
 }
-
-async function writeNoteLines(id: string, note: { title: string; lines: string[]; pinned: boolean; tags: string[] }): Promise<void> {
-  await invoke("db_save_note", {
-    id,
-    title: note.title,
-    content: note.lines.join("\n"),
-    pinned: note.pinned,
-    tags: note.tags,
-  });
+async function writeNoteLines(id: string, change: { note: NoteContent; lines: string[] }): Promise<void> {
+  await dbSaveNote(id, change.note.meta, change.lines.join('\n'), change.note.raw);
 }
 
 function resolveLine(lines: string[], line: number, rawLine: string): number {
@@ -377,16 +335,16 @@ function resolveLine(lines: string[], line: number, rawLine: string): number {
   throw new Error("Task line not found; the note changed since the task list was built");
 }
 
-export async function dbSetTaskDone(noteId: string, line: number, rawLine: string, done: boolean): Promise<void> {
-  const note = await readNoteLines(noteId);
+export async function dbSetTaskDone(noteId: string, line: number, rawLine: string, done: boolean, vaultPath?: string): Promise<void> {
+  const note = await readNoteLines(noteId, vaultPath);
   const idx = resolveLine(note.lines, line, rawLine);
   const target = done ? "[x]" : "[ ]";
   note.lines[idx] = note.lines[idx].replace(/\[([ xX])\]/, target);
   await writeNoteLines(noteId, note);
 }
 
-export async function dbSetTaskPriority(noteId: string, line: number, rawLine: string, priority: string | null): Promise<void> {
-  const note = await readNoteLines(noteId);
+export async function dbSetTaskPriority(noteId: string, line: number, rawLine: string, priority: string | null, vaultPath?: string): Promise<void> {
+  const note = await readNoteLines(noteId, vaultPath);
   const idx = resolveLine(note.lines, line, rawLine);
   let text = note.lines[idx].replace(/\s*!(high|medium|med|low)\b/gi, "");
   if (priority) {
@@ -399,8 +357,8 @@ export async function dbSetTaskPriority(noteId: string, line: number, rawLine: s
   await writeNoteLines(noteId, note);
 }
 
-export async function dbSetTaskDue(noteId: string, line: number, rawLine: string, due: string | null): Promise<void> {
-  const note = await readNoteLines(noteId);
+export async function dbSetTaskDue(noteId: string, line: number, rawLine: string, due: string | null, vaultPath?: string): Promise<void> {
+  const note = await readNoteLines(noteId, vaultPath);
   const idx = resolveLine(note.lines, line, rawLine);
   let text = note.lines[idx].replace(/\s*due:\d{4}-\d{2}-\d{2}/g, "");
   if (due) {

@@ -89,6 +89,7 @@ CREATE INDEX IF NOT EXISTS idx_session_links_session ON session_links(session_id
 pub struct VaultDb {
     pub conn: Connection,
     pub max_attachment_bytes: i64,
+    pub(crate) writer_identity: super::writer::VaultIdentity,
 }
 
 pub struct NewNote {
@@ -140,6 +141,7 @@ impl VaultDb {
     }
 
     fn init(conn: Connection) -> Result<Self, String> {
+        let writer_identity = super::writer::VaultIdentity::capture(&conn)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| e.to_string())?;
         conn.pragma_update(None, "foreign_keys", "ON")
@@ -202,6 +204,7 @@ impl VaultDb {
             return Ok(Self {
                 conn,
                 max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+                writer_identity,
             });
         }
         let tx =
@@ -303,6 +306,7 @@ impl VaultDb {
         Ok(Self {
             conn,
             max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+            writer_identity,
         })
     }
 
@@ -380,8 +384,9 @@ impl VaultDb {
             .map_err(|e| e.to_string())
     }
 
-    /// Inserts a note (or replaces it wholesale by id) and refreshes its tags
-    /// and the search index in one transaction.
+    /// Legacy library upsert (also used by fixtures). Official authoring routes
+    /// must choose an explicit policy in writer.rs; this is not guarded editing.
+    /// Inserts/replaces by ID and refreshes tags and FTS in one transaction.
     pub fn upsert_note(&self, note: &NewNote) -> Result<(), String> {
         self.upsert_note_checked(note, None)
     }
@@ -661,7 +666,7 @@ impl VaultDb {
             .conn
             .query_row(
                 "SELECT id, title, content, pinned, trashed, created, modified,
-                        (SELECT group_concat(t.tag, char(31)) FROM note_tags t WHERE t.note_id = n.id)
+                        (SELECT json_group_array(tag) FROM (SELECT tag FROM note_tags WHERE note_id=n.id ORDER BY tag))
                  FROM notes n WHERE id = ?1",
                 params![id],
                 |row| {
@@ -690,7 +695,7 @@ impl VaultDb {
                     "created": created,
                     "modified": modified,
                     "tags": tags
-                        .map(|b| b.split('\u{1f}').map(str::to_string).collect::<Vec<_>>())
+                        .map(|b| serde_json::from_str::<Vec<String>>(&b).expect("SQLite emits a valid JSON tag array"))
                         .unwrap_or_default(),
                 })
             },

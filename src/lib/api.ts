@@ -219,7 +219,7 @@ export async function saveNote(
   body: string,
   expectedRaw: string,
 ): Promise<NoteContent> {
-  if (isDbVault()) return dbSaveNote(path, meta, body, expectedRaw);
+  if (isDbVault()) return dbSaveNote(path, meta, body, expectedRaw, vaultPath);
   return invoke("save_note", { vaultPath, path, meta, body, expectedRaw });
 }
 
@@ -244,12 +244,12 @@ export async function createNote(
 }
 
 export async function duplicateNote(vaultPath: string, path: string): Promise<NoteEntry> {
-  if (isDbVault()) return dbDuplicateNote(path);
+  if (isDbVault()) return dbDuplicateNote(path, vaultPath);
   return invoke("duplicate_note", { vaultPath, path });
 }
 
 export async function createDailyNote(vaultPath: string, date?: string): Promise<NoteEntry> {
-  if (isDbVault()) return dbCreateDailyNote(date);
+  if (isDbVault()) return dbCreateDailyNote(date, vaultPath);
   return invoke("create_daily_note", { vaultPath, date: date ?? null });
 }
 
@@ -258,7 +258,7 @@ export async function renameNote(
   path: string,
   newTitle: string,
 ): Promise<string> {
-  if (isDbVault()) return dbRenameNote(path, newTitle);
+  if (isDbVault()) return dbRenameNote(path, newTitle, vaultPath);
   return invoke("rename_note", { vaultPath, path, newTitle });
 }
 
@@ -645,7 +645,7 @@ export async function setTaskDone(
   rawLine: string,
   done: boolean,
 ): Promise<void> {
-  if (isDbVault()) return dbSetTaskDone(notePath, line, rawLine, done);
+  if (isDbVault()) return dbSetTaskDone(notePath, line, rawLine, done, vaultPath);
   return invoke("set_task_done", { vaultPath, notePath, line, rawLine, done });
 }
 
@@ -656,7 +656,7 @@ export async function setTaskPriority(
   rawLine: string,
   priority: string | null,
 ): Promise<void> {
-  if (isDbVault()) return dbSetTaskPriority(notePath, line, rawLine, priority);
+  if (isDbVault()) return dbSetTaskPriority(notePath, line, rawLine, priority, vaultPath);
   return invoke("set_task_priority", { vaultPath, notePath, line, rawLine, priority });
 }
 
@@ -667,7 +667,7 @@ export async function setTaskDue(
   rawLine: string,
   due: string | null,
 ): Promise<void> {
-  if (isDbVault()) return dbSetTaskDue(notePath, line, rawLine, due);
+  if (isDbVault()) return dbSetTaskDue(notePath, line, rawLine, due, vaultPath);
   return invoke("set_task_due", { vaultPath, notePath, line, rawLine, due });
 }
 

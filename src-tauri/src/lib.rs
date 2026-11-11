@@ -254,6 +254,7 @@ pub fn run() {
             commands::db_is_open,
             commands::db_list_notes,
             commands::db_get_note,
+            commands::db_writer_identity,
             commands::db_save_note,
             commands::db_search_notes,
             commands::db_add_attachment,

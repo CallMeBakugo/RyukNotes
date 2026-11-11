@@ -424,7 +424,8 @@ pub(crate) fn import_export(root: &Path, db: &VaultDb) -> Result<Option<ImportRe
         if meta.id != exported.id {
             return Err("Export note identity changed".into());
         }
-        VaultDb::write_note(
+        super::writer::write_import_on(
+            db,
             &tx,
             &NewNote {
                 id: meta.id,
@@ -435,8 +436,7 @@ pub(crate) fn import_export(root: &Path, db: &VaultDb) -> Result<Option<ImportRe
                 created: exported.created.clone(),
                 modified: exported.modified.clone(),
             },
-            None,
-            None,
+            super::writer::ImportPolicy::Replace,
         )?;
         tx.execute(
             "UPDATE notes SET trashed=?2 WHERE id=?1",

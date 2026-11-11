@@ -9,6 +9,7 @@
 //   ryuk session start --notes <id> [...]      (notes -> context file -> hermes)
 
 use app_lib::vault::db::{NewNote, VaultDb};
+use app_lib::vault::writer::{NoteWrite, WriteError, WriteErrorKind, WritePolicy};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -47,12 +48,14 @@ fn usage() -> ! {
 
 USAGE:
   ryuk [--vault PATH] notes list [--trashed]
-  ryuk [--vault PATH] notes show <id>
+  ryuk [--vault PATH] notes show <id> [--json]
+  ryuk [--vault PATH] notes update <id> --expected-token <token> --stdin
   ryuk [--vault PATH] notes new <title> [--tag a --tag b] [--stdin]
   ryuk [--vault PATH] notes tag <id> [--add a] [--remove b]
   ryuk [--vault PATH] notes search <query>
   ryuk [--vault PATH] notes trash <id> | restore <id>
   ryuk [--vault PATH] session import --file <summary.json>
+  ryuk [--vault PATH] session pending <session-id>
   ryuk [--vault PATH] session restore <session-id>
   ryuk [--vault PATH] session start --notes <id> [--prompt <text>]   (resumes linked session if any)
   ryuk [--vault PATH] session resume-for-note <note-id>
@@ -88,18 +91,39 @@ fn main() {
     let sub = rest.get(1).map(String::as_str);
     let tail = &rest[2.min(rest.len())..];
 
+    let authoritative = match (cmd, sub) {
+        ("notes", Some("tag")) => Some(notes_tag(&vault_flag, tail)),
+        ("notes", Some("update")) => Some(notes_update(&vault_flag, tail)),
+        ("session", Some("import")) => Some(session_import(&vault_flag, tail)),
+        _ => None,
+    };
+    if let Some(result) = authoritative {
+        if let Err(error) = result {
+            eprintln!(
+                "{}",
+                serde_json::to_string(&error).expect("writer error serializes")
+            );
+            std::process::exit(match error.kind {
+                WriteErrorKind::Changed
+                | WriteErrorKind::Deleted
+                | WriteErrorKind::Trashed
+                | WriteErrorKind::VaultReplaced => 3,
+                _ => 1,
+            });
+        }
+        return;
+    }
     let result = match (cmd, sub) {
         ("notes", Some("list")) => notes_list(&vault_flag, tail),
         ("notes", Some("show")) => notes_show(&vault_flag, tail),
         ("notes", Some("new")) => notes_new(&vault_flag, tail),
-        ("notes", Some("tag")) => notes_tag(&vault_flag, tail),
         ("notes", Some("search")) => notes_search(&vault_flag, tail),
         ("notes", Some("trash")) => notes_trash(&vault_flag, tail, true),
         ("notes", Some("restore")) => notes_trash(&vault_flag, tail, false),
-        ("session", Some("import")) => session_import(&vault_flag, tail),
         ("session", Some("restore")) => session_restore(&vault_flag, tail),
         ("session", Some("start")) => session_start(&vault_flag, tail),
         ("session", Some("resume-for-note")) => session_resume_for_note(&vault_flag, tail),
+        ("session", Some("pending")) => session_pending(&vault_flag, tail),
         ("session", Some("list-links")) => session_list_links(&vault_flag),
         _ => usage(),
     };
@@ -161,12 +185,22 @@ fn notes_list(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String
 fn notes_show(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String> {
     let id = tail.first().ok_or("notes show <id>")?;
     let db = open_vault(vault_flag.as_deref())?;
-    let Some(note) = db.get_note_full(id)? else {
-        return Err(format!("no note with id {id}"));
-    };
-    println!("# {}", note["title"].as_str().unwrap_or(""));
-    println!();
-    println!("{}", note["content"].as_str().unwrap_or(""));
+    let note = db
+        .accepted_note(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no note with id {id}"))?;
+    if tail.iter().any(|a| a == "--json") {
+        println!(
+            "{}",
+            serde_json::to_string(&note).map_err(|e| e.to_string())?
+        );
+    } else {
+        println!(
+            "# {}\n\n{}",
+            note["title"].as_str().unwrap_or(""),
+            note["content"].as_str().unwrap_or("")
+        );
+    }
     Ok(())
 }
 
@@ -189,7 +223,7 @@ fn notes_new(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String>
     let db = open_vault(vault_flag.as_deref())?;
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_rfc3339();
-    db.upsert_note(&NewNote {
+    let note = NewNote {
         id: id.clone(),
         title,
         content,
@@ -197,45 +231,69 @@ fn notes_new(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String>
         tags,
         created: now.clone(),
         modified: now,
-    })?;
+    };
+    db.write_scripted(&NoteWrite::from_note(&db, &note, WritePolicy::Create))
+        .map_err(|e| e.to_string())?;
     println!("{id}");
     Ok(())
 }
 
-fn notes_tag(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String> {
+fn notes_tag(vault_flag: &Option<String>, tail: &[String]) -> Result<(), WriteError> {
     let id = positional(tail, &[])
         .first()
         .cloned()
         .ok_or("notes tag <id>")?;
-    let add = flag_values(tail, "--add");
-    let remove = flag_values(tail, "--remove");
     let db = open_vault(vault_flag.as_deref())?;
-    let Some(note) = db.get_note_full(&id)? else {
-        return Err(format!("no note with id {id}"));
-    };
-    let mut tags: Vec<String> = note["tags"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    for tag in add {
-        if !tags.contains(&tag) {
-            tags.push(tag);
-        }
+    db.tag_atomic(
+        &id,
+        &flag_values(tail, "--add"),
+        &flag_values(tail, "--remove"),
+    )?;
+    Ok(())
+}
+
+fn notes_update(vault_flag: &Option<String>, tail: &[String]) -> Result<(), WriteError> {
+    use std::io::Read;
+    let id = positional(tail, &[])
+        .first()
+        .cloned()
+        .ok_or("notes update <id> --expected-token <token> --stdin")?;
+    let expected_token = flag_values(tail, "--expected-token")
+        .first()
+        .cloned()
+        .ok_or("notes update requires --expected-token")?;
+    if !tail.iter().any(|a| a == "--stdin") {
+        return Err("notes update requires --stdin".into());
     }
-    tags.retain(|t| !remove.contains(t));
-    db.upsert_note(&NewNote {
-        id: id.clone(),
-        title: note["title"].as_str().unwrap_or("").to_string(),
-        content: note["content"].as_str().unwrap_or("").to_string(),
-        pinned: note["pinned"].as_bool().unwrap_or(false),
-        tags,
-        created: note["created"].as_str().unwrap_or("").to_string(),
-        modified: now_rfc3339(),
+    let mut body = String::new();
+    std::io::stdin()
+        .read_to_string(&mut body)
+        .map_err(|e| e.to_string())?;
+    let db = open_vault(vault_flag.as_deref())?;
+    let current = db.accepted_note(&id)?.ok_or_else(|| WriteError {
+        kind: WriteErrorKind::Deleted,
+        message: "The note was deleted.".into(),
+        current: None,
+        artifact: None,
     })?;
+    let note = NewNote {
+        id,
+        title: current["title"].as_str().unwrap_or("").into(),
+        content: body,
+        pinned: current["pinned"].as_bool().unwrap_or(false),
+        tags: serde_json::from_value(current["tags"].clone()).map_err(|e| e.to_string())?,
+        created: current["created"].as_str().unwrap_or("").into(),
+        modified: now_rfc3339(),
+    };
+    let receipt = db.write_scripted(&NoteWrite::from_note(
+        &db,
+        &note,
+        WritePolicy::Update { expected_token },
+    ))?;
+    println!(
+        "{}",
+        serde_json::to_string(&receipt).map_err(|e| e.to_string())?
+    );
     Ok(())
 }
 
@@ -264,7 +322,7 @@ fn notes_trash(vault_flag: &Option<String>, tail: &[String], trash: bool) -> Res
 /// summary.json shape:
 /// { "session_id": "...", "title": "...", "changed": [...], "decisions": [...],
 ///   "todos": [...], "topics": [...], "tags": [...] }
-fn session_import(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String> {
+fn session_import(vault_flag: &Option<String>, tail: &[String]) -> Result<(), WriteError> {
     let file = flag_values(tail, "--file")
         .first()
         .cloned()
@@ -323,7 +381,7 @@ fn session_import(vault_flag: &Option<String>, tail: &[String]) -> Result<(), St
     let id = format!("hermes-session-{session_id}");
     let now = now_rfc3339();
     let created = db.get_note_created(&id)?.unwrap_or_else(|| now.clone());
-    db.upsert_note(&NewNote {
+    let note = NewNote {
         id,
         title,
         content: body.trim_start().to_string(),
@@ -331,8 +389,19 @@ fn session_import(vault_flag: &Option<String>, tail: &[String]) -> Result<(), St
         tags,
         created,
         modified: now,
-    })?;
+    };
+    db.import_generated_summary(&note, &v)?;
     println!("session note written");
+    Ok(())
+}
+
+fn session_pending(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String> {
+    let id = tail.first().ok_or("session pending <session-id>")?;
+    let db = open_vault(vault_flag.as_deref())?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&db.pending_summaries(id)?).map_err(|e| e.to_string())?
+    );
     Ok(())
 }
 

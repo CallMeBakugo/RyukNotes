@@ -87,12 +87,24 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
                 rusqlite::TransactionBehavior::Immediate,
             )
             .map_err(|e| e.to_string())?;
-            VaultDb::write_note(&tx, &note, None, None)?;
+            let replacing = db.get_note_content(&note.id)?.is_some();
+            if !replacing {
+                super::writer::write_import_on(db, &tx, &note, super::writer::ImportPolicy::Copy)?;
+            }
             let rewritten = super::db_attachments::import_references(
                 db, &tx, vault_root, &path, &raw, &note.id,
             )?;
             note.content = frontmatter::parse_note(&rewritten, &filename).1;
-            VaultDb::write_note(&tx, &note, None, None)?;
+            super::writer::write_import_on(
+                db,
+                &tx,
+                &note,
+                if replacing {
+                    super::writer::ImportPolicy::Replace
+                } else {
+                    super::writer::ImportPolicy::FinalizeCopy
+                },
+            )?;
             tx.commit().map_err(|e| e.to_string())
         })();
         if let Err(e) = imported {
@@ -199,11 +211,11 @@ fn collect_md_files(
 }
 
 /// A single external import is a copy: never overwrite a colliding note id.
-pub(crate) fn import_single(
+pub(crate) fn import_single_receipt(
     db: &VaultDb,
     prepared: super::operations::PreparedNoteImport,
     notebook: Option<&str>,
-) -> Result<String, String> {
+) -> Result<serde_json::Value, String> {
     let payloads = prepared
         .targets
         .iter()
@@ -240,7 +252,7 @@ pub(crate) fn import_single(
         created: meta.created.to_rfc3339(),
         modified: meta.modified.to_rfc3339(),
     };
-    VaultDb::write_note(&tx, &note, None, None)?;
+    super::writer::write_import_on(db, &tx, &note, super::writer::ImportPolicy::Copy)?;
     let mut rewritten = String::new();
     let mut previous = 0;
     for ((reference, (path, suffix)), data) in prepared
@@ -277,11 +289,27 @@ pub(crate) fn import_single(
     }
     rewritten.push_str(&prepared.raw[previous..]);
     note.content = frontmatter::parse_note(&rewritten, &filename).1;
-    VaultDb::write_note(&tx, &note, None, None)?;
+    super::writer::write_import_on(db, &tx, &note, super::writer::ImportPolicy::FinalizeCopy)?;
     layout.assign(&note.id, &relative)?;
     layout.save(&tx)?;
+    let receipt = db
+        .accepted_note(&note.id)
+        .map_err(|e| e.to_string())?
+        .ok_or("Imported note disappeared")?;
     tx.commit().map_err(|e| e.to_string())?;
-    Ok(note.id)
+    Ok(receipt)
+}
+
+#[cfg(test)]
+pub(crate) fn import_single(
+    db: &VaultDb,
+    prepared: super::operations::PreparedNoteImport,
+    notebook: Option<&str>,
+) -> Result<String, String> {
+    Ok(import_single_receipt(db, prepared, notebook)?["id"]
+        .as_str()
+        .ok_or("Missing imported identity")?
+        .into())
 }
 
 #[cfg(test)]
