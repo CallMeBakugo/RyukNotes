@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { invoke } from '@tauri-apps/api/core';
+	import { openNoteWindowSession } from '$lib/utils/note-window-session';
 	import RecoveryInbox from './RecoveryInbox.svelte';
 	import { onMount, onDestroy, untrack } from 'svelte';
 	import { listen } from '@tauri-apps/api/event';
@@ -67,6 +68,7 @@
 	let unlistenVaultRestored: (() => void) | null = null;
 	let removeMobileFlushListeners: (() => void) | null = null;
 	let maximized = $state(false);
+	let sessionReady = $state(false);
 	let loadError = $state<string | null>(null);
 	let disposed = false;
 	let initialNavigationToken: number | null = null;
@@ -183,6 +185,9 @@
 				return;
 			}
 
+			const initialContent = await openNoteWindowSession(ownerVault, path);
+			if (!isCurrentOwner() || !intent.isCurrent()) return;
+
 			const scaleListener = await listen<number>('ui-scale-changed', (event) => {
 				if (isCurrentOwner()) void applyUiScale(event.payload);
 			});
@@ -205,12 +210,13 @@
 
 			if (intent.isCurrent()) {
 				try {
-					const content = await readNote(ownerVault!, path);
+					const content = initialContent;
 					if (!isCurrentOwner()) return;
 					if (intent.isCurrent()) {
 						$activeNote = content;
 						$activeNotePath = path;
 						$editorDirty = false;
+						sessionReady = true;
 						initialLoadTimer = setTimeout(() => {
 							initialLoadTimer = null;
 							if (!isCurrentOwner() || !intent.isCurrent()
@@ -272,7 +278,10 @@
 		}
 
 		void initialize().catch(error => {
-			if (isCurrentOwner()) console.error('Failed to initialize note window:', error);
+			if (isCurrentOwner() && intent.isCurrent()) {
+				loadError = String(error);
+				console.error('Failed to initialize note window:', error);
+			}
 		});
 	});
 
@@ -356,7 +365,7 @@
 			<p>Failed to load note</p>
 			<p class="nw-error-detail">{loadError}</p>
 		</div>
-	{:else}
+	{:else if sessionReady}
 		<div class="nw-editor">
 			<Editor bind:this={editor} />
 		</div>

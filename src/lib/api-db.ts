@@ -69,6 +69,14 @@ export async function dbOpenVault(path: string): Promise<void> {
   setDbMode(true);
 }
 
+// Detached webviews have their own adapter flag, but share the native connection.
+// Attach to the originating vault without reopening it or invalidating live owners.
+export async function dbAttachVault(path: string): Promise<DbAcceptedState['vault']> {
+  const identity = await invoke<DbAcceptedState['vault']>('db_writer_identity', { vaultPath: path }).catch(writeError);
+  setDbMode(true);
+  return identity;
+}
+
 export async function dbGetNotes(notebookPath: string | null): Promise<NoteEntry[]> {
   const notes: DbNote[] = await invoke("db_get_notes", { notebookPath });
   return notes.map(toEntry);
