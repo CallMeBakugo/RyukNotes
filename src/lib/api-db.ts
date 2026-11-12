@@ -458,3 +458,22 @@ export async function dbGetNoteVersionContent(vaultPath: string, noteId: string,
 export async function dbCreateVersion(vaultPath: string, path: string, noteId: string): Promise<void> {
   return invoke("db_create_version", { vaultPath, path, noteId });
 }
+
+export interface AncestryRestoreOutcome {
+  identity: { vault_uuid: string; storage_epoch: string };
+  ledger_was_missing: boolean;
+  requires_recovery_review: boolean;
+}
+/** Explicit destination creation, never a displayed-vault switch. The caller
+ * retains operationId for retry and uses the existing all-pane pause barrier.
+ * Production activation remains gated; native code refuses unresolved owners. */
+export async function dbRestoreAncestryExport(sourceDir: string, destination: string, ledgerRoot: string,
+  mode: 'full_restore' | 'independent_copy', operationId: string): Promise<AncestryRestoreOutcome> {
+  return invoke('db_restore_ancestry_export', { sourceDir, destination, ledgerRoot, mode, operationId });
+}
+/** Append validated same-vault ancestry without promoting incoming heads. */
+export async function dbReconcileAncestryExport(sourceDir: string, vaultPath: string, operationId: string): Promise<{
+  archiveHash: string; headersAdded: number; requiresRecoveryReview: boolean;
+}> {
+  return invoke('db_reconcile_ancestry_export', { sourceDir, vaultPath, operationId });
+}

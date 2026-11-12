@@ -1,4 +1,4 @@
-# Authoritative DB writers — Stages 1, 4C and 4D
+# Authoritative DB writers — Stages 1, 4C–4E (activation gated)
 
 The UX ruling remains fork first, review second, automatic merge last. Editor
 and pane ownership are unchanged. The original Stage 1 **schema 2** contract is
@@ -186,4 +186,31 @@ pruning markers, removes eligible states/asset links and validates before commit
 Headers, parents and counters remain forever. Curated history controls none of
 these roots. BLOB GC checks note/revision/history/staging/private-artifact and
 receipt ownership. Maintenance cannot consume a writer operation index or change
-semantic state. Production v3 creation/activation and portable export remain 4E.
+semantic state. Stage 4E adds portable export below; production creation/activation
+remains conditional on all native gates passing together.
+
+
+## Portable ancestry boundary (Stage 4E; production activation blocked)
+
+[Format 2 and import modes](revision-ancestry-stage4e.md) carry complete retained
+ancestry, exact byte sidecars, pruning markers and anonymous recovery holds.
+Export's coherent SQLite snapshot covers every table and byte. Unknown formats
+or capabilities fail before destination writes; the format-1 importer cannot
+silently downgrade ancestry. Re-export checks immutable collisions and retains the
+previous authoritative sidecars until the new index is atomically published.
+
+Path-based full restore and independent copy are explicit bootstrap/maintenance
+boundaries, not alternate note writers. They validate the complete package before
+exclusive maintenance and ledger/SQL restore; fresh epochs/baselines, exact
+operation receipts and mandatory recovery-review outcomes preserve the existing
+writer identity contract. Generated summary authority follows a restore baseline
+only from an exactly generated predecessor. Same-vault reconciliation uses the
+shared maintenance helper with a reserved incoming counter floor, compares all
+immutable collisions and complete parent sets, retains current projections/heads
+and pins incoming branches. Generic metadata routes cannot forge portable receipts
+or origin records. Existing dirty-owner barriers still refuse maintenance.
+
+Native 4B–4E gates could not run in the cage, so the requested all-gates activation
+condition was not met. Ordinary opens/creation remain v2 and refuse schema 3;
+explicit native ancestry tools remain feature-gated. Npm/SQLite transport tests
+are not evidence that native migration, writer, recovery or restore gates passed.

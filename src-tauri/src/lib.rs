@@ -323,6 +323,8 @@ pub fn run() {
             commands::db_create_backup,
             commands::db_restore_backup,
             commands::db_export_md,
+            commands::db_restore_ancestry_export,
+            commands::db_reconcile_ancestry_export,
             commands::db_list_backups,
             commands::db_delete_backup,
             commands::get_install_type,

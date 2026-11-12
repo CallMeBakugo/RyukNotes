@@ -10,11 +10,14 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-const INDEX: &str = ".ryuknotes/export.json";
+pub(crate) const INDEX: &str = ".ryuknotes/export.json";
 
 #[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Index {
     format: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ancestry: Option<super::portable_ancestry::Manifest>,
     notes: Vec<ExportNote>,
     attachments: Vec<ExportAttachment>,
     versions: Vec<ExportVersion>,
@@ -48,7 +51,7 @@ struct ExportVersion {
     file: String,
     created: String,
 }
-fn digest(data: &[u8]) -> String {
+pub(crate) fn digest(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
 }
 fn note_file(id: &str, title: &str, trashed: bool) -> String {
@@ -111,7 +114,7 @@ fn convert_links(body: &str, paths: &BTreeMap<String, String>) -> String {
 
 /// Reject traversal and symlinks on both reads and writes, including an export
 /// directory planted inside an otherwise user-selected folder.
-fn checked_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
+pub(crate) fn checked_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
     let mut path = root.to_path_buf();
     for part in Path::new(relative).components() {
         let Component::Normal(part) = part else {
@@ -124,11 +127,25 @@ fn checked_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
     }
     Ok(path)
 }
-fn write(root: &Path, relative: &str, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write(root: &Path, relative: &str, bytes: &[u8]) -> Result<(), String> {
     let path = checked_path(root, relative)?;
     std::fs::create_dir_all(path.parent().ok_or("Export file has no parent")?)
         .map_err(|e| e.to_string())?;
-    super::operations::replace_file_atomically(&path, bytes)
+    super::operations::replace_file_atomically(&path, bytes)?;
+    #[cfg(unix)]
+    {
+        let mut directory = path.parent();
+        while let Some(dir) = directory {
+            if !dir.starts_with(root) {
+                break;
+            }
+            std::fs::File::open(dir)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| e.to_string())?;
+            directory = dir.parent();
+        }
+    }
+    Ok(())
 }
 fn files(index: &Index) -> BTreeSet<String> {
     index
@@ -142,12 +159,19 @@ fn files(index: &Index) -> BTreeSet<String> {
                 .iter()
                 .map(|a| asset_path(&a.id, &a.filename)),
         )
+        .chain(index.ancestry.iter().flat_map(|graph| graph.files()))
         .collect()
 }
 
 fn validate_index(index: &Index) -> Result<(), String> {
-    if index.format != 1 {
-        return Err("Unsupported Markdown export format".into());
+    match (index.format, &index.ancestry) {
+        (1, None) => {}
+        (2, Some(graph)) => graph.validate_capabilities()?,
+        _ => {
+            return Err(
+                "Unsupported Markdown export format/capability; ancestry cannot be dropped".into(),
+            )
+        }
     }
     let mut notes = BTreeSet::new();
     let mut assets = BTreeSet::new();
@@ -188,12 +212,18 @@ fn validate_index(index: &Index) -> Result<(), String> {
 }
 
 pub fn export_md_vault(root: &Path, db: &VaultDb) -> Result<u32, String> {
-    if db.is_v3() {
-        return Err("Portable v3 ancestry export is gated until Stage 4E".into());
-    }
     std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
     let root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
     let previous = checked_path(&root, INDEX)?;
+    if previous.exists() {
+        let preflight: Index =
+            serde_json::from_slice(&std::fs::read(&previous).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        validate_index(&preflight)?;
+    }
+    std::fs::create_dir_all(previous.parent().ok_or("Missing export index parent")?)
+        .map_err(|e| e.to_string())?;
+    let _publication = super::ancestry::Maintenance::exclusive(&previous)?;
     let previous: Option<Index> = if previous.exists() {
         Some(
             serde_json::from_slice(&std::fs::read(previous).map_err(|e| e.to_string())?)
@@ -221,8 +251,20 @@ pub fn export_md_vault(root: &Path, db: &VaultDb) -> Result<u32, String> {
         write(&root, relative, bytes)
     };
     let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    if db.is_v3() {
+        if let Some(graph) = previous.as_ref().and_then(|index| index.ancestry.as_ref()) {
+            super::portable_ancestry::validate_reexport(&root, graph, db)?;
+        }
+    } else if previous
+        .as_ref()
+        .is_some_and(|index| index.ancestry.is_some())
+    {
+        return Err(
+            "Cannot replace an ancestry export with a legacy format; choose a new folder".into(),
+        );
+    }
     let mut index = Index {
-        format: 1,
+        format: if db.is_v3() { 2 } else { 1 },
         ..Default::default()
     };
     let ids: Vec<String> = tx
@@ -333,7 +375,21 @@ pub fn export_md_vault(root: &Path, db: &VaultDb) -> Result<u32, String> {
         .map_err(|e| e.to_string())?
         .collect::<Result<_, _>>()
         .map_err(|e| e.to_string())?;
+    if db.is_v3() {
+        // The graph, bytes and presentation above share this same read snapshot.
+        // Immutable, hash-addressed sidecars are published before the index.
+        index.ancestry = Some(super::portable_ancestry::capture(db, &publish)?);
+        // Runtime recovery ownership never travels as live authority.
+        index.meta = super::portable_ancestry::portable_metadata(&index.meta)?;
+    }
     tx.commit().map_err(|e| e.to_string())?;
+    // Publish first: a crash must never leave the previous index pointing at
+    // sidecars already removed by cleanup. Importers share the publication lock.
+    write(
+        &root,
+        INDEX,
+        &serde_json::to_vec_pretty(&index).map_err(|e| e.to_string())?,
+    )?;
     // Re-export updates the same paths. Remove only paths owned by our previous
     // index, never an arbitrary Markdown file already in the selected directory.
     if let Some(previous) = previous {
@@ -345,11 +401,6 @@ pub fn export_md_vault(root: &Path, db: &VaultDb) -> Result<u32, String> {
             }
         }
     }
-    write(
-        &root,
-        INDEX,
-        &serde_json::to_vec_pretty(&index).map_err(|e| e.to_string())?,
-    )?;
     Ok(index.notes.len() as u32)
 }
 
@@ -376,8 +427,15 @@ pub(crate) fn import_export(root: &Path, db: &VaultDb) -> Result<Option<ImportRe
     if !path.exists() {
         return Ok(None);
     }
-    let index: Index = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("Invalid export index: {e}"))?;
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let probe: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if probe["format"] != 1 {
+        // Even a v2/default client must never fall through to plain Markdown.
+        super::portable_ancestry::probe(&probe)?;
+        return Err("Ancestry export requires explicit full restore, independent copy, or same-vault reconciliation; legacy import cannot drop ancestry".into());
+    }
+    let index: Index =
+        serde_json::from_slice(&bytes).map_err(|e| format!("Invalid export index: {e}"))?;
     validate_index(&index)?;
     let tx = db.begin_write("import", None, &serde_json::json!(&index))?;
     if tx.is_replay() {

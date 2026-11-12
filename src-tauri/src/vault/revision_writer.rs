@@ -43,6 +43,7 @@ pub(crate) fn reserved_metadata(key: &str) -> bool {
             "recovery_fork:",
             "review_apply:",
             "recovery_assets:",
+            "portable_",
         ]
         .iter()
         .any(|prefix| key.starts_with(*prefix))
@@ -213,6 +214,7 @@ impl VaultDb {
             request,
             TransactionBehavior::Immediate,
             false,
+            None,
         )
     }
     pub(crate) fn begin_auxiliary_write(
@@ -220,7 +222,14 @@ impl VaultDb {
         source: &str,
         request: &Value,
     ) -> Result<WriteTransaction<'_>, String> {
-        self.begin_write_behavior(source, None, request, TransactionBehavior::Deferred, false)
+        self.begin_write_behavior(
+            source,
+            None,
+            request,
+            TransactionBehavior::Deferred,
+            false,
+            None,
+        )
     }
     pub(crate) fn begin_revision_maintenance(
         &self,
@@ -232,8 +241,27 @@ impl VaultDb {
             request,
             TransactionBehavior::Immediate,
             true,
+            None,
         )
     }
+    pub(crate) fn begin_portable_reconcile(
+        &self,
+        request: &Value,
+        floor: i64,
+    ) -> Result<WriteTransaction<'_>, String> {
+        if floor < 0 {
+            return Err("Invalid portable counter floor".into());
+        }
+        self.begin_write_behavior(
+            "recovery",
+            None,
+            request,
+            TransactionBehavior::Immediate,
+            true,
+            Some(floor),
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Shared authoring/maintenance lock-order boundary.
     fn begin_write_behavior(
         &self,
         source: &str,
@@ -241,6 +269,7 @@ impl VaultDb {
         request: &Value,
         legacy_behavior: TransactionBehavior,
         maintenance_only: bool,
+        portable_floor: Option<i64>,
     ) -> Result<WriteTransaction<'_>, String> {
         let mut request_hash = if self.is_v3() {
             hash(&(source, request))?
@@ -295,7 +324,7 @@ impl VaultDb {
             // This permits imports with not-yet-allocated IDs without taking a
             // ledger lock or acknowledging a reservation inside BEGIN IMMEDIATE.
             // Per-note revisions stay strictly increasing; unused tickets are gaps.
-            number = locked.reserve_transaction(high)?;
+            number = locked.reserve_transaction(high.max(portable_floor.unwrap_or(0)))?;
             ledger = Some(locked);
         }
         let behavior = if self.is_v3() {

@@ -457,10 +457,19 @@ impl Ledger {
     }
     #[cfg(any(test, feature = "revision-ancestry"))]
     fn bind(&mut self, path: &Path, epoch: &str) -> Result<(), String> {
-        let canonical = fs::canonicalize(path)
+        let canonical = if path.exists() {
+            fs::canonicalize(path).map_err(err)?
+        } else {
+            fs::canonicalize(
+                path.parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new(".")),
+            )
             .map_err(err)?
-            .to_string_lossy()
-            .into_owned();
+            .join(path.file_name().ok_or("Missing restore filename")?)
+        }
+        .to_string_lossy()
+        .into_owned();
         if !self.data.bound_path.is_empty()
             && self.data.bound_path != canonical
             && Path::new(&self.data.bound_path).exists()
@@ -945,20 +954,125 @@ pub struct RestoreOutcome {
 /// must be explicitly migrated first; restore never upgrades an unknown backup.
 #[cfg(any(test, feature = "revision-ancestry"))]
 pub fn restore(path: &Path, backup: &Path, ledger_root: &Path) -> Result<RestoreOutcome, String> {
-    if inspect_version(path)? != 3 || inspect_version(backup)? != 3 {
-        return Err("Ancestry restore requires two schema 3 vaults".into());
+    restore_inner(path, backup, ledger_root, None)
+}
+/// Portable restoration admits an empty destination only, except exact replay
+/// of the acknowledged operation. It never implicitly overwrites a live vault.
+#[cfg(any(test, feature = "revision-ancestry"))]
+pub(crate) fn restore_portable(
+    path: &Path,
+    backup: &Path,
+    ledger_root: &Path,
+    key: &str,
+    request: &str,
+) -> Result<RestoreOutcome, String> {
+    restore_inner(path, backup, ledger_root, Some((key, request)))
+}
+#[cfg(any(test, feature = "revision-ancestry"))]
+fn restore_inner(
+    path: &Path,
+    backup: &Path,
+    ledger_root: &Path,
+    portable: Option<(&str, &str)>,
+) -> Result<RestoreOutcome, String> {
+    let target_version = inspect_version(path)?;
+    if (target_version != 3 && !(portable.is_some() && matches!(target_version, 0 | 2)))
+        || inspect_version(backup)? != 3
+    {
+        return Err(
+            "Ancestry restore requires a schema 3 source and compatible destination".into(),
+        );
     }
     let source = Inspection::open(backup)?;
     let source_identity = source.identity()?;
     let _maintenance = Maintenance::exclusive(path)?;
-    let target =
-        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(err)?;
-    validate(&target)?;
-    let target_identity = identity(&target)?;
-    if target_identity.vault_uuid != source_identity.vault_uuid {
-        return Err("Backup belongs to a different vault UUID".into());
+    if inspect_version(path)? != target_version {
+        return Err("Restore destination changed during preflight".into());
     }
-    drop(target);
+    let target_identity = if target_version != 0 {
+        let target =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(err)?;
+        if target_version == 3 {
+            validate(&target)?;
+        } else {
+            validate_foreign_keys(&target)?;
+        }
+        if let Some((key, request)) = portable {
+            let prior: Option<String> = target
+                .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
+                .optional()
+                .map_err(err)?;
+            if let Some(prior) = prior {
+                let prior: Value = serde_json::from_str(&prior).map_err(err)?;
+                if prior["request"] != request {
+                    return Err("Portable operation ID reused for different input".into());
+                }
+                let outcome: RestoreOutcome =
+                    serde_json::from_value(prior["outcome"].clone()).map_err(err)?;
+                if identity(&target)? != outcome.identity {
+                    return Err("Portable receipt belongs to a retired restore epoch; explicit recovery required".into());
+                }
+                let mut ledger = Ledger::acquire(ledger_root, &outcome.identity.vault_uuid)?;
+                if ledger.was_missing
+                    || (ledger.data.storage_epoch != outcome.identity.storage_epoch
+                        && ledger.data.pending_restore_epoch.as_deref()
+                            != Some(outcome.identity.storage_epoch.as_str()))
+                    || ledger
+                        .data
+                        .pending_restore_epoch
+                        .as_deref()
+                        .is_some_and(|e| e != outcome.identity.storage_epoch)
+                {
+                    return Err("Portable replay lost its ledger/epoch; explicit recovery enrollment required".into());
+                }
+                ledger.bind(path, &outcome.identity.storage_epoch)?;
+                sync_snapshot(path)?;
+                ledger.finish_restore(&outcome.identity.storage_epoch)?;
+                return Ok(outcome);
+            }
+            for table in [
+                "notes",
+                "tags",
+                "note_tags",
+                "attachments",
+                "note_attachments",
+                "versions",
+                "session_links",
+            ] {
+                let count: i64 = target
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                    .map_err(err)?;
+                if count != 0 {
+                    return Err("Full portable restore requires an empty destination; select reconciliation or independent copy".into());
+                }
+            }
+            let metadata: i64 = target
+                .query_row(
+                    "SELECT COUNT(*) FROM meta WHERE key!='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(err)?;
+            if metadata != 0 {
+                return Err("Destination contains metadata; explicit restore/copy requires a disposable empty destination".into());
+            }
+            if target_version == 3 {
+                let graph:i64=target.query_row("SELECT (SELECT COUNT(*) FROM revisions)+(SELECT COUNT(*) FROM note_revision_counters)+(SELECT COUNT(*) FROM revision_pins)",[],|r|r.get(0)).map_err(err)?;
+                if graph != 0 {
+                    return Err("Destination has retained ancestry; it is not empty".into());
+                }
+            }
+            source_identity.clone()
+        } else {
+            let identity = identity(&target)?;
+            if identity.vault_uuid != source_identity.vault_uuid {
+                return Err("Backup belongs to a different vault UUID".into());
+            }
+            identity
+        }
+    } else {
+        source_identity.clone()
+    };
     let mut ledger = Ledger::acquire(ledger_root, &source_identity.vault_uuid)?;
     let next = Identity {
         vault_uuid: source_identity.vault_uuid.clone(),
@@ -1035,7 +1149,7 @@ pub fn restore(path: &Path, backup: &Path, ledger_root: &Path) -> Result<Restore
     };
     for (note, incarnation, previous) in heads {
         let state = payload(&tx, &previous)?;
-        insert_revision(
+        let restored_revision = insert_revision(
             &tx,
             &migration,
             &note,
@@ -1043,6 +1157,30 @@ pub fn restore(path: &Path, backup: &Path, ledger_root: &Path) -> Result<Restore
             &state,
             Some(&previous),
         )?;
+        // Restore preserves generated provenance only when the exported current
+        // head was still exactly the last generated state. A manual A→B→A head
+        // never gains generated authority by resemblance.
+        let generated_key = format!("generated_summary:v3:{}", digest(note.as_bytes()));
+        tx.execute(
+            "UPDATE meta SET value=?2 WHERE key=?1 AND value=?3",
+            params![generated_key, restored_revision, previous],
+        )
+        .map_err(err)?;
+    }
+    let outcome = RestoreOutcome {
+        identity: next.clone(),
+        ledger_was_missing: ledger.was_missing,
+        requires_recovery_review: true,
+    };
+    if let Some((key, request)) = portable {
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES(?1,?2)",
+            params![
+                key,
+                json!({"request":request,"outcome":outcome}).to_string()
+            ],
+        )
+        .map_err(err)?;
     }
     validate(&tx)?;
     tx.commit().map_err(err)?;
@@ -1050,16 +1188,18 @@ pub fn restore(path: &Path, backup: &Path, ledger_root: &Path) -> Result<Restore
     sync_snapshot(stage.path())?;
     // No managed connection can hold target WAL pages under this exclusive lock.
     // Checkpoint before replacing the main file; never replay stale WAL into it.
-    let old = Connection::open(path).map_err(err)?;
-    let (busy, _, _): (i64, i64, i64) = old
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
-        .map_err(err)?;
-    if busy != 0 {
-        return Err("Restore refused: an unmanaged connection holds the WAL".into());
+    if path.exists() {
+        let old = Connection::open(path).map_err(err)?;
+        let (busy, _, _): (i64, i64, i64) = old
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(err)?;
+        if busy != 0 {
+            return Err("Restore refused: an unmanaged connection holds the WAL".into());
+        }
+        drop(old);
     }
-    drop(old);
     for suffix in ["-wal", "-shm"] {
         if PathBuf::from(format!("{}{suffix}", path.display())).exists() {
             return Err(

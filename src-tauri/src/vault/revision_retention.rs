@@ -118,7 +118,7 @@ pub(crate) fn session_lease(root: &Path, instance: &str) -> Result<File, String>
 }
 pub fn pin_session(pin: &PinRef) -> Result<&str, String> {
     let mut parts = pin.pin_id.split(':');
-    if !matches!(parts.next(), Some("read" | "base" | "review")) {
+    if !matches!(parts.next(), Some("read" | "base" | "review" | "portable")) {
         return Err("Unknown pin protocol; refusing cleanup".into());
     }
     let session = parts.next().ok_or("Missing pin session")?;

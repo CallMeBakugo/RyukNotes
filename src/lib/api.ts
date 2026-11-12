@@ -742,3 +742,8 @@ export async function getPendingOpenFile(): Promise<PendingOpenFile | null> {
 export async function ackPendingOpenFile(id: number): Promise<void> {
   return invoke("ack_pending_open_file", { id });
 }
+
+
+// Explicit native ancestry boundaries. Callers retain operation IDs and use the
+// existing all-pane pause/barrier flow; these never retarget the displayed vault.
+export { dbRestoreAncestryExport as restoreAncestryExport, dbReconcileAncestryExport as reconcileAncestryExport } from "./api-db";

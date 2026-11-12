@@ -7322,3 +7322,60 @@ mod db_command_tests {
         );
     }
 }
+
+/// Explicit portable ancestry restoration. This creates a separate destination;
+/// it never closes/rebinds the displayed connection or bypasses owner barriers.
+#[tauri::command]
+pub fn db_restore_ancestry_export<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    source_dir: String,
+    destination: String,
+    ledger_root: String,
+    mode: crate::vault::portable_ancestry::RestoreMode,
+    operation_id: String,
+) -> Result<serde_json::Value, String> {
+    ensure_scoped_path(&app, Path::new(&source_dir))?;
+    ensure_writable_path(&app, Path::new(&destination))?;
+    ensure_writable_path(&app, Path::new(&ledger_root))?;
+    state
+        .recovery
+        .lock()
+        .map_err(|e| e.to_string())?
+        .assert_quiet(None, None)?;
+    #[cfg(any(test, feature = "revision-ancestry"))]
+    {
+        let outcome = crate::vault::portable_ancestry::restore_export(
+            Path::new(&source_dir),
+            Path::new(&destination),
+            Path::new(&ledger_root),
+            mode,
+            &operation_id,
+        )?;
+        serde_json::to_value(outcome).map_err(|e| e.to_string())
+    }
+    #[cfg(not(any(test, feature = "revision-ancestry")))]
+    {
+        let _ = (destination, ledger_root, mode, operation_id);
+        Err("Portable ancestry restoration requires the gated revision-ancestry build; production activation awaits all 4B–4E native gates".into())
+    }
+}
+#[tauri::command]
+pub fn db_reconcile_ancestry_export<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    source_dir: String,
+    vault_path: String,
+    operation_id: String,
+) -> Result<crate::vault::portable_ancestry::ReconcileOutcome, String> {
+    ensure_scoped_path(&app, Path::new(&source_dir))?;
+    state
+        .recovery
+        .lock()
+        .map_err(|e| e.to_string())?
+        .assert_quiet(None, None)?;
+    with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        crate::vault::portable_ancestry::reconcile_export(Path::new(&source_dir), db, &operation_id)
+    })
+}
