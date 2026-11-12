@@ -124,3 +124,23 @@ export function createNativeDropRouter() {
   };
 }
 export const nativeEditorDrops = createNativeDropRouter();
+
+export function reviewDomIds(componentId: string) {
+  return { title: `${componentId}-review-title`, result: `${componentId}-review-result`, search: `${componentId}-review-search` };
+}
+/** Contain dialog keystrokes even if an event arrives for an inactive owner.
+ * Only the focused owning pane may advance/search/close its own proposal. */
+export function handleReviewKey(event: KeyboardEvent, inside: boolean, owns: boolean, actions: {
+  advance(reverse: boolean): void; find(): void; close(): void; canClose(): boolean;
+}): boolean {
+  if (!inside || event.isComposing) return false;
+  const find = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f';
+  const editorShortcut = (event.ctrlKey || event.metaKey) && ['s', 'f', 'h'].includes(event.key.toLowerCase());
+  if (event.key !== 'F3' && event.key !== 'Escape' && !editorShortcut) return false;
+  event.preventDefault(); event.stopPropagation();
+  if (!owns) return true;
+  if (event.key === 'F3') actions.advance(event.shiftKey);
+  else if (find) actions.find();
+  else if (event.key === 'Escape' && actions.canClose()) actions.close();
+  return true;
+}

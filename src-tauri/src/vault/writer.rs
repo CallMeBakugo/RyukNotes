@@ -217,7 +217,7 @@ impl VaultDb {
         self.validate_writer_vault(&self.identity())?;
         Ok(receipt)
     }
-    fn check_policy(&self, id: &str, policy: &WritePolicy) -> Result<(), WriteError> {
+    pub(crate) fn check_policy(&self, id: &str, policy: &WritePolicy) -> Result<(), WriteError> {
         let current = self.accepted_note(id)?;
         match policy {
             WritePolicy::Create if current.is_some() => Err(WriteError::conflict(

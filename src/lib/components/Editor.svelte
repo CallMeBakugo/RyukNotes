@@ -44,6 +44,8 @@
 	import DOMPurify from 'dompurify';
 	import { splitSnapshot } from '$lib/utils/history-comparison';
 	import HistoryReview from './HistoryReview.svelte';
+	import ConflictReview from './ConflictReview.svelte';
+	import { ConflictReviewModel, type ReviewedNote, type ReviewState } from '$lib/utils/conflict-review';
 	import { RevisionSaveQueue, type SaveRevision } from '$lib/utils/revision-save';
 	import { isCurrentVaultEvent } from '$lib/utils/note-list-updates';
 	import { getEditorPane } from '$lib/stores/editor-pane';
@@ -3471,8 +3473,86 @@
 	let recoveryBase: NoteContent | null = null;
 	let recoveryNotice = $state('');
 	let stopRecoveryWatch: (() => void) | null = null;
+	let conflictReview = $state.raw<ConflictReviewModel | null>(null);
+	let conflictReviewState = $state.raw<ReviewState | null>(null);
+	let unsubscribeConflictReview: (() => void) | null = null;
+	let reviewFocusIntent: () => boolean = () => false;
+	let reviewRenderSnapshot: (body: string) => string = () => '';
+	let pendingReviewedNote: NoteContent | null = null;
+	let reviewSourceMode: boolean | null = null;
+	$effect(() => {
+		const mode = $sourceMode;
+		untrack(() => {
+			if (reviewSourceMode !== null && mode !== reviewSourceMode) conflictReview?.invalidate('The editing surface changed. Your result is preserved; renew review.');
+			reviewSourceMode = mode;
+		});
+	});
+	async function openConflictReview() {
+		if (!saveError?.conflict || !paneIsActive() || !document.hasFocus()) return;
+		reviewFocusIntent = captureFocusIntent();
+		await recoveryReady; await saves.idle();
+		if (!recoveryOwner) return;
+		if (!conflictReview) {
+			const owner = recoveryOwner, sessionOrigin = captureOrigin();
+			let origin = sessionOrigin;
+			const sameOwner = () => !editorDisposed && sessionOrigin.path === loadedPath && sessionOrigin.path === $activeNotePath
+				&& sessionOrigin.vault === $appConfig?.active_vault && saves.isCurrentSession(sessionOrigin.snapshot);
+			reviewRenderSnapshot = body => sameOwner() ? markdownToHtml(body, true) : '';
+			const model = new ConflictReviewModel({
+				open: async () => {
+					if (!sameOwner()) throw new Error('The originating note session ended.');
+					origin = captureOrigin();
+					const captured = await owner.openReview();
+					return { ...captured, remote: captured.remote ? dbContentFromReceipt(captured.remote as Record<string, unknown>) : undefined } as unknown as ReviewedNote;
+				},
+				checkpoint: (id, sequence, proposal) => owner.checkpointReview(id, sequence, proposal),
+				cancel: id => owner.cancelReview(id),
+				asset: (id, reference) => owner.reviewAsset(id, reference),
+				apply: async (id, revision, sequence) => {
+					if (!isOriginCurrent(origin) || saves.capture().revision !== revision || !externalOperationBusy) throw new Error('The captured local revision changed.');
+					return dbContentFromReceipt(await owner.applyReview(id, revision, sequence));
+				},
+				localRevision: () => saves.capture().revision,
+				ownerIsCurrent: () => isOriginCurrent(origin),
+				adopt: async (note, revision) => {
+					if (!isOriginCurrent(origin) || saves.capture().revision !== revision || !(await owner.discard(revision))) return false;
+					pendingReviewedNote = note; return true;
+				},
+			});
+			conflictReview = model;
+			unsubscribeConflictReview = model.subscribe(state => { conflictReviewState = state; });
+		}
+		await conflictReview.open();
+	}
+	async function applyConflictReview() {
+		const model = conflictReview;
+		if (!model?.canApply || !paneIsActive() || !document.hasFocus() || externalOperationBusy) return;
+		const captured = saves.capture();
+		pendingReviewedNote = null;
+		// Freeze only this owner through persistence, CAS, retirement and adoption.
+		// Undo history remains intact until the exact CAS receipt is accepted.
+		externalOperationBusy = true;
+		source.configure(true, !isMobile && ($appConfig?.show_line_numbers ?? false)); editor?.setEditable(false);
+		try {
+			const applied = await model.apply();
+			const note = pendingReviewedNote as NoteContent | null;
+			if (!applied || !note || !saves.acceptReviewed(captured, note.raw)) return;
+			$activeNote = note; $editorDirty = false; recoveryBase = structuredClone(note);
+			// Deliberate undo boundary only after verified apply. Pre-apply L is
+			// retained in its journal; no stale proposal resets the live document.
+			clearEditorHistory();
+			loadNote(note.path, note.content);
+		} finally {
+			pendingReviewedNote = null;
+			externalOperationBusy = false;
+			source.configure($readOnly || !!$viewerNote, !isMobile && ($appConfig?.show_line_numbers ?? false)); editor?.setEditable(!$readOnly && !$viewerNote);
+		}
+	}
+
 	function beginRecovery(path: string, accepted: NoteContent | null) {
 		stopRecoveryWatch?.();
+		unsubscribeConflictReview?.(); unsubscribeConflictReview = null;
+		conflictReview = null; conflictReviewState = null;
 		const previous = recoveryOwner;
 		recoveryOwner = null;
 		void previous?.release().catch(() => {});
@@ -3500,13 +3580,14 @@
 				try {
 					const remote = await readNote(vault, path);
 					if (!saves.isCurrentSession(session) || recoveryBase !== baseline || externalOperationBusy || editorDisposed) return;
+					conflictReview?.observe(remote);
 					const changed = baseline?.meta.accepted && remote.meta.accepted
 						? baseline.meta.accepted.token !== remote.meta.accepted.token : baseline?.raw !== remote.raw;
 					if (!changed) return;
 					if ($editorDirty || !saves.isCurrent(before)) { flagExternalConflict(); return; }
 					$activeNote = remote;
 					loadNote(path, remote.content);
-				} catch { if (saves.isCurrentSession(session) && $editorDirty) flagExternalConflict(); }
+				} catch { if (saves.isCurrentSession(session) && $editorDirty) { conflictReview?.invalidate('The saved note is unavailable. Preserve your result or Keep both.'); flagExternalConflict(); } }
 			});
 		})().catch(() => { recoveryNotice = 'Recovery registration failed. Keep this editor open.'; });
 	}
@@ -3549,6 +3630,7 @@
 		saves.markChanged();
 		$editorDirty = true;
 		recoveryOwner?.edit();
+		conflictReview?.invalidate('Your draft changed during review. Your result is preserved; renew review.');
 		saves.schedule(() => { void forceSave(); });
 	}
 
@@ -3583,6 +3665,7 @@
 		const origin = captureOrigin();
 		retryingSave = true;
 		try {
+			if (conflictReview && !(await conflictReview.close())) return;
 			await recoveryReady;
 			await saves.idle();
 			if (!recoveryOwner || !isOriginCurrent(origin, true)) return;
@@ -3612,6 +3695,7 @@
 		const isCurrent = beginEditorNoteNavigation();
 		const origin = captureOrigin();
 		try {
+			if (conflictReview && !(await conflictReview.close())) return;
 			await saves.idle();
 			if (!isCurrent() || !isOriginCurrent(origin, true)) return;
 			const content = await readNote(origin.vault!, origin.path!);
@@ -7567,6 +7651,8 @@
 		closeOwnedCalloutMenu?.();
 		cancelProgressiveLoad();
 		stopRecoveryWatch?.();
+		void conflictReview?.close().catch(() => {});
+		unsubscribeConflictReview?.();
 		if ($editorDirty || saves.fenced) void recoveryOwner?.checkpoint().catch(() => {});
 		void recoveryOwner?.release().catch(() => {});
 		closeAiMenu();
@@ -7934,6 +8020,10 @@
 
 
 <div class="editor-container" bind:this={editorRoot} data-editor-id={componentId} class:mobile={isMobile} inert={externalOperationBusy}>
+	{#if conflictReview && conflictReviewState?.visible}
+		<ConflictReview model={conflictReview} ownerId={componentId} ownsFocus={() => paneIsActive() && document.hasFocus()}
+			focusIntent={reviewFocusIntent} onApply={applyConflictReview} onKeepBoth={saveConflictCopy} renderSnapshot={reviewRenderSnapshot} />
+	{/if}
 	{#if !$activeNote}
 		<div class="empty-editor">
 			<div class="empty-icon">
@@ -8225,6 +8315,7 @@
 				<span>{saveError.conflict ? "This note changed elsewhere. Your draft is still here." : `Save failed. ${saveError.message}`}</span>
 				{#if saveError.conflict}
 					<button type="button" onclick={saveConflictCopy} disabled={retryingSave} aria-label="Keep both notes">Keep both</button>
+					<button type="button" onclick={() => void openConflictReview()} disabled={retryingSave}>Review changes</button>
 					<button type="button" onclick={reloadConflictedNote} disabled={retryingSave} aria-label="Discard draft and reload saved version">Reload saved version</button>
 				{:else}
 					<button type="button" onclick={retrySave} disabled={retryingSave} aria-label="Retry saving note">

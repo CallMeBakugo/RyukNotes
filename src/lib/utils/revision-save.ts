@@ -66,6 +66,18 @@ export class RevisionSaveQueue {
     return this.isCurrentSession(snapshot) && snapshot.revision === this.session.revision;
   }
 
+  /** Explicit reviewed commit: the caller froze this exact local revision and
+   * received its native CAS receipt. Events/proposals never call this hook. */
+  acceptReviewed(snapshot: SaveRevision, raw: string): boolean {
+    if (!this.isCurrent(snapshot) || !this.session.fenced) return false;
+    this.cancelScheduled();
+    this.session.raw = raw;
+    this.session.savedRevision = snapshot.revision;
+    this.session.fenced = false;
+    this.session.epoch++;
+    return true;
+  }
+
   get raw(): string {
     return this.session.raw;
   }

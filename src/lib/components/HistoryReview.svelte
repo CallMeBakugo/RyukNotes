@@ -6,7 +6,10 @@
 	import SnapshotDocument from './SnapshotDocument.svelte';
 	import { comparableBody, compareHistory, splitSnapshot, type HistoryComparison, type HistoryRow } from '$lib/utils/history-comparison';
 
-	let { raw, current, selected, loading, error, canRestore, onRetry, onRestore, renderSnapshot }: {
+	let { raw, current, selected, loading, error, canRestore, onRetry, onRestore, renderSnapshot, mode = 'history', beforeLabel = 'Current note', afterLabel = 'Selected snapshot' }: {
+		mode?: 'history' | 'conflict';
+		beforeLabel?: string;
+		afterLabel?: string;
 		raw: string | null;
 		current: string;
 		selected: string | null;
@@ -24,7 +27,7 @@
 	let comparing = $state(false);
 	let comparisonError = $state<string | null>(null);
 	let request = 0;
-	const snapshot = $derived(splitSnapshot(raw ?? ''));
+	const snapshot = $derived(mode === 'history' ? splitSnapshot(raw ?? '') : { body: raw ?? '', metadata: '' });
 	const rendered = $derived.by(() => {
 		if (view !== 'snapshot' || source || raw === null) return { html: '', error: '' };
 		try {
@@ -68,15 +71,15 @@
 {#snippet lines(rows: HistoryRow[])}
 	{#each rows as row}
 		<div class="diff-line {row.kind}">
-			<span class="line-number" aria-label="Current note line">{row.currentLine ?? ''}</span>
-			<span class="line-number" aria-label="Snapshot line">{row.snapshotLine ?? ''}</span>
-			<span class="line-sign" aria-label={row.kind === 'added' ? 'Added by restoring' : row.kind === 'removed' ? 'Removed by restoring' : 'Unchanged'}>{row.kind === 'added' ? '+' : row.kind === 'removed' ? '−' : ' '}</span>
+			<span class="line-number" aria-label={`${beforeLabel} line`}>{row.currentLine ?? ''}</span>
+			<span class="line-number" aria-label={`${afterLabel} line`}>{row.snapshotLine ?? ''}</span>
+			<span class="line-sign" aria-label={row.kind === 'added' ? (mode === 'history' ? 'Added by restoring' : `Added in ${afterLabel}`) : row.kind === 'removed' ? (mode === 'history' ? 'Removed by restoring' : `Removed from ${beforeLabel}`) : 'Unchanged'}>{row.kind === 'added' ? '+' : row.kind === 'removed' ? '−' : ' '}</span>
 			<span class="line-text">{row.text || ' '}{#if !row.newline}<span class="line-ending">No final newline</span>{/if}</span>
 		</div>
 	{/each}
 {/snippet}
 
-<section class="history-review" aria-label="Version review">
+<section class="history-review" aria-label={mode === 'history' ? 'Version review' : `${beforeLabel} to ${afterLabel}`}>
 	<div class="review-header">
 		<div class="review-heading">
 			<strong>{selected ?? 'Version History'}</strong>
@@ -97,7 +100,7 @@
 	{:else if view === 'changes'}
 		<div id={ids.changesPanel} class="review-panel" role="tabpanel" aria-labelledby={ids.changesTab} tabindex="0">
 			<div class="comparison-heading">
-				<span>Current note → selected version</span>
+				<span>{beforeLabel} → {afterLabel}</span>
 				{#if comparison}<span class="comparison-count"><span class="added-count">+{comparison.added}</span> <span class="removed-count">−{comparison.removed}</span> lines</span>{/if}
 			</div>
 			{#if comparing}
@@ -105,7 +108,7 @@
 			{:else if comparisonError}
 				<p class="review-status" role="alert">{comparisonError}</p>
 			{:else if comparison && comparison.added === 0 && comparison.removed === 0}
-				<p class="review-status">No content changes. Metadata is not restored.</p>
+				<p class="review-status">{mode === 'history' ? 'No content changes. Metadata is not restored.' : 'No display changes. Exact source, line endings and merge choices remain authoritative.'}</p>
 			{:else if comparison}
 				<div class="history-diff">
 					{#key raw}
@@ -122,7 +125,7 @@
 		</div>
 	{:else}
 		<div id={ids.snapshotPanel} class="review-panel" role="tabpanel" aria-labelledby={ids.snapshotTab} tabindex="0">
-			<div class="snapshot-heading"><span>Selected snapshot</span><button class="source-toggle" aria-pressed={source} onclick={() => source = !source}>{source ? 'Rendered view' : 'View source'}</button></div>
+			<div class="snapshot-heading"><span>{afterLabel}</span><button class="source-toggle" aria-pressed={source} onclick={() => source = !source}>{source ? 'Rendered view' : 'View source'}</button></div>
 			{#if snapshot.body === ''}
 				<p class="review-status">This snapshot is empty.</p>
 			{:else if source}
@@ -138,7 +141,7 @@
 	{#if raw !== null && snapshot.metadata}
 		<details class="history-metadata"><summary>Metadata (not restored)</summary><pre>{snapshot.metadata}</pre></details>
 	{/if}
-	{#if selected}
+	{#if selected && mode === 'history'}
 		<div class="review-actions"><span>Restore replaces the current note’s content only.</span><button class="history-restore-btn" disabled={!canRestore} onclick={onRestore}>Restore this version</button></div>
 	{/if}
 </section>

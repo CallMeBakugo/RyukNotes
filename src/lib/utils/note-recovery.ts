@@ -16,7 +16,7 @@ export function isRecoveryConflict(error: unknown): boolean {
 export interface RecoveryBlob { reference: string; name: string; mime: string; data: number[] }
 export interface RecoveryDraft {
   owner: string; sequence: number; revision: number; capturedAt: string; vault: DbAcceptedState['vault']; noteId: string;
-  base: NoteContent; body: string; title: string; tags: string[]; pinned: boolean;
+  base: NoteContent & { reviewResult?: { reviewId: string; sourceOwner: string } }; body: string; title: string; tags: string[]; pinned: boolean;
   blobs: RecoveryBlob[]; conflicted: boolean;
 }
 export interface DraftCapture { revision: number; base: NoteContent; body: string; meta: NoteMeta }
@@ -151,6 +151,20 @@ export function createRecoveryOwner(vault: DbAcceptedState['vault'], noteId: str
       if (record.revision !== revision) { pendingFork = null; throw new Error('The draft changed; Keep both again to preserve the new revision.'); }
       const note = await ordered(() => invoke<Record<string, unknown>>('recovery_fork', { owner, sequence: record.sequence }));
       return { note, revision: record.revision, sequence: record.sequence };
+    },
+    async openReview(): Promise<Record<string, unknown>> {
+      const record = await checkpoint();
+      return ordered(() => invoke<Record<string, unknown>>('recovery_review_open', { owner, sequence: record.sequence, revision: record.revision }));
+    },
+    checkpointReview(reviewId: string, sequence: number, proposal: { body: string; title: string; tags: string[]; pinned: boolean }): Promise<void> {
+      return ordered(() => invoke('recovery_review_checkpoint', { owner, reviewId, sequence, proposal }));
+    },
+    reviewAsset(reviewId: string, reference: string): Promise<{ mime: string; data: number[] }> {
+      return invoke('recovery_review_asset', { owner, reviewId, reference });
+    },
+    cancelReview(reviewId: string): Promise<void> { return ordered(() => invoke('recovery_review_cancel', { owner, reviewId })); },
+    applyReview(reviewId: string, revision: number, sequence: number): Promise<Record<string, unknown>> {
+      return ordered(() => invoke<Record<string, unknown>>('recovery_review_apply', { owner, reviewId, revision, sequence }));
     },
     async pause(): Promise<boolean> {
       await tail;

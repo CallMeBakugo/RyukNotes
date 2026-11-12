@@ -47,7 +47,7 @@
     {#if message}<p role="status">{message}</p>{/if}
     {#each drafts as draft (draft.owner)}
       <div>
-        <span>Recovered draft: {draft.title}</span>
+        <span>{draft.base.reviewResult ? 'Review result' : 'Recovered draft'}: {draft.title}</span>
         <button disabled={busy} onclick={() => resolve(draft, false)}>Keep both</button>
         <button disabled={busy} onclick={() => resolve(draft, true)}>Discard recovered draft…</button>
       </div>

@@ -249,3 +249,13 @@ test('conflict fencing cancels both timers and queued callbacks without acknowle
   saves.markChanged();
   assert.equal(await saves.save(saves.capture(), async () => 'resolved'), true);
 });
+
+test('only a current fenced review revision can acknowledge the CAS receipt', async () => {
+  const saves = new RevisionSaveQueue();saves.startSession('B');saves.markChanged();saves.fence();
+  const captured=saves.capture();
+  assert.equal(saves.raw,'B');assert.equal(saves.dirty,true);
+  saves.markChanged();assert.equal(saves.acceptReviewed(captured,'stale result'),false);assert.equal(saves.raw,'B');
+  const current=saves.capture();assert.equal(saves.acceptReviewed(current,'committed result'),true);
+  assert.equal(saves.raw,'committed result');assert.equal(saves.dirty,false);assert.equal(saves.fenced,false);
+  saves.markChanged();assert.equal(saves.acceptReviewed(saves.capture(),'unguarded'),false);
+});

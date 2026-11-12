@@ -55,6 +55,7 @@ pub struct Recovery {
     owners: HashMap<String, Owner>,
     barrier: Option<(String, String)>,
     versions: HashMap<String, (u64, VaultIdentity, i64)>,
+    reviews: HashMap<String, Review>,
 }
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -498,7 +499,10 @@ pub fn recovery_list<R: Runtime>(
     Ok(service
         .records()?
         .into_iter()
-        .filter(|d| !service.owners.contains_key(&d.owner))
+        .filter(|d| {
+            !service.owners.contains_key(&d.owner)
+                && !service.reviews.get(&d.owner).is_some_and(|r| r.active)
+        })
         .collect())
 }
 #[tauri::command]
@@ -1363,6 +1367,7 @@ mod publication_tests {
 pub fn window_gone(state: &AppState, label: &str) {
     if let Ok(mut service) = state.recovery.lock() {
         service.owners.retain(|_, owner| owner.window != label);
+        service.reviews.retain(|_, review| review.window != label);
         service
             .versions
             .retain(|key, _| !key.starts_with(&format!("{label}:")));
@@ -1432,4 +1437,958 @@ mod tombstone_tests {
         assert!(service.records().unwrap().is_empty());
         assert!(!service.owners[&owner].dirty);
     }
+}
+
+// Stage 3: explicit proposals. Display diffs have no authority to apply a patch.
+#[derive(Clone)]
+struct Review {
+    window: String,
+    owner: String,
+    draft: Draft,
+    remote: Value,
+    active: bool,
+    proposal_sequence: u64,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewProposal {
+    pub body: String,
+    pub title: String,
+    pub tags: Vec<String>,
+    pub pinned: bool,
+}
+/// Verify the journal's exact accepted body AND metadata against its captured
+/// state token. Never select a base by snapshot date or resemblance. This is a
+/// verified live accepted state, not durable revision ancestry (ABA still applies).
+fn verified_review_base(db: &VaultDb, draft: &Draft) -> bool {
+    let base = &draft.base;
+    let accepted = &base["meta"]["accepted"];
+    let state = json!({"id":draft.note_id,"content":accepted["body"],"title":accepted["title"],
+        "tags":accepted["tags"],"pinned":accepted["pinned"],"trashed":accepted["trashed"]});
+    accepted["vault"] == json!(draft.vault)
+        && base["path"] == draft.note_id
+        && base["content"].is_string()
+        && base["content"] == accepted["body"]
+        && base["raw"] == accepted["body"]
+        && base["meta"]["id"] == draft.note_id
+        && base["meta"]["title"] == accepted["title"]
+        && base["meta"]["tags"] == accepted["tags"]
+        && base["meta"]["pinned"] == accepted["pinned"]
+        && base["meta"]["created"] == accepted["created"]
+        && base["meta"]["modified"] == accepted["modified"]
+        && accepted["trashed"] == false
+        && accepted["token"].as_str() == Some(db.state_token(&state).as_str())
+}
+fn collect_review_blobs(db: &VaultDb, content: &str, blobs: &mut Vec<Blob>) -> Result<(), String> {
+    let refs =
+        regex::Regex::new(r#"(?:\]\(|(?:src|href)=["']|<)(\.rn-attachments/([a-zA-Z0-9-]+))"#)
+            .map_err(|e| e.to_string())?;
+    for cap in refs.captures_iter(content) {
+        if blobs.iter().any(|b| b.reference == cap[1]) {
+            continue;
+        }
+        let (meta, data) = db
+            .get_attachment_data(&cap[2])?
+            .ok_or("Review attachment is unavailable; use Keep both")?;
+        blobs.push(Blob {
+            reference: cap[1].into(),
+            name: meta.filename,
+            mime: meta.mime_type,
+            data,
+            checkpoint_bytes: None,
+        });
+    }
+    Ok(())
+}
+#[tauri::command]
+pub fn recovery_review_open<R: Runtime>(
+    window: tauri::Window<R>,
+    state: State<'_, AppState>,
+    owner: String,
+    sequence: u64,
+    revision: u64,
+) -> Result<Value, String> {
+    let service = state.recovery.lock().map_err(|e| e.to_string())?;
+    let registered = service.owner(&owner, window.label())?;
+    if registered.sequence != sequence || service.barrier.is_some() {
+        return Err("The owner changed before review opened".into());
+    }
+    let mut draft = read_draft(&service.dir(&owner)?.join(format!("{sequence:020}.json")))?;
+    if draft.owner != owner || draft.sequence != sequence || draft.revision != revision {
+        return Err("The captured local revision changed".into());
+    }
+    drop(service);
+    let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+    let Some(db) = slot.as_ref().filter(|db| db.identity() == draft.vault) else {
+        return Ok(
+            json!({"available":false,"reason":"No verified accepted base in this originating connection. Use Keep both."}),
+        );
+    };
+    let saved = db
+        .accepted_note(&draft.note_id)
+        .map_err(|e| e.to_string())?;
+    if !verified_review_base(db, &draft) {
+        let local = json!({"path":draft.note_id,"raw":draft.body,"content":draft.body,"meta":{
+            "id":draft.note_id,"title":draft.title,"tags":draft.tags,"pinned":draft.pinned,
+            "created":draft.base["meta"]["created"],"modified":draft.base["meta"]["modified"]}});
+        return Ok(
+            json!({"available":false,"local":local,"remote":saved,"reason":"The journal does not hold an exact verified accepted base. Inspect both sources or use Keep both."}),
+        );
+    }
+    let Some(remote) = saved else {
+        return Ok(
+            json!({"available":false,"reason":"The saved note was deleted. Use Keep both."}),
+        );
+    };
+    if remote["trashed"] == true {
+        return Ok(
+            json!({"available":false,"reason":"The saved note is in trash. Use Keep both."}),
+        );
+    }
+    collect_review_blobs(
+        db,
+        remote["content"].as_str().unwrap_or(""),
+        &mut draft.blobs,
+    )?;
+    drop(slot);
+    let mut service = state.recovery.lock().map_err(|e| e.to_string())?;
+    if service.owner(&owner, window.label())?.sequence != sequence || service.barrier.is_some() {
+        return Err("The draft changed while opening review".into());
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let local = json!({"path":draft.note_id,"raw":draft.body,"content":draft.body,"meta":{
+        "id":draft.note_id,"title":draft.title,"tags":draft.tags,"pinned":draft.pinned,
+        "created":draft.base["meta"]["created"],"modified":draft.base["meta"]["modified"]}});
+    let previews: Vec<_> = draft
+        .blobs
+        .iter()
+        .filter(|blob| blob.mime.starts_with("image/"))
+        .map(|blob| blob.reference.clone())
+        .collect();
+    let result = json!({"available":true,"reviewId":id,"revision":revision,"base":draft.base,"local":local,"remote":remote,"previewReferences":previews});
+    service.reviews.insert(
+        id,
+        Review {
+            window: window.label().into(),
+            owner,
+            draft,
+            remote,
+            active: true,
+            proposal_sequence: 0,
+        },
+    );
+    Ok(result)
+}
+fn review_for(service: &Recovery, window: &str, owner: &str, id: &str) -> Result<Review, String> {
+    service.owner(owner, window)?;
+    service
+        .reviews
+        .get(id)
+        .filter(|r| r.active && r.owner == owner && r.window == window)
+        .cloned()
+        .ok_or("This review no longer belongs to this owner".into())
+}
+#[tauri::command]
+pub fn recovery_review_checkpoint<R: Runtime>(
+    window: tauri::Window<R>,
+    state: State<'_, AppState>,
+    owner: String,
+    review_id: String,
+    sequence: u64,
+    proposal: ReviewProposal,
+) -> Result<(), String> {
+    let mut service = state.recovery.lock().map_err(|e| e.to_string())?;
+    let review = review_for(&service, window.label(), &owner, &review_id)?;
+    let mut draft = review.draft.clone();
+    draft.owner = review_id.clone();
+    draft.sequence = sequence;
+    draft.base["reviewResult"] = json!({"reviewId":review_id,"sourceOwner":owner,"baseVerified":true,
+        "yourDraft":{"body":review.draft.body,"title":review.draft.title,"tags":review.draft.tags,"pinned":review.draft.pinned,"revision":review.draft.revision},
+        "saved":review.remote});
+    draft.body = proposal.body;
+    draft.title = proposal.title;
+    draft.tags = proposal.tags;
+    draft.pinned = proposal.pinned;
+    let refs =
+        regex::Regex::new(r#"(?:\]\(|(?:src|href)=["']|<)(\.rn-attachments/([a-zA-Z0-9-]+))"#)
+            .map_err(|e| e.to_string())?;
+    if refs
+        .captures_iter(&draft.body)
+        .any(|cap| !draft.blobs.iter().any(|blob| blob.reference == cap[1]))
+    {
+        let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+        let db = slot
+            .as_ref()
+            .ok_or("The new result references an unavailable vault attachment")?;
+        db.validate_writer_vault(&draft.vault)
+            .map_err(|e| e.to_string())?;
+        collect_review_blobs(db, &draft.body, &mut draft.blobs)?;
+    }
+    // A result is a separate recoverable artifact, never the original live L.
+    // Failed publication retains an unsafe native owner and renderer memory.
+    service.owners.entry(review_id.clone()).or_insert(Owner {
+        window: window.label().into(),
+        vault: draft.vault.clone(),
+        note: draft.note_id.clone(),
+        dirty: true,
+        conflicted: true,
+        locked: false,
+        sequence: review.proposal_sequence,
+    });
+    if sequence == review.proposal_sequence && sequence > 0 {
+        let prior = read_draft(
+            &service
+                .dir(&review_id)?
+                .join(format!("{sequence:020}.json")),
+        )?;
+        if prior.body != draft.body
+            || prior.title != draft.title
+            || prior.tags != draft.tags
+            || prior.pinned != draft.pinned
+        {
+            return Err("Proposal sequence reused for different content".into());
+        }
+    } else {
+        service.checkpoint(window.label(), &draft)?;
+    }
+    service.owners.remove(&review_id);
+    service
+        .reviews
+        .get_mut(&review_id)
+        .unwrap()
+        .proposal_sequence = sequence;
+    Ok(())
+}
+#[tauri::command]
+pub fn recovery_review_cancel<R: Runtime>(
+    window: tauri::Window<R>,
+    state: State<'_, AppState>,
+    owner: String,
+    review_id: String,
+) -> Result<(), String> {
+    let mut service = state.recovery.lock().map_err(|e| e.to_string())?;
+    service.owner(&owner, window.label())?;
+    if !service.reviews.contains_key(&review_id) {
+        return Ok(());
+    }
+    review_for(&service, window.label(), &owner, &review_id)?;
+    if service.owners.contains_key(&review_id) {
+        return Err(
+            "The edited result is not durable; keep it in memory and retry preservation".into(),
+        );
+    }
+    service.reviews.remove(&review_id);
+    drop(service);
+    let _ = window.app_handle().emit("recovery-available", ());
+    Ok(())
+}
+fn apply_review(
+    db: &VaultDb,
+    id: &str,
+    review: &Review,
+    proposal: &Draft,
+) -> Result<Value, crate::vault::writer::WriteError> {
+    use crate::vault::writer::{WriteError, WriteErrorKind, WritePolicy};
+    db.validate_writer_vault(&review.draft.vault)?;
+    validate_blobs(proposal)?;
+    let tx =
+        rusqlite::Transaction::new_unchecked(&db.conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+    let key = format!("review_apply:v1:{id}");
+    let payload = digest(
+        &serde_json::to_vec(&json!([
+            proposal.sequence,
+            proposal.body,
+            proposal.title,
+            proposal.tags,
+            proposal.pinned
+        ]))
+        .map_err(|e| e.to_string())?,
+    );
+    let prior: Option<String> = tx
+        .query_row("SELECT value FROM meta WHERE key=?1", [&key], |r| r.get(0))
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if let Some(prior) = prior {
+        let prior: Value = serde_json::from_str(&prior).map_err(|e| e.to_string())?;
+        if prior["payload"] != payload {
+            return Err(WriteError::conflict(
+                WriteErrorKind::Changed,
+                "This review already applied another result. Renew review.",
+                None,
+            ));
+        }
+        return Ok(prior["receipt"].clone());
+    }
+    db.check_policy(
+        &review.draft.note_id,
+        &WritePolicy::Update {
+            expected_token: review.remote["accepted"]["token"]
+                .as_str()
+                .ok_or("Missing reviewed token")?
+                .into(),
+        },
+    )?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut note = NewNote {
+        id: review.draft.note_id.clone(),
+        title: proposal.title.clone(),
+        content: proposal.body.clone(),
+        tags: proposal.tags.clone(),
+        pinned: proposal.pinned,
+        created: review.remote["created"].as_str().unwrap_or(&now).into(),
+        modified: now.clone(),
+    };
+    let previous = db
+        .get_note_content(&note.id)?
+        .ok_or("Reviewed note disappeared")?;
+    // Forced predecessor checkpoint: interactive apply must not lose R to the
+    // ordinary GUI history cooldown. The snapshot remains ancestry-unknown.
+    for blob in &proposal.blobs {
+        let attachment =
+            db.store_attachment_on(&tx, &note.id, &blob.name, &blob.mime, &blob.data, &now)?;
+        note.content = note
+            .content
+            .replace(&blob.reference, &format!(".rn-attachments/{attachment}"));
+    }
+    if previous != note.content {
+        VaultDb::snapshot_on(&tx, &note.id, &previous, 0, true)?;
+    }
+    VaultDb::write_note(&tx, &note, None, None)?;
+    let receipt = db
+        .accepted_note(&note.id)?
+        .ok_or("Applied note disappeared")?;
+    tx.execute(
+        "INSERT INTO meta(key,value) VALUES(?1,?2)",
+        params![
+            key,
+            json!({"payload":payload,"receipt":receipt}).to_string()
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(receipt)
+}
+#[tauri::command]
+pub fn recovery_review_apply<R: Runtime>(
+    window: tauri::Window<R>,
+    state: State<'_, AppState>,
+    owner: String,
+    review_id: String,
+    revision: u64,
+    sequence: u64,
+) -> Result<Value, crate::vault::writer::WriteError> {
+    use crate::vault::writer::{WriteError, WriteErrorKind};
+    let mut service = state.recovery.lock().map_err(|e| e.to_string())?;
+    let review = review_for(&service, window.label(), &owner, &review_id)?;
+    let registered = service.owner(&owner, window.label())?;
+    if revision != review.draft.revision
+        || registered.sequence != review.draft.sequence
+        || service.barrier.is_some()
+    {
+        return Err(WriteError::conflict(
+            WriteErrorKind::Changed,
+            "Your draft changed during review. The result is preserved; renew review.",
+            None,
+        ));
+    }
+    if sequence == 0 || review.proposal_sequence != sequence {
+        return Err("Checkpoint the exact edited result before applying".into());
+    }
+    let proposal = read_draft(
+        &service
+            .dir(&review_id)?
+            .join(format!("{sequence:020}.json")),
+    )?;
+    if proposal.owner != review_id
+        || proposal.sequence != sequence
+        || proposal.revision != revision
+        || proposal.vault != review.draft.vault
+        || proposal.note_id != review.draft.note_id
+    {
+        return Err("The result artifact does not match this captured owner/revision".into());
+    }
+    // Keep the owner generation stable through the short CAS transaction.
+    // No DB->registry lock is held elsewhere while waiting for this guard.
+    let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+    let db = slot.as_ref().ok_or_else(|| {
+        WriteError::conflict(
+            WriteErrorKind::VaultReplaced,
+            "The originating vault is closed",
+            None,
+        )
+    })?;
+    let receipt = apply_review(db, &review_id, &review, &proposal)?;
+    drop(slot);
+    // A post-commit journal error is retryable through the receipt key above.
+    service.owners.insert(
+        review_id.clone(),
+        Owner {
+            window: window.label().into(),
+            vault: proposal.vault.clone(),
+            note: proposal.note_id.clone(),
+            dirty: true,
+            conflicted: true,
+            locked: false,
+            sequence,
+        },
+    );
+    service.resolve(window.label(), &review_id, sequence)?;
+    service.owners.remove(&review_id);
+    drop(service);
+    notify(&state);
+    Ok(receipt)
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use crate::vault::writer::{NoteWrite, WriteErrorKind, WritePolicy};
+    fn setup(db: &VaultDb) -> (Review, Draft) {
+        let note = NewNote {
+            id: "review-note".into(),
+            title: "Title".into(),
+            content: "base\r\n".into(),
+            tags: vec!["base".into()],
+            pinned: false,
+            created: "2026-11-11T00:00:00Z".into(),
+            modified: "2026-11-11T00:00:00Z".into(),
+        };
+        let base = db
+            .write_authoritative(&NoteWrite::from_note(db, &note, WritePolicy::Create), 20)
+            .unwrap();
+        let accepted = json!({"vault":base["accepted"]["vault"],"token":base["accepted"]["token"],"body":base["content"],"title":base["title"],"tags":base["tags"],"pinned":base["pinned"],"trashed":false,"created":base["created"],"modified":base["modified"]});
+        let snapshot = json!({"path":note.id,"content":note.content,"raw":note.content,"meta":{"id":note.id,"title":base["title"],"tags":base["tags"],"pinned":false,"created":base["created"],"modified":base["modified"],"accepted":accepted}});
+        let draft = Draft {
+            owner: uuid::Uuid::new_v4().to_string(),
+            sequence: 1,
+            revision: 2,
+            captured_at: note.created,
+            vault: db.identity(),
+            note_id: note.id,
+            base: snapshot,
+            body: "local\r\n".into(),
+            title: "Local title".into(),
+            tags: vec!["local".into()],
+            pinned: true,
+            blobs: vec![],
+            conflicted: true,
+        };
+        assert!(verified_review_base(db, &draft));
+        let review = Review {
+            window: "main".into(),
+            owner: draft.owner.clone(),
+            draft: draft.clone(),
+            remote: base,
+            active: true,
+            proposal_sequence: 1,
+        };
+        let proposal = Draft {
+            owner: uuid::Uuid::new_v4().to_string(),
+            body: "reviewed\r\n".into(),
+            title: "Chosen title".into(),
+            ..draft
+        };
+        (review, proposal)
+    }
+    #[test]
+    fn exact_base_requires_accepted_body_metadata_and_origin_not_snapshot_resemblance() {
+        let db = VaultDb::open_in_memory().unwrap();
+        let (review, _) = setup(&db);
+        for field in ["raw", "title", "tags", "vault", "missing"] {
+            let mut draft = review.draft.clone();
+            match field {
+                "raw" => draft.base["raw"] = json!("base\n"),
+                "title" => draft.base["meta"]["title"] = json!("wrong title"),
+                "tags" => draft.base["meta"]["tags"] = json!(["wrong"]),
+                "vault" => draft.base["meta"]["accepted"]["vault"]["file"] = json!("another file"),
+                _ => draft.base["meta"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("accepted")
+                    .map(|_| ())
+                    .unwrap(),
+            }
+            assert!(!verified_review_base(&db, &draft));
+        }
+    }
+    #[test]
+    fn explicit_apply_is_exact_atomic_and_retry_idempotent_without_replaying_over_later_writer() {
+        let db = VaultDb::open_in_memory().unwrap();
+        let (review, proposal) = setup(&db);
+        let receipt = apply_review(&db, "ticket", &review, &proposal).unwrap();
+        assert_eq!(receipt["content"], "reviewed\r\n");
+        assert_eq!(receipt["title"], "Chosen title");
+        assert_eq!(receipt["tags"], json!(["local"]));
+        assert_eq!(receipt["pinned"], true);
+        assert_eq!(db.list_versions("review-note").unwrap().len(), 1);
+        db.tag_atomic("review-note", &["later".into()], &[])
+            .unwrap();
+        let later = db.accepted_note("review-note").unwrap().unwrap();
+        assert_eq!(
+            apply_review(&db, "ticket", &review, &proposal).unwrap(),
+            receipt
+        );
+        assert_eq!(db.accepted_note("review-note").unwrap().unwrap(), later);
+        let mut changed = proposal.clone();
+        changed.body = "different proposal".into();
+        assert_eq!(
+            apply_review(&db, "ticket", &review, &changed)
+                .unwrap_err()
+                .kind,
+            WriteErrorKind::Changed
+        );
+    }
+    #[test]
+    fn separate_connection_body_and_metadata_races_reject_without_partial_apply_or_history() {
+        for mutation in ["body", "title", "tags", "pinned", "deleted", "trashed"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.rn");
+            let db = VaultDb::open(&path).unwrap();
+            let other = VaultDb::open(&path).unwrap();
+            let (review, proposal) = setup(&db);
+            match mutation {
+                "body" => {
+                    other
+                        .conn
+                        .execute(
+                            "UPDATE notes SET content='racing writer' WHERE id='review-note'",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "title" => {
+                    other
+                        .conn
+                        .execute(
+                            "UPDATE notes SET title='racing title' WHERE id='review-note'",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "tags" => {
+                    other
+                        .tag_atomic("review-note", &["racing".into()], &[])
+                        .unwrap();
+                }
+                "pinned" => {
+                    other
+                        .conn
+                        .execute("UPDATE notes SET pinned=1 WHERE id='review-note'", [])
+                        .unwrap();
+                }
+                "deleted" => {
+                    other.delete_note("review-note").unwrap();
+                }
+                _ => {
+                    other.set_note_trashed("review-note", true).unwrap();
+                }
+            }
+            let before = other.get_note_full("review-note").unwrap();
+            let error = apply_review(&db, "stale-ticket", &review, &proposal).unwrap_err();
+            assert_eq!(
+                error.kind,
+                match mutation {
+                    "deleted" => WriteErrorKind::Deleted,
+                    "trashed" => WriteErrorKind::Trashed,
+                    _ => WriteErrorKind::Changed,
+                }
+            );
+            assert_eq!(other.get_note_full("review-note").unwrap(), before);
+            assert_eq!(
+                db.conn
+                    .query_row("SELECT COUNT(*) FROM versions", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+    #[test]
+    fn result_artifact_is_independent_of_original_draft_and_recoverable_after_cancel_or_restart() {
+        let db = VaultDb::open_in_memory().unwrap();
+        let (review, proposal) = setup(&db);
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = Recovery::default();
+        service.set_root(dir.path().into()).unwrap();
+        for draft in [&review.draft, &proposal] {
+            service.owners.insert(
+                draft.owner.clone(),
+                Owner {
+                    window: "main".into(),
+                    vault: draft.vault.clone(),
+                    note: draft.note_id.clone(),
+                    dirty: true,
+                    conflicted: true,
+                    locked: false,
+                    sequence: 0,
+                },
+            );
+            service.checkpoint("main", draft).unwrap();
+        }
+        let mut restarted = Recovery::default();
+        restarted.set_root(dir.path().into()).unwrap();
+        let records = restarted.records().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|d| d.body == "local\r\n"));
+        assert!(records.iter().any(|d| d.body == "reviewed\r\n"));
+        assert_eq!(
+            db.get_note_content("review-note").unwrap().unwrap(),
+            "base\r\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod review_ipc_tests {
+    use super::*;
+    use crate::types::AppConfig;
+    use crate::vault::writer::{NoteWrite, WritePolicy};
+    #[test]
+    fn real_review_commands_gate_owner_revision_and_exact_result_before_adoption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.rn");
+        let db = VaultDb::open(&path).unwrap();
+        let note = NewNote {
+            id: "n".into(),
+            title: "Title".into(),
+            content: "base\r\n".into(),
+            tags: vec![],
+            pinned: false,
+            created: "2026-11-11T00:00:00Z".into(),
+            modified: "2026-11-11T00:00:00Z".into(),
+        };
+        let saved = db
+            .write_authoritative(&NoteWrite::from_note(&db, &note, WritePolicy::Create), 20)
+            .unwrap();
+        let identity = db.identity();
+        let image = db
+            .add_attachment(
+                "n",
+                "snapshot.png",
+                "image/png",
+                b"captured image bytes",
+                "2026-11-11T00:00:00Z",
+            )
+            .unwrap();
+        let base = json!({"path":"n","raw":saved["content"],"content":saved["content"],"meta":{
+            "id":"n","title":saved["title"],"tags":saved["tags"],"pinned":false,"created":saved["created"],"modified":saved["modified"],
+            "accepted":{"vault":identity,"token":saved["accepted"]["token"],"body":saved["content"],"title":saved["title"],"tags":saved["tags"],"pinned":false,"trashed":false,"created":saved["created"],"modified":saved["modified"]}}});
+        let app = tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![
+                recovery_register,
+                recovery_checkpoint,
+                recovery_review_open,
+                recovery_review_checkpoint,
+                recovery_review_apply,
+                recovery_review_cancel,
+                recovery_review_asset,
+                recovery_list
+            ])
+            .manage(AppState::new(AppConfig::default()))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = app.state::<AppState>();
+        *state.vault_db.lock().unwrap() = Some(db);
+        state
+            .recovery
+            .lock()
+            .unwrap()
+            .set_root(dir.path().join("private"))
+            .unwrap();
+        let main = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let other = tauri::WebviewWindowBuilder::new(&app, "note-other", Default::default())
+            .build()
+            .unwrap();
+        let request =
+            |view: &tauri::WebviewWindow<tauri::test::MockRuntime>, cmd: &str, body: Value| {
+                tauri::test::get_ipc_response(
+                    view,
+                    tauri::webview::InvokeRequest {
+                        cmd: cmd.into(),
+                        callback: tauri::ipc::CallbackFn(0),
+                        error: tauri::ipc::CallbackFn(1),
+                        url: "http://tauri.localhost".parse().unwrap(),
+                        body: tauri::ipc::InvokeBody::Json(body),
+                        headers: Default::default(),
+                        invoke_key: tauri::test::INVOKE_KEY.into(),
+                    },
+                )
+            };
+        let owner = uuid::Uuid::new_v4().to_string();
+        request(
+            &main,
+            "recovery_register",
+            json!({"owner":owner,"vault":identity,"noteId":"n"}),
+        )
+        .unwrap();
+        let mut draft = Draft {
+            owner: owner.clone(),
+            sequence: 1,
+            revision: 1,
+            captured_at: note.created,
+            vault: identity,
+            note_id: "n".into(),
+            base,
+            body: format!("local ![image](.rn-attachments/{})\r\n", image.id),
+            title: "Title".into(),
+            tags: vec![],
+            pinned: false,
+            blobs: vec![],
+            conflicted: true,
+        };
+        request(&main, "recovery_checkpoint", json!({"draft":draft})).unwrap();
+        let ticket: Value = request(
+            &main,
+            "recovery_review_open",
+            json!({"owner":owner,"sequence":1,"revision":1}),
+        )
+        .unwrap()
+        .deserialize()
+        .unwrap();
+        assert_eq!(ticket["available"], true);
+        let id = ticket["reviewId"].as_str().unwrap();
+        let reference = format!(".rn-attachments/{}", image.id);
+        assert!(request(
+            &other,
+            "recovery_review_asset",
+            json!({"owner":owner,"reviewId":id,"reference":reference})
+        )
+        .is_err());
+        let preview: Value = request(
+            &main,
+            "recovery_review_asset",
+            json!({"owner":owner,"reviewId":id,"reference":reference}),
+        )
+        .unwrap()
+        .deserialize()
+        .unwrap();
+        assert_eq!(preview["data"], json!(b"captured image bytes".to_vec()));
+        let proposal =
+            json!({"body":"chosen\r\n","title":"Chosen title","tags":["chosen"],"pinned":true});
+        request(
+            &main,
+            "recovery_review_checkpoint",
+            json!({"owner":owner,"reviewId":id,"sequence":1,"proposal":proposal}),
+        )
+        .unwrap();
+        assert!(request(
+            &other,
+            "recovery_review_apply",
+            json!({"owner":owner,"reviewId":id,"sequence":1,"revision":1})
+        )
+        .is_err());
+        draft.sequence = 2;
+        draft.revision = 2;
+        draft.body = "new typing".into();
+        request(&main, "recovery_checkpoint", json!({"draft":draft})).unwrap();
+        let stale = request(
+            &main,
+            "recovery_review_apply",
+            json!({"owner":owner,"reviewId":id,"sequence":1,"revision":1}),
+        )
+        .unwrap_err();
+        assert_eq!(stale["kind"], "changed");
+        request(
+            &main,
+            "recovery_review_cancel",
+            json!({"owner":owner,"reviewId":id}),
+        )
+        .unwrap();
+        let artifacts: Value = request(&main, "recovery_list", json!({}))
+            .unwrap()
+            .deserialize()
+            .unwrap();
+        assert_eq!(artifacts.as_array().unwrap().len(), 1);
+        assert_eq!(artifacts[0]["body"], "chosen\r\n");
+        let renewed: Value = request(
+            &main,
+            "recovery_review_open",
+            json!({"owner":owner,"sequence":2,"revision":2}),
+        )
+        .unwrap()
+        .deserialize()
+        .unwrap();
+        let next = renewed["reviewId"].as_str().unwrap();
+        request(
+            &main,
+            "recovery_review_checkpoint",
+            json!({"owner":owner,"reviewId":next,"sequence":1,"proposal":proposal}),
+        )
+        .unwrap();
+        let receipt: Value = request(
+            &main,
+            "recovery_review_apply",
+            json!({"owner":owner,"reviewId":next,"sequence":1,"revision":2}),
+        )
+        .unwrap()
+        .deserialize()
+        .unwrap();
+        assert_eq!(receipt["content"], "chosen\r\n");
+        assert_eq!(receipt["title"], "Chosen title");
+        assert_eq!(receipt["tags"], json!(["chosen"]));
+        assert_eq!(receipt["pinned"], true);
+        assert!(
+            state.recovery.lock().unwrap().owners[&owner].dirty,
+            "Native commit alone cannot acknowledge the live editor revision"
+        );
+        let again: Value = request(
+            &main,
+            "recovery_review_apply",
+            json!({"owner":owner,"reviewId":next,"sequence":1,"revision":2}),
+        )
+        .unwrap()
+        .deserialize()
+        .unwrap();
+        assert_eq!(again, receipt);
+        draft.sequence = 3;
+        draft.revision = 3;
+        draft.base["meta"]
+            .as_object_mut()
+            .unwrap()
+            .remove("accepted");
+        request(&main, "recovery_checkpoint", json!({"draft":draft})).unwrap();
+        let unknown: Value = request(
+            &main,
+            "recovery_review_open",
+            json!({"owner":owner,"sequence":3,"revision":3}),
+        )
+        .unwrap()
+        .deserialize()
+        .unwrap();
+        assert_eq!(unknown["available"], false);
+        assert!(unknown.get("reviewId").is_none());
+    }
+}
+
+#[cfg(test)]
+mod review_race_tests {
+    use super::*;
+    use crate::vault::writer::{NoteWrite, WriteErrorKind, WritePolicy};
+    #[test]
+    fn a_writer_committing_while_apply_waits_for_the_lock_invalidates_the_reviewed_token() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WAITING: AtomicBool = AtomicBool::new(false);
+        WAITING.store(false, Ordering::Release);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.rn");
+        let writer = VaultDb::open(&path).unwrap();
+        let reviewer = VaultDb::open(&path).unwrap();
+        let note = NewNote {
+            id: "n".into(),
+            title: "Title".into(),
+            content: "base".into(),
+            tags: vec![],
+            pinned: false,
+            created: "2026-11-11T00:00:00Z".into(),
+            modified: "2026-11-11T00:00:00Z".into(),
+        };
+        let remote = writer
+            .write_authoritative(
+                &NoteWrite::from_note(&writer, &note, WritePolicy::Create),
+                20,
+            )
+            .unwrap();
+        let draft = Draft {
+            owner: uuid::Uuid::new_v4().to_string(),
+            sequence: 1,
+            revision: 1,
+            captured_at: note.created.clone(),
+            vault: reviewer.identity(),
+            note_id: note.id.clone(),
+            base: json!({}),
+            body: "local".into(),
+            title: note.title.clone(),
+            tags: vec![],
+            pinned: false,
+            blobs: vec![],
+            conflicted: true,
+        };
+        let review = Review {
+            window: "main".into(),
+            owner: draft.owner.clone(),
+            draft: draft.clone(),
+            remote,
+            active: true,
+            proposal_sequence: 1,
+        };
+        let proposal = Draft {
+            body: "result".into(),
+            ..draft
+        };
+        let tx = rusqlite::Transaction::new_unchecked(
+            &writer.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .unwrap();
+        tx.execute(
+            "UPDATE notes SET content='concurrent committed body' WHERE id='n'",
+            [],
+        )
+        .unwrap();
+        reviewer
+            .conn
+            .busy_handler(Some(|_| {
+                WAITING.store(true, Ordering::Release);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                true
+            }))
+            .unwrap();
+        let applying = std::thread::spawn(move || {
+            apply_review(&reviewer, "racing-review", &review, &proposal)
+        });
+        let started = std::time::Instant::now();
+        while !WAITING.load(Ordering::Acquire) {
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::yield_now();
+        }
+        tx.commit().unwrap();
+        assert_eq!(
+            applying.join().unwrap().unwrap_err().kind,
+            WriteErrorKind::Changed
+        );
+        assert_eq!(
+            writer.get_note_content("n").unwrap().unwrap(),
+            "concurrent committed body"
+        );
+        assert_eq!(writer.list_versions("n").unwrap().len(), 0);
+    }
+}
+
+/// Snapshot assets come from the captured review, never the currently displayed
+/// vault or a global active note. Non-images stay inert attachment references.
+#[tauri::command]
+pub fn recovery_review_asset<R: Runtime>(
+    window: tauri::Window<R>,
+    state: State<'_, AppState>,
+    owner: String,
+    review_id: String,
+    reference: String,
+) -> Result<Value, String> {
+    let service = state.recovery.lock().map_err(|e| e.to_string())?;
+    service.owner(&owner, window.label())?;
+    let review = service
+        .reviews
+        .get(&review_id)
+        .filter(|review| review.active && review.owner == owner && review.window == window.label())
+        .ok_or("This image does not belong to the active owner review")?;
+    let blob = review
+        .draft
+        .blobs
+        .iter()
+        .find(|blob| {
+            blob.reference == reference
+                && matches!(
+                    blob.mime.as_str(),
+                    "image/png"
+                        | "image/jpeg"
+                        | "image/gif"
+                        | "image/webp"
+                        | "image/avif"
+                        | "image/bmp"
+                )
+        })
+        .ok_or("Image is not part of this captured review")?;
+    Ok(json!({"mime":blob.mime,"data":blob.data}))
 }
