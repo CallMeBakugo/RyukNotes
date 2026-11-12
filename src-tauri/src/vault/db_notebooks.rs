@@ -74,9 +74,7 @@ pub fn create(
     parent: Option<&str>,
     name: &str,
 ) -> Result<NotebookEntry, String> {
-    let tx =
-        rusqlite::Transaction::new_unchecked(&db.conn, rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+    let tx = db.begin_write("gui", None, &serde_json::json!([vault, parent, name]))?;
     let mut layout = Layout::load(&tx)?;
     let parent = relative(vault, parent.unwrap_or(""))?;
     layout.require(&parent)?;
@@ -89,6 +87,17 @@ pub fn create(
     } else {
         format!("{parent}/{name}")
     };
+    if tx.is_replay() {
+        // A retried create replays the same synthesized entry the original
+        // call returned; create receipts derive from inputs, not stored state.
+        return Ok(NotebookEntry {
+            name: target.rsplit('/').next().unwrap_or("").into(),
+            path: format!("{vault}/{target}"),
+            relative_path: target,
+            children: vec![],
+            note_count: 0,
+        });
+    }
     if layout.notebooks.contains(&target) {
         return Err("Notebook already exists".into());
     }
@@ -140,9 +149,10 @@ pub fn list(db: &VaultDb, vault: &str) -> Result<Vec<NotebookEntry>, String> {
 }
 
 pub fn move_note(db: &VaultDb, vault: &str, id: &str, destination: &str) -> Result<String, String> {
-    let tx =
-        rusqlite::Transaction::new_unchecked(&db.conn, rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+    let tx = db.begin_write("gui", None, &serde_json::json!([vault, id, destination]))?;
+    if tx.is_replay() {
+        return Ok(id.into());
+    }
     let exists: bool = tx
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM notes WHERE id=?1)",
@@ -166,9 +176,14 @@ pub fn repath(
     source: &str,
     destination: &str,
 ) -> Result<String, String> {
-    let tx =
-        rusqlite::Transaction::new_unchecked(&db.conn, rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+    let tx = db.begin_write(
+        "gui",
+        None,
+        &serde_json::json!([vault, source, destination]),
+    )?;
+    if tx.is_replay() {
+        return Ok(format!("{vault}/{}", relative(vault, destination)?));
+    }
     let mut layout = Layout::load(&tx)?;
     let source = relative(vault, source)?;
     let destination = relative(vault, destination)?;

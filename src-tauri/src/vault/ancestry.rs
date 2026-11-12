@@ -228,7 +228,7 @@ pub struct Identity {
     pub vault_uuid: String,
     pub storage_epoch: String,
 }
-fn identity(conn: &Connection) -> Result<Identity, String> {
+pub(crate) fn identity(conn: &Connection) -> Result<Identity, String> {
     let value = conn
         .query_row(
             "SELECT vault_uuid,storage_epoch FROM vault_identity WHERE singleton=1",
@@ -332,6 +332,8 @@ struct LedgerData {
     pending_restore_epoch: Option<String>,
     bound_path: String,
     counters: BTreeMap<String, i64>,
+    #[serde(default)]
+    global_high_water: i64,
 }
 /// Lock this before any SQLite write transaction; reserve() fsyncs before return.
 /// Locks are OS-released on process death. Reservations may leave gaps, never reuse.
@@ -360,9 +362,17 @@ impl Ledger {
             }
         } else {
             let file = private_file(&path, false)?;
-            let data: LedgerData = serde_json::from_reader(file).map_err(err)?;
-            if data.format != 1
+            let raw: Value = serde_json::from_reader(file).map_err(err)?;
+            let data: LedgerData = serde_json::from_value(raw.clone()).map_err(err)?;
+            if !matches!(data.format, 1 | 2)
+                || (data.format == 2
+                    && raw
+                        .get("global_high_water")
+                        .and_then(Value::as_i64)
+                        .is_none())
+                || (data.format == 1 && data.global_high_water != 0)
                 || data.vault_uuid != vault_uuid
+                || data.global_high_water < 0
                 || data.counters.values().any(|n| *n < 0)
             {
                 return Err("Invalid high-water ledger".into());
@@ -395,7 +405,8 @@ impl Ledger {
             .get(note_id)
             .copied()
             .unwrap_or(0)
-            .max(database_high_water);
+            .max(database_high_water)
+            .max(self.data.global_high_water);
         let next = previous
             .checked_add(1)
             .ok_or("Revision counter exhausted")?;
@@ -404,6 +415,45 @@ impl Ledger {
         // as reserved. Never return a number before disk and directory sync.
         self.persist()?;
         Ok(next)
+    }
+    pub(crate) fn reserve_transaction(&mut self, database_high_water: i64) -> Result<i64, String> {
+        if database_high_water < 0 {
+            return Err("Invalid database high water".into());
+        }
+        let highest = self
+            .data
+            .counters
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .max(self.data.global_high_water)
+            .max(database_high_water);
+        let next = highest.checked_add(1).ok_or("Revision counter exhausted")?;
+        // Older 4B tooling must reject, rather than ignore, the global floor.
+        // Vault schema stays 3; this is the external ledger's own format version.
+        self.data.format = 2;
+        self.data.global_high_water = next;
+        self.persist()?;
+        Ok(next)
+    }
+    pub(crate) fn verify_session(&self, path: &Path, identity: &Identity) -> Result<(), String> {
+        if self.was_missing
+            || self.data.pending_restore_epoch.is_some()
+            || self.data.storage_epoch != identity.storage_epoch
+        {
+            return Err(
+                "Vault ledger requires explicit restore/recovery enrollment before writing".into(),
+            );
+        }
+        let canonical = fs::canonicalize(path)
+            .map_err(err)?
+            .to_string_lossy()
+            .into_owned();
+        if self.data.bound_path != canonical {
+            return Err("Vault path changed; use explicit restore/recovery enrollment".into());
+        }
+        Ok(())
     }
     #[cfg(any(test, feature = "revision-ancestry"))]
     fn bind(&mut self, path: &Path, epoch: &str) -> Result<(), String> {
@@ -517,22 +567,22 @@ pub(crate) fn validate_foreign_keys(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct FullState {
-    body: Vec<u8>,
-    title: String,
-    tags: Vec<String>,
-    pinned: bool,
-    lifecycle: String,
-    created: String,
-    modified: String,
-    extra: Value,
+pub(crate) struct FullState {
+    pub(crate) body: Vec<u8>,
+    pub(crate) title: String,
+    pub(crate) tags: Vec<String>,
+    pub(crate) pinned: bool,
+    pub(crate) lifecycle: String,
+    pub(crate) created: String,
+    pub(crate) modified: String,
+    pub(crate) extra: Value,
 }
 impl FullState {
-    fn hash(&self) -> Result<String, String> {
+    pub(crate) fn hash(&self) -> Result<String, String> {
         Ok(digest(&serde_json::to_vec(&(1, self)).map_err(err)?))
     }
 }
-fn states(conn: &Connection) -> Result<BTreeMap<String, FullState>, String> {
+pub(crate) fn states(conn: &Connection) -> Result<BTreeMap<String, FullState>, String> {
     let layout = super::db_notebooks::Layout::load(conn)?;
     let mut statement = conn
         .prepare("SELECT id,content,title,pinned,trashed,created,modified FROM notes ORDER BY id")
@@ -584,13 +634,35 @@ fn states(conn: &Connection) -> Result<BTreeMap<String, FullState>, String> {
             )
             .optional()
             .map_err(err)?;
-        result.insert(id.clone(), FullState { body: body.into_bytes(), title, tags, pinned,
-            lifecycle: if trashed { "trashed".into() } else { "live".into() }, created, modified,
-            extra: json!({"notebook":layout.notes.get(&id),"attachments":links,"session":session,"generatedSummaryV1":generated}) });
+        let mut extra = json!({"notebook":layout.notes.get(&id),"attachments":links,"session":session,"generatedSummaryV1":generated});
+        let predecessor_extra: Option<String> = conn.query_row("SELECT s.extra_json FROM note_revision_heads h JOIN revision_states s USING(revision_id) WHERE h.note_id=?1", [&id], |r| r.get(0)).optional().map_err(err)?;
+        if let Some(previous) = predecessor_extra {
+            let previous: Value = serde_json::from_str(&previous).map_err(err)?;
+            if let Some(origin) = previous.get("incarnationOrigin") {
+                extra["incarnationOrigin"] = origin.clone();
+            }
+        }
+        result.insert(
+            id.clone(),
+            FullState {
+                body: body.into_bytes(),
+                title,
+                tags,
+                pinned,
+                lifecycle: if trashed {
+                    "trashed".into()
+                } else {
+                    "live".into()
+                },
+                created,
+                modified,
+                extra,
+            },
+        );
     }
     Ok(result)
 }
-fn insert_state(conn: &Connection, id: &str, state: &FullState) -> Result<(), String> {
+pub(crate) fn insert_state(conn: &Connection, id: &str, state: &FullState) -> Result<(), String> {
     conn.execute(
         "INSERT INTO revision_states VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
         params![
@@ -701,7 +773,7 @@ pub(crate) fn bootstrap(conn: &Connection, migration: &Migration) -> Result<(), 
     }
     Ok(())
 }
-fn payload(conn: &Connection, revision: &str) -> Result<FullState, String> {
+pub(crate) fn payload(conn: &Connection, revision: &str) -> Result<FullState, String> {
     let (body,title,tags,pinned,lifecycle,created,modified,extra) = conn.query_row("SELECT body,title,tags_json,pinned,lifecycle,note_created,note_modified,extra_json FROM revision_states WHERE revision_id=?1",[revision],|r| Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,bool>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?))).map_err(err)?;
     Ok(FullState {
         body,

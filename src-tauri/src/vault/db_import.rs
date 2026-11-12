@@ -52,6 +52,9 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
     collect_md_files(&trash_dir, &metadata_dir, &mut md_files)
         .map_err(|e| format!("walking trash: {e}"))?;
 
+    if db.is_v3() {
+        md_files.sort();
+    }
     for path in md_files {
         let raw = match std::fs::read_to_string(&path) {
             Ok(text) => text,
@@ -82,11 +85,11 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
         };
         let note_id = note.id.clone();
         let imported = (|| -> Result<(), String> {
-            let tx = rusqlite::Transaction::new_unchecked(
-                &db.conn,
-                rusqlite::TransactionBehavior::Immediate,
-            )
-            .map_err(|e| e.to_string())?;
+            let tx =
+                db.begin_write("import", None, &serde_json::json!([note.id, raw, in_trash]))?;
+            if tx.is_replay() {
+                return tx.commit();
+            }
             let replacing = db.get_note_content(&note.id)?.is_some();
             if !replacing {
                 super::writer::write_import_on(db, &tx, &note, super::writer::ImportPolicy::Copy)?;
@@ -105,6 +108,13 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
                     super::writer::ImportPolicy::FinalizeCopy
                 },
             )?;
+            if db.is_v3() {
+                tx.execute(
+                    "UPDATE notes SET trashed=?2 WHERE id=?1",
+                    rusqlite::params![note.id, in_trash],
+                )
+                .map_err(|e| e.to_string())?;
+            }
             tx.commit().map_err(|e| e.to_string())
         })();
         if let Err(e) = imported {
@@ -115,7 +125,9 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
             continue;
         }
         if in_trash {
-            db.set_note_trashed(&note_id, true)?;
+            if !db.is_v3() {
+                db.set_note_trashed(&note_id, true)?;
+            }
             report.notes_trashed += 1;
         } else {
             report.notes_imported += 1;
@@ -135,7 +147,13 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
                     }
                     if let Ok(snapshot) = std::fs::read_to_string(&history_path) {
                         let imported = (|| -> Result<(), String> {
-                            let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+                            let tx = db.begin_auxiliary_write(
+                                "import",
+                                &serde_json::json!([note_id, snapshot]),
+                            )?;
+                            if tx.is_replay() {
+                                return tx.commit();
+                            }
                             let snapshot = super::db_attachments::import_references(
                                 db,
                                 &tx,
@@ -227,9 +245,18 @@ pub(crate) fn import_single_receipt(
         .ok_or("Source has no filename")?
         .to_string_lossy();
     let (mut meta, body) = frontmatter::parse_note(&prepared.raw, &filename);
-    let tx =
-        rusqlite::Transaction::new_unchecked(&db.conn, rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+    let payload_hashes = payloads
+        .iter()
+        .map(|bytes| format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(bytes)))
+        .collect::<Vec<_>>();
+    let tx = db.begin_write(
+        "import",
+        None,
+        &serde_json::json!([prepared.raw, notebook, payload_hashes]),
+    )?;
+    if let Some(receipt) = tx.replay_any_receipt()? {
+        return Ok(receipt);
+    }
     let mut layout = super::db_notebooks::Layout::load(&tx)?;
     let relative = super::db_notebooks::relative("", notebook.unwrap_or(""))?;
     layout.require(&relative)?;
@@ -292,10 +319,7 @@ pub(crate) fn import_single_receipt(
     super::writer::write_import_on(db, &tx, &note, super::writer::ImportPolicy::FinalizeCopy)?;
     layout.assign(&note.id, &relative)?;
     layout.save(&tx)?;
-    let receipt = db
-        .accepted_note(&note.id)
-        .map_err(|e| e.to_string())?
-        .ok_or("Imported note disappeared")?;
+    let receipt = tx.receipt(&note.id)?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(receipt)
 }

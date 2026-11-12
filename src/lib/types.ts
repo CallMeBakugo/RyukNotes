@@ -2,6 +2,12 @@
 export interface DbAcceptedState {
   readonly vault: { readonly path: string; readonly file: string };
   readonly token: string;
+  readonly vaultUuid?: string;
+  readonly storageEpoch?: string;
+  readonly revision?: Readonly<{
+    incarnationId: string; revisionId: string; revision: string;
+    commitToken: string; stateSha256: string; storageEpoch: string;
+  }>;
   readonly body: string;
   readonly title: string;
   readonly tags: readonly string[];

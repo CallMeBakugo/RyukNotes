@@ -585,16 +585,26 @@ pub fn recovery_poll<R: Runtime>(
 pub fn fork(db: &VaultDb, draft: &Draft) -> Result<Value, String> {
     db.validate_writer_vault(&draft.vault)
         .map_err(|e| e.to_string())?;
+    if let Some(session) = &db.revision_session {
+        let accepted = &draft.base["meta"]["accepted"];
+        if accepted["vaultUuid"].as_str() != Some(session.identity.vault_uuid.as_str())
+            || accepted["storageEpoch"].as_str() != Some(session.identity.storage_epoch.as_str())
+        {
+            return Err("Recovery origin requires explicit vault/restore enrollment; the draft is preserved".into());
+        }
+    }
     validate_blobs(draft)?;
-    let tx =
-        rusqlite::Transaction::new_unchecked(&db.conn, rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
     let key = format!("recovery_fork:v1:{}:{}", draft.owner, draft.sequence);
     let mut payload_draft = draft.clone();
     for blob in &mut payload_draft.blobs {
         blob.checkpoint_bytes = None;
     }
     let payload = digest(&serde_json::to_vec(&payload_draft).map_err(|e| e.to_string())?);
+    let tx = db.begin_write(
+        "recovery",
+        Some(&format!("fork:{}:{}", draft.owner, draft.sequence)),
+        &serde_json::to_value(&payload_draft).map_err(|e| e.to_string())?,
+    )?;
     let prior: Option<String> = tx
         .query_row("SELECT value FROM meta WHERE key=?1", [&key], |r| r.get(0))
         .optional()
@@ -626,10 +636,7 @@ pub fn fork(db: &VaultDb, draft: &Draft) -> Result<Value, String> {
     }
     VaultDb::write_note(&tx, &note, None, None)?;
     // Keep provenance as metadata, never a session_links row/generated digest.
-    let receipt = db
-        .accepted_note(&note.id)
-        .map_err(|e| e.to_string())?
-        .ok_or("Fork disappeared")?;
+    let receipt = tx.receipt(&note.id)?;
     tx.execute(
         "INSERT INTO meta(key,value) VALUES(?1,?2)",
         params![
@@ -1477,7 +1484,11 @@ fn verified_review_base(db: &VaultDb, draft: &Draft) -> bool {
         && base["meta"]["created"] == accepted["created"]
         && base["meta"]["modified"] == accepted["modified"]
         && accepted["trashed"] == false
-        && accepted["token"].as_str() == Some(db.state_token(&state).as_str())
+        && if db.is_v3() {
+            crate::vault::revision_writer::verify_snapshot(db, &draft.note_id, accepted)
+        } else {
+            accepted["token"].as_str() == Some(db.state_token(&state).as_str())
+        }
 }
 fn collect_review_blobs(db: &VaultDb, content: &str, blobs: &mut Vec<Blob>) -> Result<(), String> {
     let refs =
@@ -1691,9 +1702,11 @@ fn apply_review(
     use crate::vault::writer::{WriteError, WriteErrorKind, WritePolicy};
     db.validate_writer_vault(&review.draft.vault)?;
     validate_blobs(proposal)?;
-    let tx =
-        rusqlite::Transaction::new_unchecked(&db.conn, rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+    let tx = db.begin_write(
+        "recovery",
+        Some(&format!("review:{id}")),
+        &serde_json::to_value(proposal).map_err(|e| e.to_string())?,
+    )?;
     let key = format!("review_apply:v1:{id}");
     let payload = digest(
         &serde_json::to_vec(&json!([
@@ -1755,9 +1768,10 @@ fn apply_review(
         VaultDb::snapshot_on(&tx, &note.id, &previous, 0, true)?;
     }
     VaultDb::write_note(&tx, &note, None, None)?;
-    let receipt = db
-        .accepted_note(&note.id)?
-        .ok_or("Applied note disappeared")?;
+    if let Some(base) = review.draft.base["meta"]["accepted"]["revision"]["revisionId"].as_str() {
+        tx.merge_base(&note.id, base);
+    }
+    let receipt = tx.receipt_typed(&note.id)?;
     tx.execute(
         "INSERT INTO meta(key,value) VALUES(?1,?2)",
         params![
@@ -1766,7 +1780,7 @@ fn apply_review(
         ],
     )
     .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
+    tx.commit_typed()?;
     Ok(receipt)
 }
 #[tauri::command]

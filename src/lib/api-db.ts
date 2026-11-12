@@ -24,12 +24,14 @@ import type {
 import type { ExternalNoteReference } from "./editor/externalNote";
 
 let dbMode = false;
+let dbSessionGeneration = 0;
 
 export function isDbVault(): boolean {
   return dbMode;
 }
 
 export function setDbMode(on: boolean): void {
+  dbSessionGeneration++;
   dbMode = on;
 }
 
@@ -100,7 +102,11 @@ function writeError(error: unknown): never {
   }
   throw error;
 }
-interface AcceptanceChain { current: DbAcceptedState }
+interface AcceptanceChain {
+  current: DbAcceptedState;
+  generation: number;
+  pending?: { key: string; operationId: string };
+}
 // A read owns a lineage. Unrelated reads (including task/list reads) cannot
 // promote a dirty editor's baseline. Weak keys keep inactive live buffers valid.
 const acceptedChains = new WeakMap<DbAcceptedState, AcceptanceChain>();
@@ -121,30 +127,54 @@ function toContent(note: Record<string, unknown>, chain?: AcceptanceChain): Note
   const content = String(note.content ?? '');
   const meta: NoteMeta = { id: path, title: String(note.title), tags: [...((note.tags as string[]) ?? [])],
     pinned: !!note.pinned, created: String(note.created), modified: String(note.modified) };
-  const receipt = note.accepted as { vault: DbAcceptedState['vault']; token: string } | undefined;
+  const receipt = note.accepted as Pick<DbAcceptedState, 'vault' | 'token' | 'revision' | 'vaultUuid' | 'storageEpoch'> | undefined;
   if (receipt) {
     const accepted: DbAcceptedState = Object.freeze({ vault: Object.freeze({ ...receipt.vault }), token: receipt.token,
       body: content, title: meta.title, tags: Object.freeze([...meta.tags]), pinned: meta.pinned, trashed: !!note.trashed,
-      created: meta.created, modified: meta.modified });
+      created: meta.created, modified: meta.modified,
+      ...(receipt.revision ? { revision: Object.freeze({ ...receipt.revision }), vaultUuid: receipt.vaultUuid, storageEpoch: receipt.storageEpoch } : {}) });
     meta.accepted = accepted;
-    chain ??= { current: accepted };
+    chain ??= { current: accepted, generation: dbSessionGeneration };
     chain.current = accepted;
     acceptedChains.set(accepted, chain);
   }
   return { path, meta, content, raw: content };
 }
 
-export async function dbSaveNote(path: string, meta: NoteMeta, body: string, expectedRaw: string, vaultPath?: string): Promise<NoteContent> {
+export async function dbSaveNote(path: string, meta: NoteMeta, body: string, expectedRaw: string, vaultPath?: string, writerSource: 'gui' | 'task' = 'gui'): Promise<NoteContent> {
   const chain = meta.accepted && acceptedChains.get(meta.accepted);
   if (!chain || chain.current.body !== expectedRaw || meta.id !== path) {
     throw new DbWriteError('invalid_policy', 'A captured accepted state is required before updating this note.');
   }
   const accepted = chain.current;
+  const v3 = accepted.token.startsWith('revision-v3.');
+  const generation = dbSessionGeneration;
+  if (v3 && chain.generation !== generation) throw new DbWriteError('vault_replaced', 'This accepted state belongs to a prior vault session.');
+  let operationId: string | undefined;
+  const tags = v3 ? [...new Set(meta.tags ?? [])].sort() : meta.tags ?? [];
+  if (v3) {
+    const key = JSON.stringify([accepted.token, path, meta.title, body, tags, meta.pinned ?? false, writerSource]);
+    if (chain.pending?.key !== key) chain.pending = { key, operationId: crypto.randomUUID() };
+    operationId = chain.pending.operationId;
+  }
   const full = await invoke<Record<string, unknown>>('db_save_note', { request: {
     vault: accepted.vault, vaultPath, id: path, title: meta.title, content: body,
-    pinned: meta.pinned ?? false, tags: meta.tags ?? [],
+    pinned: meta.pinned ?? false, tags,
     policy: { kind: 'update', expectedToken: accepted.token },
+    ...(v3 ? { operationId, writerSource } : {}),
   } }).catch(writeError);
+  if (v3) {
+    // A late reply is an acknowledgment of its own transaction, never permission
+    // to adopt a baseline after this runtime was invalidated or a newer receipt won.
+    if (generation !== dbSessionGeneration || chain.generation !== generation) throw new DbWriteError('vault_replaced', 'The vault session changed while saving.');
+    if (chain.current !== accepted) throw new DbWriteError('changed', 'Another acknowledgment already advanced this buffer.');
+    const next = full.accepted as { token?: string; vaultUuid?: string; storageEpoch?: string; revision?: DbAcceptedState['revision'] } | undefined;
+    if (full.id !== path || !next?.token?.startsWith('revision-v3.') || next.vaultUuid !== accepted.vaultUuid
+      || next.storageEpoch !== accepted.storageEpoch || next.revision?.incarnationId !== accepted.revision?.incarnationId) {
+      throw new DbWriteError('vault_replaced', 'The acknowledgment does not belong to this note incarnation and vault.');
+    }
+    chain.pending = undefined;
+  }
   // Only this transaction's receipt can advance this lineage. No read-back.
   return toContent(full, chain);
 }
@@ -318,6 +348,7 @@ export async function dbCreateBackup(): Promise<import("./types").BackupEntry> {
 }
 
 export async function dbRestoreBackup(backupPath: string, vaultPath: string): Promise<void> {
+  dbSessionGeneration++;
   return invoke("db_restore_backup", { backupPath, vaultPath });
 }
 
@@ -335,7 +366,7 @@ async function readNoteLines(id: string, vaultPath?: string): Promise<{ note: No
   return { note, lines: note.content.split('\n') };
 }
 async function writeNoteLines(id: string, change: { note: NoteContent; lines: string[] }): Promise<void> {
-  await dbSaveNote(id, change.note.meta, change.lines.join('\n'), change.note.raw);
+  await dbSaveNote(id, change.note.meta, change.lines.join('\n'), change.note.raw, undefined, 'task');
 }
 
 function resolveLine(lines: string[], line: number, rawLine: string): number {

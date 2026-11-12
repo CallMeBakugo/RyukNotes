@@ -4568,11 +4568,10 @@ pub fn db_create_note(
 ) -> Result<serde_json::Value, String> {
     with_db(&state, |db| {
         validate_db_vault(db, &vault_path)?;
-        let tx = rusqlite::Transaction::new_unchecked(
-            &db.conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )
-        .map_err(|e| e.to_string())?;
+        let tx = db.begin_write("gui", None, &serde_json::json!([title, notebook_relative]))?;
+        if let Some(receipt) = tx.replay_any_receipt()? {
+            return Ok(receipt);
+        }
         let mut layout = crate::vault::db_notebooks::Layout::load(&tx)?;
         let relative =
             crate::vault::db_notebooks::relative("", notebook_relative.as_deref().unwrap_or(""))?;
@@ -4590,10 +4589,7 @@ pub fn db_create_note(
         crate::vault::writer::create_on(db, &tx, &note)?;
         layout.assign(&note.id, &relative)?;
         layout.save(&tx)?;
-        let receipt = db
-            .accepted_note(&note.id)
-            .map_err(|e| e.to_string())?
-            .ok_or("Created note disappeared")?;
+        let receipt = tx.receipt(&note.id)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(receipt)
     })
@@ -4932,6 +4928,9 @@ pub fn db_empty_trash(state: State<'_, AppState>) -> Result<u32, String> {
         .map_err(|e| e.to_string())?
         .assert_quiet(None, None)?;
     with_db(&state, |db| {
+        if db.is_v3() {
+            return db.empty_trash_v3();
+        }
         let ids: Vec<String> = {
             let mut stmt = db
                 .conn
@@ -6341,6 +6340,72 @@ mod db_command_tests {
         assert_eq!(crate::vault::ancestry::inspect_version(&v3).unwrap(), 3);
     }
 
+    #[test]
+    fn v3_writer_ipc_returns_revision_receipts_and_rejects_body_only_tokens() {
+        let app = app_with_state();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let state: tauri::State<AppState> = app.state();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3.rn");
+        let ledger = dir.path().join("ledger");
+        crate::vault::ancestry::migrate(&path, &ledger).unwrap();
+        *state.vault_db.lock().unwrap() =
+            Some(crate::vault::db::VaultDb::open_v3(&path, &ledger).unwrap());
+        let request = |cmd: &str, body: serde_json::Value| {
+            tauri::test::get_ipc_response(
+                &webview,
+                tauri::webview::InvokeRequest {
+                    cmd: cmd.into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: "http://tauri.localhost".parse().unwrap(),
+                    body: tauri::ipc::InvokeBody::Json(body),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.into(),
+                },
+            )
+        };
+        let identity: serde_json::Value = request(
+            "db_writer_identity",
+            serde_json::json!({"vaultPath":path.to_string_lossy()}),
+        )
+        .unwrap()
+        .deserialize()
+        .unwrap();
+        let mut write = serde_json::json!({"vault":identity,"vaultPath":path.to_string_lossy(),"id":"n","title":"Title","content":"A","pinned":false,"tags":[],"policy":{"kind":"create"},"operationId":"create-ipc"});
+        let base: serde_json::Value = request("db_save_note", serde_json::json!({"request":write}))
+            .unwrap()
+            .deserialize()
+            .unwrap();
+        assert!(base["accepted"]["token"]
+            .as_str()
+            .unwrap()
+            .starts_with("revision-v3."));
+        assert!(base["accepted"]["revision"]["revisionId"].is_string());
+        write["policy"] =
+            serde_json::json!({"kind":"update","expectedToken":base["accepted"]["token"]});
+        write["operationId"] = serde_json::json!("update-ipc");
+        write["content"] = serde_json::json!("B");
+        let committed: serde_json::Value =
+            request("db_save_note", serde_json::json!({"request":write}))
+                .unwrap()
+                .deserialize()
+                .unwrap();
+        let retry: serde_json::Value =
+            request("db_save_note", serde_json::json!({"request":write}))
+                .unwrap()
+                .deserialize()
+                .unwrap();
+        assert_eq!(committed, retry);
+        assert_eq!(committed["content"], "B");
+        write["operationId"] = serde_json::json!("legacy-ipc");
+        write["policy"] = serde_json::json!({"kind":"update","expectedToken":format!("state-v1.{}.{}","a".repeat(64),"b".repeat(64))});
+        let error = request("db_save_note", serde_json::json!({"request":write})).unwrap_err();
+        assert_eq!(error["kind"], "invalid_policy");
+    }
+
     fn db_get_note(
         state: State<'_, AppState>,
         id: String,
@@ -6388,6 +6453,8 @@ mod db_command_tests {
                 pinned,
                 tags,
                 policy,
+                operation_id: None,
+                writer_source: None,
             })
         })?;
         super::db_save_note(state, request)

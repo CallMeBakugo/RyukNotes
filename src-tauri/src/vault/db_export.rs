@@ -188,6 +188,9 @@ fn validate_index(index: &Index) -> Result<(), String> {
 }
 
 pub fn export_md_vault(root: &Path, db: &VaultDb) -> Result<u32, String> {
+    if db.is_v3() {
+        return Err("Portable v3 ancestry export is gated until Stage 4E".into());
+    }
     std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
     let root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
     let previous = checked_path(&root, INDEX)?;
@@ -376,9 +379,15 @@ pub(crate) fn import_export(root: &Path, db: &VaultDb) -> Result<Option<ImportRe
     let index: Index = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
         .map_err(|e| format!("Invalid export index: {e}"))?;
     validate_index(&index)?;
-    let tx =
-        rusqlite::Transaction::new_unchecked(&db.conn, rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+    let tx = db.begin_write("import", None, &serde_json::json!(&index))?;
+    if tx.is_replay() {
+        return Ok(Some(ImportReport {
+            notes_imported: index.notes.iter().filter(|n| !n.trashed).count() as u32,
+            notes_trashed: index.notes.iter().filter(|n| n.trashed).count() as u32,
+            versions_imported: index.versions.len() as u32,
+            ..Default::default()
+        }));
+    }
     let mut ids = BTreeMap::new();
     for asset in &index.attachments {
         uuid::Uuid::parse_str(&asset.id).map_err(|e| e.to_string())?;
@@ -477,7 +486,11 @@ pub(crate) fn import_export(root: &Path, db: &VaultDb) -> Result<Option<ImportRe
         report.versions_imported += 1;
     }
     for (key, value) in &index.meta {
-        if key == "schema_version" {
+        if key == "schema_version"
+            || (db.is_v3()
+                && super::revision_writer::reserved_metadata(key)
+                && !key.starts_with("generated_summary:v1:"))
+        {
             return Err("Export cannot replace schema metadata".into());
         }
         let value = if key == "notebook_layout" {

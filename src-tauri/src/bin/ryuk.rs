@@ -35,6 +35,13 @@ fn resolve_vault(flag: Option<&str>) -> Result<PathBuf, String> {
 
 fn open_vault(flag: Option<&str>) -> Result<VaultDb, String> {
     let path = resolve_vault(flag)?;
+    // Explicit opt-in native tooling only; default production selection stays v2.
+    #[cfg(feature = "revision-ancestry")]
+    if let Some(root) = std::env::var_os("RYUK_V3_LEDGER") {
+        if app_lib::vault::ancestry::inspect_version(&path)? == 3 {
+            return VaultDb::open_v3(&path, std::path::Path::new(&root));
+        }
+    }
     VaultDb::open(&path)
 }
 
@@ -51,7 +58,7 @@ USAGE:
   ryuk [--vault PATH] notes show <id> [--json]
   ryuk [--vault PATH] notes update <id> --expected-token <token> --stdin
   ryuk [--vault PATH] notes new <title> [--tag a --tag b] [--stdin]
-  ryuk [--vault PATH] notes tag <id> [--add a] [--remove b]
+  ryuk [--vault PATH] notes tag <id> [--add a] [--remove b] [--expected-token TOKEN] [--operation-id ID]
   ryuk [--vault PATH] notes search <query>
   ryuk [--vault PATH] notes trash <id> | restore <id>
   ryuk [--vault PATH] session import --file <summary.json>
@@ -221,7 +228,24 @@ fn notes_new(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String>
         String::new()
     };
     let db = open_vault(vault_flag.as_deref())?;
-    let id = uuid::Uuid::new_v4().to_string();
+    let operation = if db.is_v3() {
+        flag_values(tail, "--operation-id").first().cloned()
+    } else {
+        None
+    };
+    let id = if let Some(operation) = &operation {
+        let bytes: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(
+            serde_json::to_vec(&(db.identity().path, operation)).map_err(|e| e.to_string())?,
+        )
+        .into();
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&bytes[..16]);
+        id[6] = (id[6] & 0x0f) | 0x40;
+        id[8] = (id[8] & 0x3f) | 0x80;
+        uuid::Uuid::from_bytes(id).to_string()
+    } else {
+        uuid::Uuid::new_v4().to_string()
+    };
     let now = now_rfc3339();
     let note = NewNote {
         id: id.clone(),
@@ -232,8 +256,9 @@ fn notes_new(vault_flag: &Option<String>, tail: &[String]) -> Result<(), String>
         created: now.clone(),
         modified: now,
     };
-    db.write_scripted(&NoteWrite::from_note(&db, &note, WritePolicy::Create))
-        .map_err(|e| e.to_string())?;
+    let mut request = NoteWrite::from_note(&db, &note, WritePolicy::Create);
+    request.operation_id = operation;
+    db.write_scripted(&request).map_err(|e| e.to_string())?;
     println!("{id}");
     Ok(())
 }
@@ -244,10 +269,22 @@ fn notes_tag(vault_flag: &Option<String>, tail: &[String]) -> Result<(), WriteEr
         .cloned()
         .ok_or("notes tag <id>")?;
     let db = open_vault(vault_flag.as_deref())?;
-    db.tag_atomic(
+    let expected = flag_values(tail, "--expected-token").first().cloned();
+    let operation = flag_values(tail, "--operation-id").first().cloned();
+    if db.is_v3() && expected.is_none() {
+        return Err(WriteError {
+            kind: WriteErrorKind::InvalidPolicy,
+            message: "Schema 3 notes tag requires --expected-token".into(),
+            current: None,
+            artifact: None,
+        });
+    }
+    db.tag_atomic_expected(
         &id,
         &flag_values(tail, "--add"),
         &flag_values(tail, "--remove"),
+        expected.as_deref(),
+        operation.as_deref(),
     )?;
     Ok(())
 }
@@ -270,7 +307,12 @@ fn notes_update(vault_flag: &Option<String>, tail: &[String]) -> Result<(), Writ
         .read_to_string(&mut body)
         .map_err(|e| e.to_string())?;
     let db = open_vault(vault_flag.as_deref())?;
-    let current = db.accepted_note(&id)?.ok_or_else(|| WriteError {
+    let current = if db.is_v3() {
+        Some(db.accepted_at_token(&id, &expected_token)?)
+    } else {
+        db.accepted_note(&id)?
+    }
+    .ok_or_else(|| WriteError {
         kind: WriteErrorKind::Deleted,
         message: "The note was deleted.".into(),
         current: None,
@@ -285,11 +327,9 @@ fn notes_update(vault_flag: &Option<String>, tail: &[String]) -> Result<(), Writ
         created: current["created"].as_str().unwrap_or("").into(),
         modified: now_rfc3339(),
     };
-    let receipt = db.write_scripted(&NoteWrite::from_note(
-        &db,
-        &note,
-        WritePolicy::Update { expected_token },
-    ))?;
+    let mut request = NoteWrite::from_note(&db, &note, WritePolicy::Update { expected_token });
+    request.operation_id = flag_values(tail, "--operation-id").first().cloned();
+    let receipt = db.write_scripted(&request)?;
     println!(
         "{}",
         serde_json::to_string(&receipt).map_err(|e| e.to_string())?
@@ -314,7 +354,13 @@ fn notes_search(vault_flag: &Option<String>, tail: &[String]) -> Result<(), Stri
 fn notes_trash(vault_flag: &Option<String>, tail: &[String], trash: bool) -> Result<(), String> {
     let id = tail.first().ok_or("notes trash|restore <id>")?;
     let db = open_vault(vault_flag.as_deref())?;
-    db.set_note_trashed(id, trash)?;
+    db.set_note_trashed_as_cli(
+        id,
+        trash,
+        flag_values(tail, "--operation-id")
+            .first()
+            .map(String::as_str),
+    )?;
     println!("{} {}", id, if trash { "trashed" } else { "restored" });
     Ok(())
 }
@@ -390,7 +436,13 @@ fn session_import(vault_flag: &Option<String>, tail: &[String]) -> Result<(), Wr
         created,
         modified: now,
     };
-    db.import_generated_summary(&note, &v)?;
+    db.import_generated_summary_with_operation(
+        &note,
+        &v,
+        flag_values(tail, "--operation-id")
+            .first()
+            .map(String::as_str),
+    )?;
     println!("session note written");
     Ok(())
 }

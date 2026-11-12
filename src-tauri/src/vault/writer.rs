@@ -118,6 +118,10 @@ pub struct NoteWrite {
     pub pinned: bool,
     pub tags: Vec<String>,
     pub policy: WritePolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_source: Option<String>,
 }
 
 /// Only semantic state participates: modification timestamps are not revisions.
@@ -152,6 +156,8 @@ impl NoteWrite {
             pinned: note.pinned,
             tags: note.tags.clone(),
             policy,
+            operation_id: None,
+            writer_source: None,
         }
     }
 }
@@ -197,9 +203,19 @@ impl VaultDb {
                 None,
             ));
         }
+        self.validate_revision_session()?;
         Ok(())
     }
     pub fn state_token(&self, note: &Value) -> String {
+        if self.is_v3() {
+            return self
+                .accepted_note(note["id"].as_str().unwrap_or(""))
+                .ok()
+                .flatten()
+                .filter(|current| state_digest(current) == state_digest(note))
+                .and_then(|current| current["accepted"]["token"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| "invalid-v3-state".into());
+        }
         format!(
             "state-v1.{}.{}",
             self.writer_identity.hash(),
@@ -208,6 +224,9 @@ impl VaultDb {
     }
     pub fn accepted_note(&self, id: &str) -> Result<Option<Value>, WriteError> {
         self.validate_writer_vault(&self.identity())?;
+        if self.is_v3() {
+            return super::revision_writer::read_accepted(self, id);
+        }
         let note = self.get_note_full(id)?;
         let receipt = note.map(|mut note| {
             let token = self.state_token(&note);
@@ -218,6 +237,9 @@ impl VaultDb {
         Ok(receipt)
     }
     pub(crate) fn check_policy(&self, id: &str, policy: &WritePolicy) -> Result<(), WriteError> {
+        if self.is_v3() {
+            return super::revision_writer::check_policy(self, id, policy);
+        }
         let current = self.accepted_note(id)?;
         match policy {
             WritePolicy::Create if current.is_some() => Err(WriteError::conflict(
@@ -294,11 +316,32 @@ impl VaultDb {
     ) -> Result<Value, WriteError> {
         self.validate_writer_path(request.vault_path.as_deref())?;
         self.validate_writer_vault(&request.vault)?;
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )
-        .map_err(|e| e.to_string())?;
+        let source = if force_history {
+            "cli"
+        } else {
+            match request.writer_source.as_deref() {
+                None | Some("gui") => "gui",
+                Some("task") => "task",
+                _ => {
+                    return Err(WriteError::conflict(
+                        WriteErrorKind::InvalidPolicy,
+                        "Invalid editor writer source.",
+                        None,
+                    ))
+                }
+            }
+        };
+        let mut operation_request = request.clone();
+        operation_request.tags.sort();
+        operation_request.tags.dedup();
+        let tx = self.begin_write(
+            source,
+            request.operation_id.as_deref(),
+            &serde_json::to_value(&operation_request).map_err(|e| e.to_string())?,
+        )?;
+        if let Some(receipt) = tx.replay_receipt(&request.id)? {
+            return Ok(receipt);
+        }
         self.validate_writer_vault(&request.vault)?;
         self.check_policy(&request.id, &request.policy)?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -330,10 +373,8 @@ impl VaultDb {
                 Some(max_versions)
             },
         )?;
-        let receipt = self
-            .accepted_note(&note.id)?
-            .ok_or_else(|| "Committed note disappeared".to_string())?;
-        tx.commit().map_err(|e| e.to_string())?;
+        let receipt = tx.receipt_typed(&note.id)?;
+        tx.commit_typed()?;
         Ok(receipt)
     }
     /// Atomic field intent: read after acquiring the write lock, never replay an
@@ -344,12 +385,29 @@ impl VaultDb {
         add: &[String],
         remove: &[String],
     ) -> Result<Value, WriteError> {
+        self.tag_atomic_expected(id, add, remove, None, None)
+    }
+    pub fn tag_atomic_expected(
+        &self,
+        id: &str,
+        add: &[String],
+        remove: &[String],
+        expected: Option<&str>,
+        operation: Option<&str>,
+    ) -> Result<Value, WriteError> {
         self.validate_writer_vault(&self.identity())?;
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )
-        .map_err(|e| e.to_string())?;
+        let tx = self.begin_write("cli", operation, &json!([id, add, remove, expected]))?;
+        if let Some(receipt) = tx.replay_receipt(id)? {
+            return Ok(receipt);
+        }
+        if let Some(expected) = expected {
+            self.check_policy(
+                id,
+                &WritePolicy::Update {
+                    expected_token: expected.into(),
+                },
+            )?;
+        }
         let current = self.accepted_note(id)?.ok_or_else(|| {
             WriteError::conflict(WriteErrorKind::Deleted, "No note with that identity.", None)
         })?;
@@ -376,10 +434,8 @@ impl VaultDb {
             modified: chrono::Utc::now().to_rfc3339(),
         };
         Self::write_note(&tx, &note, None, None)?;
-        let receipt = self
-            .accepted_note(id)?
-            .ok_or_else(|| "Updated note disappeared".to_string())?;
-        tx.commit().map_err(|e| e.to_string())?;
+        let receipt = tx.receipt_typed(id)?;
+        tx.commit_typed()?;
         Ok(receipt)
     }
 }
@@ -433,12 +489,22 @@ impl VaultDb {
         note: &NewNote,
         input: &Value,
     ) -> Result<Value, WriteError> {
+        if self.is_v3() {
+            return super::revision_writer::import_summary(self, note, input, None);
+        }
         self.validate_writer_vault(&self.identity())?;
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )
-        .map_err(|e| e.to_string())?;
+        let tx = self.begin_write(
+            "session_import",
+            None,
+            &json!([
+                input,
+                note.id,
+                note.title,
+                note.content,
+                note.tags,
+                note.pinned
+            ]),
+        )?;
         let key = format!("generated_summary:v1:{}", hash(note.id.as_bytes()));
         let current = self.accepted_note(&note.id)?;
         let generated: Option<String> = tx
@@ -472,14 +538,14 @@ impl VaultDb {
                 )
                 .map_err(|e| e.to_string())?;
                 // Commit preservation deliberately, but never replace the manual note.
-                tx.commit().map_err(|e| e.to_string())?;
+                tx.commit_typed()?;
                 let mut error = WriteError::conflict(if current["trashed"] == true { WriteErrorKind::Trashed } else { WriteErrorKind::Changed },
                     "Summary import conflicts with saved edits; incoming summary preserved as a labeled pending artifact.", Some(current.clone()));
                 error.artifact = Some(artifact);
                 return Err(error);
             }
             if state_digest(current) == state_digest(&incoming) {
-                tx.commit().map_err(|e| e.to_string())?;
+                tx.commit_typed()?;
                 return Ok(current.clone()); // Exact repeated import is a no-op, including modified time.
             }
         }
@@ -498,8 +564,20 @@ impl VaultDb {
             .ok_or("Imported summary disappeared")?;
         tx.execute("INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![key, state_digest(&receipt)]).map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())?;
+        tx.commit_typed()?;
         Ok(receipt)
+    }
+    pub fn import_generated_summary_with_operation(
+        &self,
+        note: &NewNote,
+        input: &Value,
+        operation: Option<&str>,
+    ) -> Result<Value, WriteError> {
+        if self.is_v3() {
+            super::revision_writer::import_summary(self, note, input, operation)
+        } else {
+            self.import_generated_summary(note, input)
+        }
     }
     pub fn pending_summaries(&self, session_id: &str) -> Result<Vec<Value>, String> {
         let prefix = format!(

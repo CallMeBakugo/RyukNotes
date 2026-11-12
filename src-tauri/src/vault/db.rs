@@ -92,6 +92,7 @@ pub struct VaultDb {
     pub(crate) writer_identity: super::writer::VaultIdentity,
     // Keep cooperating maintenance outside live connections, including CLI.
     pub(crate) _maintenance: Option<super::ancestry::Maintenance>,
+    pub(crate) revision_session: Option<super::revision_writer::Session>,
 }
 
 pub struct NewNote {
@@ -223,6 +224,7 @@ impl VaultDb {
                 max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
                 writer_identity,
                 _maintenance: None,
+                revision_session: None,
             });
         }
         let tx =
@@ -338,10 +340,24 @@ impl VaultDb {
             max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
             writer_identity,
             _maintenance: None,
+            revision_session: None,
         })
     }
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
+        if self.is_v3() {
+            if super::revision_writer::reserved_metadata(key) {
+                return Err(
+                    "Reserved authoritative metadata requires its explicit writer policy".into(),
+                );
+            }
+            let tx = self.begin_write("gui", None, &serde_json::json!([key, value]))?;
+            if tx.is_replay() {
+                return tx.commit();
+            }
+            tx.execute("INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key,value]).map_err(|e| e.to_string())?;
+            return tx.commit();
+        }
         self.conn
             .execute(
                 "INSERT INTO meta(key, value) VALUES(?1, ?2)
@@ -390,6 +406,14 @@ impl VaultDb {
     }
 
     pub fn set_session_link(&self, note_id: &str, session_id: &str) -> Result<(), String> {
+        if self.is_v3() {
+            let tx = self.begin_write("cli", None, &serde_json::json!([note_id, session_id]))?;
+            if tx.is_replay() {
+                return tx.commit();
+            }
+            tx.execute("INSERT INTO session_links(note_id,session_id,created) VALUES(?1,?2,?3) ON CONFLICT(note_id) DO UPDATE SET session_id=excluded.session_id,created=excluded.created WHERE session_links.session_id<>excluded.session_id", params![note_id,session_id,chrono::Utc::now().to_rfc3339()]).map_err(|e| e.to_string())?;
+            return tx.commit();
+        }
         self.conn
             .execute(
                 "INSERT INTO session_links(note_id, session_id, created) VALUES(?1, ?2, ?3)
@@ -438,6 +462,9 @@ impl VaultDb {
         expected_raw: Option<&str>,
         max_versions: Option<u32>,
     ) -> Result<(), String> {
+        if self.is_v3() {
+            return Err("Legacy upsert/body-only policies cannot write schema 3".into());
+        }
         let tx = rusqlite::Transaction::new_unchecked(
             &self.conn,
             rusqlite::TransactionBehavior::Immediate,
@@ -541,10 +568,11 @@ impl VaultDb {
             hasher.update(content.as_bytes());
             format!("{:x}", hasher.finalize())
         };
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| e.to_string())?;
+        let tx =
+            self.begin_auxiliary_write("import", &serde_json::json!([note_id, content, created]))?;
+        if tx.is_replay() {
+            return Ok(digest);
+        }
         tx.execute(
             "INSERT INTO versions(id, note_id, content, created) VALUES(?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO NOTHING",
@@ -591,17 +619,25 @@ impl VaultDb {
             }
             instant += chrono::Duration::nanoseconds(1);
         };
+        let version_id = uuid::Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO versions(id,note_id,content,created) VALUES(?1,?2,?3,?4)",
-            params![
-                uuid::Uuid::new_v4().to_string(),
-                note_id,
-                content,
-                timestamp
-            ],
+            params![version_id, note_id, content, timestamp],
         )
         .map_err(|e| e.to_string())?;
         Self::link_content(conn, note_id, content)?;
+        let v3: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='schema_version' AND value='3')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if v3 {
+            // Only a fresh native current/predecessor checkpoint gains a link.
+            // Imported/deduped legacy versions never gain guessed ancestry.
+            conn.execute("UPDATE versions SET ancestry='verified',revision_id=(SELECT h.revision_id FROM note_revision_heads h JOIN revision_states s USING(revision_id) WHERE h.note_id=?1 AND s.body=CAST(?2 AS BLOB)) WHERE id=?3 AND EXISTS(SELECT 1 FROM note_revision_heads h JOIN revision_states s USING(revision_id) WHERE h.note_id=?1 AND s.body=CAST(?2 AS BLOB))",params![note_id,content,version_id]).map_err(|e| e.to_string())?;
+        }
         if max_versions > 0 {
             conn.execute("DELETE FROM versions WHERE note_id=?1 AND id NOT IN (SELECT id FROM versions WHERE note_id=?1 ORDER BY julianday(created) DESC, created DESC, id DESC LIMIT ?2)", params![note_id, max_versions]).map_err(|e| e.to_string())?;
         }
@@ -609,11 +645,10 @@ impl VaultDb {
     }
 
     pub fn force_version(&self, note_id: &str, max_versions: u32) -> Result<(), String> {
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )
-        .map_err(|e| e.to_string())?;
+        let tx = self.begin_write("gui", None, &serde_json::json!([note_id, max_versions]))?;
+        if tx.is_replay() {
+            return tx.commit();
+        }
         let content: String = tx
             .query_row(
                 "SELECT content FROM notes WHERE id=?1",
@@ -653,6 +688,22 @@ impl VaultDb {
     }
 
     pub fn set_note_trashed(&self, id: &str, trashed: bool) -> Result<(), String> {
+        if self.is_v3() {
+            let tx = self.begin_write("gui", None, &serde_json::json!([id, trashed]))?;
+            if tx.is_replay() {
+                return tx.commit();
+            }
+            let changed = tx
+                .execute(
+                    "UPDATE notes SET trashed=?2 WHERE id=?1",
+                    params![id, trashed],
+                )
+                .map_err(|e| e.to_string())?;
+            if changed == 0 {
+                return Err(format!("No note with id {id}"));
+            }
+            return tx.commit();
+        }
         let changed = self
             .conn
             .execute(
@@ -667,11 +718,10 @@ impl VaultDb {
     }
 
     pub fn delete_note(&self, id: &str) -> Result<(), String> {
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )
-        .map_err(|e| e.to_string())?;
+        let tx = self.begin_write("gui", None, &serde_json::json!([id, "delete"]))?;
+        if tx.is_replay() {
+            return tx.commit();
+        }
         tx.execute(
             "DELETE FROM notes_fts WHERE rowid = (SELECT rowid FROM notes WHERE id = ?1)",
             params![id],
@@ -831,12 +881,54 @@ impl VaultDb {
         data: &[u8],
         now: &str,
     ) -> Result<AttachmentMeta, String> {
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )
-        .map_err(|e| e.to_string())?;
+        let tx = self.begin_write(
+            "gui",
+            None,
+            &serde_json::json!([
+                note_id,
+                filename,
+                mime_type,
+                format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(data))
+            ]),
+        )?;
+        let prior_owners = if self.is_v3() {
+            let mut statement = tx
+                .prepare("SELECT attachment_id FROM note_attachments WHERE note_id=?1")
+                .map_err(|e| e.to_string())?;
+            let rows = statement
+                .query_map([note_id], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            Some(
+                rows.collect::<Result<std::collections::BTreeSet<_>, _>>()
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
         let id = self.store_attachment_on(&tx, note_id, filename, mime_type, data, now)?;
+        if prior_owners
+            .as_ref()
+            .is_some_and(|owners| !owners.contains(&id))
+        {
+            // Upload is draft staging, not a committed note edit. Link the asset
+            // when its reference is accepted with the body; otherwise uploading
+            // would make this very editor's still-valid base immediately stale.
+            // Stage 4D GC must retain these durable staging holds as well as pins.
+            tx.execute(
+                "DELETE FROM note_attachments WHERE note_id=?1 AND attachment_id=?2",
+                params![note_id, id],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO NOTHING",
+                params![
+                    format!("attachment_stage:v3:{note_id}:{id}"),
+                    serde_json::json!({"noteId":note_id,"attachmentId":id,"created":now})
+                        .to_string()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
         let mut meta = self.attachment_meta(&id)?.ok_or("Attachment disappeared")?;
         meta.note_id = Some(note_id.to_string());
         tx.commit().map_err(|e| e.to_string())?;

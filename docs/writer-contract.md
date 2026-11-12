@@ -1,9 +1,18 @@
-# Authoritative DB writers — Stage 1
+# Authoritative DB writers — Stages 1 and 4C
 
-The UX ruling remains fork first, review second, automatic merge last. This stage
-adds no conflict interface or merge engine. Editor and pane ownership are unchanged.
+The UX ruling remains fork first, review second, automatic merge last. Editor
+and pane ownership are unchanged. The original Stage 1 **schema 2** contract is
+preserved below. Stage 4C adds the complete **schema 3** writer contract described
+in [the implementation audit](revision-ancestry-stage4c.md); no production format
+activation, retention GC or new conflict UI is included.
 
-## Accepted state and acknowledgments
+Schema 3 tools must explicitly opt into the native `revision-ancestry` feature
+and `VaultDb::open_v3(path, ledger_root)`. Ordinary GUI/CLI opens still create/use
+schema 2 and reject schema 3 until Stage 4E. Feature-enabled CLI tests/tools can
+set `RYUK_V3_LEDGER` explicitly; default builds do not honor it. There is no
+partial fallback from a v3 writer to the body-digest contract.
+
+## Schema 2 accepted state and acknowledgments
 
 A DB read returns an opaque state token and captured vault identity with the exact
 body, title, tags, pinned flag and trash state. Tokens hash these semantic fields
@@ -53,7 +62,7 @@ The low-level legacy `upsert_note*` helpers remain for library fixtures; officia
 content writers use the explicit policy boundary. Tokens do not guard unrelated
 notebook/state metadata and are not a general distributed lock.
 
-## CLI and generated summaries
+## Schema 2 CLI and generated summaries
 
 `ryuk --vault vault.rn notes show ID --json` exposes `accepted.token`.
 Pass that exact token to
@@ -84,3 +93,66 @@ cover separate-connection schedules in both orders, exact receipts, full state,
 missing/trash/replacement, tags, creation, summary provenance and ABA. Mock-app IPC
 and executable CLI tests cover the real wire contracts and exit/artifact behavior.
 Rust tests and formatting must be run host-side; npm gates do not compile Rust.
+
+## Schema 3 accepted state and writes
+
+A coherent read returns the full current projection plus an opaque `revision-v3`
+token binding vault UUID, restore epoch, note incarnation, revision UUID, commit
+UUID and full-state digest. The adapter retains the immutable revision descriptor
+with accepted metadata. Old `state-v1` tokens are invalid policies for v3 writes.
+Metadata/lifecycle ABA and identical delete/recreate no longer compare equal.
+The runtime still validates canonical path/file identity and its captured epoch.
+
+`WriteTransaction` acquires the private ledger before BEGIN IMMEDIATE, then
+captures predecessor state under that same SQLite transaction. It records every
+semantic change, full state, known parent edges, attachment references, counter,
+head, projections and exact receipt before commit. No-op semantic writes keep the
+existing revision/modified time. Failure never returns a successful receipt. A
+second prepare refuses mutations after receipt construction. Metadata, lifecycle,
+notebook/session changes and imports cannot bypass this helper; connection-local
+TEMP guards reject forgotten direct DML, and legacy upserts explicitly refuse v3.
+The guards are a backstop for official routes, not protection from arbitrary SQL.
+
+Use `NoteWrite.operationId` for editor/scripted writes, CLI `--operation-id`, or a
+native `with_write_operation(id, request, action)` scope for multi-item/field
+routes. Without an explicit key, a dispatch is a fresh intent with a generated
+operation ID. Scope claims bind root input and ordered child operations; each
+revision records its note ID as the operation item. Reusing a committed key with
+another input/policy rejects; retrying the same key returns its own prior receipt
+without changing a later writer's state. Retained operation metadata references
+revision IDs, not duplicate full-body receipts. A pruned historical result refuses
+replay instead of becoming a fresh write.
+
+A global ledger ticket may be shared by all affected notes in one transaction.
+It is reserved/fsynced above every known ledger/DB counter before the DB write
+lock, so even IDs allocated inside imports receive strictly increasing per-note
+numbers. This deliberately permits gaps. The external ledger upgrades to format
+2 when global tickets are first used; older 4B tooling rejects that format rather
+than silently ignoring its floor. Existing format-1 migration ledgers remain
+readable. Restore uses the global floor too; ledger loss still requires explicit
+epoch-changing recovery and cannot prove order against a lost future.
+
+Generated-summary replacement requires the exact last generated revision ID,
+not a body digest. A manual edit followed by a return to identical text still
+preserves incoming summary JSON/rendered content as a labeled pending artifact
+and reports conflict. Imported legacy digests do not prove generated ancestry.
+Exact generated repeats are no-ops; authoritative deletion/trash is respected.
+CLI v3 tag intents require `--expected-token` and preserve the body under the same
+atomic lock; native fresh-field tag intents can use freshly read state. Scripted
+content retries reconstruct metadata from the supplied accepted revision, never
+from a racing writer's current metadata.
+
+Standalone v3 attachment uploads stage bytes in durable `attachment_stage:v3`
+metadata without advancing the note. Accepting the body reference commits its
+note ownership and revision together; this prevents self-conflicts during paste
+and drop. Import/fork asset finalization remains within their note transaction.
+Stage 4D cleanup must honor staging holds and revision references as well as
+recovery/review pins. No GC is enabled here.
+
+V3 adapter pending operation IDs survive a lost reply for identical input. Late
+or reordered acknowledgments, another vault generation, or another incarnation
+cannot advance the lineage. Failed writes do not change raw/savedRevision; the
+existing save queue remains responsible for acknowledging only current local
+revisions. Recovery review binds only verified committed B as a draft-base edge;
+uncommitted L is never invented as a parent. Pre-restore journal tokens cannot
+silently rebind to a new epoch.
