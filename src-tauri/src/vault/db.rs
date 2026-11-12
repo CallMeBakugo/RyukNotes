@@ -24,7 +24,7 @@ pub const DEFAULT_MAX_ATTACHMENT_BYTES: i64 = 25 * 1024 * 1024;
 
 const SCHEMA_VERSION: i64 = 2;
 
-const SCHEMA: &str = r#"
+pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -90,6 +90,8 @@ pub struct VaultDb {
     pub conn: Connection,
     pub max_attachment_bytes: i64,
     pub(crate) writer_identity: super::writer::VaultIdentity,
+    // Keep cooperating maintenance outside live connections, including CLI.
+    pub(crate) _maintenance: Option<super::ancestry::Maintenance>,
 }
 
 pub struct NewNote {
@@ -131,8 +133,33 @@ pub struct AttachmentMeta {
 impl VaultDb {
     /// Opens (creating if needed) the vault database and applies migrations.
     pub fn open(path: &Path) -> Result<Self, String> {
+        // Preflight read-only: future/malformed versions must not change WAL mode
+        // or create snapshots. All production writers stay v2 through Stage 4B.
+        let version = super::ancestry::inspect_version(path)?;
+        if version > SCHEMA_VERSION {
+            return Err(format!(
+                "Unsupported vault schema version {version}; v3 is read-only until Stage 4E"
+            ));
+        }
+        let maintenance = if version == 1 {
+            super::ancestry::Maintenance::exclusive(path)?
+        } else {
+            super::ancestry::Maintenance::shared(path)?
+        };
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
-        Self::init(conn)
+        let mut db = Self::init(conn)?;
+        maintenance.downgrade()?;
+        // Lock conversion may briefly yield to queued maintenance. Revalidate
+        // after acquiring shared ownership before exposing the v2 connection.
+        if super::ancestry::inspect_version(path)? != SCHEMA_VERSION {
+            return Err(
+                "Vault schema changed while opening; retry with a compatible client".into(),
+            );
+        }
+        db.validate_writer_vault(&db.identity())
+            .map_err(|e| e.to_string())?;
+        db._maintenance = Some(maintenance);
+        Ok(db)
     }
 
     pub fn open_in_memory() -> Result<Self, String> {
@@ -141,70 +168,61 @@ impl VaultDb {
     }
 
     fn init(conn: Connection) -> Result<Self, String> {
+        Self::init_target(conn, SCHEMA_VERSION, None)
+    }
+
+    pub(crate) fn init_target(
+        conn: Connection,
+        target: i64,
+        migration: Option<&super::ancestry::Migration>,
+    ) -> Result<Self, String> {
         let writer_identity = super::writer::VaultIdentity::capture(&conn)?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| e.to_string())?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(|e| e.to_string())?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| e.to_string())?;
-        let has_meta: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        let version = if has_meta {
-            let raw: Option<String> = conn
-                .query_row(
-                    "SELECT value FROM meta WHERE key = 'schema_version'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?;
-            raw.ok_or("Vault schema version is missing")?
-                .parse::<i64>()
-                .map_err(|_| "Invalid vault schema version")?
-        } else {
-            let tables: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
-                    [],
-                    |r| r.get(0),
-                )
-                .map_err(|e| e.to_string())?;
-            if tables != 0 {
-                return Err("Unrecognized vault schema".into());
-            }
-            0
-        };
-        if !(0..=SCHEMA_VERSION).contains(&version) || (has_meta && version == 0) {
+        let version = super::ancestry::schema_version(&conn)?;
+        if version > target || !matches!(target, 2 | 3) {
             return Err(format!("Unsupported vault schema version {version}"));
         }
-        if version == 1 {
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|e| e.to_string())?;
+        if target == 3 {
+            conn.pragma_update(None, "synchronous", "FULL")
+                .map_err(|e| e.to_string())?;
+        }
+        // Do not change journal mode before validation/transaction success. This
+        // also keeps failed migrations from rewriting the source header.
+        let preserved = if target == 3 && version > 0 && version < target {
+            Some(super::ancestry::PreservedProjection::capture(
+                &conn, version,
+            )?)
+        } else {
+            None
+        };
+        if version > 0 && version < target {
             // VACUUM INTO makes a consistent snapshot, including committed WAL data.
             if let Some(path) = conn.path().filter(|p| !p.is_empty() && *p != ":memory:") {
-                let backup = format!("{path}.pre-v2-{}.bak", uuid::Uuid::new_v4());
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true).create_new(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
-                }
-                // Reserve a private, empty destination; SQLite accepts an empty file.
-                drop(options.open(&backup).map_err(|e| e.to_string())?);
-                conn.execute("VACUUM INTO ?1", params![backup])
-                    .map_err(|e| e.to_string())?;
+                let backup = format!("{path}.pre-v{target}-{}.bak", uuid::Uuid::new_v4());
+                super::ancestry::snapshot(
+                    &conn,
+                    Path::new(&backup),
+                    migration.is_some_and(|m| m.fault == super::ancestry::Fault::Snapshot),
+                    target == 3,
+                )?;
             }
         }
-        if version == SCHEMA_VERSION {
+        if version == target {
+            if target == 2 {
+                conn.pragma_update(None, "journal_mode", "WAL")
+                    .map_err(|e| e.to_string())?;
+                conn.pragma_update(None, "synchronous", "NORMAL")
+                    .map_err(|e| e.to_string())?;
+            } else {
+                conn.pragma_update(None, "query_only", true)
+                    .map_err(|e| e.to_string())?;
+            }
             return Ok(Self {
                 conn,
                 max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
                 writer_identity,
+                _maintenance: None,
             });
         }
         let tx =
@@ -274,39 +292,52 @@ impl VaultDb {
                     SELECT v.note_id, a.id FROM versions v JOIN attachments a ON instr(v.content, a.id) > 0;
             "#).map_err(|e| e.to_string())?;
         }
-        let violations = {
-            let mut statement = tx
-                .prepare("PRAGMA foreign_key_check")
+        if target == 3 {
+            let migration = migration.ok_or("Schema 3 requires an explicit migration context")?;
+            tx.execute_batch(super::ancestry::DDL)
                 .map_err(|e| e.to_string())?;
-            let rows = statement
-                .query_map([], |row| {
-                    let table: String = row.get(0)?;
-                    let rowid: Option<i64> = row.get(1)?;
-                    let parent: String = row.get(2)?;
-                    let foreign_key: i64 = row.get(3)?;
-                    let rowid = rowid.map_or_else(|| "NULL".to_string(), |id| id.to_string());
-                    Ok(format!(
-                        "table={table}, rowid={rowid}, parent={parent}, foreign_key={foreign_key}"
-                    ))
-                })
-                .map_err(|e| e.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?
-        };
-        if !violations.is_empty() {
-            return Err(format!(
-                "Vault foreign-key validation failed: {} violation(s): {}",
-                violations.len(),
-                violations.join("; ")
-            ));
+            super::ancestry::fail(migration.fault, super::ancestry::Fault::Ddl)?;
+            super::ancestry::bootstrap(&tx, migration)?;
+            super::ancestry::validate(&tx)?;
+            if let Some(preserved) = &preserved {
+                preserved.verify(&tx)?;
+            }
+            super::ancestry::fail(migration.fault, super::ancestry::Fault::Validation)?;
         }
+        super::ancestry::validate_foreign_keys(&tx)?;
         tx.execute("INSERT INTO meta(key, value) VALUES('schema_version', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![SCHEMA_VERSION.to_string()]).map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())?;
+            params![target.to_string()]).map_err(|e| e.to_string())?;
+        let inject_commit_failure =
+            migration.is_some_and(|m| m.fault == super::ancestry::Fault::Commit);
+        if inject_commit_failure {
+            // Exercise SQLite's actual COMMIT failure path, not just an early
+            // return before commit. Transaction::drop must roll back the DDL,
+            // orphan sweep, graph and schema version together.
+            tx.execute_batch("PRAGMA defer_foreign_keys=ON;
+                INSERT INTO revision_pins VALUES('injected-commit-failure','missing-revision','review','fixture','now');")
+                .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| {
+            if inject_commit_failure {
+                format!("Injected ancestry Commit failure: {e}")
+            } else {
+                e.to_string()
+            }
+        })?;
+        if target == 3 {
+            conn.pragma_update(None, "query_only", true)
+                .map_err(|e| e.to_string())?;
+        } else {
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .map_err(|e| e.to_string())?;
+            conn.pragma_update(None, "synchronous", "NORMAL")
+                .map_err(|e| e.to_string())?;
+        }
         Ok(Self {
             conn,
             max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
             writer_identity,
+            _maintenance: None,
         })
     }
 

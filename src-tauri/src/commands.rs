@@ -5111,6 +5111,14 @@ pub fn db_restore_backup(
     backup_path: String,
     vault_path: String,
 ) -> Result<(), String> {
+    // Stage 4B: production restore must not overwrite an ancestry vault through
+    // the v2 path. Explicit v3 restore is native-feature-gated until activation.
+    for path in [&backup_path, &vault_path] {
+        let version = crate::vault::ancestry::inspect_version(std::path::Path::new(path))?;
+        if version > 2 {
+            return Err("Schema 3 restore requires the gated ancestry restore protocol".into());
+        }
+    }
     state
         .recovery
         .lock()
@@ -5124,9 +5132,20 @@ pub fn db_restore_backup(
             .vault_db_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
+    let maintenance = crate::vault::ancestry::Maintenance::exclusive(Path::new(&vault_path))?;
+    let backup_maintenance = crate::vault::ancestry::Maintenance::shared(Path::new(&backup_path))?;
+    // Recheck under both leases: the first preflight was deliberately before
+    // disposing the current connection, and another process could migrate then.
+    for path in [&backup_path, &vault_path] {
+        if crate::vault::ancestry::inspect_version(Path::new(path))? > 2 {
+            return Err("Schema changed while preparing restore; reopen read-only".into());
+        }
+    }
     let temp = std::path::Path::new(&vault_path).with_extension("rn.restoring");
     std::fs::copy(&backup_path, &temp).map_err(|e| e.to_string())?;
     std::fs::rename(&temp, &vault_path).map_err(|e| e.to_string())?;
+    drop(backup_maintenance);
+    drop(maintenance);
     let db = crate::vault::db::VaultDb::open(std::path::Path::new(&vault_path))?;
     let mut slot = state.vault_db.lock().map_err(|e| e.to_string())?;
     *slot = Some(db);
@@ -6256,6 +6275,7 @@ mod db_command_tests {
         tauri::test::mock_builder()
             .plugin(tauri_plugin_fs::init())
             .invoke_handler(tauri::generate_handler![
+                super::db_restore_backup,
                 super::db_writer_identity,
                 super::db_save_note,
                 super::db_get_note,
@@ -6280,6 +6300,45 @@ mod db_command_tests {
             .manage(AppState::new(AppConfig::default()))
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap()
+    }
+
+    #[test]
+    fn production_restore_ipc_refuses_v3_before_closing_the_current_v2_connection() {
+        let app = app_with_state();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let state: tauri::State<AppState> = app.state();
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("current.rn");
+        db_open(state.clone(), current.to_string_lossy().into_owned()).unwrap();
+        let v3 = dir.path().join("ancestry.rn");
+        crate::vault::ancestry::migrate(&v3, &dir.path().join("ledger")).unwrap();
+        let error = tauri::test::get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: "db_restore_backup".into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "http://tauri.localhost".parse().unwrap(),
+                body: tauri::ipc::InvokeBody::Json(serde_json::json!({
+                    "backupPath": v3.to_string_lossy(), "vaultPath": current.to_string_lossy()
+                })),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.into(),
+            },
+        )
+        .unwrap_err();
+        assert!(error
+            .as_str()
+            .unwrap()
+            .contains("gated ancestry restore protocol"));
+        assert!(state.vault_db.lock().unwrap().is_some());
+        assert_eq!(
+            crate::vault::ancestry::inspect_version(&current).unwrap(),
+            2
+        );
+        assert_eq!(crate::vault::ancestry::inspect_version(&v3).unwrap(), 3);
     }
 
     fn db_get_note(

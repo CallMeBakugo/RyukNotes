@@ -8,6 +8,10 @@ license = "AGPL-3.0-or-later"
 edition = "2021"
 rust-version = "1.88"
 
+# Stage 4B is opt-in only. Ordinary GUI/CLI creation and writers remain schema 2.
+[features]
+revision-ancestry = []
+
 [lints.clippy]
 # This style lint is version-dependent and produces over 100 legacy-only diagnostics on Rust 1.88.
 uninlined_format_args = "allow"
@@ -52,7 +56,7 @@ rayon = "1"
 quick-xml = "0.41"
 urlencoding = "2"
 sha2 = "0.10"
-fs4 = { version = "0.8", default-features = false }
+fs4 = { version = "0.8", default-features = false, features = ["sync"] }
 rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 [target.'cfg(target_os = "macos")'.dependencies]
