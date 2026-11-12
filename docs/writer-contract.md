@@ -1,10 +1,11 @@
-# Authoritative DB writers — Stages 1 and 4C
+# Authoritative DB writers — Stages 1, 4C and 4D
 
 The UX ruling remains fork first, review second, automatic merge last. Editor
 and pane ownership are unchanged. The original Stage 1 **schema 2** contract is
 preserved below. Stage 4C adds the complete **schema 3** writer contract described
-in [the implementation audit](revision-ancestry-stage4c.md); no production format
-activation, retention GC or new conflict UI is included.
+in [the implementation audit](revision-ancestry-stage4c.md). Stage 4D adds
+[recovery pins and retention](revision-ancestry-stage4d.md) for explicitly opened
+v3 vaults. Production format activation remains gated until 4E.
 
 Schema 3 tools must explicitly opt into the native `revision-ancestry` feature
 and `VaultDb::open_v3(path, ledger_root)`. Ordinary GUI/CLI opens still create/use
@@ -146,8 +147,9 @@ Standalone v3 attachment uploads stage bytes in durable `attachment_stage:v3`
 metadata without advancing the note. Accepting the body reference commits its
 note ownership and revision together; this prevents self-conflicts during paste
 and drop. Import/fork asset finalization remains within their note transaction.
-Stage 4D cleanup must honor staging holds and revision references as well as
-recovery/review pins. No GC is enabled here.
+Stage 4D cleanup honors staging holds, revision references, private recovery asset
+holds, curated history and durable recovery receipts. It never infers release
+from a missing journal or expired owner heartbeat.
 
 V3 adapter pending operation IDs survive a lost reply for identical input. Late
 or reordered acknowledgments, another vault generation, or another incarnation
@@ -156,3 +158,32 @@ existing save queue remains responsible for acknowledging only current local
 revisions. Recovery review binds only verified committed B as a draft-base edge;
 uncommitted L is never invented as a parent. Pre-restore journal tokens cannot
 silently rebind to a new epoch.
+
+
+## Schema 3 recovery and retention (Stage 4D)
+
+Editable owner enrollment returns an exact immutable accepted read and installs
+its base pin in the same immediate transaction. Conservative connection read holds
+protect the earlier unowned read handoff; they persist until explicit orphan
+cleanup after their connection dies. A private OS-lock lease prevents another
+live process from being mistaken for an orphan. Checkpoints record vault UUID,
+storage epoch, incarnation, revision/commit UUIDs and local revision. Base pins
+and asset holds precede private blob/JSON publication; failed publication keeps
+dirty memory and all holds.
+
+Review opening pins the verified committed base and reviewed remote together.
+Read-only cancel, successful apply, explicit discard, successful save or clean
+owner release require a matching ordered acknowledgment and fsynced journal
+tombstone before pin deletion. A save installs its next accepted-base pin first.
+Pin-set changes and newer typing refuse retirement. Lost events never acknowledge
+saves; lost replies can replay only their exact durable resolution proof. Crashed
+owners do not expire. The inbox provides explicit orphan cleanup; absent journals
+are never pruning authority.
+
+Retention uses fixed 90-day AND newest-100 floors plus heads and non-expiring
+pins. Under ledger → immediate SQL locks it rechecks every predicate, records
+pruning markers, removes eligible states/asset links and validates before commit.
+Headers, parents and counters remain forever. Curated history controls none of
+these roots. BLOB GC checks note/revision/history/staging/private-artifact and
+receipt ownership. Maintenance cannot consume a writer operation index or change
+semantic state. Production v3 creation/activation and portable export remain 4E.

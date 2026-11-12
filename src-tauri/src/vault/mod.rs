@@ -7,6 +7,7 @@ pub mod db_notebooks;
 pub mod frontmatter;
 pub mod import;
 pub mod operations;
+pub mod revision_retention;
 pub mod revision_writer;
 pub mod watcher;
 pub mod writer;

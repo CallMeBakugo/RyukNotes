@@ -4919,6 +4919,14 @@ pub fn db_vault_stats(state: State<'_, AppState>) -> Result<crate::types::VaultS
     })
 }
 
+/// Revision payload retention is independent of curated body history settings.
+#[tauri::command]
+pub fn db_collect_revisions(
+    state: State<'_, AppState>,
+) -> Result<crate::vault::revision_retention::GcReport, String> {
+    with_db(&state, |db| db.collect_revisions())
+}
+
 /// DB-mode empty trash: permanently delete every trashed note.
 #[tauri::command]
 pub fn db_empty_trash(state: State<'_, AppState>) -> Result<u32, String> {

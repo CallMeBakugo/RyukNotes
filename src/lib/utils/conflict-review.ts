@@ -1,7 +1,8 @@
-import type { NoteContent, NoteMeta } from '../types';
+import type { NoteContent, NoteMeta, DbAcceptedState } from '../types';
+import type { RecoveryIdentity } from './note-recovery';
 import { ExactResult, planMerge, constructCandidate, type MergePlan, type Side, type Candidate } from './three-way-merge.ts';
 
-export interface ReviewedNote { available: boolean; reason?: string; reviewId?: string; revision?: number; base?: NoteContent; local?: NoteContent; remote?: NoteContent; previewReferences?: readonly string[] }
+export interface ReviewedNote { ancestry?: { base: RecoveryIdentity; remote: RecoveryIdentity } | null; available: boolean; reason?: string; reviewId?: string; revision?: number; base?: NoteContent; local?: NoteContent; remote?: NoteContent; previewReferences?: readonly string[] }
 export interface Proposal { body: string; title: string; tags: string[]; pinned: boolean }
 export type MetadataField = 'title' | 'tags' | 'pinned';
 export type MetadataChoice = Side | 'union';
@@ -25,6 +26,11 @@ export interface ReviewDependencies {
 function freeze<T>(value: T): T {
   if (value && typeof value === 'object') { Object.values(value).forEach(freeze); Object.freeze(value); }
   return value;
+}
+function binds(identity: RecoveryIdentity, accepted: DbAcceptedState): boolean {
+  return identity.vaultUuid === accepted.vaultUuid && identity.storageEpoch === accepted.storageEpoch
+    && identity.incarnationId === accepted.revision?.incarnationId
+    && identity.revisionId === accepted.revision?.revisionId && identity.commitToken === accepted.revision?.commitToken;
 }
 function equal(a: unknown, b: unknown): boolean {
   if (Array.isArray(a) && Array.isArray(b)) return JSON.stringify([...new Set(a)].sort()) === JSON.stringify([...new Set(b)].sort());
@@ -79,6 +85,16 @@ export class ConflictReviewModel {
       }
       if (!reviewed.available || !reviewed.base || !reviewed.local || !reviewed.remote || !reviewed.reviewId) {
         this.emit({ reviewed, status: 'unavailable', plan: null, message: reviewed.reason ?? 'No verified common base. Use Keep both.' }); return;
+      }
+      if (reviewed.base.meta.accepted?.revision || reviewed.remote.meta.accepted?.revision) {
+        const proof = reviewed.ancestry;
+        const base = reviewed.base.meta.accepted, remote = reviewed.remote.meta.accepted;
+        if (!proof || !base?.revision || !remote?.revision || !binds(proof.base, base)
+          || !binds(proof.remote, remote) || proof.base.vaultUuid !== proof.remote.vaultUuid
+          || proof.base.storageEpoch !== proof.remote.storageEpoch || proof.base.incarnationId !== proof.remote.incarnationId) {
+          await this.deps.cancel(reviewed.reviewId);
+          throw new Error('Review revision identity was not coherently pinned.');
+        }
       }
       this.emit({ reviewed });
       const plan = planMerge(reviewed.base.content, reviewed.local.content, reviewed.remote.content);

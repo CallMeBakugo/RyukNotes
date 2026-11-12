@@ -2,6 +2,7 @@
 //! the original. No SQLite schema change and no text merge.
 use crate::state::AppState;
 use crate::vault::db::{NewNote, VaultDb};
+use crate::vault::revision_retention::{PinGroup, PinRef, RevisionBinding};
 use crate::vault::writer::{create_on, VaultIdentity};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -56,6 +57,15 @@ pub struct Recovery {
     barrier: Option<(String, String)>,
     versions: HashMap<String, (u64, VaultIdentity, i64)>,
     reviews: HashMap<String, Review>,
+    bindings: HashMap<String, RevisionBinding>,
+    claimed: std::collections::HashSet<String>,
+}
+// Crash probes exist only in disposable native fixture subprocesses.
+#[cfg(test)]
+pub(crate) fn crash_boundary(name: &str) {
+    if std::env::var("RYUK_4D_CRASH_AT").ok().as_deref() == Some(name) {
+        std::process::exit(87);
+    }
 }
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -253,8 +263,12 @@ impl Recovery {
             blob.checkpoint_bytes = Some(hash);
             blob.data.clear();
         }
+        #[cfg(test)]
+        crash_boundary("checkpoint-bytes");
         let bytes = serde_json::to_vec(&persisted).map_err(|e| e.to_string())?;
         atomic(&dir.join(format!("{:020}.json", draft.sequence)), &bytes)?;
+        #[cfg(test)]
+        crash_boundary("checkpoint-published");
         self.owners.get_mut(&draft.owner).unwrap().sequence = draft.sequence;
         Ok(())
     }
@@ -354,9 +368,11 @@ pub fn recovery_register<R: Runtime>(
     valid_owner(&owner)?;
     if vault.path.ends_with(".rn") {
         let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
-        slot.as_ref()
-            .ok_or("Originating vault is closed")?
-            .validate_writer_vault(&vault)
+        let db = slot.as_ref().ok_or("Originating vault is closed")?;
+        if db.is_v3() {
+            return Err("Revision owners require an atomic pinned accepted read".into());
+        }
+        db.validate_writer_vault(&vault)
             .map_err(|e| e.to_string())?;
     } else if filesystem_identity(Path::new(&vault.path))? != vault {
         return Err("Originating vault identity changed".into());
@@ -410,8 +426,8 @@ pub fn recovery_checkpoint<R: Runtime>(
     state: State<'_, AppState>,
     mut draft: Draft,
 ) -> Result<(), String> {
+    let mut service = state.recovery.lock().map_err(|e| e.to_string())?;
     {
-        let mut service = state.recovery.lock().map_err(|e| e.to_string())?;
         let owner = service.owner(&draft.owner, window.label())?;
         if owner.vault != draft.vault || owner.note != draft.note_id {
             return Err("Recovery owner rebinding refused".into());
@@ -436,6 +452,35 @@ pub fn recovery_checkpoint<R: Runtime>(
             draft.base["content"].as_str().unwrap_or(""),
             draft.base["raw"].as_str().unwrap_or("")
         );
+        if db.is_v3() {
+            let proposed = RevisionBinding::from_accepted(&draft.base["meta"]["accepted"])?;
+            if service.bindings.get(&draft.owner).is_none_or(|b| {
+                b.vault_uuid != proposed.vault_uuid
+                    || b.storage_epoch != proposed.storage_epoch
+                    || b.incarnation_id != proposed.incarnation_id
+            }) {
+                return Err(
+                    "Checkpoint cannot rebind an owner to another vault, epoch or incarnation"
+                        .into(),
+                );
+            }
+            let assets = refs
+                .captures_iter(&referenced)
+                .map(|c| c[2].to_string())
+                .collect::<Vec<_>>();
+            let binding = db.hold_checkpoint(
+                &draft.owner,
+                &draft.note_id,
+                &draft.base["meta"]["accepted"],
+                &assets,
+                false,
+            )?;
+            #[cfg(test)]
+            crash_boundary("checkpoint-holds");
+            draft.base["recoveryIdentity"] =
+                serde_json::to_value(&binding).map_err(|e| e.to_string())?;
+            draft.base["recoveryIdentity"]["localRevision"] = json!(draft.revision);
+        }
         for cap in refs.captures_iter(&referenced) {
             let reference = cap[1].to_string();
             if draft.blobs.iter().any(|b| b.reference == reference) {
@@ -453,11 +498,14 @@ pub fn recovery_checkpoint<R: Runtime>(
             });
         }
     }
-    state
-        .recovery
-        .lock()
-        .map_err(|e| e.to_string())?
-        .checkpoint(window.label(), &draft)
+    service.checkpoint(window.label(), &draft)?;
+    if let Some(identity) = draft.base.get("recoveryIdentity") {
+        service.bindings.insert(
+            draft.owner.clone(),
+            serde_json::from_value(identity.clone()).map_err(|e| e.to_string())?,
+        );
+    }
+    Ok(())
 }
 #[tauri::command]
 pub fn recovery_resolve<R: Runtime>(
@@ -466,11 +514,11 @@ pub fn recovery_resolve<R: Runtime>(
     owner: String,
     sequence: u64,
 ) -> Result<(), String> {
-    state
-        .recovery
-        .lock()
-        .map_err(|e| e.to_string())?
-        .resolve(window.label(), &owner, sequence)
+    let mut service = state.recovery.lock().map_err(|e| e.to_string())?;
+    if service.bindings.contains_key(&owner) {
+        return Err("Revision resolution requires matching identity and local revision".into());
+    }
+    service.resolve(window.label(), &owner, sequence)
 }
 #[tauri::command]
 pub fn recovery_unregister<R: Runtime>(
@@ -483,7 +531,18 @@ pub fn recovery_unregister<R: Runtime>(
     if o.dirty || o.conflicted {
         return Err("Owner still has an unresolved draft".into());
     }
+    if service.bindings.contains_key(&owner) {
+        let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+        let db = slot.as_ref().ok_or("Originating vault is closed")?;
+        if !db.owner_pins(&owner)?.is_empty() {
+            return Err(
+                "Release the accepted-base pin with an ordered acknowledgment first".into(),
+            );
+        }
+        service.bindings.remove(&owner);
+    }
     service.owners.remove(&owner);
+    service.claimed.remove(&owner);
     service
         .versions
         .remove(&format!("{}:{owner}", window.label()));
@@ -521,6 +580,13 @@ pub fn recovery_claim<R: Runtime>(
         .into_iter()
         .find(|d| d.owner == owner)
         .ok_or("Recovery record not found")?;
+    if let Some(identity) = draft.base.get("recoveryIdentity") {
+        service.bindings.insert(
+            owner.clone(),
+            serde_json::from_value(identity.clone()).map_err(|e| e.to_string())?,
+        );
+    }
+    service.claimed.insert(owner.clone());
     service.owners.insert(
         owner,
         Owner {
@@ -545,7 +611,8 @@ pub fn recovery_poll<R: Runtime>(
 ) -> Result<bool, String> {
     let mut service = state.recovery.lock().map_err(|e| e.to_string())?;
     let o = service.owner(&owner, window.label())?.clone();
-    // Do not hold registry -> DB lock: checkpoint uses DB -> registry.
+    // Polling releases both guards before reacquiring the registry. Native
+    // recovery mutations consistently use registry -> DB -> ledger -> SQL.
     drop(service);
     let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
     let Some(db) = slot.as_ref() else {
@@ -583,14 +650,31 @@ pub fn recovery_poll<R: Runtime>(
 /// receipt commit beside the new note in existing meta storage. Lost replies can
 /// be retried, but changing a captured draft cannot reuse the same operation ID.
 pub fn fork(db: &VaultDb, draft: &Draft) -> Result<Value, String> {
-    db.validate_writer_vault(&draft.vault)
-        .map_err(|e| e.to_string())?;
-    if let Some(session) = &db.revision_session {
-        let accepted = &draft.base["meta"]["accepted"];
-        if accepted["vaultUuid"].as_str() != Some(session.identity.vault_uuid.as_str())
-            || accepted["storageEpoch"].as_str() != Some(session.identity.storage_epoch.as_str())
+    fork_with_origin(db, draft, false)
+}
+fn fork_with_origin(db: &VaultDb, draft: &Draft, recovered: bool) -> Result<Value, String> {
+    if recovered {
+        let identity: RevisionBinding =
+            serde_json::from_value(draft.base["recoveryIdentity"].clone())
+                .map_err(|e| e.to_string())?;
+        if db
+            .revision_session
+            .as_ref()
+            .is_none_or(|s| s.identity.vault_uuid != identity.vault_uuid)
         {
-            return Err("Recovery origin requires explicit vault/restore enrollment; the draft is preserved".into());
+            return Err("Recovered copy belongs to another logical vault".into());
+        }
+    } else {
+        db.validate_writer_vault(&draft.vault)
+            .map_err(|e| e.to_string())?;
+        if let Some(session) = &db.revision_session {
+            let accepted = &draft.base["meta"]["accepted"];
+            if accepted["vaultUuid"].as_str() != Some(session.identity.vault_uuid.as_str())
+                || accepted["storageEpoch"].as_str()
+                    != Some(session.identity.storage_epoch.as_str())
+            {
+                return Err("Recovery origin requires explicit vault/restore enrollment; the draft is preserved".into());
+            }
         }
     }
     validate_blobs(draft)?;
@@ -661,10 +745,16 @@ pub fn recovery_fork<R: Runtime>(
     if draft.owner != owner || draft.sequence != sequence {
         return Err("Recovery checkpoint identity mismatch".into());
     }
+    let claimed = service.claimed.contains(&owner);
     drop(service);
     let receipt = if draft.vault.path.ends_with(".rn") {
         let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
-        if let Some(db) = slot.as_ref().filter(|db| db.identity() == draft.vault) {
+        if let Some(db) = slot
+            .as_ref()
+            .filter(|db| claimed && db.is_v3() && draft.base.get("recoveryIdentity").is_some())
+        {
+            fork_with_origin(db, &draft, true)?
+        } else if let Some(db) = slot.as_ref().filter(|db| db.identity() == draft.vault) {
             fork(db, &draft)?
         } else {
             drop(slot);
@@ -1529,15 +1619,19 @@ pub fn recovery_review_open<R: Runtime>(
         return Err("The captured local revision changed".into());
     }
     drop(service);
+    let id = uuid::Uuid::new_v4().to_string();
     let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
     let Some(db) = slot.as_ref().filter(|db| db.identity() == draft.vault) else {
         return Ok(
             json!({"available":false,"reason":"No verified accepted base in this originating connection. Use Keep both."}),
         );
     };
-    let saved = db
-        .accepted_note(&draft.note_id)
-        .map_err(|e| e.to_string())?;
+    let saved = if db.is_v3() && verified_review_base(db, &draft) {
+        Some(db.pin_review(&id, &draft.note_id, &draft.base["meta"]["accepted"])?)
+    } else {
+        db.accepted_note(&draft.note_id)
+            .map_err(|e| e.to_string())?
+    };
     if !verified_review_base(db, &draft) {
         let local = json!({"path":draft.note_id,"raw":draft.body,"content":draft.body,"meta":{
             "id":draft.note_id,"title":draft.title,"tags":draft.tags,"pinned":draft.pinned,
@@ -1566,7 +1660,6 @@ pub fn recovery_review_open<R: Runtime>(
     if service.owner(&owner, window.label())?.sequence != sequence || service.barrier.is_some() {
         return Err("The draft changed while opening review".into());
     }
-    let id = uuid::Uuid::new_v4().to_string();
     let local = json!({"path":draft.note_id,"raw":draft.body,"content":draft.body,"meta":{
         "id":draft.note_id,"title":draft.title,"tags":draft.tags,"pinned":draft.pinned,
         "created":draft.base["meta"]["created"],"modified":draft.base["meta"]["modified"]}});
@@ -1576,7 +1669,14 @@ pub fn recovery_review_open<R: Runtime>(
         .filter(|blob| blob.mime.starts_with("image/"))
         .map(|blob| blob.reference.clone())
         .collect();
-    let result = json!({"available":true,"reviewId":id,"revision":revision,"base":draft.base,"local":local,"remote":remote,"previewReferences":previews});
+    let ancestry = if remote["accepted"].get("revision").is_some() {
+        Some(
+            json!({"base":RevisionBinding::from_accepted(&draft.base["meta"]["accepted"])?,"remote":RevisionBinding::from_accepted(&remote["accepted"])?}),
+        )
+    } else {
+        None
+    };
+    let result = json!({"ancestry":ancestry,"available":true,"reviewId":id,"revision":revision,"base":draft.base,"local":local,"remote":remote,"previewReferences":previews});
     service.reviews.insert(
         id,
         Review {
@@ -1623,6 +1723,26 @@ pub fn recovery_review_checkpoint<R: Runtime>(
     let refs =
         regex::Regex::new(r#"(?:\]\(|(?:src|href)=["']|<)(\.rn-attachments/([a-zA-Z0-9-]+))"#)
             .map_err(|e| e.to_string())?;
+    {
+        let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+        if let Some(db) = slot.as_ref().filter(|db| db.is_v3()) {
+            let assets = refs
+                .captures_iter(&draft.body)
+                .map(|c| c[2].to_string())
+                .collect::<Vec<_>>();
+            let binding = db.hold_checkpoint(
+                &review_id,
+                &draft.note_id,
+                &draft.base["meta"]["accepted"],
+                &assets,
+                true,
+            )?;
+            draft.base["recoveryIdentity"] =
+                serde_json::to_value(&binding).map_err(|e| e.to_string())?;
+            draft.base["recoveryIdentity"]["localRevision"] = json!(draft.revision);
+            service.bindings.insert(review_id.clone(), binding);
+        }
+    }
     if refs
         .captures_iter(&draft.body)
         .any(|cap| !draft.blobs.iter().any(|blob| blob.reference == cap[1]))
@@ -1682,11 +1802,42 @@ pub fn recovery_review_cancel<R: Runtime>(
     if !service.reviews.contains_key(&review_id) {
         return Ok(());
     }
-    review_for(&service, window.label(), &owner, &review_id)?;
-    if service.owners.contains_key(&review_id) {
+    let review = review_for(&service, window.label(), &owner, &review_id)?;
+    if service
+        .owners
+        .get(&review_id)
+        .is_some_and(|o| o.dirty || o.conflicted)
+    {
         return Err(
             "The edited result is not durable; keep it in memory and retry preservation".into(),
         );
+    }
+    if review.proposal_sequence == 0 && review.remote["accepted"].get("revision").is_some() {
+        let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+        let db = slot.as_ref().ok_or("Originating vault is closed")?;
+        let binding = RevisionBinding::from_accepted(&review.draft.base["meta"]["accepted"])?;
+        service.bindings.insert(review_id.clone(), binding.clone());
+        service.owners.entry(review_id.clone()).or_insert(Owner {
+            window: window.label().into(),
+            vault: review.draft.vault.clone(),
+            note: review.draft.note_id.clone(),
+            dirty: false,
+            conflicted: false,
+            locked: false,
+            sequence: 0,
+        });
+        service.resolve_revision(
+            db,
+            window.label(),
+            &review_id,
+            0,
+            review.draft.revision,
+            &binding,
+            "review_cancel",
+            None,
+        )?;
+        service.owners.remove(&review_id);
+        service.bindings.remove(&review_id);
     }
     service.reviews.remove(&review_id);
     drop(service);
@@ -1847,7 +1998,22 @@ pub fn recovery_review_apply<R: Runtime>(
             sequence,
         },
     );
-    service.resolve(window.label(), &review_id, sequence)?;
+    if let Some(binding) = service.bindings.get(&review_id).cloned() {
+        let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+        service.resolve_revision(
+            slot.as_ref().ok_or("Originating vault is closed")?,
+            window.label(),
+            &review_id,
+            sequence,
+            revision,
+            &binding,
+            "apply",
+            None,
+        )?;
+        service.bindings.remove(&review_id);
+    } else {
+        service.resolve(window.label(), &review_id, sequence)?;
+    }
     service.owners.remove(&review_id);
     drop(service);
     notify(&state);
@@ -2405,4 +2571,1168 @@ pub fn recovery_review_asset<R: Runtime>(
         })
         .ok_or("Image is not part of this captured review")?;
     Ok(json!({"mime":blob.mime,"data":blob.data}))
+}
+
+// Only successful private journal publication can construct this capability.
+// Retention cannot authorize pin deletion using a fabricated digest/string.
+pub(crate) struct DurableResolution {
+    owner: String,
+    vault_uuid: String,
+    storage_epoch: String,
+    pins: Vec<PinRef>,
+    keep_revision: Option<String>,
+    digest: String,
+}
+impl DurableResolution {
+    pub(crate) fn digest(&self) -> &str {
+        &self.digest
+    }
+    pub(crate) fn matches(
+        &self,
+        db: &VaultDb,
+        owner: &str,
+        pins: &[PinRef],
+        keep: Option<&str>,
+    ) -> bool {
+        db.revision_session.as_ref().is_some_and(|s| {
+            s.identity.vault_uuid == self.vault_uuid
+                && s.identity.storage_epoch == self.storage_epoch
+        }) && self.owner == owner
+            && self.pins.as_slice() == pins
+            && self.keep_revision.as_deref() == keep
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolutionTombstone<'a> {
+    owner: &'a str,
+    vault_uuid: &'a str,
+    storage_epoch: &'a str,
+    through_sequence: u64,
+    local_revision: u64,
+    identity: Option<&'a RevisionBinding>,
+    action: &'a str,
+    pins: &'a [PinRef],
+    keep_revision: Option<&'a str>,
+    stream_order: u64,
+}
+impl Recovery {
+    /// Immutable ordered proof first, then the stream's atomic resolved marker.
+    /// A failed fsync/SQL release never authorizes disposal or a guessed cleanup.
+    #[allow(clippy::too_many_arguments)] // All resolution fences are recorded explicitly.
+    fn publish_resolution(
+        &self,
+        db: &VaultDb,
+        owner: &str,
+        sequence: u64,
+        local: u64,
+        identity: Option<&RevisionBinding>,
+        action: &str,
+        pins: &[PinRef],
+        keep: Option<&str>,
+    ) -> Result<DurableResolution, String> {
+        let dir = self.dir(owner)?;
+        private_dir(&dir)?;
+        let mut order = 0u64;
+        for file in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+            let name = file
+                .map_err(|e| e.to_string())?
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            if let Some(n) = name
+                .strip_prefix("tombstone-")
+                .and_then(|n| n.strip_suffix(".json"))
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                order = order.max(n);
+            }
+        }
+        let order = order.checked_add(1).ok_or("Recovery stream exhausted")?;
+        let vault = &db
+            .revision_session
+            .as_ref()
+            .ok_or("Expected revision vault")?
+            .identity;
+        let proof = ResolutionTombstone {
+            owner,
+            vault_uuid: &vault.vault_uuid,
+            storage_epoch: &vault.storage_epoch,
+            through_sequence: sequence,
+            local_revision: local,
+            identity,
+            action,
+            pins,
+            keep_revision: keep,
+            stream_order: order,
+        };
+        let bytes = serde_json::to_vec(&proof).map_err(|e| e.to_string())?;
+        atomic(&dir.join(format!("tombstone-{order:020}.json")), &bytes)?;
+        #[cfg(test)]
+        crash_boundary("resolution-proof");
+        atomic(&dir.join(format!("resolved-{sequence}")), &bytes)?;
+        #[cfg(test)]
+        crash_boundary("resolution-marker");
+        Ok(DurableResolution {
+            owner: owner.into(),
+            vault_uuid: vault.vault_uuid.clone(),
+            storage_epoch: vault.storage_epoch.clone(),
+            pins: pins.to_vec(),
+            keep_revision: keep.map(str::to_owned),
+            digest: digest(&bytes),
+        })
+    }
+    #[allow(clippy::too_many_arguments)] // Mirrors the owner-scoped acknowledgment contract.
+    fn resolve_revision(
+        &mut self,
+        db: &VaultDb,
+        window: &str,
+        id: &str,
+        sequence: u64,
+        local: u64,
+        expected: &RevisionBinding,
+        action: &str,
+        next: Option<&Value>,
+    ) -> Result<(), String> {
+        let owner = self.owner(id, window)?.clone();
+        let current = &db
+            .revision_session
+            .as_ref()
+            .ok_or("Expected revision vault")?
+            .identity;
+        if expected.vault_uuid != current.vault_uuid
+            || (action != "discard" && expected.storage_epoch != current.storage_epoch)
+        {
+            return Err(
+                "Reopen the originating vault; saved baselines cannot cross restore epochs".into(),
+            );
+        }
+        let enrolled = self
+            .bindings
+            .get(id)
+            .ok_or("Owner has no revision enrollment")?;
+        if !matches!(
+            action,
+            "save" | "discard" | "release" | "apply" | "review_cancel"
+        ) || enrolled.vault_uuid != expected.vault_uuid
+            || enrolled.storage_epoch != expected.storage_epoch
+            || enrolled.incarnation_id != expected.incarnation_id
+        {
+            return Err("Resolution identity/action does not match this owner".into());
+        }
+        // A checkpoint/save reply may be lost after native enrollment advanced.
+        // Older accepted bases remain pinned until this ordered acknowledgment.
+        // Never treat an arbitrary unpinned historical token as owner authority.
+        if enrolled != expected && !db.owns_binding(id, expected)? {
+            if action == "save" && !owner.dirty && !owner.conflicted {
+                if let Some(next) = next {
+                    let next_binding = RevisionBinding::from_accepted(next)?;
+                    next_binding.verify(db, &owner.note, next)?;
+                    if &next_binding == enrolled {
+                        for file in std::fs::read_dir(self.dir(id)?).map_err(|e| e.to_string())? {
+                            let file = file.map_err(|e| e.to_string())?;
+                            if !file.file_name().to_string_lossy().starts_with("tombstone-") {
+                                continue;
+                            }
+                            let proof: Value = serde_json::from_slice(
+                                &std::fs::read(file.path()).map_err(|e| e.to_string())?,
+                            )
+                            .map_err(|e| e.to_string())?;
+                            if proof["identity"] == json!(expected)
+                                && proof["action"] == "save"
+                                && proof["localRevision"] == local
+                                && proof["throughSequence"]
+                                    .as_u64()
+                                    .is_some_and(|n| n >= sequence)
+                                && proof["keepRevision"] == enrolled.revision_id
+                            {
+                                let pins = db.owner_pins(id)?;
+                                if !pins.is_empty()
+                                    && pins.iter().all(|p| p.revision_id == enrolled.revision_id)
+                                {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return Err("Resolution base is no longer pinned by this owner".into());
+        }
+        if action == "save" && next.is_none() {
+            return Err("Saved resolution requires its exact committed receipt".into());
+        }
+        if action == "release" && (owner.dirty || owner.conflicted) {
+            return Err("Unresolved owner cannot release pins".into());
+        }
+        if sequence > owner.sequence {
+            return Err("Unacknowledged journal sequence".into());
+        }
+        let mut published = sequence;
+        let mut latest: Option<(u64, u64)> = None;
+        let dir = self.dir(id)?;
+        match std::fs::read_dir(&dir) {
+            Ok(files) => {
+                for file in files {
+                    let file = file.map_err(|e| e.to_string())?;
+                    let name = file.file_name().to_string_lossy().into_owned();
+                    if let Some(n) = name
+                        .strip_suffix(".json")
+                        .and_then(|n| n.parse::<u64>().ok())
+                    {
+                        let draft = read_draft(&file.path())?;
+                        if draft.owner != id || draft.revision > local {
+                            return Err("A newer local draft still needs recovery".into());
+                        }
+                        let identity: RevisionBinding =
+                            serde_json::from_value(draft.base["recoveryIdentity"].clone())
+                                .map_err(|e| e.to_string())?;
+                        if identity.vault_uuid != expected.vault_uuid
+                            || identity.storage_epoch != expected.storage_epoch
+                            || identity.incarnation_id != expected.incarnation_id
+                        {
+                            return Err(
+                                "Journal ancestry changed; explicit enrollment required".into()
+                            );
+                        }
+                        if latest.is_none_or(|(seq, _)| n > seq) {
+                            latest = Some((n, draft.revision));
+                        }
+                        published = published.max(n);
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && sequence == 0 => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        if matches!(action, "discard" | "apply")
+            && latest.is_some_and(|(_, revision)| revision != local)
+        {
+            return Err("Acknowledgment does not match the latest published local revision".into());
+        }
+        if let Some(accepted) = next {
+            let next_identity = RevisionBinding::from_accepted(accepted)?;
+            if next_identity.vault_uuid != expected.vault_uuid
+                || next_identity.storage_epoch != expected.storage_epoch
+                || next_identity.incarnation_id != expected.incarnation_id
+            {
+                return Err("Resolution cannot rebind a vault, epoch or incarnation".into());
+            }
+        }
+        let next_binding = next
+            .map(|accepted| db.pin_owner_base(id, &owner.note, accepted))
+            .transpose()?;
+        let pins = db.owner_pins(id)?;
+        let proof = self.publish_resolution(
+            db,
+            id,
+            published,
+            local,
+            Some(expected),
+            action,
+            &pins,
+            next_binding.as_ref().map(|b| b.revision_id.as_str()),
+        )?;
+        db.release_pins(
+            id,
+            &pins,
+            next_binding.as_ref().map(|b| b.revision_id.as_str()),
+            &proof,
+        )?;
+        #[cfg(test)]
+        crash_boundary("resolution-released");
+        if let Some(binding) = next_binding {
+            self.bindings.insert(id.into(), binding);
+        }
+        let owner = self
+            .owners
+            .get_mut(id)
+            .ok_or("Owner ended during resolution")?;
+        owner.sequence = published;
+        owner.dirty = false;
+        owner.conflicted = false;
+        Ok(())
+    }
+    pub(crate) fn cleanup_pin_group(
+        &mut self,
+        db: &VaultDb,
+        group: &PinGroup,
+    ) -> Result<(), String> {
+        if group.pins.is_empty() {
+            return Err("Empty pin cleanup is not an acknowledgment".into());
+        }
+        if self.owners.contains_key(&group.owner)
+            || self
+                .reviews
+                .values()
+                .any(|r| r.active && (r.owner == group.owner))
+            || self.reviews.contains_key(&group.owner)
+            || self.records()?.iter().any(|d| d.owner == group.owner)
+        {
+            return Err("Resolve the live/recovered artifact instead of cleaning its pins".into());
+        }
+        let session = &db
+            .revision_session
+            .as_ref()
+            .ok_or("Expected revision vault")?
+            .instance;
+        for pin in &group.pins {
+            let origin = crate::vault::revision_retention::pin_session(pin)?;
+            if (origin != session || group.owner == *session)
+                && crate::vault::revision_retention::session_active(db, origin)?
+            {
+                return Err("This pin's process is still alive".into());
+            }
+        }
+        if db.owner_pins(&group.owner)? != group.pins {
+            return Err("Orphan pin set changed; refresh recovery inbox".into());
+        }
+        let proof = self.publish_resolution(
+            db,
+            &group.owner,
+            0,
+            0,
+            None,
+            "explicit_orphan_cleanup",
+            &group.pins,
+            None,
+        )?;
+        db.release_pins(&group.owner, &group.pins, None, &proof)
+    }
+}
+
+#[tauri::command]
+pub fn recovery_register_revision<R: Runtime>(
+    window: tauri::Window<R>,
+    state: State<'_, AppState>,
+    owner: String,
+    vault: VaultIdentity,
+    note_id: String,
+    accepted: Value,
+) -> Result<Value, String> {
+    init(window.app_handle(), &state)?;
+    valid_owner(&owner)?;
+    let mut service = state.recovery.lock().map_err(|e| e.to_string())?;
+    if service.barrier.is_some() {
+        return Err("A vault operation is pausing new owners".into());
+    }
+    if let Some(existing) = service.owners.get(&owner) {
+        if existing.window != window.label() || existing.vault != vault || existing.note != note_id
+        {
+            return Err("Owner rebinding refused".into());
+        }
+    }
+    let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+    let db = slot.as_ref().ok_or("Originating vault is closed")?;
+    db.validate_writer_vault(&vault)
+        .map_err(|e| e.to_string())?;
+    let proposed = RevisionBinding::from_accepted(&accepted)?;
+    if service.bindings.get(&owner).is_some_and(|b| {
+        b.vault_uuid != proposed.vault_uuid
+            || b.storage_epoch != proposed.storage_epoch
+            || b.incarnation_id != proposed.incarnation_id
+    }) {
+        return Err("Owner revision identity rebinding refused".into());
+    }
+    let receipt = db.pinned_owner_read(&owner, &note_id, &accepted)?;
+    #[cfg(test)]
+    crash_boundary("owner-accepted");
+    let binding = RevisionBinding::from_accepted(&receipt["accepted"])?;
+    service.owners.entry(owner.clone()).or_insert(Owner {
+        window: window.label().into(),
+        vault,
+        note: note_id,
+        dirty: false,
+        conflicted: false,
+        locked: false,
+        sequence: 0,
+    });
+    service.bindings.insert(owner, binding.clone());
+    Ok(json!({"identity":binding,"accepted":receipt}))
+}
+#[allow(clippy::too_many_arguments)] // Explicit wire fields preserve the narrow recovery API.
+#[tauri::command]
+pub fn recovery_resolve_revision<R: Runtime>(
+    window: tauri::Window<R>,
+    state: State<'_, AppState>,
+    owner: String,
+    sequence: u64,
+    local_revision: u64,
+    identity: RevisionBinding,
+    action: String,
+    next_accepted: Option<Value>,
+) -> Result<(), String> {
+    let mut service = state.recovery.lock().map_err(|e| e.to_string())?;
+    let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+    let db = slot.as_ref().ok_or("Originating vault is closed")?;
+    service.resolve_revision(
+        db,
+        window.label(),
+        &owner,
+        sequence,
+        local_revision,
+        &identity,
+        &action,
+        next_accepted.as_ref(),
+    )
+}
+#[tauri::command]
+pub fn recovery_orphan_pins<R: Runtime>(
+    window: tauri::Window<R>,
+    state: State<'_, AppState>,
+) -> Result<Vec<PinGroup>, String> {
+    init(window.app_handle(), &state)?;
+    let service = state.recovery.lock().map_err(|e| e.to_string())?;
+    let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+    let Some(db) = slot.as_ref().filter(|db| db.is_v3()) else {
+        return Ok(vec![]);
+    };
+    let records = service.records()?;
+    let mut result = Vec::new();
+    for group in db.pin_groups()? {
+        if service.owners.contains_key(&group.owner)
+            || service.reviews.contains_key(&group.owner)
+            || records.iter().any(|r| r.owner == group.owner)
+        {
+            continue;
+        }
+        let instance = &db.revision_session.as_ref().unwrap().instance;
+        let mut active = false;
+        for pin in &group.pins {
+            let origin = crate::vault::revision_retention::pin_session(pin)?;
+            if (origin != instance || group.owner == *instance)
+                && crate::vault::revision_retention::session_active(db, origin)?
+            {
+                active = true;
+                break;
+            }
+        }
+        if !active {
+            result.push(group);
+        }
+    }
+    Ok(result)
+}
+#[tauri::command]
+pub fn recovery_cleanup_pins<R: Runtime>(
+    window: tauri::Window<R>,
+    state: State<'_, AppState>,
+    group: PinGroup,
+) -> Result<(), String> {
+    init(window.app_handle(), &state)?;
+    let mut service = state.recovery.lock().map_err(|e| e.to_string())?;
+    let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+    service.cleanup_pin_group(slot.as_ref().ok_or("Originating vault is closed")?, &group)
+}
+
+#[cfg(test)]
+mod revision_retention_tests {
+    use super::*;
+    use crate::vault::{
+        ancestry,
+        writer::{NoteWrite, WritePolicy},
+    };
+    struct Fixture {
+        root: tempfile::TempDir,
+        path: PathBuf,
+        ledger: PathBuf,
+        journal: PathBuf,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("test.rn");
+            let ledger = root.path().join("ledger");
+            let journal = root.path().join("journal");
+            ancestry::migrate(&path, &ledger).unwrap();
+            Self {
+                root,
+                path,
+                ledger,
+                journal,
+            }
+        }
+        fn open(&self) -> VaultDb {
+            VaultDb::open_v3(&self.path, &self.ledger).unwrap()
+        }
+        fn service(&self) -> Recovery {
+            let mut r = Recovery::default();
+            r.set_root(self.journal.clone()).unwrap();
+            r
+        }
+    }
+    fn write(db: &VaultDb, prior: Option<&Value>, body: &str) -> Value {
+        let note = NewNote {
+            id: "n".into(),
+            title: "Title".into(),
+            content: body.into(),
+            tags: vec![],
+            pinned: false,
+            created: "created".into(),
+            modified: "modified".into(),
+        };
+        let policy = prior
+            .map(|p| WritePolicy::Update {
+                expected_token: p["accepted"]["token"].as_str().unwrap().into(),
+            })
+            .unwrap_or(WritePolicy::Create);
+        db.write_authoritative(&NoteWrite::from_note(db, &note, policy), 1)
+            .unwrap()
+    }
+    fn snapshot(receipt: &Value) -> Value {
+        let mut accepted = receipt["accepted"].clone();
+        for (target, source) in [
+            ("body", "content"),
+            ("title", "title"),
+            ("tags", "tags"),
+            ("pinned", "pinned"),
+            ("trashed", "trashed"),
+            ("created", "created"),
+            ("modified", "modified"),
+        ] {
+            accepted[target] = receipt[source].clone();
+        }
+        json!({"path":"n","content":receipt["content"],"raw":receipt["content"],"meta":{"id":"n","title":receipt["title"],"tags":receipt["tags"],"pinned":receipt["pinned"],"created":receipt["created"],"modified":receipt["modified"],"accepted":accepted}})
+    }
+    fn enroll(service: &mut Recovery, db: &VaultDb, owner: &str, base: &Value) -> Draft {
+        let receipt = db.pinned_owner_read(owner, "n", &base["accepted"]).unwrap();
+        let binding = RevisionBinding::from_accepted(&receipt["accepted"]).unwrap();
+        let mut base = snapshot(base);
+        base["recoveryIdentity"] = json!(binding);
+        base["recoveryIdentity"]["localRevision"] = json!(2);
+        service.bindings.insert(owner.into(), binding);
+        service.owners.insert(
+            owner.into(),
+            Owner {
+                window: "main".into(),
+                vault: db.identity(),
+                note: "n".into(),
+                dirty: true,
+                conflicted: true,
+                locked: false,
+                sequence: 0,
+            },
+        );
+        Draft {
+            owner: owner.into(),
+            sequence: 1,
+            revision: 2,
+            captured_at: chrono::Utc::now().to_rfc3339(),
+            vault: db.identity(),
+            note_id: "n".into(),
+            base,
+            body: "local draft".into(),
+            title: "Local title".into(),
+            tags: vec![],
+            pinned: false,
+            blobs: vec![],
+            conflicted: true,
+        }
+    }
+    fn prune_unclaimed_sessions(service: &mut Recovery, db: &VaultDb, except: &[&str]) {
+        for group in db.pin_groups().unwrap() {
+            if !except.contains(&group.owner.as_str()) {
+                service.cleanup_pin_group(db, &group).unwrap();
+            }
+        }
+    }
+    fn count(db: &VaultDb, table: &str) -> i64 {
+        db.conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+    #[test]
+    fn retention_rechecks_fixed_floors_and_review_pins_and_rolls_back_every_marker_on_failure() {
+        let f = Fixture::new();
+        let db = f.open();
+        let base = write(&db, None, "B");
+        let owner = uuid::Uuid::new_v4().to_string();
+        let review = uuid::Uuid::new_v4().to_string();
+        let mut service = f.service();
+        let draft = enroll(&mut service, &db, &owner, &base);
+        service.checkpoint("main", &draft).unwrap();
+        let remote = write(&db, Some(&base), "R");
+        assert_eq!(
+            db.pin_review(&review, "n", &draft.base["meta"]["accepted"])
+                .unwrap(),
+            remote
+        );
+        let mut head = remote.clone();
+        for n in 2..130 {
+            head = write(&db, Some(&head), &format!("body {n}"));
+        }
+        let header_count = count(&db, "revisions");
+        let parent_count = count(&db, "revision_parents");
+        let counter: i64 = db
+            .conn
+            .query_row(
+                "SELECT high_water FROM note_revision_counters WHERE note_id='n'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(db);
+        let db = f.open();
+        // Restart does not expire any pin, even with no native owner/heartbeat.
+        assert_eq!(
+            db.collect_revisions_at(chrono::Utc::now() + chrono::Duration::days(120))
+                .unwrap()
+                .states_pruned,
+            0
+        );
+        prune_unclaimed_sessions(&mut service, &db, &[&owner, &review]);
+        db.conn.execute_batch("CREATE TEMP TRIGGER fail_retention BEFORE DELETE ON revision_states BEGIN SELECT RAISE(ABORT,'fixture disk failure'); END;").unwrap();
+        assert!(db
+            .collect_revisions_at(chrono::Utc::now() + chrono::Duration::days(120))
+            .is_err());
+        assert_eq!(count(&db, "revision_pruning"), 0);
+        assert_eq!(count(&db, "revision_states"), 130);
+        db.conn
+            .execute_batch("DROP TRIGGER fail_retention")
+            .unwrap();
+        let report = db
+            .collect_revisions_at(chrono::Utc::now() + chrono::Duration::days(120))
+            .unwrap();
+        assert_eq!(report.states_pruned, 28);
+        assert_eq!(count(&db, "revision_states"), 102);
+        assert_eq!(count(&db, "revisions"), header_count);
+        assert_eq!(count(&db, "revision_parents"), parent_count);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT high_water FROM note_revision_counters WHERE note_id='n'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            counter
+        );
+        assert_eq!(
+            db.accepted_at_token("n", base["accepted"]["token"].as_str().unwrap())
+                .unwrap(),
+            base
+        );
+        assert_eq!(
+            db.accepted_at_token("n", remote["accepted"]["token"].as_str().unwrap())
+                .unwrap(),
+            remote
+        );
+        // Clearing curated history changes neither graph retention nor pins.
+        let pins = count(&db, "revision_pins");
+        let tx = db
+            .begin_write("gui", None, &json!(["clear-history"]))
+            .unwrap();
+        tx.execute("DELETE FROM versions", []).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(count(&db, "revision_pins"), pins);
+        assert_eq!(db.collect_revisions().unwrap().states_pruned, 0);
+        assert!(service.assert_quiet(None, None).is_err());
+    }
+    #[test]
+    fn exact_resolution_rejects_newer_typing_missing_proofs_and_journal_disk_failure() {
+        let f = Fixture::new();
+        let db = f.open();
+        let base = write(&db, None, "B");
+        let mut service = f.service();
+        let owner = uuid::Uuid::new_v4().to_string();
+        let draft = enroll(&mut service, &db, &owner, &base);
+        service.checkpoint("main", &draft).unwrap();
+        let binding = service.bindings[&owner].clone();
+        let pins = db.owner_pins(&owner).unwrap();
+        assert!(service
+            .resolve_revision(&db, "main", &owner, 1, 2, &binding, "invented-action", None)
+            .is_err());
+        let mut next = draft.clone();
+        next.sequence = 2;
+        next.revision = 3;
+        next.body = "new typing".into();
+        next.base["recoveryIdentity"]["localRevision"] = json!(3);
+        service.checkpoint("main", &next).unwrap();
+        assert!(service
+            .resolve_revision(&db, "main", &owner, 1, 2, &binding, "discard", None)
+            .is_err());
+        assert!(service
+            .resolve_revision(&db, "other-window", &owner, 2, 3, &binding, "discard", None)
+            .is_err());
+        // An unusable private directory fails before releasing even one pin.
+        let dir = service.dir(&owner).unwrap();
+        std::fs::write(dir.join("tombstone-00000000000000000001.json"), b"occupied").unwrap();
+        let original = service.root.take();
+        service.root = Some(f.root.path().join("not-a-directory"));
+        std::fs::write(service.root.as_ref().unwrap(), b"disk failure").unwrap();
+        assert!(service
+            .resolve_revision(&db, "main", &owner, 2, 3, &binding, "discard", None)
+            .is_err());
+        assert_eq!(db.owner_pins(&owner).unwrap(), pins);
+        assert!(service.owners[&owner].dirty);
+        service.root = original;
+        // A lost checkpoint reply leaves a lower renderer sequence; exact local
+        // revision plus the published stream permits an ordered explicit discard.
+        service
+            .resolve_revision(&db, "main", &owner, 1, 3, &binding, "discard", None)
+            .unwrap();
+        assert!(db.owner_pins(&owner).unwrap().is_empty());
+        assert!(service.records().unwrap().is_empty());
+        assert!(dir.join("tombstone-00000000000000000002.json").exists());
+    }
+    #[test]
+    fn lost_save_acknowledgment_replays_only_the_matching_durable_proof_and_never_resolves_new_typing(
+    ) {
+        let f = Fixture::new();
+        let db = f.open();
+        let base = write(&db, None, "B");
+        let mut service = f.service();
+        let owner = uuid::Uuid::new_v4().to_string();
+        let draft = enroll(&mut service, &db, &owner, &base);
+        service.checkpoint("main", &draft).unwrap();
+        let binding = service.bindings[&owner].clone();
+        let committed = write(&db, Some(&base), "saved local");
+        let accepted = snapshot(&committed)["meta"]["accepted"].clone();
+        service
+            .resolve_revision(&db, "main", &owner, 1, 2, &binding, "save", Some(&accepted))
+            .unwrap();
+        assert_eq!(db.owner_pins(&owner).unwrap().len(), 1);
+        service
+            .resolve_revision(&db, "main", &owner, 1, 2, &binding, "save", Some(&accepted))
+            .unwrap();
+        let mut next = draft.clone();
+        next.sequence = 2;
+        next.revision = 3;
+        next.body = "newer typing".into();
+        next.base = snapshot(&committed);
+        next.base["recoveryIdentity"] = json!(service.bindings[&owner]);
+        next.base["recoveryIdentity"]["localRevision"] = json!(3);
+        service.checkpoint("main", &next).unwrap();
+        assert!(service
+            .resolve_revision(&db, "main", &owner, 1, 2, &binding, "save", Some(&accepted))
+            .is_err());
+        assert!(service.owners[&owner].dirty);
+        assert_eq!(service.records().unwrap()[0].body, "newer typing");
+    }
+    #[test]
+    fn missing_journal_never_releases_orphans_and_live_process_cleanup_is_refused() {
+        let f = Fixture::new();
+        let db = f.open();
+        let base = write(&db, None, "B");
+        let id = db.revision_session.as_ref().unwrap().instance.clone();
+        db.accepted_note("n").unwrap().unwrap();
+        let read = db
+            .pin_groups()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.owner == id)
+            .unwrap();
+        let mut service = f.service();
+        assert!(service.cleanup_pin_group(&db, &read).is_err());
+        let owner = uuid::Uuid::new_v4().to_string();
+        db.pin_owner_base(&owner, "n", &base["accepted"]).unwrap();
+        let group = PinGroup {
+            owner: owner.clone(),
+            pins: db.owner_pins(&owner).unwrap(),
+        };
+        let other = f.open();
+        assert!(service.cleanup_pin_group(&other, &group).is_err());
+        drop(other);
+        drop(db);
+        let db = f.open();
+        assert!(!db.owner_pins(&owner).unwrap().is_empty());
+        // No local journal merely offers a choice. Only this explicit inbox
+        // acknowledgement writes a durable proof before releasing the holds.
+        service.cleanup_pin_group(&db, &group).unwrap();
+        assert!(db.owner_pins(&owner).unwrap().is_empty());
+        assert!(service
+            .dir(&owner)
+            .unwrap()
+            .join("tombstone-00000000000000000001.json")
+            .exists());
+    }
+    #[test]
+    fn deleted_original_keeps_shared_revision_and_recovery_bytes_and_failed_checkpoint_holds() {
+        let f = Fixture::new();
+        let db = f.open();
+        let base = write(&db, None, "B");
+        let asset = db
+            .add_attachment(
+                "n",
+                "proof.pdf",
+                "application/pdf",
+                b"shared private bytes",
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .unwrap()
+            .id;
+        let body = format!("[proof](.rn-attachments/{asset})");
+        let base = write(&db, Some(&base), &body);
+        let mut service = f.service();
+        let owner = uuid::Uuid::new_v4().to_string();
+        let mut draft = enroll(&mut service, &db, &owner, &base);
+        db.hold_checkpoint(
+            &owner,
+            "n",
+            &draft.base["meta"]["accepted"],
+            std::slice::from_ref(&asset),
+            false,
+        )
+        .unwrap();
+        draft.body = body.clone();
+        draft.blobs.push(Blob {
+            reference: format!(".rn-attachments/{asset}"),
+            name: "proof.pdf".into(),
+            mime: "application/pdf".into(),
+            data: b"shared private bytes".to_vec(),
+            checkpoint_bytes: None,
+        });
+        service.checkpoint("main", &draft).unwrap();
+        db.delete_note("n").unwrap();
+        db.collect_revisions().unwrap();
+        assert_eq!(
+            db.get_attachment_data(&asset).unwrap().unwrap().1,
+            b"shared private bytes"
+        );
+        let recovered = read_draft(
+            &service
+                .dir(&owner)
+                .unwrap()
+                .join("00000000000000000001.json"),
+        )
+        .unwrap();
+        assert_eq!(recovered.blobs[0].data, b"shared private bytes");
+        // Failing private storage after establishing holds does not pretend the
+        // checkpoint is durable, nor does it make the asset a GC candidate.
+        let invalid = service.dir(&owner).unwrap().join("blocked");
+        std::fs::write(&invalid, b"full").unwrap();
+        let mut failed = Recovery {
+            root: Some(invalid),
+            owners: service.owners.clone(),
+            ..Default::default()
+        };
+        let mut next = draft.clone();
+        next.sequence = 2;
+        assert!(failed.checkpoint("main", &next).is_err());
+        assert!(!db.owner_pins(&owner).unwrap().is_empty());
+        assert!(service.assert_quiet(None, None).is_err());
+        // The same bytes copied to a fresh note are linked before fork ack.
+        let copy = fork(&db, &recovered).unwrap();
+        let copy_id = copy["id"].as_str().unwrap();
+        assert!(copy["content"].as_str().unwrap().contains(&asset));
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM note_attachments WHERE note_id=?1",
+                    [copy_id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert!(service
+            .assert_quiet(Some(&db.identity().path), None)
+            .is_err());
+    }
+    #[test]
+    #[ignore = "crash fixture subprocess; invoked by parent"]
+    fn crash_probe() {
+        let Some(root) = std::env::var_os("RYUK_4D_CRASH_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let db = VaultDb::open_v3(&root.join("test.rn"), &root.join("ledger")).unwrap();
+        let base = db.accepted_note("n").unwrap().unwrap();
+        let owner = std::env::var("RYUK_4D_CRASH_OWNER").unwrap();
+        let mut service = Recovery::default();
+        service.set_root(root.join("journal")).unwrap();
+        let mut draft = enroll(&mut service, &db, &owner, &base);
+        draft.body = "[file](.rn-recovery/transient)".into();
+        draft.blobs.push(Blob {
+            reference: ".rn-recovery/transient".into(),
+            name: "transient.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: b"captured transient bytes".to_vec(),
+            checkpoint_bytes: None,
+        });
+        db.hold_checkpoint(&owner, "n", &draft.base["meta"]["accepted"], &[], false)
+            .unwrap();
+        crash_boundary("checkpoint-holds");
+        if std::env::var("RYUK_4D_CRASH_AT").unwrap() == "review-pins" {
+            db.pin_review(
+                &uuid::Uuid::new_v4().to_string(),
+                "n",
+                &draft.base["meta"]["accepted"],
+            )
+            .unwrap();
+        }
+        service.checkpoint("main", &draft).unwrap();
+        let binding = service.bindings[&owner].clone();
+        service
+            .resolve_revision(&db, "main", &owner, 1, 2, &binding, "discard", None)
+            .unwrap();
+        panic!("probe did not crash");
+    }
+    #[test]
+    fn restart_at_pin_checkpoint_and_resolution_boundaries_never_infers_release() {
+        for boundary in [
+            "owner-pin",
+            "review-pins",
+            "checkpoint-holds",
+            "checkpoint-bytes",
+            "checkpoint-published",
+            "resolution-proof",
+            "resolution-marker",
+            "resolution-released",
+        ] {
+            let f = Fixture::new();
+            let db = f.open();
+            write(&db, None, "B");
+            drop(db);
+            let owner = uuid::Uuid::new_v4().to_string();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "recovery::revision_retention_tests::crash_probe",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("RYUK_4D_CRASH_AT", boundary)
+                .env("RYUK_4D_CRASH_ROOT", f.root.path())
+                .env("RYUK_4D_CRASH_OWNER", &owner)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(87), "{boundary}");
+            let db = f.open();
+            let service = f.service();
+            let pins = db.owner_pins(&owner).unwrap();
+            assert_eq!(
+                pins.is_empty(),
+                boundary == "resolution-released",
+                "{boundary}"
+            );
+            assert_eq!(count(&db, "revision_states"), 1);
+            assert_eq!(
+                db.collect_revisions_at(chrono::Utc::now() + chrono::Duration::days(400))
+                    .unwrap()
+                    .states_pruned,
+                0
+            );
+            if matches!(
+                boundary,
+                "checkpoint-bytes"
+                    | "checkpoint-published"
+                    | "resolution-proof"
+                    | "resolution-marker"
+                    | "resolution-released"
+            ) {
+                assert_eq!(
+                    std::fs::read(
+                        service
+                            .dir(&owner)
+                            .unwrap()
+                            .join(format!("blob-{}", digest(b"captured transient bytes")))
+                    )
+                    .unwrap(),
+                    b"captured transient bytes"
+                );
+            }
+            if matches!(boundary, "checkpoint-published" | "resolution-proof") {
+                let records = service.records().unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].blobs[0].data, b"captured transient bytes");
+                assert!(service.assert_quiet(None, None).is_err());
+            }
+            if matches!(boundary, "resolution-marker" | "resolution-released") {
+                assert!(service.records().unwrap().is_empty());
+            }
+        }
+    }
+    #[test]
+    fn ipc_revision_enrollment_and_review_pins_preserve_dirty_detached_owner_across_maintenance() {
+        use crate::commands;
+        let f = Fixture::new();
+        let db = f.open();
+        let base = write(&db, None, "B");
+        let identity = db.identity();
+        let app = tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![
+                recovery_register_revision,
+                recovery_status,
+                recovery_checkpoint,
+                recovery_resolve_revision,
+                recovery_unregister,
+                recovery_review_open,
+                recovery_review_cancel,
+                recovery_barrier,
+                recovery_orphan_pins,
+                recovery_cleanup_pins,
+                commands::db_collect_revisions,
+                commands::db_close,
+                commands::db_open,
+                commands::db_open_vault,
+                commands::db_empty_trash,
+                commands::db_restore_backup
+            ])
+            .manage(AppState::new(crate::types::AppConfig::default()))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = app.state::<AppState>();
+        *state.vault_db.lock().unwrap() = Some(db);
+        state
+            .recovery
+            .lock()
+            .unwrap()
+            .set_root(f.journal.clone())
+            .unwrap();
+        let main = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let detached = tauri::WebviewWindowBuilder::new(&app, "note-detached", Default::default())
+            .build()
+            .unwrap();
+        let request =
+            |view: &tauri::WebviewWindow<tauri::test::MockRuntime>, cmd: &str, body: Value| {
+                tauri::test::get_ipc_response(
+                    view,
+                    tauri::webview::InvokeRequest {
+                        cmd: cmd.into(),
+                        callback: tauri::ipc::CallbackFn(0),
+                        error: tauri::ipc::CallbackFn(1),
+                        url: "http://tauri.localhost".parse().unwrap(),
+                        body: tauri::ipc::InvokeBody::Json(body),
+                        headers: Default::default(),
+                        invoke_key: tauri::test::INVOKE_KEY.into(),
+                    },
+                )
+            };
+        let a = uuid::Uuid::new_v4().to_string();
+        let b = uuid::Uuid::new_v4().to_string();
+        let accepted = snapshot(&base)["meta"]["accepted"].clone();
+        for (view, owner) in [(&main, &a), (&detached, &b)] {
+            let receipt: Value = request(
+                view,
+                "recovery_register_revision",
+                json!({"owner":owner,"vault":identity,"noteId":"n","accepted":accepted}),
+            )
+            .unwrap()
+            .deserialize()
+            .unwrap();
+            assert_eq!(receipt["accepted"], base);
+            let slot = state.vault_db.lock().unwrap();
+            assert_eq!(slot.as_ref().unwrap().owner_pins(owner).unwrap().len(), 1);
+        }
+        request(
+            &main,
+            "recovery_status",
+            json!({"owner":a,"dirty":false,"conflicted":false,"locked":true}),
+        )
+        .unwrap();
+        let mut draft = Draft {
+            owner: b.clone(),
+            sequence: 1,
+            revision: 2,
+            captured_at: chrono::Utc::now().to_rfc3339(),
+            vault: identity.clone(),
+            note_id: "n".into(),
+            base: snapshot(&base),
+            body: "detached unsaved".into(),
+            title: "Title".into(),
+            tags: vec![],
+            pinned: false,
+            blobs: vec![],
+            conflicted: true,
+        };
+        request(&detached, "recovery_checkpoint", json!({"draft":draft})).unwrap();
+        assert!(request(&main, "recovery_unregister", json!({"owner":b})).is_err());
+        let ticket: Value = request(
+            &detached,
+            "recovery_review_open",
+            json!({"owner":b,"sequence":1,"revision":2}),
+        )
+        .unwrap()
+        .deserialize()
+        .unwrap();
+        assert_eq!(
+            ticket["ancestry"]["base"]["revisionId"],
+            base["accepted"]["revision"]["revisionId"]
+        );
+        let review = ticket["reviewId"].as_str().unwrap();
+        assert!(!state
+            .vault_db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .owner_pins(review)
+            .unwrap()
+            .is_empty());
+        for (cmd, args) in [
+            (
+                "recovery_barrier",
+                json!({"vault":identity.path,"roots":null}),
+            ),
+            ("db_close", json!({})),
+            ("db_open", json!({"path":f.path})),
+            ("db_open_vault", json!({"path":f.path})),
+            ("db_empty_trash", json!({})),
+            (
+                "db_restore_backup",
+                json!({"vaultPath":f.path,"backupPath":f.path}),
+            ),
+        ] {
+            assert!(
+                request(&main, cmd, args).is_err(),
+                "{cmd} must refuse without disposing any owner"
+            );
+            assert!(state.vault_db.lock().unwrap().is_some());
+            assert!(state.recovery.lock().unwrap().owners[&b].dirty);
+        }
+        assert!(close_window(&state, "note-detached").is_err());
+        assert!(
+            close_window(&state, "main").is_ok(),
+            "closing another clean paused window retains detached ownership"
+        );
+        // GC is safe with dirty windows because their base pins are independent
+        // roots. It never uses the maintenance barrier to discard those drafts.
+        request(&main, "db_collect_revisions", json!({})).unwrap();
+        assert!(state.recovery.lock().unwrap().owners[&b].dirty);
+        request(
+            &detached,
+            "recovery_review_cancel",
+            json!({"owner":b,"reviewId":review}),
+        )
+        .unwrap();
+        assert!(state
+            .vault_db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .owner_pins(review)
+            .unwrap()
+            .is_empty());
+        draft.sequence = 2;
+        draft.revision = 3;
+        draft.body = "latest detached typing".into();
+        request(&detached, "recovery_checkpoint", json!({"draft":draft})).unwrap();
+        let binding = state.recovery.lock().unwrap().bindings[&b].clone();
+        assert!(request(&detached,"recovery_resolve_revision",json!({"owner":b,"sequence":1,"localRevision":2,"identity":binding,"action":"discard","nextAccepted":null})).is_err());
+        assert!(close_window(&state, "note-detached").is_err());
+        window_gone(&state, "note-detached");
+        assert!(!state
+            .vault_db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .owner_pins(&b)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            state.recovery.lock().unwrap().records().unwrap()[0].body,
+            "latest detached typing"
+        );
+        assert!(state
+            .recovery
+            .lock()
+            .unwrap()
+            .assert_quiet(None, None)
+            .is_err());
+    }
 }

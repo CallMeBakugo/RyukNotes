@@ -42,6 +42,7 @@ pub(crate) fn reserved_metadata(key: &str) -> bool {
             "attachment_stage:",
             "recovery_fork:",
             "review_apply:",
+            "recovery_assets:",
         ]
         .iter()
         .any(|prefix| key.starts_with(*prefix))
@@ -51,6 +52,7 @@ pub(crate) struct Session {
     pub ledger_root: PathBuf,
     pub guard: Arc<AtomicBool>,
     pub instance: String,
+    _pin_lease: std::fs::File,
     operation: RefCell<Option<ScopedOperation>>,
 }
 struct ScopedOperation {
@@ -133,6 +135,8 @@ impl VaultDb {
             }
         }
         let writer_identity = super::writer::VaultIdentity::capture(&conn)?;
+        let instance = uuid();
+        let pin_lease = super::revision_retention::session_lease(ledger_root, &instance)?;
         Ok(Self {
             conn,
             max_attachment_bytes: super::db::DEFAULT_MAX_ATTACHMENT_BYTES,
@@ -142,7 +146,8 @@ impl VaultDb {
                 identity,
                 ledger_root: ledger_root.into(),
                 guard,
-                instance: uuid(),
+                instance,
+                _pin_lease: pin_lease,
                 operation: RefCell::new(None),
             }),
         })
@@ -207,6 +212,7 @@ impl VaultDb {
             operation_id,
             request,
             TransactionBehavior::Immediate,
+            false,
         )
     }
     pub(crate) fn begin_auxiliary_write(
@@ -214,7 +220,19 @@ impl VaultDb {
         source: &str,
         request: &Value,
     ) -> Result<WriteTransaction<'_>, String> {
-        self.begin_write_behavior(source, None, request, TransactionBehavior::Deferred)
+        self.begin_write_behavior(source, None, request, TransactionBehavior::Deferred, false)
+    }
+    pub(crate) fn begin_revision_maintenance(
+        &self,
+        request: &Value,
+    ) -> Result<WriteTransaction<'_>, String> {
+        self.begin_write_behavior(
+            "recovery",
+            None,
+            request,
+            TransactionBehavior::Immediate,
+            true,
+        )
     }
     fn begin_write_behavior(
         &self,
@@ -222,6 +240,7 @@ impl VaultDb {
         operation_id: Option<&str>,
         request: &Value,
         legacy_behavior: TransactionBehavior,
+        maintenance_only: bool,
     ) -> Result<WriteTransaction<'_>, String> {
         let mut request_hash = if self.is_v3() {
             hash(&(source, request))?
@@ -231,7 +250,12 @@ impl VaultDb {
         let mut operation = operation_id.map(str::to_owned).unwrap_or_else(uuid);
         let mut root_claim = None;
         if let Some(session) = &self.revision_session {
-            if let Some(scope) = session.operation.borrow().as_ref() {
+            if let Some(scope) = session
+                .operation
+                .borrow()
+                .as_ref()
+                .filter(|_| !maintenance_only)
+            {
                 let index = scope.next.get();
                 scope
                     .next
@@ -307,6 +331,7 @@ impl VaultDb {
             draft_bases: RefCell::new(BTreeMap::new()),
             kind_hint: RefCell::new(None),
             root_claim,
+            maintenance_only: std::cell::Cell::new(maintenance_only),
         };
         if self.is_v3() {
             ancestry::validate(&result)?;
@@ -366,6 +391,7 @@ pub struct WriteTransaction<'a> {
     draft_bases: RefCell<BTreeMap<String, String>>,
     kind_hint: RefCell<Option<String>>,
     root_claim: Option<(String, String)>,
+    maintenance_only: std::cell::Cell<bool>,
 }
 impl Deref for WriteTransaction<'_> {
     type Target = Connection;
@@ -453,6 +479,9 @@ impl WriteTransaction<'_> {
             return Ok(());
         }
         let after = ancestry::states(self)?;
+        if self.maintenance_only.get() && after != *self.before.borrow() {
+            return Err("Recovery maintenance cannot mutate semantic note state".into());
+        }
         if let Some(prepared) = self.prepared.borrow().as_ref() {
             if prepared != &after {
                 return Err("Semantic state changed after preparing the exact receipt".into());
@@ -656,7 +685,7 @@ impl WriteTransaction<'_> {
             self.db.validate_writer_vault(&self.db.identity())?;
         }
         self.prepare()?;
-        if self.db.is_v3() && self.replay.borrow().is_none() {
+        if self.db.is_v3() && self.replay.borrow().is_none() && !self.maintenance_only.get() {
             if let Some((key, expected)) = &self.root_claim {
                 self.execute(
                     "INSERT OR IGNORE INTO meta(key,value) VALUES(?1,?2)",
@@ -720,7 +749,11 @@ pub(crate) fn accepted_for_revision(db: &VaultDb, revision: &Value) -> Result<Va
         json!({"vault":db.identity(),"token":token,"revision":revision,"vaultUuid":identity.vault_uuid,"storageEpoch":epoch}),
     )
 }
-fn receipt_for_revision(db: &VaultDb, id: &str, revision_id: &str) -> Result<Value, String> {
+pub(crate) fn receipt_for_revision(
+    db: &VaultDb,
+    id: &str,
+    revision_id: &str,
+) -> Result<Value, String> {
     let state = ancestry::payload(&db.conn, revision_id).map_err(|_| {
         "Historical operation payload unavailable; never retry as a fresh write".to_string()
     })?;
@@ -797,12 +830,35 @@ impl VaultDb {
 }
 
 pub(crate) fn read_accepted(db: &VaultDb, id: &str) -> Result<Option<Value>, WriteError> {
-    // Both the projection and the durable head come from ONE SQLite snapshot.
-    let read = if db.conn.is_autocommit() {
-        Some(db.conn.unchecked_transaction().map_err(error)?)
-    } else {
-        None
-    };
+    if !db.conn.is_autocommit() {
+        let result = read_accepted_core(db, id)?;
+        if let Some(note) = &result {
+            super::revision_retention::pin_read_on(db, note)?;
+        }
+        return Ok(result);
+    }
+    {
+        let read = db.conn.unchecked_transaction().map_err(error)?;
+        let result = read_accepted_core(db, id)?;
+        let held = result
+            .as_ref()
+            .map(|note| super::revision_retention::read_is_pinned(db, note))
+            .transpose()?
+            .unwrap_or(true);
+        read.commit().map_err(error)?;
+        if held {
+            return Ok(result);
+        }
+    }
+    let tx = db.begin_revision_maintenance(&json!(["accepted-read", id]))?;
+    let result = read_accepted_core(db, id)?;
+    if let Some(note) = &result {
+        super::revision_retention::pin_read_on(db, note)?;
+    }
+    tx.commit_typed()?;
+    Ok(result)
+}
+fn read_accepted_core(db: &VaultDb, id: &str) -> Result<Option<Value>, WriteError> {
     let Some(mut note) = db.get_note_full(id)? else {
         return Ok(None);
     };
@@ -825,9 +881,6 @@ pub(crate) fn read_accepted(db: &VaultDb, id: &str) -> Result<Option<Value>, Wri
     }
     note["accepted"] = accepted_for_revision(db, &revision)?;
     db.validate_writer_vault(&db.identity())?;
-    if let Some(read) = read {
-        read.commit().map_err(error)?;
-    }
     Ok(Some(note))
 }
 pub(crate) fn check_policy(

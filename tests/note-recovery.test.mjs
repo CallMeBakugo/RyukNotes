@@ -8,7 +8,7 @@ import ts from 'typescript';
 const source = await readFile(new URL('../src/lib/utils/note-recovery.ts', import.meta.url), 'utf8');
 const js = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
-function fixture() {
+function fixture(v3 = false) {
   let revision = 1;
   let body = 'draft one';
   let failedDisk = false;
@@ -27,12 +27,17 @@ function fixture() {
   const invoke = async (cmd, args) => {
     calls.push([cmd, args]);
     if (cmd === 'recovery_register') { registered = true; return; }
+    if (cmd === 'recovery_register_revision') {
+      registered = true;
+      const a = args.accepted;
+      return { identity: { vaultUuid: a.vaultUuid, storageEpoch: a.storageEpoch, ...a.revision }, accepted: { accepted: a } };
+    }
     assert.equal(registered, true);
     if (cmd === 'recovery_checkpoint') {
       if (failedDisk) throw new Error('disk full');
       records.set(args.draft.sequence, structuredClone(args.draft)); return;
     }
-    if (cmd === 'recovery_resolve') {
+    if (cmd === 'recovery_resolve' || cmd === 'recovery_resolve_revision') {
       if (failedDisk) throw new Error('disk full');
       assert.ok(args.sequence === 0 || records.has(args.sequence)); return;
     }
@@ -52,9 +57,15 @@ function fixture() {
     window: target, document: { ...target, visibilityState: 'visible' },
     setInterval: fn => { interval = fn; return 1; }, clearInterval: () => {} });
   const base = { path: 'n', raw: 'base', content: 'base', meta: { id: 'n', title: 'Title', tags: [], pinned: false, created: '', modified: '' } };
+  if (v3) base.meta.accepted = { vault: { path: '/v.rn', file: 'inode' }, token: 'v3-B',
+    body: 'base', title: 'Title', tags: [], pinned: false, trashed: false, created: '', modified: '',
+    vaultUuid: randomUUID(), storageEpoch: randomUUID(), revision: {
+      incarnationId: randomUUID(), revisionId: randomUUID(), commitToken: randomUUID(), revision: '9007199254740993',
+    } };
   const owner = exports.createRecoveryOwner({ path: '/v.rn', file: 'inode' }, 'n', () => ({ revision, base, body, meta: base.meta }), message => notices.push(message));
   return { owner, records, forks, calls, notices, isConflict: exports.isRecoveryConflict, memory: exports.recoveryMemory, base,
     edit(value) { body = value; revision++; owner.edit(); },
+    resetRevision() { revision = 0; },
     disk(value) { failedDisk = value; }, loseReply(value) { failedForkReply = value; },
     gate() { forkGate = deferred(); return forkGate; },
     async tick() { interval(); await new Promise(r => setTimeout(r, 0)); },
@@ -179,4 +190,74 @@ test('literal blob syntax in prose is preserved without treating it as a transie
   assert.equal(record.blobs.length, 0);
   const result = await f.owner.fork();
   assert.equal(result.note.content, 'The URL scheme is `blob:example`; this is prose.');
+});
+
+
+test('v3 owner adopts a transactionally pinned read and every checkpoint binds exact revision identity', async () => {
+  const f = fixture(true);
+  assert.equal(await f.owner.ready(), true);
+  f.owner.edit();
+  const record = await f.owner.checkpoint();
+  assert.equal(f.calls[0][0], 'recovery_register_revision');
+  assert.equal(record.base.recoveryIdentity.revisionId, f.base.meta.accepted.revision.revisionId);
+  assert.equal(record.base.recoveryIdentity.commitToken, f.base.meta.accepted.revision.commitToken);
+  assert.equal(record.base.recoveryIdentity.localRevision, record.revision);
+  assert.equal(record.base.meta.accepted.revision.revision, '9007199254740993');
+  const old = structuredClone(f.base.meta.accepted.revision);
+  f.base.meta.accepted.token = 'v3-C';
+  f.base.meta.accepted.revision = { ...old, revisionId: randomUUID(), commitToken: randomUUID() };
+  await f.owner.saved(record.revision);
+  const saved = f.calls.filter(([cmd]) => cmd === 'recovery_resolve_revision').at(-1)[1];
+  assert.equal(saved.action, 'save');
+  assert.equal(saved.identity.revisionId, old.revisionId);
+  assert.equal(saved.nextAccepted.revision.revisionId, f.base.meta.accepted.revision.revisionId);
+  assert.equal(f.owner.unresolved, false);
+  await f.owner.release();
+  const release = f.calls.filter(([cmd]) => cmd === 'recovery_resolve_revision').at(-1)[1];
+  assert.equal(release.action, 'release');
+  assert.equal(release.identity.revisionId, f.base.meta.accepted.revision.revisionId);
+  assert.equal(f.calls.at(-1)[0], 'recovery_unregister');
+});
+
+test('v3 journal and tombstone failures preserve memory, block pause and never use legacy release', async () => {
+  const f = fixture(true);
+  await f.owner.ready(); f.owner.edit(); f.disk(true);
+  await assert.rejects(f.owner.checkpoint());
+  assert.equal(await f.owner.pause(), false);
+  f.disk(false); const record = await f.owner.checkpoint();
+  f.disk(true); await assert.rejects(f.owner.saved(record.revision));
+  assert.equal(f.owner.unresolved, true);
+  assert.equal(f.memory.has(f.owner.owner), true);
+  assert.equal(f.calls.some(([cmd]) => cmd === 'recovery_resolve'), false);
+  f.edit('newer draft');
+  await f.owner.saved(record.revision);
+  assert.equal(f.memory.get(f.owner.owner).body, 'newer draft');
+  f.disk(false); await f.owner.checkpoint();
+  const latest = f.memory.get(f.owner.owner);
+  assert.equal(await f.owner.discard(latest.revision), true);
+  await f.owner.release();
+});
+
+test('v3 lost and reordered invalidations never release pins or adopt remote identity', async () => {
+  const f = fixture(true); await f.owner.ready(); f.owner.conflict(); await f.owner.checkpoint();
+  const identity = structuredClone(f.memory.get(f.owner.owner).base.recoveryIdentity);
+  const stop = f.watch();
+  await f.hint('note-invalidated'); await f.hint('focus'); await f.tick(); await f.hint('note-invalidated');
+  assert.equal(JSON.stringify(f.memory.get(f.owner.owner).base.recoveryIdentity), JSON.stringify(identity));
+  assert.equal(f.calls.some(([cmd]) => cmd === 'recovery_resolve_revision'), false);
+  assert.equal(await f.owner.pause(), false); stop();
+  await f.owner.discard(f.memory.get(f.owner.owner).revision); await f.owner.release();
+});
+
+
+test('v3 clean release uses its own acknowledged revision after the editor capture switches notes', async () => {
+  const f = fixture(true); await f.owner.ready(); f.edit('saved draft');
+  const record = await f.owner.checkpoint(); await f.owner.saved(record.revision);
+  const accepted = structuredClone(f.base.meta.accepted);
+  f.resetRevision(); f.base.meta.accepted = { ...accepted, token:'another-note-token', revision:{...accepted.revision,revisionId:randomUUID()} };
+  await f.owner.release();
+  const release = f.calls.filter(([cmd])=>cmd==='recovery_resolve_revision').at(-1)[1];
+  assert.equal(release.action,'release'); assert.equal(release.localRevision,record.revision);
+  assert.equal(release.identity.revisionId,accepted.revision.revisionId);
+  assert.equal(f.calls.at(-1)[0],'recovery_unregister');
 });

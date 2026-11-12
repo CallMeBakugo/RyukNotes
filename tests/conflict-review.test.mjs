@@ -123,3 +123,23 @@ test('late image responses cannot bind to a canceled or different owner generati
   assert.deepEqual((await other.model.preview('.rn-attachments/image')).data,[4]);other.away();
   await assert.rejects(other.model.preview('.rn-attachments/image'),/owned/);await other.model.close();
 });
+
+
+test('v3 review requires coherently pinned base and remote identities and preserves edited artifacts on refusal', async () => {
+  const f = fixture(); await f.model.open(); ready(f.model);
+  f.model.edit([{from:0,to:0,insert:'preserve me '}]); const result = f.model.state.result;
+  const base = note('base','B'), remote = note('remote','R');
+  base.meta.accepted.vaultUuid = remote.meta.accepted.vaultUuid = 'v';
+  base.meta.accepted.storageEpoch = remote.meta.accepted.storageEpoch = 'e';
+  base.meta.accepted.revision = { revisionId:'B', incarnationId:'life', commitToken:'base-token' };
+  remote.meta.accepted.revision = { revisionId:'R', incarnationId:'life', commitToken:'remote-token' };
+  f.setResponse(() => ({available:true, reviewId:'unproven', revision:1, base, local:note('local','B'), remote}));
+  await f.model.open(true);
+  assert.equal(f.model.state.status,'unavailable'); assert.equal(f.model.canApply,false);
+  assert.equal(f.model.state.result,result); assert.ok(f.canceled.includes('unproven'));
+  f.setResponse(() => ({available:true, reviewId:'pinned', revision:1, base, local:note('local','B'), remote,
+    ancestry:{base:{vaultUuid:'v',storageEpoch:'e',incarnationId:'life',revisionId:'B',commitToken:'base-token'},
+      remote:{vaultUuid:'v',storageEpoch:'e',incarnationId:'life',revisionId:'R',commitToken:'remote-token'}}}));
+  await f.model.open(true); assert.equal(f.model.state.status,'ready'); assert.equal(f.model.state.result,result);
+  await f.model.close();
+});

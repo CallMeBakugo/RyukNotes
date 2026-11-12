@@ -13,10 +13,19 @@ export function isRecoveryConflict(error: unknown): boolean {
   return /^Save conflict:/i.test(message);
 }
 
+export interface RecoveryIdentity {
+  vaultUuid: string; storageEpoch: string; incarnationId: string; revisionId: string; commitToken: string;
+}
+function revisionIdentity(base: NoteContent): RecoveryIdentity | undefined {
+  const accepted = base.meta.accepted;
+  if (!accepted?.revision || !accepted.vaultUuid || !accepted.storageEpoch) return;
+  return { vaultUuid: accepted.vaultUuid, storageEpoch: accepted.storageEpoch,
+    incarnationId: accepted.revision.incarnationId, revisionId: accepted.revision.revisionId, commitToken: accepted.revision.commitToken };
+}
 export interface RecoveryBlob { reference: string; name: string; mime: string; data: number[] }
 export interface RecoveryDraft {
   owner: string; sequence: number; revision: number; capturedAt: string; vault: DbAcceptedState['vault']; noteId: string;
-  base: NoteContent & { reviewResult?: { reviewId: string; sourceOwner: string } }; body: string; title: string; tags: string[]; pinned: boolean;
+  base: NoteContent & { recoveryIdentity?: RecoveryIdentity & { localRevision: number }; reviewResult?: { reviewId: string; sourceOwner: string } }; body: string; title: string; tags: string[]; pinned: boolean;
   blobs: RecoveryBlob[]; conflicted: boolean;
 }
 export interface DraftCapture { revision: number; base: NoteContent; body: string; meta: NoteMeta }
@@ -26,6 +35,9 @@ export const recoveryMemory = new Map<string, RecoveryDraft>();
 export function createRecoveryOwner(vault: DbAcceptedState['vault'], noteId: string,
   capture: () => DraftCapture, onError: (message: string) => void) {
   const owner = crypto.randomUUID();
+  const initial = capture();
+  const initialAccepted = structuredClone(initial.base.meta.accepted);
+  let ownerRevision = initial.revision;
   let sequence = 0;
   let conflicted = false;
   let dirty = false;
@@ -38,8 +50,17 @@ export function createRecoveryOwner(vault: DbAcceptedState['vault'], noteId: str
   const cancelJournalTimers = () => { clearTimeout(journalIdle); clearTimeout(journalMax); journalIdle = undefined; journalMax = undefined; };
   let pendingFork: RecoveryDraft | null = null;
   let registered = false;
+  let pinnedIdentity = revisionIdentity(initial.base);
   const register = async () => {
-    if (!registered) { await invoke('recovery_register', { owner, vault, noteId }); registered = true; }
+    if (!registered) {
+      if (pinnedIdentity) {
+        const accepted = initialAccepted;
+        const reply = await invoke<{ identity: RecoveryIdentity; accepted: { accepted: { token: string } } }>('recovery_register_revision', { owner, vault, noteId, accepted });
+        if (reply.accepted.accepted.token !== accepted?.token) throw new Error('The pinned accepted read did not match this buffer.');
+        pinnedIdentity = reply.identity;
+      } else await invoke('recovery_register', { owner, vault, noteId });
+      registered = true;
+    }
   };
   let tail: Promise<unknown> = register().catch(() => onError('Recovery registration failed. Keep this editor open.'));
   const ordered = <T>(work: () => Promise<T>): Promise<T> => {
@@ -53,8 +74,12 @@ export function createRecoveryOwner(vault: DbAcceptedState['vault'], noteId: str
   }
   function snapshot(): RecoveryDraft {
     const current = capture();
+    ownerRevision = current.revision;
+    const identity = revisionIdentity(current.base);
+    const base = structuredClone(current.base) as RecoveryDraft['base'];
+    if (identity) base.recoveryIdentity = { ...identity, localRevision: current.revision };
     return { owner, sequence: ++sequence, revision: current.revision, capturedAt: new Date().toISOString(), vault: { ...vault }, noteId,
-      base: structuredClone(current.base), body: current.body, title: current.meta.title, tags: [...current.meta.tags],
+      base, body: current.body, title: current.meta.title, tags: [...current.meta.tags],
       pinned: current.meta.pinned, blobs: [], conflicted };
   }
   async function durable(record: RecoveryDraft): Promise<void> {
@@ -74,6 +99,16 @@ export function createRecoveryOwner(vault: DbAcceptedState['vault'], noteId: str
     }
     await invoke('recovery_checkpoint', { draft: record });
     durableSequence = Math.max(durableSequence, record.sequence);
+    pinnedIdentity = revisionIdentity(record.base) ?? pinnedIdentity;
+  }
+  async function resolve(sequence: number, revision: number, action: 'save' | 'discard' | 'release'): Promise<void> {
+    if (!pinnedIdentity) { await invoke('recovery_resolve', { owner, sequence }); return; }
+    const current = action === 'save' ? capture() : undefined;
+    const nextAccepted = current?.base.meta.accepted;
+    const nextIdentity = current ? revisionIdentity(current.base) : undefined;
+    await invoke('recovery_resolve_revision', { owner, sequence, localRevision: revision,
+      identity: { ...pinnedIdentity }, action, nextAccepted: nextAccepted ?? null });
+    if (nextIdentity) pinnedIdentity = nextIdentity;
   }
   function checkpoint(): Promise<RecoveryDraft> {
     cancelJournalTimers();
@@ -118,15 +153,15 @@ export function createRecoveryOwner(vault: DbAcceptedState['vault'], noteId: str
       if (revision !== capture().revision || conflicted) return;
       cancelJournalTimers();
       const record = recoveryMemory.get(owner);
-      if (!record) { dirty = false; return; }
+      if (!record && !pinnedIdentity) { dirty = false; return; }
       await ordered(async () => {
         if (revision !== capture().revision || conflicted) return;
         // The exact note commit already made this captured revision durable.
         // Retire the last journal checkpoint, without refetching object URLs
         // that a successful upload may legitimately have retired. Tombstone
         // I/O failure still retains memory/owner state and refuses disposal.
-        await invoke('recovery_resolve', { owner, sequence: durableSequence });
-        if (revision === capture().revision) { dirty = false; recoveryMemory.delete(owner); }
+        await resolve(durableSequence, revision, 'save');
+        if (revision === capture().revision) { ownerRevision = revision; dirty = false; recoveryMemory.delete(owner); }
       });
     },
     async discard(revision: number): Promise<boolean> {
@@ -139,10 +174,10 @@ export function createRecoveryOwner(vault: DbAcceptedState['vault'], noteId: str
       if (!record || record.revision !== revision) record = await checkpoint();
       await ordered(async () => {
         if (durableSequence < record!.sequence) await durable(record!);
-        await invoke('recovery_resolve', { owner, sequence: record!.sequence });
+        await resolve(record!.sequence, revision, 'discard');
       });
       if (revision !== capture().revision) return false;
-      dirty = false; conflicted = false; recoveryMemory.delete(owner); return true;
+      ownerRevision = revision; dirty = false; conflicted = false; recoveryMemory.delete(owner); return true;
     },
     async fork(): Promise<{ note: Record<string, unknown>; revision: number; sequence: number }> {
       const revision = capture().revision;
@@ -179,6 +214,13 @@ export function createRecoveryOwner(vault: DbAcceptedState['vault'], noteId: str
       cancelJournalTimers();
       await tail;
       if (dirty || conflicted) return; // Native registry and memory still own it.
+      if (pinnedIdentity) {
+        await register();
+        // The editor may already expose another note's queue/base by unmount.
+        // Retire this owner's last acknowledged local revision, never capture it
+        // from a different pane session after awaiting the RPC tail.
+        await resolve(durableSequence, ownerRevision, 'release');
+      }
       await invoke('recovery_unregister', { owner });
     },
     watch(reread: () => Promise<void>) {
