@@ -9,6 +9,7 @@
 // Notebook membership is logical metadata; note paths remain stable IDs.
 
 import { invoke } from "@tauri-apps/api/core";
+import { recordVaultOpenStatus } from "./utils/vault-open-status";
 import type {
   NoteContent,
   DbAcceptedState,
@@ -33,6 +34,7 @@ export function isDbVault(): boolean {
 export function setDbMode(on: boolean): void {
   dbSessionGeneration++;
   dbMode = on;
+  if (!on) recordVaultOpenStatus(null);
 }
 
 export function looksLikeDbVault(path: string | null | undefined): boolean {
@@ -66,9 +68,14 @@ function toEntry(note: DbNote): NoteEntry {
   };
 }
 
+export interface DbOpenReport {
+  schema: number; previousSchema: number; status: string | null; vaultUuid: string; storageEpoch: string;
+}
 export async function dbOpenVault(path: string): Promise<void> {
-  await invoke("db_open_vault", { path });
+  recordVaultOpenStatus(null);
+  const report = await invoke<DbOpenReport>('db_open_vault', { path });
   setDbMode(true);
+  recordVaultOpenStatus(report?.status ?? null);
 }
 
 // Detached webviews have their own adapter flag, but share the native connection.
@@ -348,8 +355,9 @@ export async function dbCreateBackup(): Promise<import("./types").BackupEntry> {
 }
 
 export async function dbRestoreBackup(backupPath: string, vaultPath: string): Promise<void> {
+  const outcome = await invoke<AncestryRestoreOutcome | null>('db_restore_backup', { backupPath, vaultPath });
   dbSessionGeneration++;
-  return invoke("db_restore_backup", { backupPath, vaultPath });
+  if (outcome?.requires_recovery_review) recordVaultOpenStatus('Vault restored with a new storage epoch. Review recovered drafts before rebinding.');
 }
 
 export async function dbExportMd(outDir: string, vaultPath: string): Promise<number> {

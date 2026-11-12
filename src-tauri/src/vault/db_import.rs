@@ -504,7 +504,7 @@ mod real_vault_tests {
                 if path.exists() && !upsert {
                     std::fs::remove_file(&path).unwrap();
                 }
-                VaultDb::open(&path).unwrap()
+                VaultDb::open_legacy_v2(&path).unwrap()
             }
             Err(_) => VaultDb::open_in_memory().unwrap(),
         };

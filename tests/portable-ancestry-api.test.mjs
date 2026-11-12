@@ -8,7 +8,7 @@ const js = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind
 function fixture() {
   const calls=[]; const exports={}; let failure;
   const receipt={identity:{vault_uuid:'new-vault',storage_epoch:'new-epoch'},ledger_was_missing:true,requires_recovery_review:true};
-  runInNewContext(js,{exports,require:()=>({invoke:async(command,args)=>{calls.push([command,structuredClone(args)]);if(failure)throw failure;return receipt;}})});
+  runInNewContext(js,{exports,require:()=>({recordVaultOpenStatus:()=>{},invoke:async(command,args)=>{calls.push([command,structuredClone(args)]);if(failure)throw failure;return receipt;}})});
   return {api:exports,calls,receipt,fail(error){failure=error;}};
 }
 test('explicit restore/copy preserve destination, mode and operation identity without changing the displayed DB session',async()=>{

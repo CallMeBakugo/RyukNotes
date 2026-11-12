@@ -15,12 +15,21 @@ impl Fixture {
         }
     }
     fn db(&self) -> VaultDb {
-        VaultDb::open(&self.dir.path().join("test.rn")).unwrap()
+        VaultDb::open_with_report(
+            &self.dir.path().join("test.rn"),
+            &self.dir.path().join("host-data/ryuknotes/revision-ledger"),
+        )
+        .unwrap()
+        .0
     }
     fn run(&self, args: &[&str], input: &str) -> Output {
         let mut child = Command::new(env!("CARGO_BIN_EXE_ryuk"))
             .arg("--vault")
             .arg(self.dir.path().join("test.rn"))
+            .env(
+                "RYUK_V3_LEDGER",
+                self.dir.path().join("host-data/ryuknotes/revision-ledger"),
+            )
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -90,7 +99,18 @@ fn cli_tokens_tags_and_gui_saves_preserve_the_winning_state_in_both_orders() {
     let db = f.db();
     let base: Value = serde_json::from_str(&f.ok(&["notes", "show", &id, "--json"], "")).unwrap();
     let gui = gui_write(&db, &base, "GUI winner");
-    f.ok(&["notes", "tag", &id, "--add", "cli"], "");
+    f.ok(
+        &[
+            "notes",
+            "tag",
+            &id,
+            "--add",
+            "cli",
+            "--expected-token",
+            token(&gui),
+        ],
+        "",
+    );
     let tagged = db.accepted_note(&id).unwrap().unwrap();
     assert_eq!(tagged["content"], "GUI winner");
     assert_eq!(tagged["tags"], json!(["cli"]));
@@ -169,18 +189,47 @@ fn summary_repeats_replace_generated_state_but_manual_state_preserves_pending_in
                 let base = db.accepted_note(id).unwrap().unwrap();
                 gui_write(&db, &base, "manual");
             }
-            "title" => {
-                db.conn
-                    .execute("UPDATE notes SET title='manual' WHERE id=?1", [id])
-                    .unwrap();
-            }
-            "pinned" => {
-                db.conn
-                    .execute("UPDATE notes SET pinned=1 WHERE id=?1", [id])
-                    .unwrap();
+            "title" | "pinned" => {
+                let current = db.accepted_note(id).unwrap().unwrap();
+                let note = NewNote {
+                    id: id.into(),
+                    title: if field == "title" {
+                        "manual".into()
+                    } else {
+                        current["title"].as_str().unwrap().into()
+                    },
+                    content: current["content"].as_str().unwrap().into(),
+                    tags: serde_json::from_value(current["tags"].clone()).unwrap(),
+                    pinned: field == "pinned",
+                    created: current["created"].as_str().unwrap().into(),
+                    modified: "unused".into(),
+                };
+                db.write_authoritative(
+                    &NoteWrite::from_note(
+                        &db,
+                        &note,
+                        WritePolicy::Update {
+                            expected_token: token(&current).into(),
+                        },
+                    ),
+                    20,
+                )
+                .unwrap();
             }
             "tags" => {
-                f.ok(&["notes", "tag", id, "--add", "manual"], "");
+                let current = db.accepted_note(id).unwrap().unwrap();
+                f.ok(
+                    &[
+                        "notes",
+                        "tag",
+                        id,
+                        "--add",
+                        "manual",
+                        "--expected-token",
+                        token(&current),
+                    ],
+                    "",
+                );
             }
             _ => unreachable!(),
         }

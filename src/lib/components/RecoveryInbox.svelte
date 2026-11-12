@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { vaultOpenStatus } from '$lib/utils/vault-open-status';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import type { RecoveryDraft } from '$lib/utils/note-recovery';
@@ -54,8 +55,9 @@
   }
 </script>
 
-{#if drafts.length || orphanPins.length || notice || message}
+{#if drafts.length || orphanPins.length || notice || message || $vaultOpenStatus}
   <aside class="recovery-inbox" aria-label="Draft recovery">
+    {#if $vaultOpenStatus}<p role="status">{$vaultOpenStatus}</p>{/if}
     {#if notice}<p role="status">{notice}</p>{/if}
     {#if message}<p role="status">{message}</p>{/if}
     {#each drafts as draft (draft.owner)}

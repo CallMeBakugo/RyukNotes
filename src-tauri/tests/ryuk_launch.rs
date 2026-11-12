@@ -2,6 +2,7 @@
 #![cfg(unix)]
 
 use app_lib::vault::db::{NewNote, VaultDb};
+use app_lib::vault::writer::{NoteWrite, WritePolicy};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -18,13 +19,15 @@ impl Fixture {
         std::fs::create_dir_all(&dir).unwrap();
         let vault = dir.join("displayed vault.rn");
         let home = format!("home-{}", uuid::Uuid::new_v4());
-        let db = VaultDb::open(&vault).unwrap();
+        let db = VaultDb::open_with_report(&vault, &dir.join("ledger"))
+            .unwrap()
+            .0;
         for (id, body) in [
             (&home[..], "live home"),
             ("extra-a", "live extra A"),
             ("extra-b", "live extra B"),
         ] {
-            db.upsert_note(&NewNote {
+            let note = NewNote {
                 id: id.into(),
                 title: id.into(),
                 content: body.into(),
@@ -32,8 +35,9 @@ impl Fixture {
                 tags: vec![],
                 created: "2026-10-15T00:00:00Z".into(),
                 modified: "2026-10-15T00:00:00Z".into(),
-            })
-            .unwrap();
+            };
+            db.write_authoritative(&NoteWrite::from_note(&db, &note, WritePolicy::Create), 20)
+                .unwrap();
         }
         let program = dir.join("hermes");
         std::fs::write(
@@ -57,6 +61,11 @@ printf started > "$HERMES_TEST_DIR/started"
         Self { dir, vault, home }
     }
 
+    fn db(&self) -> VaultDb {
+        VaultDb::open_with_report(&self.vault, &self.dir.join("ledger"))
+            .unwrap()
+            .0
+    }
     fn context(&self) -> PathBuf {
         std::env::temp_dir().join("ryuk-sessions").join(&self.home)
     }
@@ -65,6 +74,7 @@ printf started > "$HERMES_TEST_DIR/started"
         let output = Command::new(env!("CARGO_BIN_EXE_ryuk"))
             .arg("--vault")
             .arg(&self.vault)
+            .env("RYUK_V3_LEDGER", self.dir.join("ledger"))
             .args(args)
             .env("PATH", &self.dir)
             .env("HERMES_TEST_DIR", &self.dir)
@@ -106,8 +116,7 @@ impl Drop for Fixture {
 #[test]
 fn linked_start_and_explicit_resume_routes_keep_extras_prompt_and_displayed_vault() {
     let f = Fixture::new();
-    VaultDb::open(&f.vault)
-        .unwrap()
+    f.db()
         .set_session_link(&f.home, "20261015_120000_abcdef")
         .unwrap();
     // Both established forms of extra notes survive the linked-session branch.
@@ -146,10 +155,7 @@ fn new_session_discovers_and_links_by_full_workspace() {
     let f = Fixture::new();
     f.run(&["session", "start", "--notes", &f.home]);
     assert_eq!(
-        VaultDb::open(&f.vault)
-            .unwrap()
-            .get_session_link(&f.home)
-            .unwrap(),
+        f.db().get_session_link(&f.home).unwrap(),
         Some("20261015_120000_abcdef".into())
     );
     let workspaces = std::fs::read_to_string(f.dir.join("workspaces")).unwrap();
@@ -171,11 +177,5 @@ fn failed_before_discovery_never_records_an_unverified_session_link() {
     )
     .unwrap();
     f.run(&["session", "start", "--notes", &f.home]);
-    assert_eq!(
-        VaultDb::open(&f.vault)
-            .unwrap()
-            .get_session_link(&f.home)
-            .unwrap(),
-        None
-    );
+    assert_eq!(f.db().get_session_link(&f.home).unwrap(), None);
 }

@@ -28,6 +28,7 @@ function fixture() {
   let interleave;
   let error;
   const adapter = load(adapterSource, { require: name => {
+    if (name === './utils/vault-open-status') return { recordVaultOpenStatus: () => {} };
     assert.equal(name, '@tauri-apps/api/core');
     return { invoke: async (command, args) => {
       if (command === 'db_get_note') { reads++; return stored && receipt(stored); }

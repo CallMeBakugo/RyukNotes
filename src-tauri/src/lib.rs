@@ -263,6 +263,7 @@ pub fn run() {
             commands::db_open_vault,
             commands::db_close,
             commands::db_is_open,
+            commands::db_revision_status,
             commands::db_list_notes,
             commands::db_get_note,
             recovery::recovery_origin,

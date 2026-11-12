@@ -4202,19 +4202,23 @@ pub fn ai_ask(
 // VaultDb per running app; operations are short and run inline (WAL mode).
 
 #[tauri::command]
-pub fn db_open(state: State<'_, AppState>, path: String) -> Result<(), String> {
+pub fn db_open(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<crate::vault::db::OpenReport, String> {
     state
         .recovery
         .lock()
         .map_err(|e| e.to_string())?
         .assert_quiet(None, None)?;
-    let db = crate::vault::db::VaultDb::open(std::path::Path::new(&path))?;
+    let root = crate::vault::ancestry::production_ledger_root(Path::new(&path))?;
+    let (db, report) = crate::vault::db::VaultDb::open_with_report(Path::new(&path), &root)?;
     let mut slot = state.vault_db.lock().map_err(|e| e.to_string())?;
     *slot = Some(db);
     state
         .vault_db_epoch
         .fetch_add(1, std::sync::atomic::Ordering::Release);
-    Ok(())
+    Ok(report)
 }
 
 #[tauri::command]
@@ -4802,7 +4806,10 @@ pub fn db_list_versions(
 /// app config the same way `open_vault` does for directory vaults. No search
 /// index and no filesystem watcher — the DB is the source of truth.
 #[tauri::command]
-pub async fn db_open_vault(state: State<'_, AppState>, path: String) -> Result<(), String> {
+pub async fn db_open_vault(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<crate::vault::db::OpenReport, String> {
     let _transition = state.vault_transition.lock().await;
     state
         .recovery
@@ -4814,10 +4821,8 @@ pub async fn db_open_vault(state: State<'_, AppState>, path: String) -> Result<(
             "'{path}' is not a RyukNotes database (expected a .rn file)"
         ));
     }
-    if !std::path::Path::new(&path).is_file() {
-        return Err(format!("'{path}' does not exist"));
-    }
-    let db = crate::vault::db::VaultDb::open(std::path::Path::new(&path))?;
+    let root = crate::vault::ancestry::production_ledger_root(Path::new(&path))?;
+    let (db, report) = crate::vault::db::VaultDb::open_with_report(Path::new(&path), &root)?;
     {
         let mut slot = state.vault_db.lock().map_err(|e| e.to_string())?;
         *slot = Some(db);
@@ -4841,10 +4846,13 @@ pub async fn db_open_vault(state: State<'_, AppState>, path: String) -> Result<(
         });
     }
     next.active_vault = Some(path);
-    save_app_config(&next)?;
+    save_app_config(&next).map_err(|error| match &report.status {
+        Some(status) => format!("{status} Unable to save vault configuration: {error}"),
+        None => error,
+    })?;
     *config = next;
     drop(config);
-    Ok(())
+    Ok(report)
 }
 
 /// Spawns a terminal emulator running `ryuk <args>`, detached. The Hermes
@@ -5048,16 +5056,7 @@ pub fn db_create_backup(
         let filename = format!("{stem}-db-backup-{stamp}.rn");
         let backup_path = backup_dir.join(&filename);
         with_db(&state, |db| {
-            db.conn
-                .pragma_update(None, "wal_checkpoint", "TRUNCATE")
-                .map_err(|e| e.to_string())?;
-            db.conn
-                .execute(
-                    "VACUUM INTO ?1",
-                    rusqlite::params![backup_path.to_string_lossy().as_ref()],
-                )
-                .map_err(|e| e.to_string())?;
-            Ok(())
+            crate::vault::ancestry::snapshot(&db.conn, &backup_path, false, true)
         })?;
         let size = std::fs::metadata(&backup_path)
             .map(|m| m.len())
@@ -5113,25 +5112,32 @@ pub fn db_create_backup(
 /// DB-mode restore: close the DB, copy the backup over the vault, reopen.
 /// The frontend must refresh all lists afterward.
 #[tauri::command]
-pub fn db_restore_backup(
+pub fn db_restore_backup<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppState>,
     backup_path: String,
     vault_path: String,
-) -> Result<(), String> {
-    // Stage 4B: production restore must not overwrite an ancestry vault through
-    // the v2 path. Explicit v3 restore is native-feature-gated until activation.
-    for path in [&backup_path, &vault_path] {
-        let version = crate::vault::ancestry::inspect_version(std::path::Path::new(path))?;
-        if version > 2 {
-            return Err("Schema 3 restore requires the gated ancestry restore protocol".into());
-        }
+) -> Result<Option<crate::vault::ancestry::RestoreOutcome>, String> {
+    let target_version = crate::vault::ancestry::inspect_version(Path::new(&vault_path))?;
+    let source_version = crate::vault::ancestry::inspect_version(Path::new(&backup_path))?;
+    if target_version != 3 || source_version != 3 {
+        return Err("Schema 3 restore requires a matching schema 3 backup; import legacy backups into a separate vault".into());
     }
     state
         .recovery
         .lock()
         .map_err(|e| e.to_string())?
         .assert_quiet(Some(&vault_path), None)?;
-    // Close the DB so we are not copying over an open handle.
+    let root = with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        let source =
+            crate::vault::ancestry::Inspection::open(Path::new(&backup_path))?.identity()?;
+        let current = crate::vault::ancestry::identity(&db.conn)?;
+        if source.vault_uuid != current.vault_uuid {
+            return Err("Backup belongs to a different vault UUID".into());
+        }
+        Ok(db.revision_ledger_root()?.to_path_buf())
+    })?;
     {
         let mut slot = state.vault_db.lock().map_err(|e| e.to_string())?;
         *slot = None;
@@ -5139,27 +5145,31 @@ pub fn db_restore_backup(
             .vault_db_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
-    let maintenance = crate::vault::ancestry::Maintenance::exclusive(Path::new(&vault_path))?;
-    let backup_maintenance = crate::vault::ancestry::Maintenance::shared(Path::new(&backup_path))?;
-    // Recheck under both leases: the first preflight was deliberately before
-    // disposing the current connection, and another process could migrate then.
-    for path in [&backup_path, &vault_path] {
-        if crate::vault::ancestry::inspect_version(Path::new(path))? > 2 {
-            return Err("Schema changed while preparing restore; reopen read-only".into());
+    let outcome = match crate::vault::ancestry::restore(
+        Path::new(&vault_path),
+        Path::new(&backup_path),
+        &root,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // A pre-replacement failure can safely reopen its old session.
+            // Pending/uncertain restore epochs stay closed for recovery.
+            if let Ok(db) = crate::vault::db::VaultDb::open_v3(Path::new(&vault_path), &root) {
+                *state.vault_db.lock().map_err(|e| e.to_string())? = Some(db);
+            }
+            return Err(error);
         }
-    }
-    let temp = std::path::Path::new(&vault_path).with_extension("rn.restoring");
-    std::fs::copy(&backup_path, &temp).map_err(|e| e.to_string())?;
-    std::fs::rename(&temp, &vault_path).map_err(|e| e.to_string())?;
-    drop(backup_maintenance);
-    drop(maintenance);
-    let db = crate::vault::db::VaultDb::open(std::path::Path::new(&vault_path))?;
-    let mut slot = state.vault_db.lock().map_err(|e| e.to_string())?;
-    *slot = Some(db);
+    };
+    let db = crate::vault::db::VaultDb::open_v3(Path::new(&vault_path), &root)?;
+    *state.vault_db.lock().map_err(|e| e.to_string())? = Some(db);
     state
         .vault_db_epoch
         .fetch_add(1, std::sync::atomic::Ordering::Release);
-    Ok(())
+    let _ = app.emit(
+        "vault-restored",
+        serde_json::json!({"vault_path":vault_path,"requires_recovery_review":true}),
+    );
+    Ok(Some(outcome))
 }
 
 /// Export the DB vault to a folder of .md files — the inverse of the
@@ -5245,6 +5255,7 @@ static MOBILE_CONFIG_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::O
 
 #[cfg(mobile)]
 pub fn set_mobile_config_dir(path: std::path::PathBuf) {
+    crate::vault::ancestry::set_mobile_ledger_root(path.join("ryuknotes").join("revision-ledger"));
     let _ = MOBILE_CONFIG_DIR.set(path);
 }
 
@@ -6278,6 +6289,14 @@ mod db_command_tests {
     use crate::types::AppConfig;
     use tauri::Manager;
 
+    fn db_open(state: State<'_, AppState>, path: String) -> Result<(), String> {
+        let db = crate::vault::db::VaultDb::open_legacy_v2(Path::new(&path))?;
+        *state.vault_db.lock().unwrap() = Some(db);
+        state
+            .vault_db_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
     fn app_with_state() -> tauri::App<tauri::test::MockRuntime> {
         tauri::test::mock_builder()
             .plugin(tauri_plugin_fs::init())
@@ -6336,10 +6355,7 @@ mod db_command_tests {
             },
         )
         .unwrap_err();
-        assert!(error
-            .as_str()
-            .unwrap()
-            .contains("gated ancestry restore protocol"));
+        assert!(error.as_str().unwrap().contains("matching schema 3 backup"));
         assert!(state.vault_db.lock().unwrap().is_some());
         assert_eq!(
             crate::vault::ancestry::inspect_version(&current).unwrap(),
@@ -6766,7 +6782,7 @@ mod db_command_tests {
         .unwrap();
 
         // Simulate the CLI writing through its own SQLite connection.
-        let cli = crate::vault::db::VaultDb::open(&path).unwrap();
+        let cli = crate::vault::db::VaultDb::open_legacy_v2(&path).unwrap();
         cli.upsert_note(&crate::vault::db::NewNote {
             id: "n1".into(),
             title: "CLI title".into(),
@@ -7343,22 +7359,14 @@ pub fn db_restore_ancestry_export<R: Runtime>(
         .lock()
         .map_err(|e| e.to_string())?
         .assert_quiet(None, None)?;
-    #[cfg(any(test, feature = "revision-ancestry"))]
-    {
-        let outcome = crate::vault::portable_ancestry::restore_export(
-            Path::new(&source_dir),
-            Path::new(&destination),
-            Path::new(&ledger_root),
-            mode,
-            &operation_id,
-        )?;
-        serde_json::to_value(outcome).map_err(|e| e.to_string())
-    }
-    #[cfg(not(any(test, feature = "revision-ancestry")))]
-    {
-        let _ = (destination, ledger_root, mode, operation_id);
-        Err("Portable ancestry restoration requires the gated revision-ancestry build; production activation awaits all 4B–4E native gates".into())
-    }
+    let outcome = crate::vault::portable_ancestry::restore_export(
+        Path::new(&source_dir),
+        Path::new(&destination),
+        Path::new(&ledger_root),
+        mode,
+        &operation_id,
+    )?;
+    serde_json::to_value(outcome).map_err(|e| e.to_string())
 }
 #[tauri::command]
 pub fn db_reconcile_ancestry_export<R: Runtime>(
@@ -7378,4 +7386,236 @@ pub fn db_reconcile_ancestry_export<R: Runtime>(
         validate_db_vault(db, &vault_path)?;
         crate::vault::portable_ancestry::reconcile_export(Path::new(&source_dir), db, &operation_id)
     })
+}
+
+/// Read-only inspection for Stage 4F: connection-local data_version is a hint,
+/// not a baseline or a global sequence. Exposes no note bodies/private journals.
+#[tauri::command]
+pub fn db_revision_status(
+    state: State<'_, AppState>,
+    vault_path: String,
+) -> Result<serde_json::Value, String> {
+    // Match the established registry -> DB order used by recovery mutations.
+    let recovery = state.recovery.lock().map_err(|e| e.to_string())?;
+    with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        let read = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let identity = crate::vault::ancestry::identity(&read)?;
+        let session = db
+            .revision_session
+            .as_ref()
+            .ok_or("Expected schema 3 session")?;
+        let counts=read.query_row("SELECT (SELECT COUNT(*) FROM revisions),(SELECT COUNT(*) FROM revision_states),(SELECT COUNT(*) FROM revision_pins),(SELECT COUNT(*) FROM revision_pruning)",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?))).map_err(|e|e.to_string())?;
+        let version: i64 = read
+            .pragma_query_value(None, "data_version", |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        read.commit().map_err(|e| e.to_string())?;
+        Ok(
+            serde_json::json!({"schema":3,"vaultUuid":identity.vault_uuid,"storageEpoch":identity.storage_epoch,
+            "connectionId":session.instance,"ledgerRoot":session.ledger_root,"dataVersion":version,
+            "headers":counts.0,"retainedStates":counts.1,"pins":counts.2,"prunedStates":counts.3,
+            "owners":recovery.owner_diagnostics(&db.identity().path)}),
+        )
+    })
+}
+
+#[cfg(test)]
+mod activated_vault_tests {
+    use super::*;
+    use crate::vault::{
+        db::{NewNote, VaultDb},
+        writer::{NoteWrite, WritePolicy},
+    };
+    #[test]
+    fn actual_open_status_and_restore_ipc_keep_dirty_windows_and_retire_only_clean_old_epoch_owners(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("activate.rn");
+        let old = VaultDb::open_legacy_v2(&path).unwrap();
+        old.upsert_note(&NewNote {
+            id: "n".into(),
+            title: "Title".into(),
+            content: "backup body".into(),
+            tags: vec![],
+            pinned: false,
+            created: "2020".into(),
+            modified: "2020".into(),
+        })
+        .unwrap();
+        drop(old);
+        let app = tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![
+                db_open,
+                db_revision_status,
+                db_restore_backup,
+                crate::recovery::recovery_register_revision,
+                crate::recovery::recovery_status,
+                crate::recovery::recovery_resolve_revision,
+                crate::recovery::recovery_unregister
+            ])
+            .manage(AppState::new(AppConfig::default()))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = app.state::<AppState>();
+        state
+            .recovery
+            .lock()
+            .unwrap()
+            .set_root(dir.path().join("private"))
+            .unwrap();
+        let main = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let detached = tauri::WebviewWindowBuilder::new(&app, "note-detached", Default::default())
+            .build()
+            .unwrap();
+        let request = |view: &tauri::WebviewWindow<tauri::test::MockRuntime>,
+                       cmd: &str,
+                       body: serde_json::Value| {
+            tauri::test::get_ipc_response(
+                view,
+                tauri::webview::InvokeRequest {
+                    cmd: cmd.into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: "http://tauri.localhost".parse().unwrap(),
+                    body: tauri::ipc::InvokeBody::Json(body),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.into(),
+                },
+            )
+        };
+        let report: serde_json::Value = request(&main, "db_open", serde_json::json!({"path":path}))
+            .unwrap()
+            .deserialize()
+            .unwrap();
+        assert_eq!(report["schema"], 3);
+        assert_eq!(report["previousSchema"], 2);
+        assert!(report["status"].as_str().unwrap().contains("snapshot"));
+        let backup = dir.path().join("backup.rn");
+        let (vault, current) = {
+            let slot = state.vault_db.lock().unwrap();
+            let db = slot.as_ref().unwrap();
+            crate::vault::ancestry::snapshot(&db.conn, &backup, false, true).unwrap();
+            let base = db.accepted_note("n").unwrap().unwrap();
+            let note = NewNote {
+                id: "n".into(),
+                title: "Title".into(),
+                content: "current body".into(),
+                tags: vec![],
+                pinned: false,
+                created: base["created"].as_str().unwrap().into(),
+                modified: "ignored".into(),
+            };
+            let current = db
+                .write_authoritative(
+                    &NoteWrite::from_note(
+                        db,
+                        &note,
+                        WritePolicy::Update {
+                            expected_token: base["accepted"]["token"].as_str().unwrap().into(),
+                        },
+                    ),
+                    0,
+                )
+                .unwrap();
+            (db.identity(), current)
+        };
+        let a = uuid::Uuid::new_v4().to_string();
+        let b = uuid::Uuid::new_v4().to_string();
+        for (view, id) in [(&main, &a), (&detached, &b)] {
+            request(view,"recovery_register_revision",serde_json::json!({"owner":id,"vault":vault,"noteId":"n","accepted":current["accepted"]})).unwrap();
+            request(
+                view,
+                "recovery_status",
+                serde_json::json!({"owner":id,"dirty":false,"conflicted":false,"locked":true}),
+            )
+            .unwrap();
+        }
+        request(
+            &detached,
+            "recovery_status",
+            serde_json::json!({"owner":b,"dirty":true,"conflicted":true,"locked":false}),
+        )
+        .unwrap();
+        let args = serde_json::json!({"vaultPath":path,"backupPath":backup});
+        assert!(request(&main, "db_restore_backup", args.clone()).is_err());
+        assert_eq!(
+            state
+                .vault_db
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get_note_content("n")
+                .unwrap()
+                .unwrap(),
+            "current body"
+        );
+        // Explicitly discard the synthetic dirty draft through the durable
+        // resolution path, even though no checkpoint was published. Retain the
+        // accepted-base pin and owner until their post-restore acknowledgment;
+        // renderer status alone must never clear a potentially memory-only draft.
+        request(
+            &detached,
+            "recovery_status",
+            serde_json::json!({"owner":b,"dirty":false,"conflicted":false,"locked":true}),
+        )
+        .unwrap();
+        assert!(request(&main, "db_restore_backup", args.clone()).is_err());
+        let binding =
+            crate::vault::revision_retention::RevisionBinding::from_accepted(&current["accepted"])
+                .unwrap();
+        request(
+            &detached,
+            "recovery_resolve_revision",
+            serde_json::json!({"owner":b,"identity":binding,"sequence":0,"localRevision":0,"action":"discard","nextAccepted":current["accepted"]}),
+        )
+        .unwrap();
+        request(
+            &detached,
+            "recovery_status",
+            serde_json::json!({"owner":b,"dirty":false,"conflicted":false,"locked":true}),
+        )
+        .unwrap();
+        let outcome: serde_json::Value = request(&main, "db_restore_backup", args)
+            .unwrap()
+            .deserialize()
+            .unwrap();
+        assert_eq!(outcome["requires_recovery_review"], true);
+        assert_ne!(outcome["identity"]["storage_epoch"], report["storageEpoch"]);
+        let status: serde_json::Value = request(
+            &main,
+            "db_revision_status",
+            serde_json::json!({"vaultPath":path}),
+        )
+        .unwrap()
+        .deserialize()
+        .unwrap();
+        assert_eq!(status["owners"].as_array().unwrap().len(), 2);
+        assert_eq!(status["schema"], 3);
+        for (view, id) in [(&main, &a), (&detached, &b)] {
+            let binding = crate::vault::revision_retention::RevisionBinding::from_accepted(
+                &current["accepted"],
+            )
+            .unwrap();
+            request(view,"recovery_resolve_revision",serde_json::json!({"owner":id,"identity":binding,"sequence":0,"localRevision":0,"action":"release","nextAccepted":null})).unwrap();
+            request(view, "recovery_unregister", serde_json::json!({"owner":id})).unwrap();
+        }
+        let status: serde_json::Value = request(
+            &main,
+            "db_revision_status",
+            serde_json::json!({"vaultPath":path}),
+        )
+        .unwrap()
+        .deserialize()
+        .unwrap();
+        assert!(status["owners"].as_array().unwrap().is_empty());
+        let slot = state.vault_db.lock().unwrap();
+        let db = slot.as_ref().unwrap();
+        assert_eq!(db.get_note_content("n").unwrap().unwrap(), "backup body");
+        assert!(db
+            .accepted_at_token("n", current["accepted"]["token"].as_str().unwrap())
+            .is_err());
+    }
 }

@@ -635,8 +635,8 @@ mod tests {
         for gui_first in [true, false] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("test.rn");
-            let gui = VaultDb::open(&path).unwrap();
-            let cli = VaultDb::open(&path).unwrap();
+            let gui = VaultDb::open_legacy_v2(&path).unwrap();
+            let cli = VaultDb::open_legacy_v2(&path).unwrap();
             let base = create(&gui);
             assert_eq!(gui.identity(), cli.identity());
             let (first, second) = if gui_first {
@@ -670,8 +670,8 @@ mod tests {
         for field in ["title", "tags", "pinned", "trashed", "deleted"] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("test.rn");
-            let gui = VaultDb::open(&path).unwrap();
-            let other = VaultDb::open(&path).unwrap();
+            let gui = VaultDb::open_legacy_v2(&path).unwrap();
+            let other = VaultDb::open_legacy_v2(&path).unwrap();
             let base = create(&gui);
             match field {
                 "title" => {
@@ -716,8 +716,8 @@ mod tests {
     fn atomic_tags_preserve_gui_body_and_make_older_gui_metadata_stale() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.rn");
-        let gui = VaultDb::open(&path).unwrap();
-        let cli = VaultDb::open(&path).unwrap();
+        let gui = VaultDb::open_legacy_v2(&path).unwrap();
+        let cli = VaultDb::open_legacy_v2(&path).unwrap();
         let base = create(&gui);
         let acknowledged = gui
             .write_authoritative(&update(&gui, &base, "GUI body"), 20)
@@ -773,7 +773,7 @@ mod tests {
     fn different_or_replaced_vault_identity_is_a_typed_conflict() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.rn");
-        let db = VaultDb::open(&path).unwrap();
+        let db = VaultDb::open_legacy_v2(&path).unwrap();
         let base = create(&db);
         let other = VaultDb::open_in_memory().unwrap();
         let mut wrong = update(&other, &base, "draft");

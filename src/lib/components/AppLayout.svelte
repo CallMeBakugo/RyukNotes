@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { sameAcceptedNote } from '$lib/utils/accepted-note';
 	import { invoke } from '@tauri-apps/api/core';
 	import RecoveryInbox from './RecoveryInbox.svelte';
 	import { createEditorWorkspace, provideEditorWorkspace, splitRatioBounds, type PaneId, type PaneNavigation, type PaneRelease, type WorkspacePane } from '$lib/stores/editor-workspace';
@@ -976,7 +977,7 @@
 				if (restored && content.raw !== instance?.getAcceptedRaw()) instance?.flagExternalConflict();
 				return;
 			}
-			if (get(context.activeNote) !== openingNote || content.raw === openingNote.raw) return;
+			if (get(context.activeNote) !== openingNote || sameAcceptedNote(openingNote, content)) return;
 			context.activeNote.set(content);
 			if (get(context.viewerNote)?.path === path) context.viewerNote.set({ path, content: content.content });
 			instance?.loadNote(path, content.content);

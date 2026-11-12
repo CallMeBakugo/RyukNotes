@@ -1,6 +1,5 @@
 //! Stage 4C: every official v3 mutation uses this transaction, including auxiliary
-//! routes. Production opens/creation stay v2 until 4E; opt-in v3 is complete, not
-//! a mixture of guarded editor writes and unchecked import/lifecycle writes.
+//! routes. Production opens and creation use the complete v3 writer contract.
 use super::writer::{WriteError, WriteErrorKind};
 use super::{
     ancestry::{self, FullState, Identity, Ledger},
@@ -69,13 +68,17 @@ impl Drop for ResetOperation<'_> {
 }
 
 impl VaultDb {
+    pub fn revision_ledger_root(&self) -> Result<&Path, String> {
+        self.revision_session
+            .as_ref()
+            .map(|session| session.ledger_root.as_path())
+            .ok_or("Expected revision vault".into())
+    }
     pub fn is_v3(&self) -> bool {
         self.revision_session.is_some()
     }
 
-    /// Explicit tooling/fixture entry point. Neither GUI startup nor CLI vault
-    /// selection activates this. All ordinary opens still reject v3 until 4E.
-    #[cfg(any(test, feature = "revision-ancestry"))]
+    /// Attach an already-enrolled v3 vault; ordinary opens migrate first.
     pub fn open_v3(path: &Path, ledger_root: &Path) -> Result<Self, String> {
         if ancestry::inspect_version(path)? != 3 {
             return Err("Expected schema 3".into());
@@ -99,6 +102,8 @@ impl VaultDb {
         let ledger = Ledger::acquire(ledger_root, &identity.vault_uuid)?;
         ledger.verify_session(path, &identity)?;
         drop(ledger);
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(error)?;
         let guard = Arc::new(AtomicBool::new(false));
         let flag = guard.clone();
         conn.create_scalar_function(

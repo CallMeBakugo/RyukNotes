@@ -35,13 +35,6 @@ fn resolve_vault(flag: Option<&str>) -> Result<PathBuf, String> {
 
 fn open_vault(flag: Option<&str>) -> Result<VaultDb, String> {
     let path = resolve_vault(flag)?;
-    // Explicit opt-in native tooling only; default production selection stays v2.
-    #[cfg(feature = "revision-ancestry")]
-    if let Some(root) = std::env::var_os("RYUK_V3_LEDGER") {
-        if app_lib::vault::ancestry::inspect_version(&path)? == 3 {
-            return VaultDb::open_v3(&path, std::path::Path::new(&root));
-        }
-    }
     VaultDb::open(&path)
 }
 
@@ -58,7 +51,7 @@ USAGE:
   ryuk [--vault PATH] notes show <id> [--json]
   ryuk [--vault PATH] notes update <id> --expected-token <token> --stdin
   ryuk [--vault PATH] notes new <title> [--tag a --tag b] [--stdin]
-  ryuk [--vault PATH] notes tag <id> [--add a] [--remove b] [--expected-token TOKEN] [--operation-id ID]
+  ryuk [--vault PATH] notes tag <id> --expected-token TOKEN [--add a] [--remove b] [--operation-id ID]
   ryuk [--vault PATH] notes search <query>
   ryuk [--vault PATH] notes trash <id> | restore <id>
   ryuk [--vault PATH] session import --file <summary.json>

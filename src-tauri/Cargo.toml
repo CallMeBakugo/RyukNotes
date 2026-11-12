@@ -8,7 +8,7 @@ license = "AGPL-3.0-or-later"
 edition = "2021"
 rust-version = "1.88"
 
-# Stage 4B is opt-in only. Ordinary GUI/CLI creation and writers remain schema 2.
+# Compatibility feature name retained for existing tooling; production ancestry is active.
 [features]
 revision-ancestry = []
 

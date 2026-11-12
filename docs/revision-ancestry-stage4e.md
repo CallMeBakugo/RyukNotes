@@ -1,4 +1,9 @@
-# Stage 4E — portable ancestry; activation gate remains closed
+# Stage 4E — portable ancestry (pre-activation audit)
+
+> Follow-up: the human reported a complete host collect pass for 4B–4E and
+> authorized production activation using that proof. The current activation and
+> outstanding human gate are documented in [Stage 4F](revision-ancestry-stage4f.md).
+> The blocked status below records this earlier session, not current behavior.
 
 Portable ancestry is implemented for the explicit native v3/tooling boundary.
 **Production activation was not performed.** The request makes activation

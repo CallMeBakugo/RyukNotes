@@ -22,7 +22,8 @@ use std::path::Path;
 /// to accidental video drops.
 pub const DEFAULT_MAX_ATTACHMENT_BYTES: i64 = 25 * 1024 * 1024;
 
-const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
+const LEGACY_SCHEMA_VERSION: i64 = 2;
 
 pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
@@ -86,6 +87,15 @@ CREATE TABLE IF NOT EXISTS session_links (
 CREATE INDEX IF NOT EXISTS idx_session_links_session ON session_links(session_id);
 "#;
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenReport {
+    pub schema: i64,
+    pub previous_schema: i64,
+    pub status: Option<String>,
+    pub vault_uuid: String,
+    pub storage_epoch: String,
+}
 pub struct VaultDb {
     pub conn: Connection,
     pub max_attachment_bytes: i64,
@@ -132,15 +142,50 @@ pub struct AttachmentMeta {
 }
 
 impl VaultDb {
-    /// Opens (creating if needed) the vault database and applies migrations.
+    /// Production GUI and CLI share the same private ledger. Only explicit
+    /// recovery/restore can enroll a v3 file with a missing/retired ledger.
     pub fn open(path: &Path) -> Result<Self, String> {
+        let root = super::ancestry::production_ledger_root(path)?;
+        let (db, report) = Self::open_with_report(path, &root)?;
+        if let Some(status) = report.status {
+            eprintln!("{status}");
+        }
+        Ok(db)
+    }
+    pub fn open_with_report(path: &Path, ledger_root: &Path) -> Result<(Self, OpenReport), String> {
+        let from = super::ancestry::inspect_version(path)?;
+        if from < SCHEMA_VERSION {
+            super::ancestry::migrate(path, ledger_root)?;
+        }
+        let db = Self::open_v3(path, ledger_root)?;
+        let identity = super::ancestry::identity(&db.conn)?;
+        let status = match from {
+            1 | 2 => Some(format!(
+                "Vault upgraded from schema {from} to 3; private pre-migration snapshot saved."
+            )),
+            0 => Some("Created schema 3 vault.".into()),
+            _ => None,
+        };
+        Ok((
+            db,
+            OpenReport {
+                schema: SCHEMA_VERSION,
+                previous_schema: from,
+                status,
+                vault_uuid: identity.vault_uuid,
+                storage_epoch: identity.storage_epoch,
+            },
+        ))
+    }
+    // Frozen compatibility fixture path: production never calls this opener.
+    #[cfg(test)]
+    /// Opens (creating if needed) the vault database and applies migrations.
+    pub fn open_legacy_v2(path: &Path) -> Result<Self, String> {
         // Preflight read-only: future/malformed versions must not change WAL mode
-        // or create snapshots. All production writers stay v2 through Stage 4B.
+        // or create snapshots. This path is a frozen v2 compatibility fixture.
         let version = super::ancestry::inspect_version(path)?;
-        if version > SCHEMA_VERSION {
-            return Err(format!(
-                "Unsupported vault schema version {version}; v3 is read-only until Stage 4E"
-            ));
+        if version > LEGACY_SCHEMA_VERSION {
+            return Err(format!("Unsupported vault schema version {version}"));
         }
         let maintenance = if version == 1 {
             super::ancestry::Maintenance::exclusive(path)?
@@ -152,7 +197,7 @@ impl VaultDb {
         maintenance.downgrade()?;
         // Lock conversion may briefly yield to queued maintenance. Revalidate
         // after acquiring shared ownership before exposing the v2 connection.
-        if super::ancestry::inspect_version(path)? != SCHEMA_VERSION {
+        if super::ancestry::inspect_version(path)? != LEGACY_SCHEMA_VERSION {
             return Err(
                 "Vault schema changed while opening; retry with a compatible client".into(),
             );
@@ -163,13 +208,15 @@ impl VaultDb {
         Ok(db)
     }
 
+    /// Legacy v2 scratch database for import/compatibility fixtures; file-backed
+    /// production vault creation always uses open/open_with_report.
     pub fn open_in_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
         Self::init(conn)
     }
 
     fn init(conn: Connection) -> Result<Self, String> {
-        Self::init_target(conn, SCHEMA_VERSION, None)
+        Self::init_target(conn, LEGACY_SCHEMA_VERSION, None)
     }
 
     pub(crate) fn init_target(
@@ -1248,7 +1295,7 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         legacy_fixture(&conn);
         drop(conn);
-        let db = VaultDb::open(&path).unwrap();
+        let db = VaultDb::open_legacy_v2(&path).unwrap();
         let (meta, bytes) = db.get_attachment_data("asset-id").unwrap().unwrap();
         assert_eq!(meta.note_ids, vec!["a", "b", "c"]);
         assert_eq!(meta.filename, "f.bin");
@@ -1257,7 +1304,7 @@ mod tests {
         db.delete_note("a").unwrap();
         assert!(db.get_attachment_data("asset-id").unwrap().is_some());
         drop(db);
-        let db = VaultDb::open(&path).unwrap();
+        let db = VaultDb::open_legacy_v2(&path).unwrap();
         assert_eq!(
             db.get_attachment_data("asset-id")
                 .unwrap()
@@ -1291,7 +1338,7 @@ mod tests {
         assert_eq!(owner, "a");
         drop(snapshot);
         // Restoring a v1 snapshot must run the migration again successfully.
-        assert!(VaultDb::open(&snapshots[0])
+        assert!(VaultDb::open_legacy_v2(&snapshots[0])
             .unwrap()
             .get_attachment_data("asset-id")
             .unwrap()
@@ -1320,13 +1367,13 @@ mod tests {
         assert_eq!(violations, 5);
         drop(conn);
 
-        let db = VaultDb::open(&path).unwrap();
+        let db = VaultDb::open_legacy_v2(&path).unwrap();
         assert_eq!(
             db.get_attachment_data("asset-id").unwrap().unwrap().1,
             vec![0, 1, 255]
         );
         drop(db);
-        let db = VaultDb::open(&path).unwrap();
+        let db = VaultDb::open_legacy_v2(&path).unwrap();
         let version: String = db
             .conn
             .query_row(
@@ -1373,7 +1420,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let error = VaultDb::open(&path)
+        let error = VaultDb::open_legacy_v2(&path)
             .err()
             .expect("migration must reject invalid tags");
         assert!(
@@ -1424,7 +1471,7 @@ mod tests {
         let path = dir.path().join("invalid.rn");
         conn.execute("VACUUM INTO ?1", params![path.to_string_lossy().as_ref()])
             .unwrap();
-        assert!(VaultDb::open(&path).is_err());
+        assert!(VaultDb::open_legacy_v2(&path).is_err());
         let original = Connection::open(&path).unwrap();
         let version: String = original
             .query_row(
@@ -1442,7 +1489,7 @@ mod tests {
             .execute("UPDATE meta SET value='999' WHERE key='schema_version'", [])
             .unwrap();
         drop(original);
-        assert!(VaultDb::open(&path).is_err());
+        assert!(VaultDb::open_legacy_v2(&path).is_err());
         let original = Connection::open(&path).unwrap();
         let version: String = original
             .query_row(

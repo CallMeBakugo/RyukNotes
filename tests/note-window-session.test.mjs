@@ -13,7 +13,7 @@ function load(source, names, globals) {
   const js = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
-  runInNewContext(js, { exports, ...globals, require: () => globals });
+  runInNewContext(js, { exports, ...globals, require: () => ({ recordVaultOpenStatus: () => {}, ...globals }) });
   return Object.fromEntries(names.map(name => [name, exports[name]]));
 }
 function runtime(invoke) {

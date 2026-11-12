@@ -1,7 +1,7 @@
-//! Stage 4B foundation. Production writers remain v2; v3 is inspected read-only.
+//! Durable schema 3 identity, migration and restore protocol. Production opens
+//! activate the same guarded writer session used by the staged fixtures.
 //! No revision integers or content hashes alone authorize a write. See the approved
 //! schema proposal for ledger-loss, non-cooperating SQL and multi-host limits.
-#[cfg(any(test, feature = "revision-ancestry"))]
 use super::db::VaultDb;
 use fs4::FileExt;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -12,6 +12,35 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+// GUI and CLI must resolve exactly the same host ledger. The explicit override
+// is useful for disposable Stage 4F runs; it never silently re-enrolls v3 data.
+static MOBILE_LEDGER_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+pub fn set_mobile_ledger_root(root: PathBuf) {
+    let _ = MOBILE_LEDGER_ROOT.set(root);
+}
+pub fn production_ledger_root(vault: &Path) -> Result<PathBuf, String> {
+    #[cfg(test)]
+    {
+        Ok(vault
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("test-revision-ledger"))
+    }
+    #[cfg(not(test))]
+    {
+        let _ = vault;
+        if let Some(root) = std::env::var_os("RYUK_V3_LEDGER") {
+            return Ok(PathBuf::from(root));
+        }
+        if let Some(root) = MOBILE_LEDGER_ROOT.get() {
+            return Ok(root.clone());
+        }
+        dirs::data_local_dir()
+            .map(|root| root.join("ryuknotes").join("revision-ledger"))
+            .ok_or("Private data directory unavailable".into())
+    }
+}
 
 pub(crate) const DDL: &str = include_str!("ancestry.sql");
 fn err(error: impl std::fmt::Display) -> String {
@@ -118,6 +147,9 @@ impl Maintenance {
         })?;
         Ok(Self { _file: file })
     }
+    /// Lock-conversion seam used only by the frozen v2 compatibility fixture
+    /// (open_legacy_v2), which itself exists only under test compilation.
+    #[cfg(test)]
     pub(crate) fn downgrade(&self) -> Result<(), String> {
         FileExt::lock_shared(&self._file).map_err(err)
     }
@@ -250,7 +282,7 @@ pub(crate) fn identity(conn: &Connection) -> Result<Identity, String> {
 }
 
 /// No public connection or write API. SQLite READ_ONLY plus query_only is defense
-/// in depth; production VaultDb::open still refuses schema 3 even with the feature.
+/// in depth; inspection never grants a production writer capability.
 pub struct Inspection {
     conn: Connection,
     _maintenance: Maintenance,
@@ -455,7 +487,6 @@ impl Ledger {
         }
         Ok(())
     }
-    #[cfg(any(test, feature = "revision-ancestry"))]
     fn bind(&mut self, path: &Path, epoch: &str) -> Result<(), String> {
         let canonical = if path.exists() {
             fs::canonicalize(path).map_err(err)?
@@ -480,12 +511,10 @@ impl Ledger {
         self.data.storage_epoch = epoch.into();
         self.persist()
     }
-    #[cfg(any(test, feature = "revision-ancestry"))]
     fn prepare_restore(&mut self, epoch: &str) -> Result<(), String> {
         self.data.pending_restore_epoch = Some(epoch.into());
         self.persist()
     }
-    #[cfg(any(test, feature = "revision-ancestry"))]
     fn finish_restore(&mut self, epoch: &str) -> Result<(), String> {
         self.data.storage_epoch = epoch.into();
         self.data.pending_restore_epoch = None;
@@ -495,7 +524,6 @@ impl Ledger {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fault {
-    #[cfg(any(test, feature = "revision-ancestry"))]
     None,
     Snapshot,
     Ddl,
@@ -891,13 +919,10 @@ pub(crate) fn validate(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-/// Available only to explicitly opted-in native tooling and disposable fixtures.
-/// No production command/CLI route calls this before Stage 4E activation.
-#[cfg(any(test, feature = "revision-ancestry"))]
+/// Shared production migration boundary; ordinary opens use this protocol.
 pub fn migrate(path: &Path, ledger_root: &Path) -> Result<Identity, String> {
     migrate_with_fault(path, ledger_root, Fault::None)
 }
-#[cfg(any(test, feature = "revision-ancestry"))]
 fn migrate_with_fault(path: &Path, ledger_root: &Path, fault: Fault) -> Result<Identity, String> {
     let version = inspect_version(path)?; // Must precede locks, snapshots or new files.
     if version == 3 {
@@ -949,16 +974,14 @@ pub struct RestoreOutcome {
     pub requires_recovery_review: bool,
 }
 
-/// Stage 4B restore foundation, intentionally not wired to GUI/CLI commands yet.
+/// Shared epoch-safe production restore boundary.
 /// Exclusive maintenance refuses all managed live readers/owners. A v3 source
 /// must be explicitly migrated first; restore never upgrades an unknown backup.
-#[cfg(any(test, feature = "revision-ancestry"))]
 pub fn restore(path: &Path, backup: &Path, ledger_root: &Path) -> Result<RestoreOutcome, String> {
     restore_inner(path, backup, ledger_root, None)
 }
 /// Portable restoration admits an empty destination only, except exact replay
 /// of the acknowledged operation. It never implicitly overwrites a live vault.
-#[cfg(any(test, feature = "revision-ancestry"))]
 pub(crate) fn restore_portable(
     path: &Path,
     backup: &Path,
@@ -968,7 +991,6 @@ pub(crate) fn restore_portable(
 ) -> Result<RestoreOutcome, String> {
     restore_inner(path, backup, ledger_root, Some((key, request)))
 }
-#[cfg(any(test, feature = "revision-ancestry"))]
 fn restore_inner(
     path: &Path,
     backup: &Path,
@@ -1400,8 +1422,8 @@ mod tests {
             let id = migrate(&fixture.path, &fixture.ledger).unwrap();
             assert_eq!(inspect_version(&fixture.path).unwrap(), 3);
             assert!(
-                VaultDb::open(&fixture.path).is_err(),
-                "production v2 writer must refuse v3"
+                VaultDb::open_legacy_v2(&fixture.path).is_err(),
+                "frozen v2 compatibility opener must refuse v3"
             );
             let inspection = Inspection::open(&fixture.path).unwrap();
             assert_eq!(inspection.identity().unwrap(), id);
@@ -1534,7 +1556,7 @@ mod tests {
             let before = fs::read(&fixture.path).unwrap();
             let names = fs::read_dir(fixture.dir.path()).unwrap().count();
             assert!(migrate(&fixture.path, &fixture.ledger).is_err());
-            assert!(VaultDb::open(&fixture.path).is_err());
+            assert!(VaultDb::open_legacy_v2(&fixture.path).is_err());
             assert_eq!(fs::read(&fixture.path).unwrap(), before);
             assert_eq!(fs::read_dir(fixture.dir.path()).unwrap().count(), names);
             assert!(!fixture.ledger.exists());
@@ -1663,7 +1685,7 @@ mod tests {
     #[test]
     fn managed_v2_connections_block_migration_and_foreign_backup_never_replaces_target() {
         let fixture = Fixture::new(2);
-        let live = VaultDb::open(&fixture.path).unwrap();
+        let live = VaultDb::open_legacy_v2(&fixture.path).unwrap();
         assert!(migrate(&fixture.path, &fixture.ledger).is_err());
         drop(live);
         let id = migrate(&fixture.path, &fixture.ledger).unwrap();
@@ -1785,9 +1807,9 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn v2_version_gate_refuses_v3_and_default_creation_stays_v2() {
+    fn frozen_v2_gate_and_explicit_legacy_fixture_stay_v2() {
         let fixture = Fixture::new(0);
-        drop(VaultDb::open(&fixture.path).unwrap());
+        drop(VaultDb::open_legacy_v2(&fixture.path).unwrap());
         assert_eq!(inspect_version(&fixture.path).unwrap(), 2);
         migrate(&fixture.path, &fixture.ledger).unwrap();
         assert!(frozen_v2_gate(&fixture.path)
@@ -1813,5 +1835,76 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("Unsupported vault schema version 3")
         );
+    }
+    #[test]
+    fn activated_open_creates_v3_and_migrates_v1_v2_with_receipt_and_private_snapshot() {
+        for version in [0, 1, 2] {
+            let fixture = Fixture::new(version);
+            let before = if version > 0 {
+                Some(source_rows(&fixture.raw(), 2))
+            } else {
+                None
+            };
+            let (db, report) = VaultDb::open_with_report(&fixture.path, &fixture.ledger).unwrap();
+            assert!(db.is_v3());
+            assert_eq!(report.schema, 3);
+            assert_eq!(report.previous_schema, version);
+            if version > 0 {
+                assert!(report
+                    .status
+                    .as_deref()
+                    .unwrap()
+                    .contains("pre-migration snapshot"));
+                assert_eq!(source_rows(&db.conn, 2), before.unwrap());
+                let snapshots = fs::read_dir(fixture.dir.path())
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .filter(|entry| entry.file_name().to_string_lossy().contains(".pre-v3-"))
+                    .collect::<Vec<_>>();
+                assert_eq!(snapshots.len(), 1);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        snapshots[0].metadata().unwrap().permissions().mode() & 0o777,
+                        0o600
+                    );
+                }
+                assert!(
+                    db.accepted_note("a").unwrap().unwrap()["accepted"]["revision"].is_object()
+                );
+            }
+            assert_eq!(
+                db.conn
+                    .pragma_query_value(None, "journal_mode", |r| r.get::<_, String>(0))
+                    .unwrap(),
+                "wal"
+            );
+            assert!(frozen_v2_gate(&fixture.path)
+                .unwrap_err()
+                .contains("Unsupported vault schema version 3"));
+            drop(db);
+            let (again, report) =
+                VaultDb::open_with_report(&fixture.path, &fixture.ledger).unwrap();
+            assert_eq!(report.previous_schema, 3);
+            assert!(report.status.is_none());
+            assert!(again.is_v3());
+        }
+    }
+    #[test]
+    fn activated_open_refuses_managed_legacy_connection_and_missing_v3_ledger() {
+        let fixture = Fixture::new(2);
+        let legacy = VaultDb::open_legacy_v2(&fixture.path).unwrap();
+        assert!(VaultDb::open_with_report(&fixture.path, &fixture.ledger).is_err());
+        assert_eq!(inspect_version(&fixture.path).unwrap(), 2);
+        drop(legacy);
+        let (db, report) = VaultDb::open_with_report(&fixture.path, &fixture.ledger).unwrap();
+        drop(db);
+        fs::remove_file(fixture.ledger.join(format!("{}.json", report.vault_uuid))).unwrap();
+        assert!(VaultDb::open_with_report(&fixture.path, &fixture.ledger)
+            .err()
+            .unwrap()
+            .contains("enrollment"));
+        assert_eq!(inspect_version(&fixture.path).unwrap(), 3);
     }
 }

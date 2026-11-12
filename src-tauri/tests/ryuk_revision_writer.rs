@@ -1,5 +1,4 @@
-//! Explicit opt-in CLI rollout; default builds still refuse writable v3.
-#![cfg(feature = "revision-ancestry")]
+//! Production CLI revision contract, exercised in default and feature builds.
 use app_lib::vault::{
     ancestry,
     db::{NewNote, VaultDb},
@@ -207,11 +206,15 @@ fn cli_creates_once_retries_updates_and_tags_guard_the_gui_in_both_orders() {
         },
     ));
     assert!(result.is_err());
-    // The v2 default CLI path remains fail-closed even in this feature build.
+    // A different/missing host ledger still refuses ordinary writes after activation.
     let default = Command::new(env!("CARGO_BIN_EXE_ryuk"))
         .arg("--vault")
         .arg(fixture.dir.path().join("v.rn"))
         .env_remove("RYUK_V3_LEDGER")
+        .env(
+            "XDG_DATA_HOME",
+            fixture.dir.path().join("missing-host-data"),
+        )
         .args(["notes", "list"])
         .output()
         .unwrap();
@@ -242,4 +245,32 @@ fn cli_summary_import_does_not_promote_manually_edited_then_restored_generated_t
     let pending: Value =
         serde_json::from_str(&fixture.ok(&["session", "pending", "fixture"], "")).unwrap();
     assert_eq!(pending.as_array().unwrap().len(), 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn default_cli_creation_and_gui_opener_share_the_private_data_ledger_without_a_feature_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("default.rn");
+    let data = dir.path().join("data");
+    let output = Command::new(env!("CARGO_BIN_EXE_ryuk"))
+        .arg("--vault")
+        .arg(&path)
+        .env_remove("RYUK_V3_LEDGER")
+        .env("XDG_DATA_HOME", &data)
+        .args(["notes", "new", "Default fixture"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Created schema 3 vault"));
+    let (db, report) =
+        VaultDb::open_with_report(&path, &data.join("ryuknotes/revision-ledger")).unwrap();
+    assert!(db.is_v3());
+    assert_eq!(report.previous_schema, 3);
+    assert!(report.status.is_none());
+    assert_eq!(db.list_notes(false).unwrap().len(), 1);
 }

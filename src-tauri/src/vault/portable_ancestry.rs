@@ -1,6 +1,6 @@
 //! Format 2 portable graph. Markdown is a readable projection; hash-addressed
 //! state sidecars are authoritative and are never passed through a Markdown parser.
-//! Activation is separate: ordinary opens remain v2 until ALL native gates pass.
+//! Production activation follows the host-verified 4B–4E gate result.
 use super::{ancestry, db::VaultDb, db_export};
 use rusqlite::{
     params,
@@ -603,7 +603,6 @@ impl Package {
     /// namespace, preserving exact Markdown bytes and hashes. All graph authority
     /// UUIDs and opaque accepted tokens change. IncarnationOrigin is source
     /// provenance, not a foreign key; retain it with an explicit translation map.
-    #[cfg(any(test, feature = "revision-ancestry"))]
     fn independent_copy(&mut self, operation: &str) -> Result<(), String> {
         let namespace = mapped(operation, "copy-vault", &self.manifest.vault_uuid);
         let old_vault = self.manifest.vault_uuid.clone();
@@ -751,7 +750,6 @@ pub(crate) fn validate_reexport(
 /// Explicit path-based bootstrap/restore boundary, not an authoring backdoor.
 /// Validate all capabilities/hashes/graph before acquiring destination or ledger
 /// locks. Live destination connections exclude replacement through maintenance.
-#[cfg(any(test, feature = "revision-ancestry"))]
 pub fn restore_export(
     root: &Path,
     destination: &Path,
@@ -1362,7 +1360,7 @@ mod tests {
         )
         .unwrap_err()
         .contains("ledger/epoch"));
-        assert!(VaultDb::open(&destination)
+        assert!(VaultDb::open_legacy_v2(&destination)
             .err()
             .unwrap()
             .contains("Unsupported vault schema version 3"));
@@ -1438,7 +1436,7 @@ mod tests {
         .unwrap();
         assert_eq!(json!(retry), json!(outcome));
         let v2 = f.dir.path().join("empty-v2.rn");
-        drop(VaultDb::open(&v2).unwrap());
+        drop(VaultDb::open_legacy_v2(&v2).unwrap());
         restore_export(
             &f.out,
             &v2,

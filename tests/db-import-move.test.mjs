@@ -17,6 +17,7 @@ function load(source, globals) {
 }
 function fixture(invoke) {
   const adapter = load(adapterSource, { require: name => {
+    if (name === './utils/vault-open-status') return { recordVaultOpenStatus: () => {} };
     assert.equal(name, '@tauri-apps/api/core');
     return { invoke };
   } });

@@ -1,17 +1,21 @@
-# Authoritative DB writers — Stages 1, 4C–4E (activation gated)
+# Authoritative DB writers — schema 3 production activation
 
 The UX ruling remains fork first, review second, automatic merge last. Editor
 and pane ownership are unchanged. The original Stage 1 **schema 2** contract is
 preserved below. Stage 4C adds the complete **schema 3** writer contract described
 in [the implementation audit](revision-ancestry-stage4c.md). Stage 4D adds
 [recovery pins and retention](revision-ancestry-stage4d.md) for explicitly opened
-v3 vaults. Production format activation remains gated until 4E.
+v3 vaults. Production activation now uses the human-reported complete host 4B–4E pass; see
+[Stage 4F preparation](revision-ancestry-stage4f.md).
 
-Schema 3 tools must explicitly opt into the native `revision-ancestry` feature
-and `VaultDb::open_v3(path, ledger_root)`. Ordinary GUI/CLI opens still create/use
-schema 2 and reject schema 3 until Stage 4E. Feature-enabled CLI tests/tools can
-set `RYUK_V3_LEDGER` explicitly; default builds do not honor it. There is no
-partial fallback from a v3 writer to the body-digest contract.
+Ordinary GUI/CLI file creation and opens now use writable schema 3. V1/v2 opens
+migrate through the shared exclusive/snapshot/transaction/ledger protocol and
+return visible migration status. GUI and CLI share the private host ledger, with
+`RYUK_V3_LEDGER` available for isolated tooling. Missing/retired ledgers require
+explicit recovery; there is no body-digest fallback. Legacy contracts below remain
+compatibility fixtures, not ordinary file-open paths. Current activation changes
+still need host Rust/build/live verification; the earlier host proof is not a new
+in-cage pass.
 
 ## Schema 2 accepted state and acknowledgments
 
@@ -186,11 +190,11 @@ pruning markers, removes eligible states/asset links and validates before commit
 Headers, parents and counters remain forever. Curated history controls none of
 these roots. BLOB GC checks note/revision/history/staging/private-artifact and
 receipt ownership. Maintenance cannot consume a writer operation index or change
-semantic state. Stage 4E adds portable export below; production creation/activation
-remains conditional on all native gates passing together.
+semantic state. Stage 4E adds portable export below; production activation now
+uses the accepted human-reported host gate proof.
 
 
-## Portable ancestry boundary (Stage 4E; production activation blocked)
+## Portable ancestry boundary (Stage 4E, now activated)
 
 [Format 2 and import modes](revision-ancestry-stage4e.md) carry complete retained
 ancestry, exact byte sidecars, pruning markers and anonymous recovery holds.
@@ -210,7 +214,25 @@ immutable collisions and complete parent sets, retains current projections/heads
 and pins incoming branches. Generic metadata routes cannot forge portable receipts
 or origin records. Existing dirty-owner barriers still refuse maintenance.
 
-Native 4B–4E gates could not run in the cage, so the requested all-gates activation
-condition was not met. Ordinary opens/creation remain v2 and refuse schema 3;
-explicit native ancestry tools remain feature-gated. Npm/SQLite transport tests
-are not evidence that native migration, writer, recovery or restore gates passed.
+The earlier 4E cage session could not establish native proof. The human has now
+reported the complete 4B–4E host collect pass and explicitly accepted that proof
+for activation. Ordinary opens/creation use v3; current activation changes still
+need host verification and the human 4F boot exercises. Npm/SQLite results here
+are not represented as a new native pass.
+
+
+## Activated open, restore and human verification
+
+`open_with_report` attaches the complete writer after transparent v1/v2 upgrade
+or schema-3 creation. GUI open displays its one-line receipt; CLI logs it on
+stderr. Read-only diagnostics never acknowledge a draft. Production backup
+restore uses epoch-safe matching-UUID v3 restore, all-window barriers and explicit
+clean-owner retirement proof. Token-aware clean refresh handles same-byte restores;
+dirty buffers and failed save baselines remain preserved. An explicit legacy
+recovery copy requires its captured physical origin and never gains guessed v3
+ancestry or generated-summary authority. Editor and provider semantics are unchanged.
+
+The frozen v2 opener is test-only. Legacy backup bytes cannot overwrite a v3 file;
+migrate a separate copy for recovery. Production portable restore/reconciliation,
+GC and status commands are registered. The two actual webviews, GUI/CLI/Hermes
+races, close/restart and restores remain the [human Stage 4F gate](revision-ancestry-stage4f.md).

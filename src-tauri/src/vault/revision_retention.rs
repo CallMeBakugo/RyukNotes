@@ -110,7 +110,6 @@ fn lease_file(root: &Path, instance: &str) -> Result<File, String> {
     }
     options.open(path).map_err(error)
 }
-#[cfg(any(test, feature = "revision-ancestry"))]
 pub(crate) fn session_lease(root: &Path, instance: &str) -> Result<File, String> {
     let file = lease_file(root, instance)?;
     FileExt::try_lock_exclusive(&file).map_err(error)?;

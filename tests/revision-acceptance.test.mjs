@@ -9,7 +9,7 @@ const source=await readFile(new URL('../src/lib/api-db.ts',import.meta.url),'utf
 function adapter(invoke) {
   const exports={};
   runInNewContext(ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText,
-    {exports,crypto:{randomUUID},require:name=>{assert.equal(name,'@tauri-apps/api/core');return {invoke};}});
+    {exports,crypto:{randomUUID},require:name=>{if(name==='./utils/vault-open-status')return {recordVaultOpenStatus:()=>{}};assert.equal(name,'@tauri-apps/api/core');return {invoke};}});
   return exports;
 }
 const vault={path:'/fixture.rn',file:'file-identity'};
@@ -90,4 +90,18 @@ test('task requests carry v3 source and failures retain their original expected 
   await assert.rejects(api.dbSaveNote('n',base.meta,'- [x] task',base.raw,vault.path,'task'),error=>error.kind==='changed');
   assert.equal(requests[0].writerSource,'task');assert.equal(requests[0].operationId,requests[1].operationId);
   assert.equal(requests[1].policy.expectedToken,saved.accepted.token);
+});
+
+
+test('a refused restore keeps the existing acceptance lineage usable instead of invalidating a valid dirty baseline',async()=>{
+  const original=receipt('A',1);let writes=0;
+  const api=adapter(async(command,args)=>{
+    if(command==='db_get_note')return clone(original);
+    if(command==='db_restore_backup')throw new Error('another window is dirty');
+    assert.equal(command,'db_save_note');writes++;assert.equal(args.request.policy.expectedToken,original.accepted.token);return receipt('B',2);
+  });
+  api.setDbMode(true);const base=await api.dbReadNote('n',vault.path);
+  await assert.rejects(api.dbRestoreBackup('/backup.rn',vault.path),/dirty/);
+  const saved=await api.dbSaveNote('n',base.meta,'B','A',vault.path);
+  assert.equal(saved.content,'B');assert.equal(writes,1);assert.equal(base.raw,'A');
 });

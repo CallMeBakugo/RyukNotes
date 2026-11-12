@@ -654,15 +654,31 @@ pub fn fork(db: &VaultDb, draft: &Draft) -> Result<Value, String> {
 }
 fn fork_with_origin(db: &VaultDb, draft: &Draft, recovered: bool) -> Result<Value, String> {
     if recovered {
-        let identity: RevisionBinding =
-            serde_json::from_value(draft.base["recoveryIdentity"].clone())
+        let known_uuid = if let Some(identity) = draft.base.get("recoveryIdentity") {
+            Some(
+                serde_json::from_value::<RevisionBinding>(identity.clone())
+                    .map_err(|e| e.to_string())?
+                    .vault_uuid,
+            )
+        } else {
+            draft.base["meta"]["accepted"]["vaultUuid"]
+                .as_str()
+                .map(str::to_owned)
+        };
+        if let Some(vault_uuid) = known_uuid {
+            if db
+                .revision_session
+                .as_ref()
+                .is_none_or(|s| s.identity.vault_uuid != vault_uuid)
+            {
+                return Err("Recovered copy belongs to another logical vault".into());
+            }
+        } else {
+            // Explicit Keep both for a v2 checkpoint after in-place migration:
+            // require its exact physical origin; create a fresh incarnation and
+            // retain unknown ancestry, never promote this draft into a v3 base.
+            db.validate_writer_vault(&draft.vault)
                 .map_err(|e| e.to_string())?;
-        if db
-            .revision_session
-            .as_ref()
-            .is_none_or(|s| s.identity.vault_uuid != identity.vault_uuid)
-        {
-            return Err("Recovered copy belongs to another logical vault".into());
         }
     } else {
         db.validate_writer_vault(&draft.vault)
@@ -725,7 +741,7 @@ fn fork_with_origin(db: &VaultDb, draft: &Draft, recovered: bool) -> Result<Valu
         "INSERT INTO meta(key,value) VALUES(?1,?2)",
         params![
             key,
-            json!({"payload":payload,"source":draft.note_id,"receipt":receipt}).to_string()
+            json!({"payload":payload,"source":draft.note_id,"sourceAncestry":if draft.base["meta"]["accepted"]["revision"].is_object(){"captured-revision"}else{"legacy-unknown"},"receipt":receipt}).to_string()
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -749,10 +765,7 @@ pub fn recovery_fork<R: Runtime>(
     drop(service);
     let receipt = if draft.vault.path.ends_with(".rn") {
         let slot = state.vault_db.lock().map_err(|e| e.to_string())?;
-        if let Some(db) = slot
-            .as_ref()
-            .filter(|db| claimed && db.is_v3() && draft.base.get("recoveryIdentity").is_some())
-        {
+        if let Some(db) = slot.as_ref().filter(|db| claimed && db.is_v3()) {
             fork_with_origin(db, &draft, true)?
         } else if let Some(db) = slot.as_ref().filter(|db| db.identity() == draft.vault) {
             fork(db, &draft)?
@@ -762,6 +775,9 @@ pub fn recovery_fork<R: Runtime>(
             // checkpoint may reopen only its exact originating file identity.
             if filesystem_identity(Path::new(&draft.vault.path))? != draft.vault {
                 return Err("Originating vault identity changed".into());
+            }
+            if crate::vault::ancestry::inspect_version(Path::new(&draft.vault.path))? != 3 {
+                return Err("Open the originating vault to complete its visible upgrade before recovering this draft".into());
             }
             let db = VaultDb::open(Path::new(&draft.vault.path))?;
             fork(&db, &draft)?
@@ -1013,6 +1029,23 @@ mod tests {
         service
     }
     #[test]
+    fn explicit_legacy_recovery_copy_after_migration_preserves_original_without_guessing_ancestry()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.rn");
+        let db = VaultDb::open_legacy_v2(&path).unwrap();
+        let draft = draft(&db);
+        drop(db);
+        let (db, _) = VaultDb::open_with_report(&path, &dir.path().join("ledger")).unwrap();
+        assert!(fork(&db, &draft).is_err()); // No implicit legacy rebinding.
+        let copied = fork_with_origin(&db, &draft, true).unwrap();
+        assert_eq!(copied["content"], "local draft");
+        assert_eq!(copied["tags"], json!(["hermes/recovery"]));
+        assert_eq!(db.get_note_content("original").unwrap().unwrap(), "saved");
+        assert_ne!(copied["id"], "original");
+        assert_eq!(fork_with_origin(&db, &draft, true).unwrap(), copied);
+    }
+    #[test]
     fn forks_are_atomic_idempotent_and_link_shared_bytes_without_summary_authority() {
         let db = VaultDb::open_in_memory().unwrap();
         let mut draft = draft(&db);
@@ -1199,8 +1232,8 @@ mod tests {
     fn data_version_is_connection_local_and_external_commits_do_not_acknowledge_any_draft() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.rn");
-        let a = VaultDb::open(&path).unwrap();
-        let b = VaultDb::open(&path).unwrap();
+        let a = VaultDb::open_legacy_v2(&path).unwrap();
+        let b = VaultDb::open_legacy_v2(&path).unwrap();
         let version = |db: &VaultDb| {
             db.conn
                 .pragma_query_value(None, "data_version", |r| r.get::<_, i64>(0))
@@ -1227,7 +1260,7 @@ mod ipc_tests {
     fn registry_journal_fork_and_conflicts_are_registered_through_mock_ipc() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vault.rn");
-        let db = VaultDb::open(&path).unwrap();
+        let db = VaultDb::open_legacy_v2(&path).unwrap();
         let identity = db.identity();
         let app = tauri::test::mock_builder()
             .invoke_handler(tauri::generate_handler![
@@ -1300,7 +1333,7 @@ mod ipc_tests {
         assert!(!unchanged);
         // Reopening the exact same file is a new connection even if SQLite's
         // first data_version integer happens to equal the old observation.
-        *state.vault_db.lock().unwrap() = Some(VaultDb::open(&path).unwrap());
+        *state.vault_db.lock().unwrap() = Some(VaultDb::open_legacy_v2(&path).unwrap());
         state
             .vault_db_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -2124,8 +2157,8 @@ mod review_tests {
         for mutation in ["body", "title", "tags", "pinned", "deleted", "trashed"] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("test.rn");
-            let db = VaultDb::open(&path).unwrap();
-            let other = VaultDb::open(&path).unwrap();
+            let db = VaultDb::open_legacy_v2(&path).unwrap();
+            let other = VaultDb::open_legacy_v2(&path).unwrap();
             let (review, proposal) = setup(&db);
             match mutation {
                 "body" => {
@@ -2227,7 +2260,7 @@ mod review_ipc_tests {
     fn real_review_commands_gate_owner_revision_and_exact_result_before_adoption() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.rn");
-        let db = VaultDb::open(&path).unwrap();
+        let db = VaultDb::open_legacy_v2(&path).unwrap();
         let note = NewNote {
             id: "n".into(),
             title: "Title".into(),
@@ -2453,8 +2486,8 @@ mod review_race_tests {
         WAITING.store(false, Ordering::Release);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("race.rn");
-        let writer = VaultDb::open(&path).unwrap();
-        let reviewer = VaultDb::open(&path).unwrap();
+        let writer = VaultDb::open_legacy_v2(&path).unwrap();
+        let reviewer = VaultDb::open_legacy_v2(&path).unwrap();
         let note = NewNote {
             id: "n".into(),
             title: "Title".into(),
@@ -2700,8 +2733,17 @@ impl Recovery {
             .as_ref()
             .ok_or("Expected revision vault")?
             .identity;
+        // A paused clean owner can explicitly retire its old pin after restore,
+        // with the same local-revision/tombstone proof. This never rebinds a draft.
+        let retiring_clean = action == "release"
+            && owner.locked
+            && !owner.dirty
+            && !owner.conflicted
+            && next.is_none();
         if expected.vault_uuid != current.vault_uuid
-            || (action != "discard" && expected.storage_epoch != current.storage_epoch)
+            || (action != "discard"
+                && !retiring_clean
+                && expected.storage_epoch != current.storage_epoch)
         {
             return Err(
                 "Reopen the originating vault; saved baselines cannot cross restore epochs".into(),
@@ -3734,5 +3776,26 @@ mod revision_retention_tests {
             .unwrap()
             .assert_quiet(None, None)
             .is_err());
+    }
+}
+
+impl Recovery {
+    /// Metadata-only diagnostics for the human Stage 4F boot gate. No event or
+    /// diagnostic read acknowledges, resolves, or advances an owner baseline.
+    pub(crate) fn owner_diagnostics(&self, vault: &str) -> Value {
+        let mut rows = self
+            .owners
+            .iter()
+            .filter(|(_, owner)| owner.vault.path == vault)
+            .map(|(id, owner)| {
+                json!({
+                    "owner":id,"window":owner.window,"noteId":owner.note,"dirty":owner.dirty,
+                    "conflicted":owner.conflicted,"locked":owner.locked,"sequence":owner.sequence,
+                    "acceptedBase":self.bindings.get(id)
+                })
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| row["owner"].as_str().unwrap_or("").to_owned());
+        json!(rows)
     }
 }

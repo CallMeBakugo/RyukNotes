@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { sameAcceptedNote } from '$lib/utils/accepted-note';
 	import { invoke } from '@tauri-apps/api/core';
 	import { openNoteWindowSession } from '$lib/utils/note-window-session';
 	import RecoveryInbox from './RecoveryInbox.svelte';
@@ -50,7 +51,7 @@
 				const content = await readNote(ownerVault!, path);
 				if (disposed || get(owner.context.activeNotePath) !== path) continue;
 				if (get(owner.context.editorDirty)) { editor?.flagExternalConflict(); continue; }
-				if (content.raw !== get(owner.context.activeNote)?.raw) {
+				if (!sameAcceptedNote(get(owner.context.activeNote), content)) {
 					owner.context.activeNote.set(content);
 					editor?.loadNote(path, content.content);
 				}
@@ -248,7 +249,7 @@
 						if (restored && content.raw !== editor?.getAcceptedRaw()) editor?.flagExternalConflict();
 						return;
 					}
-					if ($activeNote !== openingNote || openingNote.raw === content.raw) return;
+					if ($activeNote !== openingNote || sameAcceptedNote(openingNote, content)) return;
 					$activeNote = content;
 					editor?.loadNote(path, content.content);
 				} catch (error) {
