@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Ryuk's Notebook",
   "mainBinaryName": "ryuknotes",
-  "version": "1.5.0",
+  "version": "2.0.0",
   "identifier": "com.callmebakugo.ryuknotes",
   "build": {
     "frontendDist": "../build",
