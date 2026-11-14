@@ -194,3 +194,13 @@ review cannot establish a verified base. Automatic merge still has no approval.
   hidden in the cage. No GUI verification was attempted.
 - No live user data/config access, network or git writes. `.session-commit-msg`
   records the changes and verification boundary. Stop for the human boot gate.
+
+## Everyday-workflow follow-up acceptance tools
+
+The approved recon follow-up adds `scripts/stage4f-host.mjs` for disposable CLI
+process races and `scripts/ui-acceptance.mjs` for a mounted browser-only review and
+notification harness. See `everyday-workflow-improvements.md` for exact commands,
+boundaries, new notebook-trash/recovery/retention cases, and the remaining live
+checks. Neither a bundled harness nor green npm controller tests count as the
+actual two-webview/CLI-versus-GUI/restore acceptance run. No live gate was executed
+inside the cage, and its status remains pending host execution.

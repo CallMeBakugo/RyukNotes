@@ -669,6 +669,16 @@ impl Package {
             if text(row, 0)?.starts_with("generated_summary:v3:") {
                 row[1] = SqlValue::Text(translate("revision", text(row, 1)?));
             }
+            if text(row,0)?.starts_with("notebook_trash:v1:") {
+                let mut record: Value = serde_json::from_str(text(row,1)?).map_err(error)?;
+                if let Some(revisions) = record["revisions"].as_object_mut() {
+                    for revision in revisions.values_mut() {
+                        let source = revision.as_str().ok_or("Invalid notebook trash revision")?;
+                        *revision = json!(translate("revision",source));
+                    }
+                }
+                row[1] = SqlValue::Text(record.to_string());
+            }
         }
         self.manifest.storage_epoch = translate("epoch", &self.manifest.storage_epoch);
         self.manifest.storage_epochs = self
@@ -1182,6 +1192,28 @@ mod tests {
         let mut index: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         index["ancestry"] = json!(package.manifest);
         std::fs::write(path, serde_json::to_vec(&index).unwrap()).unwrap();
+    }
+    #[test]
+    fn notebook_trash_restores_after_full_or_independent_portable_restore() {
+        let f = Fixture::new();
+        let db = f.open();
+        let vault = f.path.to_str().unwrap();
+        write(&db,"n","exact body\r\n",None);
+        crate::vault::db_notebooks::create(&db,vault,None,"Work/Child").unwrap();
+        crate::vault::db_notebooks::move_note(&db,vault,"n","Work/Child").unwrap();
+        crate::vault::db_notebooks::trash(&db,vault,"Work",&uuid::Uuid::new_v4().to_string()).unwrap();
+        db_export::export_md_vault(&f.out,&db).unwrap();
+        for (name,mode) in [("restored",RestoreMode::FullRestore),("independent",RestoreMode::IndependentCopy)] {
+            let path = f.dir.path().join(format!("{name}.rn"));
+            let ledger = f.dir.path().join(format!("{name}-ledger"));
+            restore_export(&f.out,&path,&ledger,mode,&uuid::Uuid::new_v4().to_string()).unwrap();
+            let copy = VaultDb::open_v3(&path,&ledger).unwrap();
+            let group = crate::vault::db_notebooks::trash_groups(&copy).unwrap().remove(0);
+            crate::vault::db_notebooks::resolve_trash(&copy,path.to_str().unwrap(),&group.path,false,&uuid::Uuid::new_v4().to_string()).unwrap();
+            assert_eq!(copy.accepted_note("n").unwrap().unwrap()["trashed"],false);
+            assert_eq!(copy.get_note_content("n").unwrap().unwrap(),"exact body\r\n");
+            assert!(crate::vault::db_notebooks::Layout::load(&copy.conn).unwrap().notebooks.contains("Work/Child"));
+        }
     }
     #[test]
     fn exact_graph_states_metadata_shared_bytes_pins_pruning_and_restore_round_trip_together() {

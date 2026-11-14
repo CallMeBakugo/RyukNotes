@@ -18,7 +18,11 @@
     "verify": "pnpm check && pnpm test && pnpm test:rust && pnpm lint:rust && pnpm build",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "test:ui": "node scripts/ui-acceptance.mjs",
+    "test:ui:build": "node scripts/ui-acceptance.mjs --build",
+    "test:ui:browser": "node scripts/run-ui-browser.mjs",
+    "test:host": "node scripts/stage4f-host.mjs"
   },
   "devDependencies": {
     "@sveltejs/adapter-auto": "^7.0.0",

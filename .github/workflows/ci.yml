@@ -33,6 +33,11 @@ jobs:
       - name: Install frontend deps
         run: pnpm install --prod=false
 
+      - name: Mounted component browser tests (installed Chrome; no browser downloads)
+        run: pnpm run test:ui:browser
+        env:
+          CHROME_BIN: /usr/bin/google-chrome
+
       - name: Verify (check + JS tests + Rust tests + clippy + fmt + build)
         run: |
           PATH="$PWD/node_modules/.bin:$PATH" pnpm run check

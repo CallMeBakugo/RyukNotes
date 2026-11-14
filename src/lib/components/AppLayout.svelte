@@ -1,4 +1,5 @@
 <script lang="ts">
+	import OperationFeedback from './OperationFeedback.svelte';
 	import { sameAcceptedNote } from '$lib/utils/accepted-note';
 	import { invoke } from '@tauri-apps/api/core';
 	import RecoveryInbox from './RecoveryInbox.svelte';
@@ -977,7 +978,14 @@
 				if (restored && content.raw !== instance?.getAcceptedRaw()) instance?.flagExternalConflict();
 				return;
 			}
-			if (get(context.activeNote) !== openingNote || sameAcceptedNote(openingNote, content)) return;
+			if (get(context.activeNote) !== openingNote) return;
+			if (content.meta.accepted?.trashed) {
+				context.activeNotePath.set(null);
+				context.activeNote.set(null);
+				context.viewerNote.set(null);
+				return;
+			}
+			if (sameAcceptedNote(openingNote, content)) return;
 			context.activeNote.set(content);
 			if (get(context.viewerNote)?.path === path) context.viewerNote.set({ path, content: content.content });
 			instance?.loadNote(path, content.content);
@@ -1428,6 +1436,7 @@
 
 <SearchPanel onSelectNote={selectNoteFromSearch} />
 <CommandPalette onNavigate={handleViewChanged} />
+<OperationFeedback />
 <RecoveryInbox notice={recoveryBarrierNotice} />
 <SettingsPanel onBeforeVaultSwitch={prepareVaultSwitch} onBeginMaintenance={() => beginPaneMutation()} />
 <InfoPanel />

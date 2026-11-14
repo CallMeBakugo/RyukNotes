@@ -1,4 +1,6 @@
 <script lang="ts">
+	import PortableRecovery from './PortableRecovery.svelte';
+	import StorageMaintenance from './StorageMaintenance.svelte';
 	import { showSettings, theme, resolvedTheme, appConfig, platformIsMobile, activeVaultConfig, installType, settingsTab, vaultReady, notebookSortMode, customThemes } from '$lib/stores/app';
 	import { setTheme, setSystemThemes, setAccentColor, setFontSize, setScrollToChangeFontSize, setFontFamily, setLineHeight, setUiScale, setContentWidth, setGeneralSettings, importObsidian, createBackup, listBackups, restoreBackup, deleteBackup, setBackupSettings, setAiSettings, testAiConnection, saveCustomTheme, deleteCustomTheme, exportCustomTheme, importCustomThemes, getVaultStats, findOrphanedAttachments, trashOrphanedAttachments } from '$lib/api';
 	import { darkThemes, isMobile, isAndroid } from '$lib/platform';
@@ -786,7 +788,7 @@
 			if (!release) throw new Error('Save every pane before exporting a vault.');
 			if (maintenanceVault !== vault) return;
 			const count = await exportDbToMd(folder as string, vault);
-			mdExportResult = `Exported ${count} notes with attachments and history.`;
+			mdExportResult = `Exported ${count} notes with attachments, history, and revision ancestry. Restore this export using Maintenance → Restore or recover a vault.`;
 		} catch (e) {
 			mdExportResult = `Export failed: ${e}`;
 		} finally {
@@ -1379,6 +1381,7 @@
 						<div class="tab-content">
 							<div class="settings-section">
 								<h3>Vault Overview</h3>
+								{#if isDbVault()}<PortableRecovery vault={maintenanceVault} begin={onBeginMaintenance} />{#if maintenanceVault}<StorageMaintenance vault={maintenanceVault} begin={onBeginMaintenance} />{/if}{/if}
 								{#if vaultStats}
 									<div class="maintenance-stats">
 										<div class="maintenance-stat-row">
@@ -1398,7 +1401,7 @@
 											<span class="maintenance-stat-value">{formatVaultSize(vaultStats.attachments_size)}</span>
 										</div>
 										<div class="maintenance-stat-row maintenance-stat-total">
-											<span class="maintenance-stat-label">Total vault size</span>
+											<span class="maintenance-stat-label">{isDbVault() ? 'Live notes + attachment payload' : 'Total vault size'}</span>
 											<span class="maintenance-stat-value">{formatVaultSize(vaultStats.total_size)}</span>
 										</div>
 									</div>
@@ -2105,6 +2108,7 @@
 						{#if isDbVault()}
 						<div class="settings-section">
 								<h3>Import .md Folder</h3>
+								<p class="import-desc">For an ancestry export from this app, use Maintenance → Restore or recover a vault. Ordinary folder import cannot discard its revision history.</p>
 								<p class="import-desc">Choose a folder of markdown notes and import them into this database vault. Frontmatter (tags, ids, dates) is preserved; re-importing updates rather than duplicates.</p>
 								<button class="import-btn" onclick={handleImportMdFolder} disabled={mdImportLoading}>
 									{#if mdImportLoading}

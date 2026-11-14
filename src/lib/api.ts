@@ -187,7 +187,7 @@ export async function renameNotebook(
 }
 
 export async function deleteNotebook(vaultPath: string, path: string): Promise<void> {
-  if (isDbVault()) throw new Error("Database notebook deletion is not supported yet.");
+  if (isDbVault()) return invoke("db_trash_notebook", { vaultPath, path, operationId: crypto.randomUUID() });
   return invoke("delete_notebook", { vaultPath, path });
 }
 
@@ -301,7 +301,7 @@ export async function searchNotes(
   limit?: number,
   offset?: number,
 ): Promise<SearchPage> {
-  if (isDbVault()) return dbSearchNotes(query);
+  if (isDbVault()) return dbSearchNotes(query, limit, offset);
   return invoke("search_notes", { query, limit, offset });
 }
 
@@ -327,11 +327,17 @@ export async function restoreNote(
 }
 
 export async function restoreNotebook(vaultPath: string, trashPath: string): Promise<string> {
+  if (isDbVault()) return invoke("db_resolve_notebook_trash", { vaultPath, path: trashPath, remove: false, operationId: crypto.randomUUID() });
   return invoke("restore_notebook", { vaultPath, trashPath });
 }
 
 export async function permanentDelete(vaultPath: string, path: string): Promise<void> {
   if (isDbVault()) return invoke("db_delete_note", { id: path });
+  return invoke("permanent_delete", { vaultPath, path });
+}
+
+export async function permanentDeleteNotebook(vaultPath: string, path: string): Promise<void> {
+  if (isDbVault()) { await invoke("db_resolve_notebook_trash", { vaultPath, path, remove: true, operationId: crypto.randomUUID() }); return; }
   return invoke("permanent_delete", { vaultPath, path });
 }
 

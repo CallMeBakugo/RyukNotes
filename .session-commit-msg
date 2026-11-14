@@ -1,0 +1,51 @@
+Fix persistent recovery confirmation; record read-only app reconnaissance
+
+RecoveryInbox previously kept successful cleanup text indefinitely. The preceding
+approved fix expires success messages after five seconds, adds manual dismissal
+for local status text, and preserves unresolved draft/hold actions and persistent
+errors. Native recovery and pin protection are unchanged.
+
+The follow-up reconnaissance made no further application changes. Reviewed current
+backlog/history, adapter routes, search, notebook actions, recovery/ancestry and
+retention entry points, export/import UI, diagnostics, test coverage and build
+configuration. Recommended priorities: human Stage 4F acceptance; user-facing
+portable restore/copy/reconciliation and missing-ledger recovery; DB search
+pagination/snippets/targets parity; actionable operation errors and notification
+lifecycle; notebook deletion semantics; focused mounted-component integration
+coverage and conflict callback reactivity; accurate storage diagnostics and
+explicit retention controls. Existing Stage 4D already includes callable BLOB GC;
+do not implement a second collector or silently schedule it. No implementation
+of these recommendations is approved or attempted.
+
+Verification on this tree: npm run check passed (0 errors, 3 existing warnings),
+npm test passed (52 test files), npm run build passed. The preceding banner-fix
+session also passed git diff --check.
+Not run: Rust check/check --tests/test, clippy/fmt (tools hidden in cage), Tauri
+native/package builds, GUI boot, live two-webview/CLI races, restore drills or
+live-vault inspection. No network, user-data access or git writes.
+
+
+Add checked Linux downloads and explicit runtime dependency declarations
+
+Linux downloads lacked installation guidance and the release workflow built only
+macOS artifacts. Missing WebKitGTK prevents the dynamic loader from reaching app
+code, leaving desktop launches silent. Declare WebKitGTK 4.1, GTK 3, Ayatana tray,
+librsvg and xdg-utils requirements in DEB/RPM metadata. Add an Ubuntu 22.04 Linux
+release job producing native packages plus a versioned x86_64 archive containing
+both binaries, installation instructions and an interactive installer. Check
+required native-package metadata in that job. The installer inspects both GUI and
+CLI libraries, reports loader/architecture failures, offers distro dependency
+commands with explicit consent, and copies binaries only after checks pass and
+confirmation. Document runtime vs build requirements and correct Linux window
+branding. Keep the preceding uncommitted application work intact.
+
+Verification for this addition: npm run check passed (0 errors/warnings), npm test
+passed (58 test files, including installer failure/decline/confirmed-copy tests),
+npm run build passed (existing large chunk notices); shell syntax, git diff --check,
+embedded release-job Python syntax and dependency config shape checks passed.
+Full YAML parser validation was unavailable (no installed Python/Node YAML parser).
+Not run: cargo check, cargo check --tests, cargo test, clippy/fmt (Rust toolchain
+hidden in cage); Tauri native/package builds, release workflow execution, clean
+Debian/Fedora/Arch installation and GUI boot. Package resolution and actual ELF
+requirements still need native release/clean-system verification outside the cage.
+No network access, user-vault/config access, git writes, pushes or PRs.

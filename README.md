@@ -40,9 +40,18 @@ workflow: sessions can be summarized into the vault as notes, and restored
 from them later with one command (or one click in the app). Any agent that
 can run a CLI can do the same.
 
+## Installing on Linux
+
+Use the `.deb` with `sudo apt install ./<downloaded-file>.deb`, or the `.rpm`
+with `sudo dnf install ./<downloaded-file>.rpm`, so your package manager checks
+and installs required libraries. For the standalone Linux archive, extract it
+and run `sh install.sh` from a terminal for a dependency check and install prompts.
+See [Linux installation and runtime requirements](docs/linux-install.md).
+
 ## Building from source
 
-Requirements: Rust, Node.js, pnpm.
+Requirements: Rust, Node.js, pnpm, and the Linux development libraries listed
+in the [Linux guide](docs/linux-install.md#building-from-source).
 
 ```sh
 pnpm install

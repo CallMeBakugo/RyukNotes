@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 // GUI and CLI must resolve exactly the same host ledger. The explicit override
@@ -974,6 +974,29 @@ pub struct RestoreOutcome {
     pub requires_recovery_review: bool,
 }
 
+/// Explicit recovery of a raw v3 file after ledger loss or relocation. Never
+/// enroll the source implicitly: publish a separate destination with a fresh
+/// epoch through the same idempotent portable-restore protocol.
+pub fn recover_copy(source: &Path, destination: &Path, ledger_root: &Path, operation: &str) -> Result<RestoreOutcome, String> {
+    uuid::Uuid::parse_str(operation).map_err(err)?;
+    let _inspection = Inspection::open(source)?;
+    let stage = tempfile::tempdir().map_err(err)?;
+    let backup = stage.path().join("recovery.rn");
+    let conn = Connection::open_with_flags(source,OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(err)?;
+    snapshot(&conn,&backup,false,true)?;
+    drop(conn);
+    let mut input = File::open(&backup).map_err(err)?;
+    let mut checksum = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = input.read(&mut buffer).map_err(err)?;
+        if count == 0 { break; }
+        checksum.update(&buffer[..count]);
+    }
+    let request = format!("{:x}", checksum.finalize());
+    restore_portable(destination,&backup,ledger_root,&format!("portable_import:v1:raw:{operation}"),&request)
+}
+
 /// Shared epoch-safe production restore boundary.
 /// Exclusive maintenance refuses all managed live readers/owners. A v3 source
 /// must be explicitly migrated first; restore never upgrades an unknown backup.
@@ -1906,5 +1929,31 @@ mod tests {
             .unwrap()
             .contains("enrollment"));
         assert_eq!(inspect_version(&fixture.path).unwrap(), 3);
+    }
+}
+
+#[cfg(test)]
+mod explicit_recovery_tests {
+    use super::*;
+    #[test]
+    fn raw_copy_after_ledger_loss_preserves_source_and_retries_fresh_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.rn");
+        let original_ledger = dir.path().join("old-ledger");
+        let (db,_) = VaultDb::open_with_report(&source,&original_ledger).unwrap();
+        let original = identity(&db.conn).unwrap();
+        drop(db);
+        let before = fs::read(&source).unwrap();
+        let destination = dir.path().join("recovered.rn");
+        let new_ledger = dir.path().join("new-host-ledger");
+        let operation = uuid();
+        let first = recover_copy(&source,&destination,&new_ledger,&operation).unwrap();
+        let second = recover_copy(&source,&destination,&new_ledger,&operation).unwrap();
+        assert_eq!(first.identity,second.identity);
+        assert_eq!(first.identity.vault_uuid,original.vault_uuid);
+        assert_ne!(first.identity.storage_epoch,original.storage_epoch);
+        assert!(first.requires_recovery_review);
+        assert_eq!(fs::read(&source).unwrap(),before);
+        assert!(VaultDb::open_v3(&destination,&new_ledger).is_ok());
     }
 }

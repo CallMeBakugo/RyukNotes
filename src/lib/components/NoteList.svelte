@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { runBatchOperation } from '$lib/utils/batch-operation';
+	import { reportOperationError } from '$lib/stores/operation-feedback';
 	import { getActiveEditorPane, getEditorWorkspace, type PaneNavigation, type PaneRelease } from '$lib/stores/editor-workspace';
 
 	import { onDestroy, tick, untrack } from 'svelte';
@@ -30,6 +32,7 @@
 		restoreNote,
 		restoreNotebook,
 		permanentDelete,
+		permanentDeleteNotebook,
 		getQuickAccess,
 		addQuickAccess,
 		removeQuickAccess,
@@ -143,6 +146,7 @@
 			await refresh();
 		} catch (e) {
 			console.error('Failed to open daily note:', e);
+				reportOperationError('Failed to open daily note', e);
 		}
 	}
 
@@ -570,6 +574,7 @@
 			}
 		} catch (e) {
 			console.error('Failed to refresh notes:', e);
+				reportOperationError('Failed to refresh notes', e);
 		} finally {
 			pendingRefreshes.delete(changes);
 		}
@@ -597,6 +602,7 @@
 			onNoteSelected(note.path, content.content, undefined, token);
 		} catch (e) {
 			console.error('Failed to read note:', e);
+				reportOperationError('Failed to read note', e);
 		}
 	}
 
@@ -619,6 +625,7 @@
 			onNoteSelected(task.note_path, content.content, task, token);
 		} catch (e) {
 			console.error('Failed to open task note:', e);
+				reportOperationError('Failed to open task note', e);
 		}
 	}
 
@@ -671,6 +678,7 @@
 			onNoteCreated(token);
 		} catch (e) {
 			console.error('Failed to create note:', e);
+				reportOperationError('Failed to create note', e);
 		}
 	}
 
@@ -697,6 +705,7 @@
 			await selectNote(entry, token);
 		} catch (e) {
 			console.error('Failed to duplicate note:', e);
+				reportOperationError('Failed to duplicate note', e);
 		}
 	}
 
@@ -732,6 +741,7 @@
 			await onPathsMoved(note.path, newPath);
 		} catch (e) {
 			console.error('Failed to rename:', e);
+				reportOperationError('Failed to rename', e);
 		} finally {
 			await release();
 		}
@@ -756,6 +766,7 @@
 			}
 			catch (e) {
 				console.error('Failed to delete:', e);
+				reportOperationError('Failed to delete', e);
 			}
 		}
 		finally {
@@ -779,6 +790,7 @@
 			}
 			catch (e) {
 				console.error('Failed to restore:', e);
+				reportOperationError('Failed to restore', e);
 			}
 		}
 		finally {
@@ -802,6 +814,7 @@
 			}
 			catch (e) {
 				console.error('Failed to delete permanently:', e);
+				reportOperationError('Failed to delete permanently', e);
 			}
 		}
 		finally {
@@ -810,7 +823,7 @@
 	}
 
 	async function handleRestoreNotebook(nb: TrashNotebookEntry) {
-		const release = await onBeforePathMutation([nb.path]);
+		const release = await onBeforePathMutation();
 		if (!release)
 			return;
 		try {
@@ -824,6 +837,7 @@
 			}
 			catch (e) {
 				console.error('Failed to restore notebook:', e);
+				reportOperationError('Failed to restore notebook', e);
 			}
 			finally {
 				trashBusy = null;
@@ -835,13 +849,13 @@
 	}
 
 	async function handleDeleteNotebook(nb: TrashNotebookEntry) {
-		const release = await onBeforePathMutation([nb.path]);
+		const release = await onBeforePathMutation();
 		if (!release)
 			return;
 		try {
 			trashBusy = nb.path;
 			try {
-				await permanentDelete(ownerVault!, nb.path);
+				await permanentDeleteNotebook(ownerVault!, nb.path);
 				if (!ownerIsCurrent())
 					return;
 				noteCache.clear();
@@ -849,6 +863,7 @@
 			}
 			catch (e) {
 				console.error('Failed to delete notebook permanently:', e);
+				reportOperationError('Failed to delete notebook permanently', e);
 			}
 			finally {
 				trashBusy = null;
@@ -899,6 +914,7 @@
 			await updateMetadata(note.path, (meta) => { meta.pinned = !meta.pinned; });
 		} catch (e) {
 			console.error('Failed to toggle pin:', e);
+				reportOperationError('Failed to toggle pin', e);
 		}
 	}
 
@@ -927,6 +943,7 @@
 			await updateMetadata(note.path, (meta) => { meta.tags = newTags; });
 		} catch (e) {
 			console.error('Failed to save tags:', e);
+				reportOperationError('Failed to save tags', e);
 		}
 	}
 
@@ -953,6 +970,7 @@
 			}
 		} catch (e) {
 			console.error('Failed to add tag to batch:', e);
+				reportOperationError('Failed to add tag to batch', e);
 		}
 	}
 
@@ -964,6 +982,7 @@
 			}
 		} catch (e) {
 			console.error('Failed to remove tag from batch:', e);
+				reportOperationError('Failed to remove tag from batch', e);
 		}
 	}
 
@@ -977,6 +996,7 @@
 			$quickAccessPaths = qaNotes.map(n => n.relative_path);
 		} catch (e) {
 			console.error('Failed to add to quick access:', e);
+				reportOperationError('Failed to add to quick access', e);
 		}
 	}
 
@@ -991,6 +1011,7 @@
 			if ($viewMode === 'quickaccess') await refresh(true);
 		} catch (e) {
 			console.error('Failed to remove from quick access:', e);
+				reportOperationError('Failed to remove from quick access', e);
 		}
 	}
 
@@ -1012,6 +1033,7 @@
 			await reorderQuickAccess(arr.map(n => n.relative_path));
 		} catch (e) {
 			console.error('Failed to reorder quick access:', e);
+				reportOperationError('Failed to reorder quick access', e);
 		}
 	}
 
@@ -1079,6 +1101,7 @@
 			if (ownerIsCurrent()) onNoteMoved();
 		} catch (e) {
 			console.error('Failed to move note:', e);
+				reportOperationError('Failed to move note', e);
 		} finally {
 			await release();
 		}
@@ -1183,30 +1206,22 @@
 		selectNote(note);
 	}
 
-	// Batch operations
-	// Batch operations
+	// Batch operations acknowledge successes individually; failed rows stay visible.
 	async function handleBatchDelete() {
 		const capturedPaths = [...selectedPaths];
 		const release = await onBeforePathMutation(capturedPaths);
-		if (!release)
-			return;
+		if (!release) return;
 		try {
-			const toDelete = new Set(capturedPaths);
-			if (!ownerIsCurrent())
-				return;
+			if (!ownerIsCurrent()) return;
+			const result = await runBatchOperation(capturedPaths, path => deleteNote(ownerVault!, path));
+			if (!ownerIsCurrent()) return;
 			noteCache.clear();
-			for (const path of toDelete)
-				removeManualNoteOrderPath(path);
-			$notes = $notes.filter(n => !toDelete.has(n.path));
-			clearSelection();
-			await Promise.all([...toDelete].map(p => deleteNote(ownerVault!, p).catch(e => console.error('Failed to delete:', p, e))));
-			if (!ownerIsCurrent())
-				return;
+			for (const path of result.succeeded) removeManualNoteOrderPath(path);
+			$notes = $notes.filter(note => !result.succeeded.has(note.path));
+			selectedPaths = new Set(result.failed.map(item => item.path));
+			if (result.failed.length) reportOperationError(`Could not trash ${result.failed.length} note(s)`, result.failed[0].error);
 			onNoteMoved();
-		}
-		finally {
-			await release();
-		}
+		} finally { await release(); }
 	}
 
 	async function handleBatchMove(destPath: string) {
@@ -1224,6 +1239,7 @@
 					$notes = $notes.filter(note => note.path !== path);
 				} catch (error) {
 					console.error('Failed to move:', path, error);
+				reportOperationError('Failed to move', error);
 				}
 			}
 			noteCache.clear();
@@ -1237,40 +1253,34 @@
 	async function handleBatchRestore() {
 		const capturedPaths = [...selectedPaths];
 		const release = await onBeforePathMutation(capturedPaths);
-		if (!release)
-			return;
+		if (!release) return;
 		try {
-			const toRestore = capturedPaths;
+			if (!ownerIsCurrent()) return;
+			const result = await runBatchOperation(capturedPaths, path => restoreNote(ownerVault!, path, null));
+			if (!ownerIsCurrent()) return;
 			noteCache.clear();
-			clearSelection();
-			await Promise.all(toRestore.map(p => restoreNote(ownerVault!, p, null).catch(e => console.error('Failed to restore:', p, e))));
 			await refresh();
-			if (!ownerIsCurrent())
-				return;
+			if (!ownerIsCurrent()) return;
+			selectedPaths = new Set(result.failed.map(item => item.path));
+			if (result.failed.length) reportOperationError(`Could not restore ${result.failed.length} note(s)`, result.failed[0].error);
 			onNoteMoved();
-		}
-		finally {
-			await release();
-		}
+		} finally { await release(); }
 	}
 
 	async function handleBatchPermanentDelete() {
 		const capturedPaths = [...selectedPaths];
 		const release = await onBeforePathMutation(capturedPaths);
-		if (!release)
-			return;
+		if (!release) return;
 		try {
-			const toDelete = new Set(capturedPaths);
+			if (!ownerIsCurrent()) return;
+			const result = await runBatchOperation(capturedPaths, path => permanentDelete(ownerVault!, path));
+			if (!ownerIsCurrent()) return;
 			noteCache.clear();
-			for (const path of toDelete)
-				removeManualNoteOrderPath(path);
-			$notes = $notes.filter(n => !toDelete.has(n.path));
-			clearSelection();
-			await Promise.all([...toDelete].map(p => permanentDelete(ownerVault!, p).catch(e => console.error('Failed to delete:', p, e))));
-		}
-		finally {
-			await release();
-		}
+			for (const path of result.succeeded) removeManualNoteOrderPath(path);
+			$notes = $notes.filter(note => !result.succeeded.has(note.path));
+			selectedPaths = new Set(result.failed.map(item => item.path));
+			if (result.failed.length) reportOperationError(`Could not permanently delete ${result.failed.length} note(s)`, result.failed[0].error);
+		} finally { await release(); }
 	}
 
 	function handleWindowClick(event: MouseEvent) {
@@ -1884,7 +1894,8 @@
 				Open in New Window
 			</button>
 			{#if !isMobile}
-			<button onclick={async () => { const n = contextMenu!.note; contextMenu = null; try { await revealFile(n.path); } catch (e) { console.error('Failed to reveal in file manager:', e); } }}>
+			<button onclick={async () => { const n = contextMenu!.note; contextMenu = null; try { await revealFile(n.path); } catch (e) { console.error('Failed to reveal in file manager:', e);
+				reportOperationError('Failed to reveal in file manager', e); } }}>
 				<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
 				</svg>

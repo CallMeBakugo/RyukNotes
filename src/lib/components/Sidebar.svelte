@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { reportOperationError } from '$lib/stores/operation-feedback';
 	import { getActiveEditorPane, type PaneRelease } from '$lib/stores/editor-workspace';
 
 	import { onDestroy, tick } from 'svelte';
@@ -178,6 +179,7 @@
 			if (ownerIsCurrent() && request === tagRefreshRequest) $tags = nextTags;
 		} catch (error) {
 			console.error('Failed to refresh tags:', error);
+				reportOperationError('Failed to refresh tags', error);
 		}
 	}
 
@@ -212,6 +214,7 @@
 			if (nextTags && tagRequest === tagRefreshRequest) $tags = nextTags;
 		} catch (e) {
 			console.error('Failed to refresh sidebar:', e);
+				reportOperationError('Failed to refresh sidebar', e);
 		}
 	}
 
@@ -353,6 +356,7 @@
 			await refresh();
 		} catch (e) {
 			console.error('Failed to create notebook:', e);
+				reportOperationError('Failed to create notebook', e);
 		}
 	}
 
@@ -404,6 +408,7 @@
 			await refresh();
 		} catch (e) {
 			console.error('Failed to rename:', e);
+				reportOperationError('Failed to rename', e);
 		} finally {
 			await release();
 		}
@@ -439,13 +444,14 @@
 				await deleteNotebook(ownerVault!, nb.path);
 				if (!ownerIsCurrent())
 					return;
-				if ($activeNotebook?.path === nb.path) {
+				if ($activeNotebook?.path === nb.path || $activeNotebook?.path.startsWith(`${nb.path}/`)) {
 					selectAllNotes();
 				}
 				await refresh();
 			}
 			catch (e) {
 				console.error('Failed to delete:', e);
+				reportOperationError('Failed to delete', e);
 			}
 		}
 		finally {
@@ -472,6 +478,7 @@
 					await onPathsMoved(notePath, newPath);
 				} catch (error) {
 					console.error('Failed to move note:', notePath, error);
+				reportOperationError('Failed to move note', error);
 				}
 			}
 			if (ownerIsCurrent()) await refresh();
@@ -506,6 +513,7 @@
 			if (ownerIsCurrent()) await refresh();
 		} catch (error) {
 			console.error('Failed to move notebook:', error);
+				reportOperationError('Failed to move notebook', error);
 		} finally {
 			await release();
 		}
@@ -639,6 +647,7 @@
 			if ($notebookSortMode !== 'manual') $notebookSortMode = 'manual';
 		} catch (e) {
 			console.error('Failed to reorder notebook:', e);
+				reportOperationError('Failed to reorder notebook', e);
 		} finally {
 			await release();
 		}
@@ -802,6 +811,7 @@
 			}
 			catch (e) {
 				console.error('Failed to empty trash:', e);
+				reportOperationError('Failed to empty trash', e);
 			}
 		}
 		finally {
@@ -1175,11 +1185,11 @@
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div class="delete-confirm-overlay" onclick={dismissDeleteConfirm} onkeydown={(e) => { if (e.key === 'Escape') deleteConfirm = null; }}>
 		<div class="delete-confirm" class:mobile={isMobile} role="alertdialog" aria-modal="true" aria-labelledby="delete-confirm-title" tabindex="-1">
-			<h4 id="delete-confirm-title">Delete "{deleteConfirm.name}"?</h4>
-			<p>This notebook contains {countNotesRecursive(deleteConfirm)} note{countNotesRecursive(deleteConfirm) === 1 ? '' : 's'} that will be permanently deleted.</p>
+			<h4 id="delete-confirm-title">{isDbVault() ? 'Trash' : 'Delete'} "{deleteConfirm.name}"?</h4>
+			<p>This notebook contains {countNotesRecursive(deleteConfirm)} note{countNotesRecursive(deleteConfirm) === 1 ? '' : 's'} {isDbVault() ? 'that will be moved to Trash with this notebook and its sub-notebooks. You can restore them together.' : 'that will be permanently deleted.'}</p>
 			<div class="delete-confirm-actions">
 				<button class="delete-confirm-cancel" onclick={() => deleteConfirm = null}>Cancel</button>
-				<button class="delete-confirm-btn" onclick={() => confirmDelete(deleteConfirm!)}>Delete</button>
+				<button class="delete-confirm-btn" onclick={() => confirmDelete(deleteConfirm!)}>{isDbVault() ? 'Move to Trash' : 'Delete'}</button>
 			</div>
 		</div>
 	</div>

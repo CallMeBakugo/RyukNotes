@@ -244,7 +244,7 @@ fn first_tag_match(
     first
 }
 
-fn match_target(text: &str, field: SearchTargetField, start: usize, end: usize) -> SearchTarget {
+pub(crate) fn match_target(text: &str, field: SearchTargetField, start: usize, end: usize) -> SearchTarget {
     let end = text[start..end]
         .char_indices()
         .nth(SNIPPET_CHARS)

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
+	import PortableRecovery from './PortableRecovery.svelte';
 	import { open } from '@tauri-apps/plugin-dialog';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { documentDir } from '@tauri-apps/api/path';
@@ -291,6 +292,8 @@
 				Choose Folder in Files
 			</button>
 		{/if}
+
+		{#if !isMobile}<PortableRecovery onOpenDestination={openSelectedVault} />{/if}
 
 		{#if $appConfig?.active_vault && !initialError}
 			<button class="btn-back" onclick={() => ($vaultReady = true)}>

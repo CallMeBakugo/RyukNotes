@@ -35,6 +35,7 @@ function fixture(overrides = {}) {
   const selected = [];
   const focused = [];
   const errors = [];
+  const visibleErrors = [];
   const context = createContext({
     ownerVault: vault,
     ownerIsCurrent: () => context.$appConfig.active_vault === vault,
@@ -61,6 +62,7 @@ function fixture(overrides = {}) {
     onNoteMoved() {},
     onNoteSelected: (path, content) => selected.push({ path, content }),
     onNoteCreated: token => focused.push(token),
+    reportOperationError: (action, error) => visibleErrors.push({ action, error }),
     console: { error: (...args) => errors.push(args) },
     ...overrides
   });
@@ -71,7 +73,7 @@ function fixture(overrides = {}) {
       get: () => get(paneContext[key]), set: value => paneContext[key].set(value),
     });
   }
-  return { context, paneContext, entry, created, selected, focused, errors, create: createScript.runInContext(context) };
+  return { context, paneContext, entry, created, selected, focused, errors, visibleErrors, create: createScript.runInContext(context) };
 }
 
 for (const mode of ['rich', 'source']) {
@@ -153,6 +155,8 @@ test('a failed read keeps the existing draft and never opens a fabricated new no
   assert.equal(f.selected.length, 0);
   assert.equal(f.focused.length, 0);
   assert.equal(f.errors.length, 1);
+  assert.equal(f.visibleErrors.length, 1);
+  assert.equal(f.visibleErrors[0].action, 'Failed to create note');
 });
 
 test('typing while the new-note read is pending must pass another save flush before selection', async () => {

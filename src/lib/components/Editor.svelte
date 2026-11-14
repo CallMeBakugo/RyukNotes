@@ -3476,8 +3476,8 @@
 	let conflictReview = $state.raw<ConflictReviewModel | null>(null);
 	let conflictReviewState = $state.raw<ReviewState | null>(null);
 	let unsubscribeConflictReview: (() => void) | null = null;
-	let reviewFocusIntent: () => boolean = () => false;
-	let reviewRenderSnapshot: (body: string) => string = () => '';
+	let reviewFocusIntent = $state<() => boolean>(() => false);
+	let reviewRenderSnapshot = $state<(body: string) => string>(() => '');
 	let pendingReviewedNote: NoteContent | null = null;
 	let reviewSourceMode: boolean | null = null;
 	$effect(() => {

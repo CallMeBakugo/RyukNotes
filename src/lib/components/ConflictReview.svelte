@@ -102,7 +102,7 @@
 </script>
 
 <!-- This dialog belongs to one editor, not a global active-note surface. -->
-<section class="conflict-review" role="dialog" aria-modal="false" aria-labelledby={ids.title}
+<div class="conflict-review" role="dialog" aria-modal="false" aria-labelledby={ids.title}
   data-editor-overlay={ownerId} bind:this={root} tabindex="-1" onkeydown={keydown}>
   <header>
     <h2 id={ids.title}>Review changes</h2>
@@ -184,7 +184,7 @@
     {#if view.status !== 'loading' && view.status !== 'applying'}<button onclick={() => void model.open(true)}>Renew review</button>{/if}
     <button disabled={!canApply} onclick={() => void onApply()}>{view.status === 'applying' ? 'Applying…' : 'Apply reviewed result'}</button>
   </footer>
-</section>
+</div>
 
 <style>
   .conflict-review { position: absolute; inset: 0; z-index: 60; display: flex; flex-direction: column; gap: 8px; overflow: auto; padding: 12px; background: var(--bg-primary); color: var(--text-primary); border: 1px solid var(--border-color); outline-offset: -3px; }

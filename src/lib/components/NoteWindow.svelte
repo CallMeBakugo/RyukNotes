@@ -1,4 +1,5 @@
 <script lang="ts">
+	import OperationFeedback from './OperationFeedback.svelte';
 	import { sameAcceptedNote } from '$lib/utils/accepted-note';
 	import { invoke } from '@tauri-apps/api/core';
 	import { openNoteWindowSession } from '$lib/utils/note-window-session';
@@ -301,6 +302,7 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
+<OperationFeedback />
 <RecoveryInbox notice={recoveryBarrierNotice} />
 
 <div class="note-window">

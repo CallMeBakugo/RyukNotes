@@ -4326,6 +4326,11 @@ pub fn db_search_notes(
     with_db(&state, |db| db.search(&query))
 }
 
+#[tauri::command]
+pub fn db_search_page(state: State<'_, AppState>, query: String, limit: Option<usize>, offset: Option<usize>) -> Result<crate::types::SearchPage, String> {
+    with_db(&state, |db| db.search_page(&query, limit.unwrap_or(20), offset.unwrap_or(0)))
+}
+
 /// A captured vault path must still name the open connection after an async paste.
 fn validate_db_vault(db: &crate::vault::db::VaultDb, vault_path: &str) -> Result<(), String> {
     let requested = std::fs::canonicalize(vault_path).map_err(|e| e.to_string())?;
@@ -4905,7 +4910,7 @@ pub fn db_vault_stats(state: State<'_, AppState>) -> Result<crate::types::VaultS
         let notes_size: u64 = db
             .conn
             .query_row(
-                "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM notes WHERE trashed = 0",
+                "SELECT COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0) FROM notes WHERE trashed = 0",
                 [],
                 |r| r.get(0),
             )
@@ -4927,12 +4932,27 @@ pub fn db_vault_stats(state: State<'_, AppState>) -> Result<crate::types::VaultS
     })
 }
 
+#[tauri::command]
+pub fn db_storage_diagnostics(state: State<'_, AppState>, vault_path: String) -> Result<serde_json::Value, String> {
+    let recovery = state.recovery.lock().map_err(|e|e.to_string())?;
+    let private_bytes = recovery.private_storage_bytes()?;
+    with_db(&state, |db| {
+        validate_db_vault(db,&vault_path)?;
+        let mut result = db.storage_diagnostics()?;
+        result["privateRecoveryBytesAllVaults"] = serde_json::json!(private_bytes);
+        Ok(result)
+    })
+}
+
 /// Revision payload retention is independent of curated body history settings.
 #[tauri::command]
 pub fn db_collect_revisions(
     state: State<'_, AppState>,
+    vault_path: String,
 ) -> Result<crate::vault::revision_retention::GcReport, String> {
-    with_db(&state, |db| db.collect_revisions())
+    let recovery = state.recovery.lock().map_err(|e|e.to_string())?;
+    recovery.assert_quiet(None,None)?;
+    with_db(&state, |db| { validate_db_vault(db,&vault_path)?; db.collect_revisions() })
 }
 
 /// DB-mode empty trash: permanently delete every trashed note.
@@ -4966,6 +4986,23 @@ pub fn db_empty_trash(state: State<'_, AppState>) -> Result<u32, String> {
         }
         Ok(deleted)
     })
+}
+
+#[tauri::command]
+pub fn db_trash_notebook(state: State<'_, AppState>, vault_path: String, path: String, operation_id: String) -> Result<(), String> {
+    let recovery = state.recovery.lock().map_err(|e|e.to_string())?;
+    recovery.assert_quiet(None,None)?;
+    with_db(&state, |db| { validate_db_vault(db,&vault_path)?; crate::vault::db_notebooks::trash(db,&vault_path,&path,&operation_id) })
+}
+#[tauri::command]
+pub fn db_notebook_trash(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+    with_db(&state, |db| Ok(crate::vault::db_notebooks::trash_groups(db)?.into_iter().map(|g| serde_json::json!({"path":g.path,"name":g.name,"modified":g.modified,"note_count":g.notes.len()})).collect()))
+}
+#[tauri::command]
+pub fn db_resolve_notebook_trash(state: State<'_, AppState>, vault_path: String, path: String, remove: bool, operation_id: String) -> Result<String, String> {
+    let recovery = state.recovery.lock().map_err(|e|e.to_string())?;
+    recovery.assert_quiet(None,None)?;
+    with_db(&state, |db| { validate_db_vault(db,&vault_path)?; crate::vault::db_notebooks::resolve_trash(db,&vault_path,&path,remove,&operation_id) })
 }
 
 /// DB-mode task extraction: checkbox items parsed straight from note bodies.
@@ -7347,22 +7384,22 @@ pub fn db_restore_ancestry_export<R: Runtime>(
     state: State<'_, AppState>,
     source_dir: String,
     destination: String,
-    ledger_root: String,
+    ledger_root: Option<String>,
     mode: crate::vault::portable_ancestry::RestoreMode,
     operation_id: String,
 ) -> Result<serde_json::Value, String> {
     ensure_scoped_path(&app, Path::new(&source_dir))?;
     ensure_writable_path(&app, Path::new(&destination))?;
-    ensure_writable_path(&app, Path::new(&ledger_root))?;
-    state
-        .recovery
-        .lock()
-        .map_err(|e| e.to_string())?
-        .assert_quiet(None, None)?;
+    let ledger_root = match ledger_root {
+        Some(root) => { ensure_writable_path(&app, Path::new(&root))?; std::path::PathBuf::from(root) }
+        None => crate::vault::ancestry::production_ledger_root(Path::new(&destination))?,
+    };
+    let recovery = state.recovery.lock().map_err(|e| e.to_string())?;
+    recovery.assert_quiet(None, None)?;
     let outcome = crate::vault::portable_ancestry::restore_export(
         Path::new(&source_dir),
         Path::new(&destination),
-        Path::new(&ledger_root),
+        &ledger_root,
         mode,
         &operation_id,
     )?;
@@ -7377,15 +7414,22 @@ pub fn db_reconcile_ancestry_export<R: Runtime>(
     operation_id: String,
 ) -> Result<crate::vault::portable_ancestry::ReconcileOutcome, String> {
     ensure_scoped_path(&app, Path::new(&source_dir))?;
-    state
-        .recovery
-        .lock()
-        .map_err(|e| e.to_string())?
-        .assert_quiet(None, None)?;
+    let recovery = state.recovery.lock().map_err(|e| e.to_string())?;
+    recovery.assert_quiet(None, None)?;
     with_db(&state, |db| {
         validate_db_vault(db, &vault_path)?;
         crate::vault::portable_ancestry::reconcile_export(Path::new(&source_dir), db, &operation_id)
     })
+}
+
+#[tauri::command]
+pub fn db_recover_vault_copy<R: Runtime>(app: AppHandle<R>, state: State<'_, AppState>, source: String, destination: String, operation_id: String) -> Result<crate::vault::ancestry::RestoreOutcome, String> {
+    ensure_scoped_path(&app,Path::new(&source))?;
+    ensure_writable_path(&app,Path::new(&destination))?;
+    let recovery = state.recovery.lock().map_err(|e|e.to_string())?;
+    recovery.assert_quiet(None,None)?;
+    let ledger = crate::vault::ancestry::production_ledger_root(Path::new(&destination))?;
+    crate::vault::ancestry::recover_copy(Path::new(&source),Path::new(&destination),&ledger,&operation_id)
 }
 
 /// Read-only inspection for Stage 4F: connection-local data_version is a hint,
@@ -7617,5 +7661,45 @@ mod activated_vault_tests {
         assert!(db
             .accepted_at_token("n", current["accepted"]["token"].as_str().unwrap())
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod everyday_workflow_ipc_tests {
+    use super::*;
+    #[test]
+    fn search_notebook_trash_and_storage_commands_work_through_real_mock_ipc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ipc.rn");
+        let app = tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![db_open,db_search_page,db_trash_notebook,db_notebook_trash,db_resolve_notebook_trash,db_storage_diagnostics,db_collect_revisions])
+            .manage(AppState::new(AppConfig::default()))
+            .build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
+        let view = tauri::WebviewWindowBuilder::new(&app,"main",Default::default()).build().unwrap();
+        let request = |cmd: &str,body: serde_json::Value| {
+            tauri::test::get_ipc_response(&view,tauri::webview::InvokeRequest {
+                cmd:cmd.into(),callback:tauri::ipc::CallbackFn(0),error:tauri::ipc::CallbackFn(1),url:"http://tauri.localhost".parse().unwrap(),body:tauri::ipc::InvokeBody::Json(body),headers:Default::default(),invoke_key:tauri::test::INVOKE_KEY.into(),
+            })
+        };
+        request("db_open",serde_json::json!({"path":path})).unwrap();
+        let state = app.state::<AppState>();
+        {
+            use crate::vault::{db::NewNote,writer::{NoteWrite,WritePolicy}};
+            let slot = state.vault_db.lock().unwrap();let db = slot.as_ref().unwrap();
+            let note = NewNote { id:"n".into(),title:"Title".into(),content:"😀 needle".into(),tags:vec![],pinned:false,created:"now".into(),modified:"now".into() };
+            db.write_authoritative(&NoteWrite::from_note(db,&note,WritePolicy::Create),0).unwrap();
+            crate::vault::db_notebooks::create(db,path.to_str().unwrap(),None,"Work").unwrap();
+            crate::vault::db_notebooks::move_note(db,path.to_str().unwrap(),"n","Work").unwrap();
+        }
+        let page: serde_json::Value = request("db_search_page",serde_json::json!({"query":"needle","limit":20,"offset":0})).unwrap().deserialize().unwrap();
+        assert_eq!(page["total"],1);assert_eq!(page["results"][0]["match_target"]["text"],"needle");
+        request("db_trash_notebook",serde_json::json!({"vaultPath":path,"path":"Work","operationId":uuid::Uuid::new_v4().to_string()})).unwrap();
+        let groups: serde_json::Value = request("db_notebook_trash",serde_json::json!({})).unwrap().deserialize().unwrap();
+        assert_eq!(groups[0]["note_count"],1);
+        request("db_resolve_notebook_trash",serde_json::json!({"vaultPath":path,"path":groups[0]["path"],"remove":false,"operationId":uuid::Uuid::new_v4().to_string()})).unwrap();
+        let stats: serde_json::Value = request("db_storage_diagnostics",serde_json::json!({"vaultPath":path})).unwrap().deserialize().unwrap();
+        assert_eq!(stats["liveBodyBytes"],11);assert_eq!(stats["trashedBodyBytes"],0);
+        assert!(request("db_collect_revisions",serde_json::json!({"vaultPath":dir.path().join("other.rn")})).is_err());
+        request("db_collect_revisions",serde_json::json!({"vaultPath":path})).unwrap();
     }
 }

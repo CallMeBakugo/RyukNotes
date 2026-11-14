@@ -225,20 +225,8 @@ export async function dbDuplicateNote(path: string, vaultPath?: string): Promise
   return createExplicit(crypto.randomUUID(), `${note.meta.title} (copy)`, note.content, note.meta.tags, note.meta.accepted?.vault.path);
 }
 
-export async function dbSearchNotes(query: string): Promise<SearchPage> {
-  const notes: DbNote[] = await invoke("db_search_notes", { query });
-  return {
-    results: notes.map((note) => ({
-      path: note.id,
-      title: note.title,
-      snippet: note.preview ?? "",
-      score: 0,
-      title_matches: [],
-      snippet_matches: [],
-      match_target: null,
-    })),
-    total: notes.length,
-  };
+export async function dbSearchNotes(query: string, limit = 20, offset = 0): Promise<SearchPage> {
+  return invoke("db_search_page", { query, limit, offset });
 }
 
 export async function dbGetAllTags(): Promise<[string, number][]> {
@@ -261,7 +249,7 @@ export async function dbGetTrash(): Promise<TrashContents> {
   const notes: DbNote[] = await invoke("db_list_notes", { includeTrashed: true });
   return {
     notes: notes.filter((note) => note.trashed).map(toEntry),
-    notebooks: [],
+    notebooks: await invoke("db_notebook_trash"),
   };
 }
 
@@ -475,7 +463,7 @@ export interface AncestryRestoreOutcome {
 /** Explicit destination creation, never a displayed-vault switch. The caller
  * retains operationId for retry and uses the existing all-pane pause barrier.
  * Production activation remains gated; native code refuses unresolved owners. */
-export async function dbRestoreAncestryExport(sourceDir: string, destination: string, ledgerRoot: string,
+export async function dbRestoreAncestryExport(sourceDir: string, destination: string, ledgerRoot: string | null,
   mode: 'full_restore' | 'independent_copy', operationId: string): Promise<AncestryRestoreOutcome> {
   return invoke('db_restore_ancestry_export', { sourceDir, destination, ledgerRoot, mode, operationId });
 }

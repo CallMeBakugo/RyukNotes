@@ -130,6 +130,18 @@ fn atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     result
 }
 impl Recovery {
+    pub(crate) fn private_storage_bytes(&self) -> Result<u64, String> {
+        let Some(root) = &self.root else { return Ok(0) };
+        let mut bytes = 0u64;
+        for entry in walkdir::WalkDir::new(root).follow_links(false) {
+            let entry = entry.map_err(|e|e.to_string())?;
+            if entry.file_type().is_file() {
+                bytes = bytes.saturating_add(entry.metadata().map_err(|e|e.to_string())?.len());
+            }
+        }
+        Ok(bytes)
+    }
+
     pub fn set_root(&mut self, path: PathBuf) -> Result<(), String> {
         private_dir(&path)?;
         self.root = Some(path);
@@ -3731,8 +3743,9 @@ mod revision_retention_tests {
             "closing another clean paused window retains detached ownership"
         );
         // GC is safe with dirty windows because their base pins are independent
-        // roots. It never uses the maintenance barrier to discard those drafts.
-        request(&main, "db_collect_revisions", json!({})).unwrap();
+        // roots, but the retention gate still refuses while a dirty owner is
+        // enrolled; refusal preserves the detached draft either way.
+        assert!(request(&main,"db_collect_revisions",json!({"vaultPath":f.path})).is_err());
         assert!(state.recovery.lock().unwrap().owners[&b].dirty);
         request(
             &detached,
