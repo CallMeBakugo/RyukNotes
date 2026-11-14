@@ -33,13 +33,21 @@ jobs:
       - name: Check packaged runtime dependency metadata
         shell: python
         run: |
-          import pathlib, subprocess
+          import pathlib, shutil, subprocess
           root = pathlib.Path('src-tauri/target/release/bundle')
+          # Stage packages under apostrophe-free names: package names carrying
+          # an apostrophe break rpm's CLI quoting on some distros and make
+          # poor download filenames.
+          staged = pathlib.Path('staged-packages'); staged.mkdir(exist_ok=True)
+          for package in root.glob('*/*.*'):
+              if package.suffix in ('.deb', '.rpm'):
+                  safe = package.name.replace("'", '').replace(' ', '-')
+                  shutil.copy2(package, staged / safe)
           for kind, command, required in [
               ('deb', ['dpkg-deb', '--field'], ['libwebkit2gtk-4.1-0', 'libgtk-3-0', 'libayatana-appindicator3-1', 'librsvg2-2', 'xdg-utils']),
               ('rpm', ['rpm', '-qp', '--requires'], ['libwebkit2gtk-4.1.so.0', 'libgtk-3.so.0', 'libayatana-appindicator3.so.1', 'librsvg-2.so.2', 'xdg-utils']),
           ]:
-              packages = list((root / kind).glob('*.' + kind))
+              packages = list(staged.glob('*.' + kind))
               assert packages, f'No {kind} packages produced'
               for package in packages:
                   args = command + [str(package)] + (['Depends'] if kind == 'deb' else [])
@@ -67,16 +75,16 @@ jobs:
         with:
           name: ryuknotes-linux-x86_64
           path: |
-            src-tauri/target/release/bundle/deb/*.deb
-            src-tauri/target/release/bundle/rpm/*.rpm
+            staged-packages/*.deb
+            staged-packages/*.rpm
             ${{ steps.standalone.outputs.archive }}
       - name: Attach Linux downloads to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            src-tauri/target/release/bundle/deb/*.deb
-            src-tauri/target/release/bundle/rpm/*.rpm
+            staged-packages/*.deb
+            staged-packages/*.rpm
             ${{ steps.standalone.outputs.archive }}
 
   build-macos:

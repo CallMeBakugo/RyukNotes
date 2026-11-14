@@ -21,7 +21,10 @@ try {
   assert(target.querySelectorAll('[role="dialog"]').length===2,'two real conflict review components mount');
   const ids=[...target.querySelectorAll('[id]')].map(el=>el.id);assert(new Set(ids).size===ids.length,'review and nested history IDs are unique across mounted panes');
   for(const el of target.querySelectorAll('[aria-labelledby]'))for(const id of el.getAttribute('aria-labelledby')!.split(' '))assert(!!document.getElementById(id),`ARIA target exists: ${id}`);
+  const snapshotTabs=[...target.querySelectorAll('[id$="-history-tab-snapshot"]')] as HTMLButtonElement[];snapshotTabs.forEach(tab=>tab.click());await settle();
+  assert(target.textContent!.includes('first:'),'mounted snapshot view renders through the live renderer');
   harness.renderer('updated');await settle();assert(target.textContent!.includes('updated:'),'new renderer callback reaches an already mounted review');
+  assert(!target.textContent!.includes('first:'),'already mounted review drops the retired renderer output');
   const pane1=target.querySelector('[data-test-pane="1"]')!, input=pane1.querySelector('input')!;
   input.focus();const focusBefore=document.activeElement;input.dispatchEvent(new KeyboardEvent('keydown',{key:'F3',bubbles:true,cancelable:true}));await settle();assert(document.activeElement===focusBefore,'inactive review F3 cannot steal focus into another pane');
   localRevision++;models[0].invalidate('typing during review');await settle();assert(models[0].state.status==='stale','typing during mounted review fences apply');
