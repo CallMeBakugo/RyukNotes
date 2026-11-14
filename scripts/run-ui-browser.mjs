@@ -49,6 +49,8 @@ try {
   socket?.close();
   if(browser && browser.exitCode===null)browser.kill('SIGTERM');
   await server.close();
-  if(passed)await rm(root,{recursive:true,force:true});
+  // Chrome may still be flushing its profile when the gate passes; a transient
+  // ENOTEMPTY during cleanup must never fail a passed run.
+  if(passed)await rm(root,{recursive:true,force:true,maxRetries:10,retryDelay:200}).catch(()=>{});
   else console.error(`UI fixture artifacts retained at ${root}`);
 }
