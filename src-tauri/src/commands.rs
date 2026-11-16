@@ -5122,7 +5122,14 @@ pub fn db_create_backup(
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let filename = format!("{stem}-db-backup-{stamp}.rn");
+        let uuid = with_db(&state, |db| {
+            validate_db_vault(db, &vault_path)?;
+            Ok(crate::vault::ancestry::identity(&db.conn)?.vault_uuid)
+        })?;
+        let filename = format!(
+            "{stem}-db-backup-{stamp}-{uuid}-{}.rn",
+            uuid::Uuid::new_v4()
+        );
         let backup_path = backup_dir.join(&filename);
         with_db(&state, |db| {
             crate::vault::ancestry::snapshot(&db.conn, &backup_path, false, true)
@@ -5270,6 +5277,10 @@ pub fn db_list_backups(
             config.active_vault.clone().unwrap_or_default(),
         )
     };
+    let uuid = with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        Ok(crate::vault::ancestry::identity(&db.conn)?.vault_uuid)
+    })?;
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&backup_dir) {
         for entry in entries.flatten() {
@@ -5292,12 +5303,10 @@ pub fn db_list_backups(
                 .and_then(|m| m.modified().ok())
                 .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
                 .unwrap_or_default();
-            let stem = std::path::Path::new(&vault_path)
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let other_vault = !filename.starts_with(stem.as_str());
+            let Ok(backup_uuid) = crate::backup::db_backup_uuid(&path) else {
+                continue;
+            };
+            let other_vault = backup_uuid != uuid;
             out.push(crate::types::BackupEntry {
                 filename,
                 path: path.to_string_lossy().into_owned(),
@@ -5312,8 +5321,11 @@ pub fn db_list_backups(
 }
 
 #[tauri::command]
-pub fn db_delete_backup(backup_path: String) -> Result<(), String> {
-    std::fs::remove_file(&backup_path).map_err(|e| e.to_string())
+pub fn db_delete_backup(state: State<'_, AppState>, backup_path: String) -> Result<(), String> {
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    let directory = crate::backup::get_backup_dir(&config.backup_location)?;
+    drop(config);
+    crate::backup::delete_db_backup(&directory, &backup_path)
 }
 
 // ── Helpers ──
@@ -7805,5 +7817,55 @@ mod everyday_workflow_ipc_tests {
             serde_json::json!({"vaultPath":path}),
         )
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod db_backup_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn backup_delete_ipc_rejects_outside_files_and_deletes_only_selected_snapshots() {
+        let root = tempfile::tempdir().unwrap();
+        let backups = root.path().join("backups");
+        std::fs::create_dir(&backups).unwrap();
+        let outside = root.path().join("outside-db-backup-fixture.rn");
+        std::fs::write(&outside, b"keep").unwrap();
+        let (db, _) = crate::vault::db::VaultDb::open_with_report(
+            &root.path().join("vault.rn"),
+            &root.path().join("ledger"),
+        )
+        .unwrap();
+        let selected = backups.join("vault-db-backup-fixture.rn");
+        crate::vault::ancestry::snapshot(&db.conn, &selected, false, true).unwrap();
+        let app = tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![db_delete_backup])
+            .manage(AppState::new(AppConfig {
+                backup_location: Some(backups.to_string_lossy().into()),
+                ..Default::default()
+            }))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let view = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let request = |path: &Path| {
+            tauri::test::get_ipc_response(
+                &view,
+                tauri::webview::InvokeRequest {
+                    cmd: "db_delete_backup".into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: "http://tauri.localhost".parse().unwrap(),
+                    body: tauri::ipc::InvokeBody::Json(serde_json::json!({"backupPath":path})),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.into(),
+                },
+            )
+        };
+        assert!(request(&outside).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+        assert!(request(&selected).is_ok());
+        assert!(!selected.exists());
     }
 }

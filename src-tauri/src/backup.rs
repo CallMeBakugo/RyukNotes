@@ -787,44 +787,62 @@ pub fn cleanup_old_backups(
     Ok(())
 }
 
-/// Prune DB snapshots matching this vault's exact stem and timestamp format.
-/// Legacy snapshot names identify vaults by stem, so equal stems share retention.
+/// Inspect ownership from the snapshot, never infer it from a filename stem.
+pub fn db_backup_uuid(path: &Path) -> Result<String, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Invalid backup name")?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || !name.contains("-db-backup-")
+        || !name.ends_with(".rn")
+    {
+        return Err("Expected a regular database backup file".into());
+    }
+    crate::vault::ancestry::Inspection::open(path)?
+        .identity()
+        .map(|i| i.vault_uuid)
+}
+
+pub fn delete_db_backup(backup_dir: &Path, backup_path: &str) -> Result<(), String> {
+    let root = fs::canonicalize(backup_dir).map_err(|e| e.to_string())?;
+    let requested = Path::new(backup_path);
+    // Check the original entry too: canonicalization must not authorize a link.
+    if fs::symlink_metadata(requested)
+        .map_err(|e| e.to_string())?
+        .file_type()
+        .is_symlink()
+    {
+        return Err("Backup must not be a symlink".into());
+    }
+    let path = fs::canonicalize(requested).map_err(|e| e.to_string())?;
+    if path.parent() != Some(root.as_path()) {
+        return Err("Backup must be in the configured backup directory".into());
+    }
+    db_backup_uuid(&path)?;
+    fs::remove_file(path).map_err(|e| e.to_string())
+}
+
 pub fn cleanup_old_db_backups(
     backup_dir: &Path,
     vault_path: &str,
     max_count: u32,
 ) -> Result<(), String> {
-    let stem = Path::new(vault_path)
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let prefix = format!("{stem}-db-backup-");
+    let identity = crate::vault::ancestry::Inspection::open(Path::new(vault_path))?.identity()?;
     let mut owned = Vec::new();
     for entry in fs::read_dir(backup_dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
-        if !entry.file_type().map_err(|e| e.to_string())?.is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(stamp) = name
-            .strip_prefix(&prefix)
-            .and_then(|s| s.strip_suffix(".rn"))
-        else {
-            continue;
-        };
-        if stamp.len() == 15
-            && stamp.bytes().enumerate().all(|(i, b)| {
-                if i == 8 {
-                    b == b'-'
-                } else {
-                    b.is_ascii_digit()
-                }
-            })
-        {
-            owned.push((name, entry.path()));
+        if db_backup_uuid(&entry.path()).is_ok_and(|uuid| uuid == identity.vault_uuid) {
+            let modified = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .map_err(|e| e.to_string())?;
+            owned.push((modified, entry.path()));
         }
     }
-    owned.sort_by(|a, b| b.0.cmp(&a.0));
+    owned.sort_by(|a, b| b.cmp(a));
     for (_, path) in owned.into_iter().skip(max_count as usize) {
         fs::remove_file(path).map_err(|e| e.to_string())?;
     }
@@ -843,31 +861,30 @@ mod tests {
     use zip::{ZipArchive, ZipWriter};
 
     #[test]
-    fn db_retention_keeps_newest_and_ignores_unrelated_files() {
-        let dir = tempdir().unwrap();
-        let names = [
-            "vault-db-backup-20260101-000000.rn",
-            "vault-db-backup-20260102-000000.rn",
-            "vault-db-backup-20260103-000000.rn",
-            "vault-extra-db-backup-20260101-000000.rn",
-            "vault-db-backup-invalid.rn",
-            "vault-db-backup-20260101-000000.zip",
-            "vault.rn",
-        ];
-        for name in names {
-            fs::write(dir.path().join(name), b"snapshot").unwrap();
-        }
-        super::cleanup_old_db_backups(dir.path(), "/notes/vault.rn", 2).unwrap();
-        assert!(!dir.path().join(names[0]).exists());
-        for name in &names[1..] {
-            assert!(dir.path().join(name).exists(), "{name}");
-        }
-        super::cleanup_old_db_backups(dir.path(), "/notes/vault.rn", 0).unwrap();
-        assert!(!dir.path().join(names[1]).exists());
-        assert!(!dir.path().join(names[2]).exists());
-        for name in &names[3..] {
-            assert!(dir.path().join(name).exists(), "{name}");
-        }
+    fn db_retention_and_delete_use_snapshot_identity_and_directory_boundaries() {
+        use crate::vault::{ancestry, db::VaultDb};
+        let root = tempdir().unwrap();
+        let backups = root.path().join("backups");
+        fs::create_dir(&backups).unwrap();
+        let vault = root.path().join("vault.rn");
+        let (db, _) = VaultDb::open_with_report(&vault, &root.path().join("ledger")).unwrap();
+        let other = root.path().join("other.rn");
+        let (other_db, _) = VaultDb::open_with_report(&other, &root.path().join("ledger")).unwrap();
+        let own = backups.join("same-db-backup-own.rn");
+        let unrelated = backups.join("same-db-backup-other.rn");
+        ancestry::snapshot(&db.conn, &own, false, true).unwrap();
+        ancestry::snapshot(&other_db.conn, &unrelated, false, true).unwrap();
+        let arbitrary = backups.join("unrelated.txt");
+        fs::write(&arbitrary, "keep").unwrap();
+        assert!(super::delete_db_backup(&backups, arbitrary.to_str().unwrap()).is_err());
+        let outside = root.path().join("vault-db-backup-outside.rn");
+        ancestry::snapshot(&db.conn, &outside, false, true).unwrap();
+        assert!(super::delete_db_backup(&backups, outside.to_str().unwrap()).is_err());
+        super::cleanup_old_db_backups(&backups, vault.to_str().unwrap(), 0).unwrap();
+        assert!(!own.exists());
+        assert!(unrelated.exists() && arbitrary.exists() && outside.exists());
+        super::delete_db_backup(&backups, unrelated.to_str().unwrap()).unwrap();
+        assert!(!unrelated.exists());
     }
 
     #[test]
