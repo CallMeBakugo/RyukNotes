@@ -366,10 +366,17 @@ async function writeNoteLines(id: string, change: { note: NoteContent; lines: st
 }
 
 function resolveLine(lines: string[], line: number, rawLine: string): number {
-  if (lines[line] === rawLine) return line;
-  const found = lines.indexOf(rawLine);
-  if (found >= 0) return found;
-  throw new Error("Task line not found; the note changed since the task list was built");
+  const same = (text: string) => text.replace(/\r$/, '') === rawLine;
+  if (lines[line] !== undefined && same(lines[line])) return line;
+  const found = lines.flatMap((text, index) => same(text) ? [index] : []);
+  if (found.length === 1) return found[0];
+  throw new Error("Task line moved or became ambiguous; refresh the task list before editing");
+}
+
+function taskMetadata(line: string, pattern: RegExp, token: string | null): string {
+  const ending = line.match(/[ \t]*\r?$/)?.[0] ?? '';
+  const body = line.slice(0, line.length - ending.length).replace(pattern, '');
+  return body + (token ? ` ${token}` : '') + ending;
 }
 
 export async function dbSetTaskDone(noteId: string, line: number, rawLine: string, done: boolean, vaultPath?: string): Promise<void> {
@@ -383,28 +390,14 @@ export async function dbSetTaskDone(noteId: string, line: number, rawLine: strin
 export async function dbSetTaskPriority(noteId: string, line: number, rawLine: string, priority: string | null, vaultPath?: string): Promise<void> {
   const note = await readNoteLines(noteId, vaultPath);
   const idx = resolveLine(note.lines, line, rawLine);
-  let text = note.lines[idx].replace(/\s*!(high|medium|med|low)\b/gi, "");
-  if (priority) {
-    const match = text.match(/^\s*([-*])\s\[([ xX])\]\s*(.*)$/);
-    if (match) {
-      text = `${match[1]} [${match[2]}] ${match[3].trimEnd()} !${priority}`;
-    }
-  }
-  note.lines[idx] = text.replace(/\s{2,}/g, " ").replace(/\s+$/, "");
+  note.lines[idx] = taskMetadata(note.lines[idx], /[ \t]+!(high|medium|med|low)\b/gi, priority ? `!${priority}` : null);
   await writeNoteLines(noteId, note);
 }
 
 export async function dbSetTaskDue(noteId: string, line: number, rawLine: string, due: string | null, vaultPath?: string): Promise<void> {
   const note = await readNoteLines(noteId, vaultPath);
   const idx = resolveLine(note.lines, line, rawLine);
-  let text = note.lines[idx].replace(/\s*due:\d{4}-\d{2}-\d{2}/g, "");
-  if (due) {
-    const match = text.match(/^\s*([-*])\s\[([ xX])\]\s*(.*)$/);
-    if (match) {
-      text = `${match[1]} [${match[2]}] ${match[3].trimEnd()} due:${due}`;
-    }
-  }
-  note.lines[idx] = text.replace(/\s{2,}/g, " ").replace(/\s+$/, "");
+  note.lines[idx] = taskMetadata(note.lines[idx], /[ \t]+due:\d{4}-\d{2}-\d{2}\b/g, due ? `due:${due}` : null);
   await writeNoteLines(noteId, note);
 }
 
