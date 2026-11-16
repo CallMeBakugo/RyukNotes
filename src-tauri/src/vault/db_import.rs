@@ -33,6 +33,17 @@ fn rfc3339(dt: chrono::DateTime<Utc>) -> String {
     dt.to_rfc3339()
 }
 
+// A source path, rather than content, distinguishes identical ID-less files and
+// keeps their identity stable when their contents change. Include the selected
+// root so unrelated folder imports cannot replace each other's fallback notes.
+fn fallback_id(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "md-import-{:x}",
+        Sha256::digest(path.as_os_str().as_encoded_bytes())
+    )
+}
+
 /// Imports every .md file in `vault_root` into `db`.
 pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, String> {
     let canonical_root = std::fs::canonicalize(vault_root).map_err(|e| e.to_string())?;
@@ -70,7 +81,14 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let (meta, body) = frontmatter::parse_note(&raw, &filename);
+        let fallback = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .map(chrono::DateTime::<Utc>::from)
+            .unwrap_or_else(|_| Utc::now());
+        let (mut meta, body) = frontmatter::parse_note_with_fallback(&raw, &filename, fallback);
+        if meta.id.trim().is_empty() {
+            meta.id = fallback_id(&path);
+        }
 
         let in_trash = path.starts_with(&trash_dir);
         // A trashed note keeps its frontmatter id so history still links.
@@ -245,6 +263,9 @@ pub(crate) fn import_single_receipt(
         .ok_or("Source has no filename")?
         .to_string_lossy();
     let (mut meta, body) = frontmatter::parse_note(&prepared.raw, &filename);
+    if meta.id.trim().is_empty() {
+        meta.id = uuid::Uuid::new_v4().to_string();
+    }
     let payload_hashes = payloads
         .iter()
         .map(|bytes| format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(bytes)))
@@ -339,6 +360,40 @@ pub(crate) fn import_single(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_files_keep_distinct_stable_identities_in_production_vaults() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("A.md"), "same body").unwrap();
+        std::fs::write(source.join("B.md"), "same body").unwrap();
+        let (db, _) =
+            VaultDb::open_with_report(&root.path().join("test.rn"), &root.path().join("ledger"))
+                .unwrap();
+        let first = import_md_vault(&source, &db).unwrap();
+        assert_eq!(first.notes_imported, 2);
+        assert!(first.warnings.is_empty());
+        let before = db.list_notes(false).unwrap();
+        assert_eq!(before.len(), 2);
+        assert!(before.iter().all(|n| !n.id.is_empty()));
+        let a = before.iter().find(|n| n.title == "A").unwrap().id.clone();
+        let b = before.iter().find(|n| n.title == "B").unwrap().id.clone();
+        assert_ne!(a, b);
+        import_md_vault(&source, &db).unwrap();
+        assert_eq!(db.list_notes(false).unwrap().len(), 2);
+        std::fs::write(source.join("A.md"), "changed A").unwrap();
+        import_md_vault(&source, &db).unwrap();
+        assert_eq!(db.list_notes(false).unwrap().len(), 2);
+        assert_eq!(
+            db.get_note_content(&a).unwrap().as_deref(),
+            Some("changed A")
+        );
+        assert_eq!(
+            db.get_note_content(&b).unwrap().as_deref(),
+            Some("same body")
+        );
+    }
 
     fn write_note(dir: &Path, name: &str, frontmatter: &str, body: &str) {
         std::fs::write(dir.join(name), format!("---\n{frontmatter}---\n{body}")).unwrap();

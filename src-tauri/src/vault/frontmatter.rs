@@ -151,6 +151,14 @@ fn read_frontmatter(data: Option<Pod>) -> RawFrontmatter {
 }
 
 pub fn parse_note(raw: &str, filename: &str) -> (NoteMeta, String) {
+    parse_note_with_fallback(raw, filename, Utc::now())
+}
+
+pub(crate) fn parse_note_with_fallback(
+    raw: &str,
+    filename: &str,
+    fallback: chrono::DateTime<Utc>,
+) -> (NoteMeta, String) {
     let matter = Matter::<BoundedYaml>::new();
     let result = matter.parse(raw);
 
@@ -161,12 +169,12 @@ pub fn parse_note(raw: &str, filename: &str) -> (NoteMeta, String) {
     let created = fm
         .created
         .and_then(|s| parse_date_flexible(&s))
-        .unwrap_or_else(Utc::now);
+        .unwrap_or(fallback);
 
     let modified = fm
         .modified
         .and_then(|s| parse_date_flexible(&s))
-        .unwrap_or_else(Utc::now);
+        .unwrap_or(fallback);
 
     // Don't generate UUID on read - empty string signals "no ID yet"
     let id = fm.id.unwrap_or_default();
