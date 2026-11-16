@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { applyTheme, applyCustomThemeVars } from '$lib/utils/theme';
 	import PortableRecovery from './PortableRecovery.svelte';
 	import StorageMaintenance from './StorageMaintenance.svelte';
 	import { showSettings, theme, resolvedTheme, appConfig, platformIsMobile, activeVaultConfig, installType, settingsTab, vaultReady, notebookSortMode, customThemes } from '$lib/stores/app';
@@ -564,52 +565,15 @@
 	}
 
 	function previewCustomTheme() {
-		if (!customThemeEditing) return;
-		const root = document.documentElement;
-		root.style.setProperty('--bg-primary', customThemeEditing.colors.bg_primary);
-		root.style.setProperty('--bg-secondary', customThemeEditing.colors.bg_secondary);
-		root.style.setProperty('--bg-tertiary', customThemeEditing.colors.bg_tertiary);
-		root.style.setProperty('--bg-hover', customThemeEditing.colors.bg_hover);
-		root.style.setProperty('--bg-active', customThemeEditing.colors.bg_active);
-		root.style.setProperty('--bg-editor', customThemeEditing.colors.bg_editor);
-		root.style.setProperty('--text-primary', customThemeEditing.colors.text_primary);
-		root.style.setProperty('--text-secondary', customThemeEditing.colors.text_secondary);
-		root.style.setProperty('--border-color', customThemeEditing.colors.border_color);
-		root.style.setProperty('--border-light', customThemeEditing.colors.border_color);
-		root.style.setProperty('--text-tertiary', customThemeEditing.colors.text_secondary);
-		root.classList.toggle('dark', customThemeEditing.is_dark);
-	}
+        if (!customThemeEditing) return;
+        const root = document.documentElement;
+        applyCustomThemeVars(root, customThemeEditing);
+        root.classList.toggle('dark', customThemeEditing.is_dark);
+    }
 
-	function restoreCurrentTheme() {
-		const root = document.documentElement;
-		const varsToClear = ['--bg-primary','--bg-secondary','--bg-tertiary','--bg-hover','--bg-active','--bg-editor','--text-primary','--text-secondary','--border-color','--border-light','--text-tertiary'];
-		root.classList.remove('dark');
-		root.removeAttribute('data-theme');
-		for (const v of varsToClear) root.style.removeProperty(v);
-		const namedThemes = ['solarized-light','solarized-dark','catppuccin','nord','tokyo-night','github-light','github-dark','dracula','blueberry','forest-green','gruvbox','midnight-tide','cherry-blossom','synthwave','ember','moonlit','light-coffee','dark-coffee','cotton-candy','crimson','cloud','peach','material-dark','material-light','monokai','rose-pine','everforest','horizon','cyberpunk','black','one-dark'];
-		if ($resolvedTheme.startsWith('custom-')) {
-			const ct = $customThemes.find(c => c.id === $resolvedTheme);
-			if (ct) {
-				root.style.setProperty('--bg-primary', ct.colors.bg_primary);
-				root.style.setProperty('--bg-secondary', ct.colors.bg_secondary);
-				root.style.setProperty('--bg-tertiary', ct.colors.bg_tertiary);
-				root.style.setProperty('--bg-hover', ct.colors.bg_hover);
-				root.style.setProperty('--bg-active', ct.colors.bg_active);
-				root.style.setProperty('--bg-editor', ct.colors.bg_editor);
-				root.style.setProperty('--text-primary', ct.colors.text_primary);
-				root.style.setProperty('--text-secondary', ct.colors.text_secondary);
-				root.style.setProperty('--border-color', ct.colors.border_color);
-				root.style.setProperty('--border-light', ct.colors.border_color);
-				root.style.setProperty('--text-tertiary', ct.colors.text_secondary);
-				if (ct.is_dark) root.classList.add('dark');
-			}
-		} else if (namedThemes.includes($resolvedTheme)) {
-			root.setAttribute('data-theme', $resolvedTheme);
-			if (darkThemes.includes($resolvedTheme)) root.classList.add('dark');
-		} else if ($resolvedTheme === 'dark') {
-			root.classList.add('dark');
-		}
-	}
+    function restoreCurrentTheme() {
+        applyTheme($resolvedTheme, $customThemes);
+    }
 
 	async function saveCustomThemeEditor() {
 		if (!customThemeEditing || !customThemeEditing.name.trim()) return;
