@@ -1504,3 +1504,14 @@ mod tests {
         assert_eq!(version, "999");
     }
 }
+
+/// SQLite INTEGER is signed; reject corrupt negative sizes rather than wrapping.
+pub(crate) fn nonnegative_integer(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    u64::try_from(row.get::<_, i64>(index)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}

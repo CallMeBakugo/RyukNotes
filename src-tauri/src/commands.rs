@@ -4941,25 +4941,27 @@ pub fn db_vault_stats(state: State<'_, AppState>) -> Result<crate::types::VaultS
         let total_notes: u64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM notes WHERE trashed = 0", [], |r| {
-                r.get(0)
+                crate::vault::db::nonnegative_integer(r, 0)
             })
             .map_err(|e| e.to_string())?;
         let total_attachments: u64 = db
             .conn
-            .query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM attachments", [], |r| {
+                crate::vault::db::nonnegative_integer(r, 0)
+            })
             .map_err(|e| e.to_string())?;
         let notes_size: u64 = db
             .conn
             .query_row(
                 "SELECT COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0) FROM notes WHERE trashed = 0",
                 [],
-                |r| r.get(0),
+                |r| crate::vault::db::nonnegative_integer(r, 0),
             )
             .map_err(|e| e.to_string())?;
         let attachments_size: u64 = db
             .conn
             .query_row("SELECT COALESCE(SUM(size), 0) FROM attachments", [], |r| {
-                r.get(0)
+                crate::vault::db::nonnegative_integer(r, 0)
             })
             .map_err(|e| e.to_string())?;
         let total_size = notes_size + attachments_size;
@@ -6461,7 +6463,13 @@ mod db_command_tests {
                 cmd: "db_restore_backup".into(),
                 callback: tauri::ipc::CallbackFn(0),
                 error: tauri::ipc::CallbackFn(1),
-                url: "http://tauri.localhost".parse().unwrap(),
+                url: if cfg!(any(windows, target_os = "android")) {
+                    "http://tauri.localhost"
+                } else {
+                    "tauri://localhost"
+                }
+                .parse()
+                .unwrap(),
                 body: tauri::ipc::InvokeBody::Json(serde_json::json!({
                     "backupPath": v3.to_string_lossy(), "vaultPath": current.to_string_lossy()
                 })),
@@ -6499,7 +6507,13 @@ mod db_command_tests {
                     cmd: cmd.into(),
                     callback: tauri::ipc::CallbackFn(0),
                     error: tauri::ipc::CallbackFn(1),
-                    url: "http://tauri.localhost".parse().unwrap(),
+                    url: if cfg!(any(windows, target_os = "android")) {
+                        "http://tauri.localhost"
+                    } else {
+                        "tauri://localhost"
+                    }
+                    .parse()
+                    .unwrap(),
                     body: tauri::ipc::InvokeBody::Json(body),
                     headers: Default::default(),
                     invoke_key: tauri::test::INVOKE_KEY.into(),
@@ -6618,7 +6632,13 @@ mod db_command_tests {
                     cmd: cmd.into(),
                     callback: tauri::ipc::CallbackFn(0),
                     error: tauri::ipc::CallbackFn(1),
-                    url: "http://tauri.localhost".parse().unwrap(),
+                    url: if cfg!(any(windows, target_os = "android")) {
+                        "http://tauri.localhost"
+                    } else {
+                        "tauri://localhost"
+                    }
+                    .parse()
+                    .unwrap(),
                     body: tauri::ipc::InvokeBody::Json(body),
                     headers: Default::default(),
                     invoke_key: tauri::test::INVOKE_KEY.into(),
@@ -6696,7 +6716,13 @@ mod db_command_tests {
                     cmd: cmd.into(),
                     callback: tauri::ipc::CallbackFn(0),
                     error: tauri::ipc::CallbackFn(1),
-                    url: "http://tauri.localhost".parse().unwrap(),
+                    url: if cfg!(any(windows, target_os = "android")) {
+                        "http://tauri.localhost"
+                    } else {
+                        "tauri://localhost"
+                    }
+                    .parse()
+                    .unwrap(),
                     body: tauri::ipc::InvokeBody::Json(body),
                     headers: Default::default(),
                     invoke_key: tauri::test::INVOKE_KEY.into(),
@@ -7096,7 +7122,13 @@ mod db_command_tests {
                     cmd: "db_save_image".into(),
                     callback: tauri::ipc::CallbackFn(0),
                     error: tauri::ipc::CallbackFn(1),
-                    url: "http://tauri.localhost".parse().unwrap(),
+                    url: if cfg!(any(windows, target_os = "android")) {
+                        "http://tauri.localhost"
+                    } else {
+                        "tauri://localhost"
+                    }
+                    .parse()
+                    .unwrap(),
                     body: tauri::ipc::InvokeBody::Json(serde_json::json!({
                         "vaultPath": path, "noteId": note_id, "name": "clipboard.png", "data": png,
                     })),
@@ -7187,7 +7219,13 @@ mod db_command_tests {
                 cmd: command.into(),
                 callback: tauri::ipc::CallbackFn(0),
                 error: tauri::ipc::CallbackFn(1),
-                url: "http://tauri.localhost".parse().unwrap(),
+                url: if cfg!(any(windows, target_os = "android")) {
+                    "http://tauri.localhost"
+                } else {
+                    "tauri://localhost"
+                }
+                .parse()
+                .unwrap(),
                 body: tauri::ipc::InvokeBody::Json(args),
                 headers: Default::default(),
                 invoke_key: tauri::test::INVOKE_KEY.into(),
@@ -7614,7 +7652,13 @@ mod activated_vault_tests {
                     cmd: cmd.into(),
                     callback: tauri::ipc::CallbackFn(0),
                     error: tauri::ipc::CallbackFn(1),
-                    url: "http://tauri.localhost".parse().unwrap(),
+                    url: if cfg!(any(windows, target_os = "android")) {
+                        "http://tauri.localhost"
+                    } else {
+                        "tauri://localhost"
+                    }
+                    .parse()
+                    .unwrap(),
                     body: tauri::ipc::InvokeBody::Json(body),
                     headers: Default::default(),
                     invoke_key: tauri::test::INVOKE_KEY.into(),
@@ -7786,7 +7830,13 @@ mod everyday_workflow_ipc_tests {
                     cmd: cmd.into(),
                     callback: tauri::ipc::CallbackFn(0),
                     error: tauri::ipc::CallbackFn(1),
-                    url: "http://tauri.localhost".parse().unwrap(),
+                    url: if cfg!(any(windows, target_os = "android")) {
+                        "http://tauri.localhost"
+                    } else {
+                        "tauri://localhost"
+                    }
+                    .parse()
+                    .unwrap(),
                     body: tauri::ipc::InvokeBody::Json(body),
                     headers: Default::default(),
                     invoke_key: tauri::test::INVOKE_KEY.into(),
@@ -7890,7 +7940,13 @@ mod db_backup_boundary_tests {
                     cmd: "db_delete_backup".into(),
                     callback: tauri::ipc::CallbackFn(0),
                     error: tauri::ipc::CallbackFn(1),
-                    url: "http://tauri.localhost".parse().unwrap(),
+                    url: if cfg!(any(windows, target_os = "android")) {
+                        "http://tauri.localhost"
+                    } else {
+                        "tauri://localhost"
+                    }
+                    .parse()
+                    .unwrap(),
                     body: tauri::ipc::InvokeBody::Json(serde_json::json!({"backupPath":path})),
                     headers: Default::default(),
                     invoke_key: tauri::test::INVOKE_KEY.into(),

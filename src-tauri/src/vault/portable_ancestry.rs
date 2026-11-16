@@ -1708,7 +1708,13 @@ mod tests {
                     cmd: "db_restore_ancestry_export".into(),
                     callback: tauri::ipc::CallbackFn(0),
                     error: tauri::ipc::CallbackFn(1),
-                    url: "http://tauri.localhost".parse().unwrap(),
+                    url: if cfg!(any(windows, target_os = "android")) {
+                        "http://tauri.localhost"
+                    } else {
+                        "tauri://localhost"
+                    }
+                    .parse()
+                    .unwrap(),
                     body: tauri::ipc::InvokeBody::Json(body),
                     headers: Default::default(),
                     invoke_key: tauri::test::INVOKE_KEY.into(),

@@ -1313,7 +1313,13 @@ mod ipc_tests {
                         cmd: cmd.into(),
                         callback: tauri::ipc::CallbackFn(0),
                         error: tauri::ipc::CallbackFn(1),
-                        url: "http://tauri.localhost".parse().unwrap(),
+                        url: if cfg!(any(windows, target_os = "android")) {
+                            "http://tauri.localhost"
+                        } else {
+                            "tauri://localhost"
+                        }
+                        .parse()
+                        .unwrap(),
                         body: tauri::ipc::InvokeBody::Json(body),
                         headers: Default::default(),
                         invoke_key: tauri::test::INVOKE_KEY.into(),
@@ -2334,7 +2340,13 @@ mod review_ipc_tests {
                         cmd: cmd.into(),
                         callback: tauri::ipc::CallbackFn(0),
                         error: tauri::ipc::CallbackFn(1),
-                        url: "http://tauri.localhost".parse().unwrap(),
+                        url: if cfg!(any(windows, target_os = "android")) {
+                            "http://tauri.localhost"
+                        } else {
+                            "tauri://localhost"
+                        }
+                        .parse()
+                        .unwrap(),
                         body: tauri::ipc::InvokeBody::Json(body),
                         headers: Default::default(),
                         invoke_key: tauri::test::INVOKE_KEY.into(),
@@ -2499,7 +2511,7 @@ mod review_race_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("race.rn");
         let writer = VaultDb::open_legacy_v2(&path).unwrap();
-        let reviewer = VaultDb::open_legacy_v2(&path).unwrap();
+        let mut reviewer = VaultDb::open_legacy_v2(&path).unwrap();
         let note = NewNote {
             id: "n".into(),
             title: "Title".into(),
@@ -3648,7 +3660,13 @@ mod revision_retention_tests {
                         cmd: cmd.into(),
                         callback: tauri::ipc::CallbackFn(0),
                         error: tauri::ipc::CallbackFn(1),
-                        url: "http://tauri.localhost".parse().unwrap(),
+                        url: if cfg!(any(windows, target_os = "android")) {
+                            "http://tauri.localhost"
+                        } else {
+                            "tauri://localhost"
+                        }
+                        .parse()
+                        .unwrap(),
                         body: tauri::ipc::InvokeBody::Json(body),
                         headers: Default::default(),
                         invoke_key: tauri::test::INVOKE_KEY.into(),

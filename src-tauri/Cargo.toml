@@ -6,7 +6,7 @@ description = "Local markdown note-taking app"
 authors = ["RyukNotes"]
 license = "AGPL-3.0-or-later"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 
 # Compatibility feature name retained for existing tooling; production ancestry is active.
 [features]
@@ -49,7 +49,7 @@ tokio = { version = "1", features = ["full"] }
 dirs = "6"
 regex = "1"
 aho-corasick = "1"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.6", default-features = false, features = ["deflate"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking"] }
 futures = "0.3"
 rayon = "1"
@@ -57,7 +57,7 @@ quick-xml = "0.41"
 urlencoding = "2"
 sha2 = "0.10"
 fs4 = { version = "0.8", default-features = false, features = ["sync"] }
-rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+rusqlite = { version = "0.43", features = ["bundled", "functions"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = "0.3.2"

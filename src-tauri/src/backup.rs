@@ -592,7 +592,7 @@ pub fn restore_backup(
     for index in 0..archive.len() {
         let item = archive.by_index(index).map_err(|e| e.to_string())?;
         name_bytes = name_bytes
-            .checked_add(item.name().len())
+            .checked_add(item.name().map_err(|e| e.to_string())?.len())
             .ok_or("Backup entry names overflow")?;
         if name_bytes > MAX_NAME_BYTES {
             return Err("Backup entry names exceed the 256 MiB limit".to_string());
@@ -610,7 +610,7 @@ pub fn restore_backup(
     let mut legacy_attachments = false;
     for index in 0..archive.len() {
         let mut item = archive.by_index(index).map_err(|e| e.to_string())?;
-        let name = item.name().to_string();
+        let name = item.name().map_err(|e| e.to_string())?.into_owned();
         // Read-compat: backups written before the RyukNotes rebrand name the internal
         // directory `.helixnotes` and the manifest `.helixnotes-backup.json`. Remap those
         // entry names to the current ones before validation and extraction.
@@ -1209,7 +1209,14 @@ mod tests {
     fn archive_names(path: &str) -> Vec<String> {
         let mut archive = ZipArchive::new(File::open(path).unwrap()).unwrap();
         (0..archive.len())
-            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .map(|index| {
+                archive
+                    .by_index(index)
+                    .unwrap()
+                    .name()
+                    .unwrap()
+                    .into_owned()
+            })
             .collect()
     }
 

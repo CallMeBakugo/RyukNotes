@@ -49,7 +49,8 @@ impl VaultDb {
             .conn
             .unchecked_transaction()
             .map_err(|e| e.to_string())?;
-        let total = snapshot.query_row("SELECT COUNT(*) FROM notes_fts f JOIN notes n ON n.rowid=f.rowid WHERE notes_fts MATCH ?1 AND n.trashed=0", [query], |r| r.get::<_, usize>(0)).map_err(|e| e.to_string())?;
+        let total = snapshot.query_row("SELECT COUNT(*) FROM notes_fts f JOIN notes n ON n.rowid=f.rowid WHERE notes_fts MATCH ?1 AND n.trashed=0", [query], |r| r.get::<_, i64>(0)).map_err(|e| e.to_string())?;
+        let total = usize::try_from(total).map_err(|e| e.to_string())?;
         let rows = {
             let mut statement = snapshot.prepare("SELECT n.id,n.title,n.content,rank FROM notes_fts f JOIN notes n ON n.rowid=f.rowid WHERE notes_fts MATCH ?1 AND n.trashed=0 ORDER BY rank,n.id LIMIT ?2 OFFSET ?3").map_err(|e| e.to_string())?;
             let rows = statement

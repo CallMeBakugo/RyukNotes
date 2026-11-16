@@ -48,13 +48,15 @@ impl VaultDb {
             }
         }
         let pages: u64 = tx
-            .pragma_query_value(None, "page_count", |r| r.get(0))
+            .pragma_query_value(None, "page_count", |r| super::db::nonnegative_integer(r, 0))
             .map_err(|e| e.to_string())?;
         let size: u64 = tx
-            .pragma_query_value(None, "page_size", |r| r.get(0))
+            .pragma_query_value(None, "page_size", |r| super::db::nonnegative_integer(r, 0))
             .map_err(|e| e.to_string())?;
         let free: u64 = tx
-            .pragma_query_value(None, "freelist_count", |r| r.get(0))
+            .pragma_query_value(None, "freelist_count", |r| {
+                super::db::nonnegative_integer(r, 0)
+            })
             .map_err(|e| e.to_string())?;
         result["databasePagesBytes"] = json!(pages.saturating_mul(size));
         result["reusablePageBytes"] = json!(free.saturating_mul(size));
