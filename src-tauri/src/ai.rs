@@ -137,6 +137,30 @@ fn openai_request_body(
     body
 }
 
+/// Decode only complete SSE frames, retaining partial UTF-8 bytes between reads.
+fn take_sse_frame(buffer: &mut Vec<u8>) -> Result<Option<String>, String> {
+    let lf = buffer
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .map(|at| (at, 2));
+    let crlf = buffer
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|at| (at, 4));
+    let boundary = match (lf, crlf) {
+        (Some(a), Some(b)) => Some(if a.0 < b.0 { a } else { b }),
+        (a, b) => a.or(b),
+    };
+    let Some((at, width)) = boundary else {
+        return Ok(None);
+    };
+    let frame = std::str::from_utf8(&buffer[..at])
+        .map_err(|e| format!("Invalid AI stream UTF-8: {e}"))?
+        .to_owned();
+    buffer.drain(..at + width);
+    Ok(Some(frame))
+}
+
 async fn stream_anthropic(
     app: &AppHandle,
     api_key: &str,
@@ -179,17 +203,14 @@ async fn stream_anthropic(
     // Parse SSE stream
     use futures::StreamExt;
     let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
+    let mut buffer = Vec::new();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("Stream error: {}", e))?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        buffer.extend_from_slice(&chunk);
 
         // Process complete SSE events from buffer
-        while let Some(event_end) = buffer.find("\n\n") {
-            let event_str = buffer[..event_end].to_string();
-            buffer = buffer[event_end + 2..].to_string();
-
+        while let Some(event_str) = take_sse_frame(&mut buffer)? {
             for line in event_str.lines() {
                 if let Some(data) = line.strip_prefix("data: ") {
                     if data == "[DONE]" {
@@ -257,17 +278,10 @@ async fn stream_anthropic(
         }
     }
 
-    let _ = app.emit(
-        "ai-stream",
-        AiStreamEvent {
-            request_id: request_id.to_owned(),
-            event_type: "done".to_string(),
-            text: None,
-            error: None,
-        },
-    );
-
-    Ok(())
+    Err(
+        "AI stream ended before a completion event; the partial response was not marked complete."
+            .into(),
+    )
 }
 
 async fn stream_openai(
@@ -303,16 +317,13 @@ async fn stream_openai(
 
     use futures::StreamExt;
     let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
+    let mut buffer = Vec::new();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("Stream error: {}", e))?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        buffer.extend_from_slice(&chunk);
 
-        while let Some(event_end) = buffer.find("\n\n") {
-            let event_str = buffer[..event_end].to_string();
-            buffer = buffer[event_end + 2..].to_string();
-
+        while let Some(event_str) = take_sse_frame(&mut buffer)? {
             for line in event_str.lines() {
                 if let Some(data) = line.strip_prefix("data: ") {
                     if data == "[DONE]" {
@@ -379,17 +390,10 @@ async fn stream_openai(
         }
     }
 
-    let _ = app.emit(
-        "ai-stream",
-        AiStreamEvent {
-            request_id: request_id.to_owned(),
-            event_type: "done".to_string(),
-            text: None,
-            error: None,
-        },
-    );
-
-    Ok(())
+    Err(
+        "AI stream ended before a completion event; the partial response was not marked complete."
+            .into(),
+    )
 }
 
 pub async fn test_connection(
@@ -483,6 +487,23 @@ async fn test_openai(url: &str, api_key: Option<&str>, model: &str) -> Result<St
 #[cfg(test)]
 mod request_tests {
     use super::*;
+
+    #[test]
+    fn sse_keeps_split_unicode_bytes_and_accepts_crlf_frames() {
+        let wire = "data: {\"text\":\"雪😀\"}\r\n\r\ndata: [DONE]\n\n".as_bytes();
+        let mut buffer = Vec::new();
+        let mut frames = Vec::new();
+        for byte in wire {
+            buffer.push(*byte);
+            while let Some(frame) = take_sse_frame(&mut buffer).unwrap() {
+                frames.push(frame);
+            }
+        }
+        assert_eq!(frames, vec!["data: {\"text\":\"雪😀\"}", "data: [DONE]"]);
+        assert!(buffer.is_empty());
+        let mut malformed = vec![255, 10, 10];
+        assert!(take_sse_frame(&mut malformed).is_err());
+    }
 
     #[test]
     fn gpt6_streaming_requests_use_supported_parameters() {
