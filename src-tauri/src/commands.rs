@@ -2449,7 +2449,11 @@ pub fn set_general_settings(
     show_daily_notes: bool,
     show_trash: bool,
 ) -> Result<(), String> {
-    let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    let mut guard = state.config.lock().map_err(|e| e.to_string())?;
+    let mut config = guard.clone();
+    if config.autostart != autostart {
+        crate::autostart::apply(autostart)?;
+    }
     config.compact_notes = compact_notes;
     config.show_note_dates = show_note_dates;
     config.show_note_switcher = show_note_switcher;
@@ -2476,7 +2480,17 @@ pub fn set_general_settings(
     config.show_tray_icon = show_tray_icon;
     config.close_to_tray = close_to_tray;
     config.enable_wiki_links = enable_wiki_links;
-    save_app_config(&config)?;
+    if let Err(error) = save_app_config(&config) {
+        if guard.autostart != autostart {
+            if let Err(rollback) = crate::autostart::apply(guard.autostart) {
+                return Err(format!(
+                    "{error}; startup registration rollback failed: {rollback}"
+                ));
+            }
+        }
+        return Err(error);
+    }
+    *guard = config;
     Ok(())
 }
 

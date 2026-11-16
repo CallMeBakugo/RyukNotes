@@ -1,5 +1,6 @@
 mod ai;
 mod asset_scope;
+mod autostart;
 mod backup;
 mod commands;
 mod history;
