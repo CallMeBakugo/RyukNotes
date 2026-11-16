@@ -1941,6 +1941,7 @@
 									</div>
 								</div>
 
+								{#if !isDbVault()}
 								<label class="setting-toggle">
 									<span class="setting-label">
 										<span class="setting-name">Include attachments</span>
@@ -1950,6 +1951,7 @@
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
+								{/if}
 
 								<div class="backup-actions">
 									{#if !isMobile}
