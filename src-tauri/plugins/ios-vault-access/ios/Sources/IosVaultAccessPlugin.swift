@@ -295,7 +295,7 @@ private enum AccessError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .denied:
-            return "RyukNotes no longer has access to this folder. Choose it again in Files."
+            return "Ryuk's Notebook no longer has access to this folder. Choose it again in Files."
         case .missing:
             return "Saved access to this folder is missing. Choose it again in Files."
         case .notFolder:

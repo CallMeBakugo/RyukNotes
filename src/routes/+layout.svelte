@@ -225,7 +225,7 @@
 <svelte:document oncontextmenu={(e) => { if (!isMobile) e.preventDefault(); }} />
 
 <svelte:head>
-	<title>RyukNotes</title>
+	<title>Ryuk's Notebook</title>
 </svelte:head>
 
 {@render children()}

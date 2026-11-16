@@ -1348,7 +1348,7 @@
 								<label class="setting-toggle">
 									<span class="setting-label">
 										<span class="setting-name">Start at system startup</span>
-										<span class="setting-desc">Launch RyukNotes when your computer starts</span>
+										<span class="setting-desc">Launch Ryuk's Notebook when your computer starts</span>
 									</span>
 									<button class="toggle-switch" class:on={autostart} role="switch" aria-checked={autostart} aria-label="Start at system startup" onclick={() => { autostart = !autostart; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
@@ -2124,7 +2124,7 @@
 						{:else}
 						<div class="settings-section">
 								<h3>Import from Obsidian</h3>
-								<p class="import-desc">Fully converts an Obsidian vault to RyukNotes format: normalizes frontmatter (tags, IDs, dates, title headings), converts <code>[[wiki-links]]</code> to standard markdown links, converts <code>==highlights==</code> and <code>%%comments%%</code>, and relocates attachments to <code>.ryuknotes/attachments/</code>. Open the Obsidian vault directory as your RyukNotes vault first.</p>
+								<p class="import-desc">Fully converts an Obsidian vault to the Ryuk's Notebook format: normalizes frontmatter (tags, IDs, dates, title headings), converts <code>[[wiki-links]]</code> to standard markdown links, converts <code>==highlights==</code> and <code>%%comments%%</code>, and relocates attachments to <code>.ryuknotes/attachments/</code>. Open the Obsidian vault directory as a vault in Ryuk's Notebook first.</p>
 								<div class="import-warn">
 									<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" /><line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
 									<span>This modifies files in place. Make a backup before running!</span>

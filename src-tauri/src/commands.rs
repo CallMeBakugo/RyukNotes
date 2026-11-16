@@ -4225,7 +4225,7 @@ pub fn ai_ask(
         (provider, key, model, style, base_url)
     };
 
-    let mut system_prompt = "You are a helpful writing assistant inside a note-taking app called RyukNotes. \
+    let mut system_prompt = "You are a helpful writing assistant inside a note-taking app called Ryuk's Notebook. \
         You help users improve, rewrite, summarize, and transform their text. \
         Return ONLY the resulting text - no explanations, no markdown code fences, no preamble. \
         Preserve the original language of the text unless specifically asked to translate. \
@@ -4983,7 +4983,7 @@ fn activate_db_vault(
         .assert_quiet(None, None)?;
     if !path.ends_with(".rn") {
         return Err(format!(
-            "'{path}' is not a RyukNotes database (expected a .rn file)"
+            "'{path}' is not a Ryuk's Notebook database (expected a .rn file)"
         ));
     }
     let root = crate::vault::ancestry::production_ledger_root(Path::new(&path))?;

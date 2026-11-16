@@ -89,7 +89,7 @@
 	});
 	$effect(() => {
 		const title = $activeNote?.meta.title;
-		if (title && !disposed) void appWindow.setTitle(`${title} - RyukNotes`);
+		if (title && !disposed) void appWindow.setTitle(`${title} - Ryuk's Notebook`);
 	});
 
 

@@ -25,7 +25,7 @@
         const chosenMode = mode, currentVault = vault;
         const source = await open({ directory: chosenMode !== 'raw_recovery', multiple: false, title: chosenMode === 'raw_recovery' ? 'Choose a moved vault or backup (.rn)' : 'Choose an ancestry export folder' });
         if (typeof source !== 'string') return;
-        const destination = chosenMode === 'reconcile' ? currentVault : await save({ title: 'Choose a NEW destination vault', filters: [{ name: 'RyukNotes vault', extensions: ['rn'] }] });
+        const destination = chosenMode === 'reconcile' ? currentVault : await save({ title: 'Choose a NEW destination vault', filters: [{ name: "Ryuk's Notebook vault", extensions: ['rn'] }] });
         if (!destination) return;
         if (chosenMode !== 'reconcile' && !destination.endsWith('.rn')) throw new Error('Choose a destination filename ending in .rn.');
         if (chosenMode === 'reconcile' && currentVault !== vault) throw new Error('The displayed vault changed. Choose it again.');

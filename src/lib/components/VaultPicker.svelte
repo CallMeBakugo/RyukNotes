@@ -72,7 +72,7 @@
 			const bridge = (window as any).Android;
 			bridge?.requestStoragePermission?.();
 		} catch {
-			error = 'Go to Settings > Apps > RyukNotes > Permissions and enable "All files access".';
+			error = 'Go to Settings > Apps > Ryuk\'s Notebook > Permissions and enable "All files access".';
 		}
 	}
 
@@ -106,8 +106,8 @@
 	async function pickDatabase() {
 		const selected = await open({
 			multiple: false,
-			title: 'Open RyukNotes Database',
-			filters: [{ name: 'RyukNotes Database', extensions: ['rn'] }],
+			title: "Open Ryuk's Notebook Database",
+			filters: [{ name: "Ryuk's Notebook Database", extensions: ['rn'] }],
 		});
 		if (selected) {
 			await openSelectedVault(selected as string);
@@ -131,7 +131,7 @@
 		} catch (e) {
 			const msg = String(e);
 			if (isAndroid && /os error 13|permission denied/i.test(msg)) {
-				error = 'Storage permission is required. Enable file access for RyukNotes in your system settings, then try again.';
+				error = 'Storage permission is required. Enable file access for Ryuk\'s Notebook in your system settings, then try again.';
 			} else {
 				error = msg;
 			}
@@ -219,7 +219,7 @@
 		<p class="subtitle">Local markdown notes</p>
 		{#if isMobile}
 			{#if isIOS}
-				<p class="description">Keep notes in RyukNotes, or use an existing folder from iCloud Drive or Files.</p>
+				<p class="description">Keep notes in Ryuk's Notebook, or use an existing folder from iCloud Drive or Files.</p>
 			{:else}
 				<p class="description">Choose where to store your notes. Sync with Syncthing, Nextcloud, or any file sync app.</p>
 			{/if}

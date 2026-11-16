@@ -2,7 +2,7 @@
   "app": {
     "windows": [
       {
-        "title": "RyukNotes",
+        "title": "Ryuk's Notebook",
         "label": "main",
         "width": 1200,
         "height": 800,
