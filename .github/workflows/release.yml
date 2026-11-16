@@ -58,7 +58,7 @@ jobs:
         id: standalone
         shell: python
         run: |
-          import json, os, pathlib, shutil, tarfile
+          import json, os, pathlib, platform, shutil, tarfile
           version = json.loads(pathlib.Path('package.json').read_text())['version']
           archive = f'ryuknotes_{version}_linux_x86_64.tar.gz'
           destination = pathlib.Path('linux-download')
@@ -67,6 +67,8 @@ jobs:
               shutil.copy2(pathlib.Path('src-tauri/target/release') / binary, destination / binary)
           shutil.copy2('scripts/install-linux.sh', destination / 'install.sh')
           shutil.copy2('docs/linux-install.md', destination / 'README.md')
+          shutil.copy2('LICENSE', destination / 'LICENSE')
+          (destination / 'BUILD.json').write_text(json.dumps({'version': version, 'commit': os.environ['GITHUB_SHA'], 'platform': 'linux-x86_64'}, indent=2) + '\n')
           with tarfile.open(archive, 'w:gz') as output:
               output.add(destination, arcname='ryuknotes-linux')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
@@ -82,6 +84,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          draft: true
           files: |
             staged-packages/*.deb
             staged-packages/*.rpm
@@ -109,18 +112,37 @@ jobs:
         env:
           NO_STRIP: true
 
+      - name: Prepare macOS downloads
+        shell: python
+        run: |
+          import json, os, pathlib, platform, shutil, tarfile
+          version = json.loads(pathlib.Path('package.json').read_text())['version']
+          staged = pathlib.Path('macos-downloads'); staged.mkdir()
+          for dmg in pathlib.Path('src-tauri/target/release/bundle/dmg').glob('*.dmg'):
+              assert version in dmg.name, f'Stale version in {dmg}'
+              shutil.copy2(dmg, staged / dmg.name.replace("'", '').replace(' ', '-'))
+          assert list(staged.glob('*.dmg')), 'No macOS disk image produced'
+          arch = {'arm64': 'aarch64', 'x86_64': 'x86_64'}[platform.machine()]
+          cli = pathlib.Path('src-tauri/target/release/ryuk')
+          assert cli.is_file(), 'No companion CLI produced'
+          root = pathlib.Path('macos-cli'); root.mkdir()
+          shutil.copy2(cli, root / 'ryuk')
+          shutil.copy2('LICENSE', root / 'LICENSE')
+          (root / 'BUILD.json').write_text(json.dumps({'version': version, 'commit': os.environ['GITHUB_SHA'], 'platform': f'macos-{arch}'}, indent=2) + '\n')
+          with tarfile.open(staged / f'ryuk_{version}_macos_{arch}.tar.gz', 'w:gz') as output:
+              output.add(root, arcname='ryuk-macos')
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ryuknotes-macos
           path: |
-            src-tauri/target/release/bundle/macos
-            src-tauri/target/release/bundle/dmg
+            macos-downloads/*
 
       - name: Attach to release (tag builds)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          draft: true
           files: |
-            src-tauri/target/release/bundle/macos/*.app
-            src-tauri/target/release/bundle/dmg/*.dmg
+            macos-downloads/*
