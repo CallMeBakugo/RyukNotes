@@ -40,12 +40,24 @@ modified. Display name is "Ryuk's Notebook"; machinery stays apostrophe-free.
 - Never push from a shallow clone; `git fetch --unshallow origin` first.
 - Commits are SSH-signed via local config. Author is already configured; do not change
   identity, remotes, or credentials.
-- Agents do not push to any remote and do not open pull requests. Finish the
-  branch, run the verification gates, and stop; the user (or Hermes, on explicit
-  instruction) handles pushes and PR creation.
-- Run sandboxed: `workspace-write` with network access disabled (see ~/.codex/config.toml).
-  The repo builds fully offline; if a task needs network, say so and wait for the user to
-  grant it — never work around the sandbox.
+- Codex has standing user authorization to stage, create signed commits and tags,
+  push ordinary updates to `github/main`, and create or publish GitHub releases
+  and their assets after the applicable verification and release gates pass.
+  It may also create pull requests when useful. No repeated permission request
+  is needed for these authorized actions. This grants authority; it does not
+  require publishing a release for every task.
+- Keep `origin` and `fork` read-only. The milestone-only rule for the `codeberg`
+  mirror remains in effect. Never force-push, rewrite published history, delete
+  remote branches/tags/releases, or bypass failed gates without specific approval.
+- Use existing Git identity, SSH credentials and signing configuration. Never
+  expose private keys, copy credentials into the repo, or disable signing to make
+  a commit succeed. If signing/authentication is unavailable, report the precise
+  blocker and leave the work ready for the user; do not invent an identity/key.
+- Main-directory Codex sessions may use full filesystem and network access via
+  the user-authorized launcher. Network use for Git, release publishing, official
+  documentation and necessary development dependencies is authorized. Repository
+  conventions and user-data protections still apply. Permission changes take
+  effect in a new host session; never try to escape a running restricted session.
 
 ## Hard rules (user's standing preferences)
 
@@ -141,29 +153,40 @@ The GitHub front stays SIMPLE: short plain-grammar README (what it is, CLI examp
 build-from-source, AGPL credit to upstream HelixNotes), no marketing, no badge
 walls, and an honest status line until the project stabilizes.
 
-## Agent branch protocol (codex/ryuk worktree)
+## Codex main-directory protocol
 
-- Codex sessions run from the worktree at `~/Public/HelixNotes-codex` on branch
-  `codex/ryuk`, launched through `codex-caged`. Work only on this branch; never
-  touch `main` from a session.
-- In the worktree, commits are authored as "Codex (RyukNotes agent)" with signing
-  disabled (worktree-scoped config). That is deliberate — do not change identity
-  or signing settings. The main checkout stays SSH-signed; the two never mix.
-- Git writes are IMPOSSIBLE in-session: the inner sandbox re-binds .git
-  read-only even for approved escalations, so staging and commits fail no
-  matter what. Do not attempt git writes from a session.
-- End every work session by writing the commit message to
-  `.session-commit-msg` in the worktree root: what changed, why, and the
-  verification results, including which gates were NOT run. The human then
-  runs `codex-collect`, which runs every gate and commits using exactly
-  that message. Until the message file exists, the session is not finished.
-- The cage shares the main checkout's node_modules read-only, so the JS gates
-  run in-session through the repo's own npm scripts: `npm run check` and
-  `npm test`. Never type file globs into a command — the `*` characters get
-  eaten by message rendering and the command arrives broken. The npm scripts
-  carry the globs safely inside package.json.
-- Rust gates CANNOT run in-session: the cage hides `~/.cargo` and `~/.rustup`.
-  Do not attempt cargo commands; state plainly in the final report which gates
-  were not run. The human runs the Rust gates outside the cage before merge.
-- The permission profile in `~/.codex/config.toml` governs sessions; do not pass
-  `--sandbox`, and do not ask for network unless a task truly needs it.
+- Work directly in `~/Public/HelixNotes` on `main`. The separate
+  `~/Public/HelixNotes-codex` worktree and `codex/ryuk` branch are retired after
+  the consolidation checks below. Do not create a worktree or task branch
+  unless the user requests one or it is necessary to preserve concurrent work.
+- Start with `git status` and inspect existing changes. Preserve unrelated user
+  work; stage only the files belonging to the current logical unit. Do not stage
+  the untracked root `target/` directory or any other build output.
+- Use `~/.local/bin/codex-ryuk` to start a fresh main-directory CLI session.
+  It selects `danger-full-access` and `approval_policy=never` for this invocation,
+  without changing global defaults or removing OS/admin restrictions. Full access
+  is not an instruction to inspect or modify unrelated user data.
+- Signed Git commits/tags and authorized pushes/releases are performed directly
+  in this checkout using the existing user identity and credentials. The old
+  worktree's unsigned agent identity must not be copied into main. Check effective
+  configuration with `git var GIT_AUTHOR_IDENT`, `git config --get gpg.format`,
+  `git config --get user.signingkey`, and the commit/tag signing settings. Use
+  `git commit -S` and signed annotated release tags (`git tag -s ... -m ...`).
+  Missing identity, SSH key/agent, or hosting authentication is a blocker to the
+  corresponding action, not permission to create unsigned substitutes.
+- Run frontend gates through `npm run check`, `npm test`, and `npm run build`.
+  Run Rust `cargo check`, `cargo check --tests`, `cargo test`, formatting and
+  clippy gates from the host as listed above. Rust tools and writable dependencies
+  must be available to the new session; obsolete cage limitations do not apply
+  unless independently observed. Use offline/cached dependencies when available.
+- Run native packaging and boot checks for changes affecting startup, packaging
+  or releases. CI, correct versions, AGPL attribution, artifact verification,
+  and the original-art requirement for public release branding remain required.
+- Report what changed, verification performed, gates not run, and any commit,
+  push or release URLs. A `.session-commit-msg` file and `codex-collect` are no
+  longer required; do not reuse the old stale handoff as a new commit message.
+- Never remove a worktree while a session/process is using it. Consolidation
+  must verify that `codex/ryuk` is an ancestor of `main`, preserve any unique
+  changes and needed local artifacts, then use `git worktree remove` from main
+  followed by `git branch -d codex/ryuk`. Never use forced removal/deletion to
+  hide unmerged or uncommitted work.
