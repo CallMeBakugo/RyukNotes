@@ -67,7 +67,12 @@ printf started > "$HERMES_TEST_DIR/started"
             .0
     }
     fn context(&self) -> PathBuf {
-        std::env::temp_dir().join("ryuk-sessions").join(&self.home)
+        use sha2::{Digest, Sha256};
+        let key =
+            serde_json::to_vec(&(std::fs::canonicalize(&self.vault).unwrap(), &self.home)).unwrap();
+        self.dir
+            .join("data/ryuknotes/session-contexts")
+            .join(format!("{:x}", Sha256::digest(key)))
     }
 
     fn run(&self, args: &[&str]) {
@@ -78,6 +83,7 @@ printf started > "$HERMES_TEST_DIR/started"
             .args(args)
             .env("PATH", &self.dir)
             .env("HERMES_TEST_DIR", &self.dir)
+            .env("XDG_DATA_HOME", self.dir.join("data"))
             // The GUI flag must override a deliberately conflicting CLI env.
             .env("RYUK_VAULT", self.dir.join("wrong-vault.rn"))
             .output()

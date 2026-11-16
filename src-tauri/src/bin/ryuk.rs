@@ -505,6 +505,64 @@ fn session_restore(vault_flag: &Option<String>, tail: &[String]) -> Result<(), S
 /// `extras` are additional notes folded into the grounding: each lands in the
 /// context file as its own `# Additional context: <title>` section (skipped when unreadable —
 /// the home note is the session's home; extras are best-effort context).
+fn session_context_dir(vault: &std::path::Path, note_id: &str) -> Result<PathBuf, String> {
+    let vault = std::fs::canonicalize(vault).map_err(|e| e.to_string())?;
+    let root = dirs::data_local_dir()
+        .ok_or("Private data directory unavailable")?
+        .join("ryuknotes")
+        .join("session-contexts");
+    private_context_dir(&root)?;
+    let directory = root.join(session_context_key(&vault, note_id)?);
+    private_context_dir(&directory)?;
+    Ok(directory)
+}
+
+fn session_context_key(vault: &std::path::Path, note_id: &str) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let key = serde_json::to_vec(&(vault, note_id)).map_err(|e| e.to_string())?;
+    Ok(format!("{:x}", Sha256::digest(key)))
+}
+
+fn private_context_dir(path: &std::path::Path) -> Result<(), String> {
+    if !path.exists() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(path).map_err(|e| e.to_string())?;
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("Unsafe session context directory".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err("Session context directory must be private (0700)".into());
+        }
+    }
+    Ok(())
+}
+
+fn write_context_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err("Unsafe session context file".into());
+        }
+    }
+    let parent = path.parent().ok_or("Missing session context directory")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+    temporary.write_all(bytes).map_err(|e| e.to_string())?;
+    temporary.as_file().sync_all().map_err(|e| e.to_string())?;
+    temporary.persist(path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn write_session_context(
     dir: &std::path::Path,
     note_id: &str,
@@ -513,7 +571,7 @@ fn write_session_context(
     vault_path: &std::path::Path,
     extras: &[(String, String, String)], // (id, title, content)
 ) -> Result<std::path::PathBuf, String> {
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    private_context_dir(dir)?;
     let context_file = dir.join("context.md");
     let mut ctx = format!(
         "# {title}\n\n{content}\n\n---\n\n*(This file grounds the session in a Ryuk's Notebook note titled \"{title}\". The note id is {note_id}.)*\n"
@@ -523,12 +581,12 @@ fn write_session_context(
             "\n\n# Additional context: {extra_title}\n\n*Note id: `{extra_id}`*\n\n{extra_content}\n"
         ));
     }
-    std::fs::write(&context_file, ctx).map_err(|e| e.to_string())?;
+    write_context_file(&context_file, ctx.as_bytes())?;
 
     // Hermes loads this file automatically (cwd-only project context) and pins
     // it in the system prompt: the note IS the basis for the session.
     let hermes_file = dir.join(".hermes.md");
-    std::fs::write(
+    write_context_file(
         &hermes_file,
         format!(
             "# RyukNotes Session Grounding\n\n\
@@ -549,7 +607,8 @@ fn write_session_context(
              the vault.\n",
             ctx = context_file.display(),
             vault = vault_path.display(),
-        ),
+        )
+        .as_bytes(),
     )
     .map_err(|e| e.to_string())?;
     Ok(context_file)
@@ -618,7 +677,7 @@ fn resume_with_fresh_grounding(
     prompt: Option<&str>,
 ) -> Result<i32, String> {
     let vault_path = resolve_vault(vault_flag)?;
-    let context_dir = std::env::temp_dir().join("ryuk-sessions").join(note_id);
+    let context_dir = session_context_dir(&vault_path, note_id)?;
     let status = grounded_resume_command(
         db,
         note_id,
@@ -673,8 +732,8 @@ fn session_start(vault_flag: &Option<String>, tail: &[String]) -> Result<(), Str
     };
     let title = String::from(note["title"].as_str().unwrap_or(""));
     let content = String::from(note["content"].as_str().unwrap_or(""));
-    let context_dir = std::env::temp_dir().join("ryuk-sessions").join(&note_id);
     let vault_path = resolve_vault(vault_flag.as_deref())?;
+    let context_dir = session_context_dir(&vault_path, &note_id)?;
     // Additional notes: best-effort extra grounding, skipped when unreadable.
     let extras = read_extra_context(&db, &extra_ids);
     let context_file = write_session_context(
@@ -874,6 +933,40 @@ mod session_grounding_tests {
     use super::write_session_context;
 
     #[test]
+    fn context_identity_contains_no_path_syntax_and_separates_vaults() {
+        let a =
+            super::session_context_key(std::path::Path::new("/a.rn"), "x/../../escape").unwrap();
+        let b =
+            super::session_context_key(std::path::Path::new("/b.rn"), "x/../../escape").unwrap();
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn context_files_are_private_and_symlinks_never_write_to_the_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("context");
+        let file = write_session_context(&dir, "id", "title", "body", root.path(), &[]).unwrap();
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let target = root.path().join("unrelated");
+        std::fs::write(&target, "unchanged").unwrap();
+        std::fs::remove_file(&file).unwrap();
+        symlink(&target, &file).unwrap();
+        assert!(write_session_context(&dir, "id", "title", "new", root.path(), &[]).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "unchanged");
+    }
+
+    #[test]
     fn writes_context_and_hermes_grounding() {
         let dir = std::env::temp_dir().join("ryuk-grounding-test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -907,7 +1000,7 @@ mod session_grounding_tests {
     fn overwrites_stale_grounding_on_relaunch() {
         let dir = std::env::temp_dir().join("ryuk-grounding-test-2");
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        super::private_context_dir(&dir).unwrap();
         std::fs::write(dir.join(".hermes.md"), "stale").unwrap();
         write_session_context(&dir, "n", "t", "c", std::path::Path::new("/v.rn"), &[]).unwrap();
         let text = std::fs::read_to_string(dir.join(".hermes.md")).unwrap();
