@@ -1,9 +1,10 @@
 <script lang="ts">
+	import { listen } from '@tauri-apps/api/event';
 	import { onMount } from 'svelte';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { nativeEditorDrops, trackEditorFocus } from '$lib/utils/editor-events';
 	import '../app.css';
-	import { resolvedTheme, appConfig, activeNotePath, installType, platformIsMobile, customThemes } from '$lib/stores/app';
+	import { resolvedTheme, theme, appConfig, activeNotePath, installType, platformIsMobile, customThemes } from '$lib/stores/app';
 	import { openFile, openUrl, getInstallType, isMobilePlatform } from '$lib/api';
 	import { get } from 'svelte/store';
 	import { isMobile, isAndroid } from '$lib/platform';
@@ -56,6 +57,18 @@
 			}
 		}
 	}
+
+	onMount(() => {
+		let disposed = false;
+		let stop: (() => void) | undefined;
+		listen<string>('theme-changed', ({payload}) => {
+			if (typeof payload !== 'string') return;
+			theme.set(payload);
+			appConfig.update(config => config ? {...config,theme:payload} : config);
+		}).then(unlisten => { if (disposed) unlisten(); else stop = unlisten; })
+		  .catch(error => console.error('Failed to listen for theme changes:',error));
+		return () => { disposed = true; stop?.(); };
+	});
 
 	onMount(() => {
 		const stopFocus = trackEditorFocus(document, window);

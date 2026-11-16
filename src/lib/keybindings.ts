@@ -24,7 +24,7 @@ const isMac = typeof navigator !== "undefined" && navigator.platform.startsWith(
 export const ACTIONS: ActionDef[] = [
   { id: "new-note", label: "New note", group: "General", default: { mod: true, code: "KeyN" } },
   { id: "save", label: "Save", group: "General", default: { mod: true, code: "KeyS" } },
-  { id: "quick-open", label: "Quick open", group: "General", default: { mod: true, code: "KeyP" } },
+  { id: "quick-open", label: "Command palette", group: "General", default: { mod: true, code: "KeyP" } },
   { id: "find-in-note", label: "Find in note", group: "General", default: { mod: true, code: "KeyF" } },
   // Cmd+H hides the application on macOS.
   { id: "replace-in-note", label: "Replace in note", group: "General", default: isMac ? { mod: true, alt: true, code: "KeyF" } : { mod: true, code: "KeyH" } },
@@ -49,40 +49,82 @@ export const DEFAULT_BINDINGS: Record<string, Binding> = Object.fromEntries(
 
 const STORAGE_KEY = "ryuk-keybindings";
 
-function loadBindings(): Record<string, Binding> {
-  const merged: Record<string, Binding> = { ...DEFAULT_BINDINGS };
-  try {
-    const raw = typeof localStorage !== "undefined" && (localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem("helix-keybindings")); // legacy key fallback
-    if (raw) {
-      const stored = JSON.parse(raw) as Record<string, Binding>;
-      for (const id of Object.keys(merged)) {
-        if (stored[id]) merged[id] = stored[id];
+// Editor and platform commands cannot also be assigned to an application action.
+const FIXED_BINDINGS: Binding[] = [
+  {code: 'F3'}, {shift: true, code: 'F3'},
+  {alt: true, code: 'F4'},
+  ...(isMac ? [{mod: true, code: 'KeyH'}, {mod: true, code: 'KeyQ'}] : []),
+  ...['KeyB', 'KeyI', 'KeyU', 'KeyE', 'KeyK', 'KeyZ', 'KeyY', 'Period', 'Equal', 'Minus', 'Digit0'].map(code => ({mod: true, code})),
+  ...['KeyX', 'KeyZ', 'Digit8', 'Digit9', 'Delete'].map(code => ({mod: true, shift: true, code})),
+  ...['Digit1','Digit2','Digit3','Digit4','Digit5','Digit6'].map(code => ({mod: true, code})),
+  ...['ArrowUp','ArrowDown'].flatMap(code => [{alt: true, code}, {alt: true, shift: true, code}]),
+];
+export function validBinding(value: unknown): value is Binding {
+  if (!value || typeof value !== 'object') return false;
+  const b = value as Binding;
+  return typeof b.code === 'string' && /^(?:Key[A-Z]|Digit[0-9]|Numpad(?:[0-9]|Add|Subtract|Multiply|Divide|Decimal|Enter|Equal|Comma)|Intl(?:Backslash|Ro|Yen)|F(?:[1-9]|1[0-9]|2[0-4])|Arrow(?:Left|Right|Up|Down)|Backslash|BracketLeft|BracketRight|Comma|Period|Slash|Semicolon|Quote|Backquote|Minus|Equal|Space|Enter|Tab|Backspace|Delete|Home|End|PageUp|PageDown|Insert)$/.test(b.code)
+    && (['mod','shift','alt'] as const).every(key => b[key] === undefined || typeof b[key] === 'boolean')
+    && (!!b.mod || !!b.alt || /^F[0-9]+$/.test(b.code));
+}
+export function bindingConflict(id: string, binding: Binding, map: Record<string, Binding>): string | null {
+  if (!(Object.hasOwn(DEFAULT_BINDINGS,id)) || !validBinding(binding)) return 'Use a modifier or function key';
+  if (FIXED_BINDINGS.some(fixed => bindingsEqual(fixed, binding))) return 'Reserved editor shortcut';
+  return ACTIONS.some(action => action.id !== id && bindingsEqual(map[action.id], binding)) ? 'Already in use' : null;
+}
+export function normalizeBindings(stored: unknown): Record<string, Binding> {
+  const map = {...DEFAULT_BINDINGS};
+  if (stored && typeof stored === 'object') for (const action of ACTIONS) {
+    const value = (stored as Record<string, unknown>)[action.id];
+    if (validBinding(value) && !FIXED_BINDINGS.some(fixed => bindingsEqual(fixed,value))) map[action.id] = {...value};
+  }
+  // Reset ambiguous assignments as a group; a restored default can expose another
+  // collision, so repeat until every action has one distinct binding.
+  for (let pass=0; pass<ACTIONS.length; pass++) {
+    const collisions = new Set<string>();
+    for (let i=0;i<ACTIONS.length;i++) for (let j=i+1;j<ACTIONS.length;j++) {
+      if (bindingsEqual(map[ACTIONS[i].id],map[ACTIONS[j].id])) {
+        collisions.add(ACTIONS[i].id); collisions.add(ACTIONS[j].id);
       }
     }
-  } catch {
-    // Corrupt storage - fall back to defaults.
+    if (!collisions.size) break;
+    for (const id of collisions) map[id] = DEFAULT_BINDINGS[id];
   }
-  return merged;
+  return map;
 }
-
-export const keybindings = writable<Record<string, Binding>>(loadBindings());
-
-keybindings.subscribe((map) => {
+function loadBindings(): Record<string, Binding> {
   try {
-    if (typeof localStorage !== "undefined") {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
-    }
-  } catch {
-    // Ignore quota / unavailable storage.
-  }
-});
-
-export function setBinding(id: string, binding: Binding) {
-  keybindings.update((m) => ({ ...m, [id]: binding }));
+    const raw = typeof localStorage !== "undefined" && (localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem("helix-keybindings"));
+    return normalizeBindings(raw ? JSON.parse(raw) : null);
+  } catch { return {...DEFAULT_BINDINGS}; }
 }
-
-export function resetBinding(id: string) {
-  keybindings.update((m) => ({ ...m, [id]: DEFAULT_BINDINGS[id] }));
+export const keybindings = writable<Record<string, Binding>>(loadBindings());
+keybindings.subscribe(map => {
+  try { if (typeof localStorage !== 'undefined') localStorage.setItem(STORAGE_KEY, JSON.stringify(map)); }
+  catch { /* Storage may be unavailable. */ }
+});
+if (typeof window !== 'undefined') window.addEventListener('storage', event => {
+  if (event.key === STORAGE_KEY || event.key === 'helix-keybindings' || event.key === null) keybindings.set(loadBindings());
+});
+export function setBinding(id: string, binding: Binding): boolean {
+  let changed = false;
+  keybindings.update(map => {
+    if (bindingConflict(id,binding,map)) return map;
+    changed = true; return {...map,[id]:{...binding}};
+  });
+  return changed;
+}
+export function resetBinding(id: string): void {
+  if (!(Object.hasOwn(DEFAULT_BINDINGS,id))) return;
+  keybindings.update(map => {
+    const restored = DEFAULT_BINDINGS[id];
+    const occupied = ACTIONS.find(action => action.id !== id && bindingsEqual(map[action.id],restored));
+    return normalizeBindings({...map, ...(occupied ? {[occupied.id]:map[id]} : {}), [id]:restored});
+  });
+}
+export function shouldHandleShortcut(event: KeyboardEvent, allowRepeat = false): boolean {
+  const target = event.target as Element | null;
+  return !event.defaultPrevented && !event.isComposing && event.keyCode !== 229 && (allowRepeat || !event.repeat) && event.key !== 'Process' && event.key !== 'Dead'
+    && !target?.closest?.('[role="dialog"], [data-editor-overlay], .settings-overlay, .info-overlay, .palette-overlay, .search-overlay');
 }
 
 // True when the keyboard event matches the given binding exactly. Modifier
@@ -100,7 +142,7 @@ export function matchBinding(e: KeyboardEvent, b: Binding | undefined): boolean 
 
 // Returns the id of the first action whose binding matches the event, or null.
 export function matchAction(e: KeyboardEvent, map: Record<string, Binding>): string | null {
-  for (const id of Object.keys(map)) {
+  for (const {id} of ACTIONS) {
     if (matchBinding(e, map[id])) return id;
   }
   return null;
@@ -123,7 +165,8 @@ export function bindingFromEvent(e: KeyboardEvent): Binding | null {
   };
 }
 
-export function bindingsEqual(a: Binding, b: Binding): boolean {
+export function bindingsEqual(a: Binding | undefined, b: Binding | undefined): boolean {
+  if (!a || !b) return false;
   return !!a.mod === !!b.mod && !!a.shift === !!b.shift && !!a.alt === !!b.alt && a.code === b.code;
 }
 

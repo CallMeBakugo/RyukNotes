@@ -1,4 +1,7 @@
 <script lang="ts">
+	import { receiveMainShortcut, type ShortcutRequest } from '$lib/utils/window-shortcuts';
+	import { shouldHandleShortcut } from '$lib/keybindings';
+	import { reportOperationError } from '$lib/stores/operation-feedback';
 	import OperationFeedback from './OperationFeedback.svelte';
 	import { sameAcceptedNote } from '$lib/utils/accepted-note';
 	import { invoke } from '@tauri-apps/api/core';
@@ -187,6 +190,7 @@
 		outlinePanelId = panelId;
 	}
 	let pendingSearchReveal = $state<{ path: string; token: PaneNavigation } | null>(null);
+	let unlistenShortcut: (() => void) | null = null;
 	let unlistenFileChange: (() => void) | null = null;
 	let unlistenClose: (() => void) | null = null;
 	let unlistenVaultRestored: (() => void) | null = null;
@@ -803,88 +807,87 @@
 		if (e.button === 4) { e.preventDefault(); navigateHistory(1); }
 	}
 
+	async function runShortcut(action: string) {
+		if (!ownerIsCurrent() || !stateReady) throw new Error('Wait for the vault to finish opening before using this shortcut.');
+		switch (action) {
+			case 'nav-back':
+				await navigateHistory(-1);
+				return;
+			case 'nav-forward':
+				await navigateHistory(1);
+				return;
+			case 'new-note':
+				await createAndFocusNote();
+				return;
+			case 'toggle-theme': {
+				const customTheme = $customThemes.find(theme => theme.id === $resolvedTheme);
+				const isDark = darkThemes.includes($resolvedTheme) || (customTheme?.is_dark ?? false);
+				const next = isDark ? 'light' : 'dark';
+				$theme = next;
+				await setTheme(next);
+				return;
+			}
+			case 'search-vault':
+				$showSearch = true;
+				return;
+			case 'find-in-note':
+				if ($activeNotePath) {
+					editor?.openNoteSearch();
+				} else {
+					$showSearch = true;
+				}
+				return;
+			case 'replace-in-note':
+				if ($activeNotePath) editor?.openNoteSearch(true);
+				return;
+			case 'quick-open':
+				$showCommandPalette = true;
+				return;
+			case 'save':
+				await editor?.forceSave();
+				return;
+			case 'toggle-source':
+				$sourceMode = !$sourceMode;
+				return;
+			case 'open-new-window':
+				if ($activeNotePath && $activeNote) {
+					await openNoteWindow(ownerVault!, $activeNotePath, $activeNote.meta.title);
+				}
+				return;
+			case 'toggle-sidebar':
+				$sidebarCollapsed = !$sidebarCollapsed;
+				return;
+			case 'toggle-notelist':
+				toggleNoteList();
+				return;
+			case 'toggle-focus':
+				$focusMode = !$focusMode;
+				return;
+			case 'toggle-readonly':
+				if ($viewerNote) return; // viewer mode is always read-only
+				$readOnly = !$readOnly;
+				return;
+			case 'fullscreen':
+				await appWindow.setFullscreen(!(await appWindow.isFullscreen()));
+				return;
+		}
+	}
+
 	function handleKeydown(e: KeyboardEvent) {
+		if (!shouldHandleShortcut(e, true) || $showSettings || $showInfo || $showSearch || $showCommandPalette) return;
 		const mod = e.ctrlKey || e.metaKey;
-		const code = e.code;
-
-		// Mod+K (insert link) is an editor formatting action and is not user-customizable.
-		if (mod && code === 'KeyK' && !e.shiftKey && $activeNotePath && !$sourceMode) {
-			e.preventDefault();
-			editor?.addLinkFromToolbar();
+		if (mod && e.code === 'KeyK' && !e.shiftKey && !e.altKey && $activeNotePath && !$sourceMode && !$readOnly && !$viewerNote) {
+			e.preventDefault(); e.stopPropagation(); if (!e.repeat) editor?.addLinkFromToolbar(); return;
 		}
-
-		// Ctrl/Cmd+Shift+Delete: move the open note to the trash.
-		if (mod && e.shiftKey && code === 'Delete' && $activeNotePath) {
-			e.preventDefault();
-			editor?.moveOpenNoteToTrash();
-			return;
+		if (mod && e.shiftKey && !e.altKey && e.code === 'Delete' && $activeNotePath) {
+			e.preventDefault(); e.stopPropagation(); if (!e.repeat) void editor?.moveOpenNoteToTrash(); return;
 		}
-
 		const action = matchAction(e, $keybindings);
 		if (action) {
-			e.preventDefault();
-			switch (action) {
-				case 'nav-back':
-					navigateHistory(-1);
-					return;
-				case 'nav-forward':
-					navigateHistory(1);
-					return;
-				case 'new-note':
-					createAndFocusNote();
-					return;
-				case 'toggle-theme': {
-					const customTheme = $customThemes.find(theme => theme.id === $resolvedTheme);
-					const isDark = darkThemes.includes($resolvedTheme) || (customTheme?.is_dark ?? false);
-					const next = isDark ? 'light' : 'dark';
-					$theme = next;
-					setTheme(next);
-					return;
-				}
-				case 'search-vault':
-					$showSearch = true;
-					return;
-				case 'find-in-note':
-					if ($activeNotePath) {
-						editor?.openNoteSearch();
-					} else {
-						$showSearch = true;
-					}
-					return;
-				case 'replace-in-note':
-					if ($activeNotePath) editor?.openNoteSearch(true);
-					return;
-				case 'quick-open':
-					$showCommandPalette = true;
-					return;
-				case 'save':
-					editor?.forceSave();
-					return;
-				case 'toggle-source':
-					$sourceMode = !$sourceMode;
-					return;
-				case 'open-new-window':
-					if ($activeNotePath && $activeNote) {
-						openNoteWindow(ownerVault!, $activeNotePath, $activeNote.meta.title);
-					}
-					return;
-				case 'toggle-sidebar':
-					$sidebarCollapsed = !$sidebarCollapsed;
-					return;
-				case 'toggle-notelist':
-					toggleNoteList();
-					return;
-				case 'toggle-focus':
-					$focusMode = !$focusMode;
-					return;
-				case 'toggle-readonly':
-					if ($viewerNote) return; // viewer mode is always read-only
-					$readOnly = !$readOnly;
-					return;
-				case 'fullscreen':
-					appWindow.isFullscreen().then(fs => appWindow.setFullscreen(!fs));
-					return;
-			}
+			e.preventDefault(); e.stopPropagation();
+			if (e.repeat) return;
+			void runShortcut(action).catch(error => reportOperationError('Shortcut', error));
+			return;
 		}
 
 		if (e.key === 'Escape') {
@@ -1046,6 +1049,13 @@
 			});
 			if (!ownerIsCurrent()) { unlistenClose(); return; }
 		}
+		unlistenShortcut = await listen<ShortcutRequest>('main-shortcut-request', ({payload}) => {
+			void receiveMainShortcut(payload, ownerVault,
+				() => stateReady && ownerIsCurrent() && !$showSettings && !$showInfo && !$showSearch && !$showCommandPalette,
+				async () => { await appWindow.show(); await appWindow.unminimize(); await appWindow.setFocus(); },
+				runShortcut).catch(error => reportOperationError('Shortcut',error));
+		});
+		if (!ownerIsCurrent()) { unlistenShortcut(); return; }
 		unlistenFileChange = await listen<FileEvent>('file-changed', ({ payload }) => {
 			if (!ownerIsCurrent() || !isCurrentVaultEvent(payload, ownerVault)) return;
 			if (!payload.note) {
@@ -1183,6 +1193,7 @@
 		backupListeners.forEach((unlisten) => unlisten());
 		backupListeners.clear();
 		unlistenFileChange?.();
+		unlistenShortcut?.();
 		unlistenVaultRestored?.();
 		unlistenPendingOpen?.();
 		unlistenClose?.();
@@ -1194,7 +1205,7 @@
 	});
 </script>
 
-<svelte:window onkeydown={handleKeydown} onmousedown={isMobile ? undefined : handleMouseDown} />
+<svelte:window onkeydowncapture={handleKeydown} onmousedown={isMobile ? undefined : handleMouseDown} />
 
 {#if isMobile}
 	<!-- ═══ MOBILE LAYOUT ═══ -->

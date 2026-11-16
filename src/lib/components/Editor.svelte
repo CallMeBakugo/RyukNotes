@@ -2199,7 +2199,7 @@
 					props: {
 						handleDOMEvents: {
 							keydown(view, event) {
-								if (!event.altKey || (event.key !== 'ArrowUp' && event.key !== 'ArrowDown')) return false;
+								if (!view.editable || !event.altKey || (event.key !== 'ArrowUp' && event.key !== 'ArrowDown')) return false;
 								event.preventDefault();
 								const { state, dispatch } = view;
 								const resolvedPos = state.selection.$from;
@@ -5761,7 +5761,7 @@
 											&& !event.altKey
 											&& event.code === 'Period';
 										if (isInsertDetails) {
-											if (get(readOnly)) return false;
+											if (!view.editable || get(readOnly)) return false;
 											event.preventDefault();
 											insertDetails();
 											return true;

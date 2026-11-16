@@ -1,4 +1,10 @@
 <script lang="ts">
+	import { MAIN_WINDOW_ACTIONS, requestMainShortcut } from '$lib/utils/window-shortcuts';
+	import { shouldHandleShortcut } from '$lib/keybindings';
+	import { reportOperationError } from '$lib/stores/operation-feedback';
+	import { openNoteWindow } from '$lib/utils/window';
+	import { darkThemes } from '$lib/platform';
+	import { setTheme } from '$lib/api';
 	import OperationFeedback from './OperationFeedback.svelte';
 	import { sameAcceptedNote } from '$lib/utils/accepted-note';
 	import { invoke } from '@tauri-apps/api/core';
@@ -9,7 +15,7 @@
 	import { getCurrentWebview } from '@tauri-apps/api/webview';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import Editor from './Editor.svelte';
-	import { appConfig, tagStyles } from '$lib/stores/app';
+	import { appConfig, tagStyles, theme, resolvedTheme, customThemes } from '$lib/stores/app';
 	import { completeWindowClose, cancelWindowClose, getTagStyles, readNote } from '$lib/api';
 	import { keybindings, matchAction } from '$lib/keybindings';
 	import { isMobile } from '$lib/platform';
@@ -19,7 +25,7 @@
 	import { createEditorWorkspace, provideEditorWorkspace } from '$lib/stores/editor-workspace';
 	import { provideEditorPane, defaultEditorPane } from '$lib/stores/editor-pane';
 
-	const { activeNote, activeNotePath, editorDirty, readOnly, sourceMode,
+	const { activeNote, activeNotePath, editorDirty, readOnly, sourceMode, viewerNote,
 		cancelNoteNavigation } = provideEditorPane();
 
 	const workspace = createEditorWorkspace(defaultEditorPane);
@@ -116,15 +122,43 @@
 		appWindow.startDragging();
 	}
 
-	function handleKeydown(e: KeyboardEvent) {
-		const action = matchAction(e, $keybindings);
-		if (action === 'save') {
-			e.preventDefault();
-			editor?.forceSave();
-		} else if (action === 'toggle-source') {
-			e.preventDefault();
-			$sourceMode = !$sourceMode;
+	async function runShortcut(action: string) {
+		if (!sessionReady || disposed) return;
+		if (MAIN_WINDOW_ACTIONS.has(action)) {
+			if (!ownerVault) return;
+			await requestMainShortcut(action,ownerVault,appWindow.label,$activeNote?.meta.accepted?.vault); return;
 		}
+		switch (action) {
+			case 'save': await editor?.forceSave(); return;
+			case 'find-in-note': editor?.openNoteSearch(); return;
+			case 'replace-in-note': editor?.openNoteSearch(true); return;
+			case 'toggle-source': $sourceMode = !$sourceMode; return;
+			case 'toggle-readonly': if (!$viewerNote) $readOnly = !$readOnly; return;
+			case 'fullscreen': await appWindow.setFullscreen(!(await appWindow.isFullscreen())); return;
+			case 'toggle-theme': {
+				const custom = $customThemes.find(value => value.id === $resolvedTheme);
+				const next = darkThemes.includes($resolvedTheme) || custom?.is_dark ? 'light' : 'dark';
+				$theme = next; await setTheme(next); return;
+			}
+			case 'open-new-window':
+				if (ownerVault && $activeNotePath && $activeNote) await openNoteWindow(ownerVault,$activeNotePath,$activeNote.meta.title);
+				return;
+		}
+	}
+	function handleKeydown(e: KeyboardEvent) {
+		if (!shouldHandleShortcut(e, true) || !sessionReady || disposed) return;
+		const mod = e.ctrlKey || e.metaKey;
+		if (mod && e.code === 'KeyK' && !e.shiftKey && !e.altKey && !$sourceMode && !$readOnly && !$viewerNote) {
+			e.preventDefault(); e.stopPropagation(); if (!e.repeat) editor?.addLinkFromToolbar(); return;
+		}
+		if (mod && e.shiftKey && !e.altKey && e.code === 'Delete') {
+			e.preventDefault(); e.stopPropagation(); if (!e.repeat) void editor?.moveOpenNoteToTrash(); return;
+		}
+		const action = matchAction(e,$keybindings);
+		if (!action) return;
+		e.preventDefault(); e.stopPropagation();
+		if (e.repeat) return;
+		void runShortcut(action).catch(error => reportOperationError('Shortcut',error));
 	}
 
 	async function applyUiScale(scale: number) {
@@ -300,7 +334,7 @@
 	});
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
+<svelte:window onkeydowncapture={handleKeydown} />
 
 <OperationFeedback />
 <RecoveryInbox notice={recoveryBarrierNotice} />

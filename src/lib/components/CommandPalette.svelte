@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { keybindings, bindingToKeys } from '$lib/keybindings';
 	import { getActiveEditorPane } from '$lib/stores/editor-workspace';
 
 	import { showCommandPalette, showSearch, theme, viewMode, activeNotebook, activeTag } from '$lib/stores/app';
@@ -23,11 +24,10 @@
 	interface Command {
 		id: string;
 		label: string;
-		shortcut?: string;
+		shortcutAction?: string;
 		action: () => void;
 	}
 
-	const modKey = navigator.platform.startsWith('Mac') ? '⌘' : 'Ctrl';
 
 	let query = $state('');
 	let selectedIndex = $state(0);
@@ -37,7 +37,7 @@
 		{
 			id: 'search',
 			label: 'Search Notes',
-			shortcut: `${modKey}+F`,
+			shortcutAction: 'search-vault',
 			action: () => {
 				$showCommandPalette = false;
 				$showSearch = true;
@@ -216,8 +216,8 @@
 						onmouseenter={() => (selectedIndex = i)}
 					>
 						<span class="cmd-label">{cmd.label}</span>
-						{#if cmd.shortcut}
-							<span class="cmd-shortcut">{cmd.shortcut}</span>
+						{#if cmd.shortcutAction}
+							<span class="cmd-shortcut">{bindingToKeys($keybindings[cmd.shortcutAction]).join('+')}</span>
 						{/if}
 					</button>
 				{/each}

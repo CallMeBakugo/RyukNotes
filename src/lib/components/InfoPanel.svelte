@@ -9,7 +9,7 @@
 		resetBinding,
 		bindingFromEvent,
 		bindingToKeys,
-		bindingsEqual,
+		bindingConflict,
 		type ActionDef,
 	} from '$lib/keybindings';
 	import { isMobile } from '$lib/platform';
@@ -27,6 +27,7 @@
 	let capturingId = $state<string | null>(null);
 	// id of an action whose row should briefly flash a "already in use" warning.
 	let conflictId = $state<string | null>(null);
+	let conflictMessage = $state('Already in use');
 	let conflictTimer: ReturnType<typeof setTimeout> | null = null;
 
 	function startCapture(id: string) {
@@ -38,7 +39,8 @@
 		capturingId = null;
 	}
 
-	function flashConflict(id: string) {
+	function flashConflict(id: string, message: string) {
+		conflictMessage = message;
 		conflictId = id;
 		if (conflictTimer) clearTimeout(conflictTimer);
 		conflictTimer = setTimeout(() => { conflictId = null; }, 1600);
@@ -58,9 +60,9 @@
 		// Reject combos already bound to a different action.
 		const map = $keybindings;
 		const target = capturingId;
-		const clash = Object.keys(map).find((other) => other !== target && bindingsEqual(map[other], binding));
+		const clash = bindingConflict(target, binding, map);
 		if (clash) {
-			flashConflict(target);
+			flashConflict(target, clash);
 			stopCapture();
 			return;
 		}
@@ -154,7 +156,7 @@
 				{:else}
 					<div class="shortcuts-section">
 						{#if !isMobile}
-							<p class="shortcuts-hint">Click a shortcut to rebind it, right-click to reset.</p>
+							<p class="shortcuts-hint">Click to rebind; right-click to reset. If its default is occupied, reset swaps the two bindings. Vault and navigation actions use the main window.</p>
 						{/if}
 						{#each actionGroups as group}
 							<h4 class="shortcuts-group-title">{group.title}</h4>
@@ -175,7 +177,7 @@
 											{#if capturingId === action.id}
 												<span class="capture-prompt">Press keys…</span>
 											{:else if conflictId === action.id}
-												<span class="conflict-msg">Already in use</span>
+												<span class="conflict-msg">{conflictMessage}</span>
 											{:else}
 												<span class="shortcut-keys">{#each bindingToKeys($keybindings[action.id]) as key, i}{#if i > 0}+{/if}<kbd>{key}</kbd>{/each}</span>
 											{/if}
@@ -186,7 +188,7 @@
 						{/each}
 						<div class="shortcut-row"><span class="shortcut-desc">Close panel / exit focus</span><span class="shortcut-keys"><kbd>Esc</kbd></span></div>
 
-						<h4 class="shortcuts-group-title">Formatting</h4>
+						<h4 class="shortcuts-group-title">WYSIWYG formatting</h4>
 						<div class="shortcut-row"><span class="shortcut-desc">Bold</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>B</kbd></span></div>
 						<div class="shortcut-row"><span class="shortcut-desc">Italic</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>I</kbd></span></div>
 						<div class="shortcut-row"><span class="shortcut-desc">Underline</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>U</kbd></span></div>
@@ -194,18 +196,23 @@
 						<div class="shortcut-row"><span class="shortcut-desc">Code</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>E</kbd></span></div>
 						<div class="shortcut-row"><span class="shortcut-desc">Link</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>K</kbd></span></div>
 						<div class="shortcut-row"><span class="shortcut-desc">Collapsible section</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>.</kbd></span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">Move list item up / down</span><span class="shortcut-keys"><kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>↑↓</kbd></span></div>
+						<h4 class="shortcuts-group-title">Both editor modes</h4>
 						<div class="shortcut-row"><span class="shortcut-desc">Undo</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>Z</kbd></span></div>
 						<div class="shortcut-row"><span class="shortcut-desc">Redo</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd></span></div>
-						<div class="shortcut-row"><span class="shortcut-desc">Move line up / down</span><span class="shortcut-keys"><kbd>Alt</kbd>+<kbd>↑↓</kbd></span></div>
-						<div class="shortcut-row"><span class="shortcut-desc">Move list item up / down</span><span class="shortcut-keys"><kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>↑↓</kbd></span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">Move block / source line up / down</span><span class="shortcut-keys"><kbd>Alt</kbd>+<kbd>↑↓</kbd></span></div>
 
-						<h4 class="shortcuts-group-title">Editor Commands</h4>
+						<h4 class="shortcuts-group-title">Source editor</h4>
+						<div class="shortcut-row"><span class="shortcut-desc">Select syntax</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>I</kbd></span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">Duplicate line up / down</span><span class="shortcut-keys"><kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>↑↓</kbd></span></div>
+
+						<h4 class="shortcuts-group-title">WYSIWYG commands</h4>
 						<div class="shortcut-row"><span class="shortcut-desc">Slash commands</span><span class="shortcut-keys"><kbd>/</kbd></span></div>
 						<div class="shortcut-row command-detail"><span class="shortcut-desc">Headings, lists, code block, table, blockquote, collapsible section, horizontal rule</span></div>
-						<div class="shortcut-row"><span class="shortcut-desc">Wiki-link to note</span><span class="shortcut-keys"><kbd>[[</kbd></span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">Wiki-link to note (when enabled)</span><span class="shortcut-keys"><kbd>[[</kbd></span></div>
 						<div class="shortcut-row command-detail"><span class="shortcut-desc">Type <kbd>[[</kbd> to search and link to another note. Close with <kbd>]]</kbd> or pick from the list.</span></div>
 
-						<h4 class="shortcuts-group-title">Editor Features</h4>
+						<h4 class="shortcuts-group-title">WYSIWYG features</h4>
 						<div class="shortcut-row"><span class="shortcut-desc">Right-click in editor for formatting menu</span></div>
 						<div class="shortcut-row"><span class="shortcut-desc">Right-click a table cell for table options</span></div>
 						<div class="shortcut-row"><span class="shortcut-desc">Right-click a link to open, copy, edit, or remove</span></div>

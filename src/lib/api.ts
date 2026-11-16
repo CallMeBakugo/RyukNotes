@@ -1,3 +1,4 @@
+import { emit } from "@tauri-apps/api/event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { dbAttachmentId, dbAttachmentTarget, isDbAssetUrl } from "./utils/paths";
 import {
@@ -102,7 +103,8 @@ export async function cancelWindowClose(): Promise<void> {
 }
 
 export async function setTheme(theme: string): Promise<void> {
-  return invoke("set_theme", { theme });
+  await invoke("set_theme", { theme });
+  await emit("theme-changed", theme);
 }
 
 export async function setSystemThemes(light: string, dark: string): Promise<void> {

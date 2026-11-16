@@ -1,3 +1,4 @@
+import { checkShortcuts } from './shortcuts';
 import { mount, unmount, tick } from 'svelte';
 import ReviewHarness from './ReviewHarness.svelte';
 import RecoveryInbox from '../../src/lib/components/RecoveryInbox.svelte';
@@ -42,6 +43,7 @@ try {
   const feedback=mount(OperationFeedback,{target});reportOperationError('Fixture action','Expected refusal');await settle();assert(!!target.querySelector('[role="alert"]'),'operation failures are visible');
   (target.querySelector('button') as HTMLButtonElement).click();await settle();assert(!target.querySelector('[role="alert"]'),'error status is dismissible');
   reportOperationSuccess('Fixture success');await settle();assert(!!target.querySelector('[role="status"]'),'success is announced');await new Promise(r=>setTimeout(r,5100));await settle();assert(!target.querySelector('[role="status"]'),'success expires without leaving a banner');operationMessage.set(null);await unmount(feedback);
+  await checkShortcuts(target,assert);
   output.textContent=`ALL MOUNTED CHECKS PASSED\n${lines.join('\n')}`;
   document.documentElement.dataset.acceptance='passed';
 } catch(error) { output.textContent=`FAILED: ${String(error)}\n${lines.join('\n')}`;document.documentElement.dataset.acceptance='failed';console.error(error); }
