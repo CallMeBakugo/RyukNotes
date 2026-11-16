@@ -383,7 +383,22 @@ impl Ledger {
         }
         private_dir(root)?;
         let lock = private_file(&root.join(format!("{vault_uuid}.lock")), false)?;
-        FileExt::try_lock_exclusive(&lock).map_err(|e| format!("Ledger busy: {e}"))?;
+        // Ordinary GUI/CLI writes briefly contend on this lock. Bound the wait
+        // without dropping the lock order or treating contention as permission
+        // to skip reservation/validation. Maintenance locks remain fail-fast.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match FileExt::try_lock_exclusive(&lock) {
+                Ok(()) => break,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => return Err(format!("Ledger busy: {e}")),
+            }
+        }
         let path = root.join(format!("{vault_uuid}.json"));
         let was_missing = !path.exists();
         let data = if was_missing {
@@ -1969,5 +1984,24 @@ mod explicit_recovery_tests {
         assert!(first.requires_recovery_review);
         assert_eq!(fs::read(&source).unwrap(), before);
         assert!(VaultDb::open_v3(&destination, &new_ledger).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod ledger_contention_tests {
+    use super::*;
+    #[test]
+    fn short_lived_writer_contention_waits_then_acquires_the_same_ledger() {
+        let root = tempfile::tempdir().unwrap();
+        let id = uuid();
+        let directory = root.path().join("ledger");
+        let held = Ledger::acquire(&directory, &id).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            drop(held);
+        });
+        let next = Ledger::acquire(&directory, &id).unwrap();
+        release.join().unwrap();
+        drop(next);
     }
 }
