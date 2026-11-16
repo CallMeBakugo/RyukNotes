@@ -33,7 +33,7 @@
 		'data-pdf-src', 'data-pdf-name', 'data-page-break',
 	];
 	// Custom asset protocols are accepted only here, then checked specifically on images.
-	const documentUris = /^(?:https?:|mailto:|tel:|asset:|imgproxy:|blob:|data:image\/(?:png|jpeg|gif|webp|avif|bmp);|#)/i;
+	const documentUris = /^(?:https?:|mailto:|tel:|asset:|dbasset:|imgproxy:|blob:|data:image\/(?:png|jpeg|gif|webp|avif|bmp);|#)/i;
 	const formattingProperties = [
 		'color', 'background-color', 'font-weight', 'font-style', 'font-size',
 		'text-align', 'text-decoration-line', 'text-decoration-color', 'vertical-align',
@@ -48,13 +48,13 @@
 
 	function imageSourceAllowed(source: string): boolean {
 		if (/[\u0000-\u0020\u007f]/.test(source)) return false;
-		if (/^(?:asset|imgproxy):\/\//i.test(source)) return true;
+		if (/^(?:asset|dbasset|imgproxy):\/\//i.test(source)) return true;
 		if (/^data:image\/(?:png|jpeg|gif|webp|avif|bmp);base64,[a-z\d+/=]+$/i.test(source)) return true;
 		try {
 			const url = new URL(source);
 			if (url.protocol === 'blob:') return new URL(url.pathname).origin === window.location.origin;
 			return ['http:', 'https:'].includes(url.protocol)
-				&& ['asset.localhost', 'imgproxy.localhost'].includes(url.hostname)
+				&& ['asset.localhost', 'dbasset.localhost', 'imgproxy.localhost'].includes(url.hostname)
 				&& !url.username && !url.password && !url.port;
 		} catch {
 			return false;
