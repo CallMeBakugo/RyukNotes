@@ -635,12 +635,23 @@ impl FullState {
     }
 }
 pub(crate) fn states(conn: &Connection) -> Result<BTreeMap<String, FullState>, String> {
+    selected_states(conn, None)
+}
+
+pub(crate) fn note_state(conn: &Connection, id: &str) -> Result<Option<FullState>, String> {
+    Ok(selected_states(conn, Some(id))?.remove(id))
+}
+
+fn selected_states(
+    conn: &Connection,
+    selected: Option<&str>,
+) -> Result<BTreeMap<String, FullState>, String> {
     let layout = super::db_notebooks::Layout::load(conn)?;
     let mut statement = conn
-        .prepare("SELECT id,content,title,pinned,trashed,created,modified FROM notes ORDER BY id")
+        .prepare(if selected.is_some() { "SELECT id,content,title,pinned,trashed,created,modified FROM notes WHERE id=?1" } else { "SELECT id,content,title,pinned,trashed,created,modified FROM notes WHERE ?1 IS NULL ORDER BY id" })
         .map_err(err)?;
     let rows = statement
-        .query_map([], |r| {
+        .query_map([selected], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,

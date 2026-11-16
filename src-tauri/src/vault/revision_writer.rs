@@ -909,9 +909,7 @@ fn read_accepted_core(db: &VaultDb, id: &str) -> Result<Option<Value>, WriteErro
             .as_str()
             .ok_or("Missing revision ID")?,
     )?;
-    let actual = ancestry::states(&db.conn)?
-        .remove(id)
-        .ok_or("Missing note projection")?;
+    let actual = ancestry::note_state(&db.conn, id)?.ok_or("Missing note projection")?;
     if actual != stored {
         return Err(WriteError::conflict(
             WriteErrorKind::Changed,
