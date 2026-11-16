@@ -134,9 +134,9 @@ impl Recovery {
         let Some(root) = &self.root else { return Ok(0) };
         let mut bytes = 0u64;
         for entry in walkdir::WalkDir::new(root).follow_links(false) {
-            let entry = entry.map_err(|e|e.to_string())?;
+            let entry = entry.map_err(|e| e.to_string())?;
             if entry.file_type().is_file() {
-                bytes = bytes.saturating_add(entry.metadata().map_err(|e|e.to_string())?.len());
+                bytes = bytes.saturating_add(entry.metadata().map_err(|e| e.to_string())?.len());
             }
         }
         Ok(bytes)
@@ -3745,7 +3745,7 @@ mod revision_retention_tests {
         // GC is safe with dirty windows because their base pins are independent
         // roots, but the retention gate still refuses while a dirty owner is
         // enrolled; refusal preserves the detached draft either way.
-        assert!(request(&main,"db_collect_revisions",json!({"vaultPath":f.path})).is_err());
+        assert!(request(&main, "db_collect_revisions", json!({"vaultPath":f.path})).is_err());
         assert!(state.recovery.lock().unwrap().owners[&b].dirty);
         request(
             &detached,

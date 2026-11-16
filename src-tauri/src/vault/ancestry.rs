@@ -977,24 +977,38 @@ pub struct RestoreOutcome {
 /// Explicit recovery of a raw v3 file after ledger loss or relocation. Never
 /// enroll the source implicitly: publish a separate destination with a fresh
 /// epoch through the same idempotent portable-restore protocol.
-pub fn recover_copy(source: &Path, destination: &Path, ledger_root: &Path, operation: &str) -> Result<RestoreOutcome, String> {
+pub fn recover_copy(
+    source: &Path,
+    destination: &Path,
+    ledger_root: &Path,
+    operation: &str,
+) -> Result<RestoreOutcome, String> {
     uuid::Uuid::parse_str(operation).map_err(err)?;
     let _inspection = Inspection::open(source)?;
     let stage = tempfile::tempdir().map_err(err)?;
     let backup = stage.path().join("recovery.rn");
-    let conn = Connection::open_with_flags(source,OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(err)?;
-    snapshot(&conn,&backup,false,true)?;
+    let conn =
+        Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(err)?;
+    snapshot(&conn, &backup, false, true)?;
     drop(conn);
     let mut input = File::open(&backup).map_err(err)?;
     let mut checksum = Sha256::new();
     let mut buffer = [0u8; 65536];
     loop {
         let count = input.read(&mut buffer).map_err(err)?;
-        if count == 0 { break; }
+        if count == 0 {
+            break;
+        }
         checksum.update(&buffer[..count]);
     }
     let request = format!("{:x}", checksum.finalize());
-    restore_portable(destination,&backup,ledger_root,&format!("portable_import:v1:raw:{operation}"),&request)
+    restore_portable(
+        destination,
+        &backup,
+        ledger_root,
+        &format!("portable_import:v1:raw:{operation}"),
+        &request,
+    )
 }
 
 /// Shared epoch-safe production restore boundary.
@@ -1940,20 +1954,20 @@ mod explicit_recovery_tests {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.rn");
         let original_ledger = dir.path().join("old-ledger");
-        let (db,_) = VaultDb::open_with_report(&source,&original_ledger).unwrap();
+        let (db, _) = VaultDb::open_with_report(&source, &original_ledger).unwrap();
         let original = identity(&db.conn).unwrap();
         drop(db);
         let before = fs::read(&source).unwrap();
         let destination = dir.path().join("recovered.rn");
         let new_ledger = dir.path().join("new-host-ledger");
         let operation = uuid();
-        let first = recover_copy(&source,&destination,&new_ledger,&operation).unwrap();
-        let second = recover_copy(&source,&destination,&new_ledger,&operation).unwrap();
-        assert_eq!(first.identity,second.identity);
-        assert_eq!(first.identity.vault_uuid,original.vault_uuid);
-        assert_ne!(first.identity.storage_epoch,original.storage_epoch);
+        let first = recover_copy(&source, &destination, &new_ledger, &operation).unwrap();
+        let second = recover_copy(&source, &destination, &new_ledger, &operation).unwrap();
+        assert_eq!(first.identity, second.identity);
+        assert_eq!(first.identity.vault_uuid, original.vault_uuid);
+        assert_ne!(first.identity.storage_epoch, original.storage_epoch);
         assert!(first.requires_recovery_review);
-        assert_eq!(fs::read(&source).unwrap(),before);
-        assert!(VaultDb::open_v3(&destination,&new_ledger).is_ok());
+        assert_eq!(fs::read(&source).unwrap(), before);
+        assert!(VaultDb::open_v3(&destination, &new_ledger).is_ok());
     }
 }

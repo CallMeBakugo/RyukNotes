@@ -859,7 +859,11 @@ impl VaultDb {
             layout.notes.remove(id);
         }
         layout.save(&tx)?;
-        tx.execute("DELETE FROM meta WHERE substr(key,1,18)='notebook_trash:v1:'", []).map_err(error)?;
+        tx.execute(
+            "DELETE FROM meta WHERE substr(key,1,18)='notebook_trash:v1:'",
+            [],
+        )
+        .map_err(error)?;
         tx.commit()?;
         Ok(ids.len() as u32)
     }
@@ -1141,7 +1145,9 @@ impl VaultDb {
         {
             return Err(format!("No note with id {id}"));
         }
-        if !trashed { super::db_notebooks::restore_orphan_to_root(&tx,id)?; }
+        if !trashed {
+            super::db_notebooks::restore_orphan_to_root(&tx, id)?;
+        }
         tx.commit()
     }
 }

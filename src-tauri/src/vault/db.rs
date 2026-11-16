@@ -749,7 +749,9 @@ impl VaultDb {
             if changed == 0 {
                 return Err(format!("No note with id {id}"));
             }
-            if !trashed { super::db_notebooks::restore_orphan_to_root(&tx,id)?; }
+            if !trashed {
+                super::db_notebooks::restore_orphan_to_root(&tx, id)?;
+            }
             return tx.commit();
         }
         let changed = self
