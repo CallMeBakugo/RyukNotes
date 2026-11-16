@@ -201,18 +201,25 @@ fn open_vault_path(
     }
     next.active_vault = Some(path);
     next.active_bookmark_id = active_bookmark_id;
+    let mut db_slot = state.vault_db.lock().map_err(|e| e.to_string())?;
     if let Err(error) = save_app_config(&next) {
         drop(config);
         drop(search_slot);
         let _ = state.retain_vault_watchers();
         return Err(error);
     }
+    let old_db = db_slot.take();
+    state
+        .vault_db_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+    drop(db_slot);
     let old_search = search_slot.replace(search.clone());
     *config = next;
     drop(config);
     drop(search_slot);
     // Index disposal and watcher shutdown must not hold global state slots.
     state.retain_vault_watchers()?;
+    drop(old_db);
     drop(old_search);
 
     Ok(search)
@@ -419,6 +426,12 @@ fn remove_vault_path<R: Runtime>(
     let Some((target_path, target_bookmark, is_active)) = target else {
         return Ok(());
     };
+    state
+        .recovery
+        .lock()
+        .map_err(|e| e.to_string())?
+        .assert_quiet(Some(&target_path), None)?;
+    let mut db_slot = state.vault_db.lock().map_err(|e| e.to_string())?;
     let old = config.clone();
     let mut next = old.clone();
     if let Some(id) = target_bookmark.as_deref() {
@@ -448,11 +461,19 @@ fn remove_vault_path<R: Runtime>(
     #[cfg(not(target_os = "ios"))]
     let _ = (app, &target_bookmark);
 
+    let old_db = if is_active { db_slot.take() } else { None };
+    if is_active {
+        state
+            .vault_db_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+    drop(db_slot);
     let old_search = if is_active { search_slot.take() } else { None };
     *config = next;
     drop(config);
     drop(search_slot);
     state.retain_vault_watchers()?;
+    drop(old_db);
     drop(old_search);
 
     Ok(())
@@ -4823,6 +4844,14 @@ pub async fn db_open_vault(
     path: String,
 ) -> Result<crate::vault::db::OpenReport, String> {
     let _transition = state.vault_transition.lock().await;
+    activate_db_vault(&state, path, &app_config_path()?)
+}
+
+fn activate_db_vault(
+    state: &AppState,
+    path: String,
+    config_path: &Path,
+) -> Result<crate::vault::db::OpenReport, String> {
     state
         .recovery
         .lock()
@@ -4835,14 +4864,8 @@ pub async fn db_open_vault(
     }
     let root = crate::vault::ancestry::production_ledger_root(Path::new(&path))?;
     let (db, report) = crate::vault::db::VaultDb::open_with_report(Path::new(&path), &root)?;
-    {
-        let mut slot = state.vault_db.lock().map_err(|e| e.to_string())?;
-        *slot = Some(db);
-        state
-            .vault_db_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
-    }
     // Register in config (same semantics as open_vault_path's directory case).
+    let mut search_slot = state.search_index.lock().map_err(|e| e.to_string())?;
     let mut config = state.config.lock().map_err(|e| e.to_string())?;
     let mut next = config.clone();
     if !next.vaults.iter().any(|vault| vault.path == path) {
@@ -4858,12 +4881,23 @@ pub async fn db_open_vault(
         });
     }
     next.active_vault = Some(path);
-    save_app_config(&next).map_err(|error| match &report.status {
+    next.active_bookmark_id = None;
+    let mut slot = state.vault_db.lock().map_err(|e| e.to_string())?;
+    save_app_config_to(&next, config_path).map_err(|error| match &report.status {
         Some(status) => format!("{status} Unable to save vault configuration: {error}"),
         None => error,
     })?;
+    let old_db = slot.replace(db);
+    let old_search = search_slot.take();
     *config = next;
+    state
+        .vault_db_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+    drop(slot);
     drop(config);
+    drop(search_slot);
+    drop(old_db);
+    drop(old_search);
     Ok(report)
 }
 
@@ -7867,5 +7901,50 @@ mod db_backup_boundary_tests {
         assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
         assert!(request(&selected).is_ok());
         assert!(!selected.exists());
+    }
+}
+
+#[cfg(test)]
+mod db_activation_tests {
+    use super::*;
+    #[test]
+    fn failed_config_publication_keeps_original_connection_and_vault() {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("a.rn");
+        let b = root.path().join("b.rn");
+        let state = AppState::new(AppConfig::default());
+        let config = root.path().join("config.json");
+        activate_db_vault(&state, a.to_string_lossy().into(), &config).unwrap();
+        let original = state.vault_db.lock().unwrap().as_ref().unwrap().identity();
+        let epoch = state
+            .vault_db_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        let blocker = root.path().join("blocked");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        assert!(activate_db_vault(
+            &state,
+            b.to_string_lossy().into(),
+            &blocker.join("config.json")
+        )
+        .is_err());
+        assert_eq!(
+            state.vault_db.lock().unwrap().as_ref().unwrap().identity(),
+            original
+        );
+        assert_eq!(
+            state.config.lock().unwrap().active_vault.as_deref(),
+            a.to_str()
+        );
+        assert_eq!(
+            state
+                .vault_db_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+            epoch
+        );
+        activate_db_vault(&state, b.to_string_lossy().into(), &config).unwrap();
+        assert_ne!(
+            state.vault_db.lock().unwrap().as_ref().unwrap().identity(),
+            original
+        );
     }
 }
