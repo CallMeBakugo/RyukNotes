@@ -299,7 +299,7 @@ export async function dbGetQuickAccess(): Promise<NoteEntry[]> {
   const out: NoteEntry[] = [];
   for (const id of ids) {
     const note = await invoke<Record<string, unknown> | null>("db_get_note", { id });
-    if (!note) continue;
+    if (!note || note.trashed) continue;
     out.push({
       path: id,
       relative_path: id,

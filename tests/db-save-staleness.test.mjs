@@ -143,3 +143,26 @@ test('daily creation delegates date and captured vault to the atomic native boun
   assert.equal(calls[0][1].vaultPath,'/vault.rn');
   assert.equal(calls[0][1].date,'2026-11-11');
 });
+
+
+test('Quick Access keeps opaque IDs after title changes and omits trashed or missing notes', async () => {
+  const requests = [];
+  const adapter = load(adapterSource, { require: name => {
+    if (name === './utils/vault-open-status') return { recordVaultOpenStatus: () => {} };
+    assert.equal(name, '@tauri-apps/api/core');
+    return { invoke: async (command, args) => {
+      requests.push([command,args]);
+      if (command === 'db_get_state') return ['n1','trash','missing'];
+      if (command === 'db_get_note') return args.id === 'missing' ? null : { ...original, id:args.id, title:'Renamed title', trashed:args.id === 'trash' };
+      if (command === 'db_set_state') return;
+      assert.fail(command);
+    } };
+  } });
+  const entries = await adapter.dbGetQuickAccess();
+  assert.equal(entries.length,1);
+  assert.equal(entries[0].relative_path,'n1');
+  assert.equal(entries[0].meta.title,'Renamed title');
+  await adapter.dbRemoveQuickAccess(entries[0].relative_path);
+  const write=requests.find(([command])=>command==='db_set_state');
+  assert.deepEqual(clone(write[1]),{key:'quick_access',value:['trash','missing']});
+});
