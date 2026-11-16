@@ -2,14 +2,13 @@
 	import { applyTheme, applyCustomThemeVars } from '$lib/utils/theme';
 	import PortableRecovery from './PortableRecovery.svelte';
 	import StorageMaintenance from './StorageMaintenance.svelte';
-	import { showSettings, theme, resolvedTheme, appConfig, platformIsMobile, activeVaultConfig, installType, settingsTab, vaultReady, notebookSortMode, customThemes } from '$lib/stores/app';
+	import { showSettings, theme, resolvedTheme, appConfig, platformIsMobile, activeVaultConfig, settingsTab, vaultReady, notebookSortMode, customThemes } from '$lib/stores/app';
 	import { setTheme, setSystemThemes, setAccentColor, setFontSize, setScrollToChangeFontSize, setFontFamily, setLineHeight, setUiScale, setContentWidth, setGeneralSettings, importObsidian, createBackup, listBackups, restoreBackup, deleteBackup, setBackupSettings, setAiSettings, testAiConnection, saveCustomTheme, deleteCustomTheme, exportCustomTheme, importCustomThemes, getVaultStats, findOrphanedAttachments, trashOrphanedAttachments } from '$lib/api';
 	import { darkThemes, isMobile, isAndroid } from '$lib/platform';
 	import { isDbVault } from '$lib/api-db';
 	import { importMdFolderIntoDb, exportDbToMd } from '$lib/api';
 	import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { listen } from '@tauri-apps/api/event';
-	import { getVersion } from '@tauri-apps/api/app';
 	import { getCurrentWebview } from '@tauri-apps/api/webview';
 	import type { OrphanAttachment } from '$lib/api';
 	import type { ImportResult, BackupEntry, CustomTheme, CustomThemeColors, StartupView, VaultStats } from '$lib/types';
@@ -21,15 +20,8 @@
 
 	const modKey = navigator.platform.startsWith('Mac') ? '⌘' : 'Ctrl';
 
-	type Tab = 'general' | 'editor' | 'styling' | 'import' | 'backup' | 'maintenance' | 'ai' | 'updates';
+	type Tab = 'general' | 'editor' | 'styling' | 'import' | 'backup' | 'maintenance' | 'ai';
 	let activeTab = $state<Tab>('styling');
-
-	let appVersion = $state('...');
-
-	async function loadAppVersion() {
-		try { appVersion = await getVersion(); } catch { appVersion = '0.0.0'; }
-	}
-	loadAppVersion();
 
 	// Switch to requested tab if set externally
 	$effect(() => {
@@ -1127,14 +1119,6 @@
 						</svg>
 						AI
 					</button>
-					{#if !isAndroid}
-					<button class="tab-btn" class:active={activeTab === 'updates'} onclick={() => activeTab = 'updates'}>
-						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-							<path d="M21 12a9 9 0 00-9-9 9.75 9.75 0 00-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 3"/>
-						</svg>
-						Updates
-					</button>
-					{/if}
 				</nav>
 
 				<div class="settings-body">
@@ -2323,30 +2307,6 @@
 								</div>
 							{/if}
 						</div>
-
-					{:else if activeTab === 'updates'}
-						<div class="tab-content">
-							<div class="settings-section">
-								<h3>Current Version</h3>
-								<p class="update-version">Ryuk's Notebook <strong>v{appVersion}</strong></p>
-							</div>
-
-							<div class="settings-section">
-								<h3>Updates</h3>
-								<p class="setting-hint">Ryuk's Notebook does not check for or install updates on its own. Use your system package manager for package-managed installations, or install a new version manually.</p>
-								{#if $installType === 'deb'}
-									<div class="update-apt-info">
-										<p>Update via your package manager:</p>
-										<code>sudo apt update && sudo apt upgrade ryuk-notes</code>
-									</div>
-								{:else if $installType === 'aur'}
-									<div class="update-apt-info">
-										<p>Update via your AUR helper:</p>
-										<code>yay -Syu ryuknotes</code>
-									</div>
-								{/if}
-							</div>
-						</div>
 					{/if}
 				</div>
 			</div>
@@ -3316,29 +3276,6 @@
 	.ai-model-desc {
 		font-size: 11px;
 		color: var(--text-tertiary);
-	}
-
-	/* Updates tab */
-	.update-version {
-		font-size: 14px;
-		color: var(--text-primary);
-	}
-
-	.update-apt-info {
-		margin-top: 8px;
-	}
-	.update-apt-info p {
-		margin: 0 0 6px 0;
-		font-size: 13px;
-		color: var(--text-secondary);
-	}
-	.update-apt-info code {
-		display: block;
-		padding: 8px 12px;
-		background: var(--bg-secondary);
-		border-radius: 6px;
-		font-size: 12px;
-		user-select: all;
 	}
 
 	/* ═══ Mobile ═══ */

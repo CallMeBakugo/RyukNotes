@@ -28,8 +28,7 @@ modified. Display name is "Ryuk's Notebook"; machinery stays apostrophe-free.
   and legacy read-compat code (`.helixnotes` dir fallbacks, `helix-secret` fence
   parsing, `helix-keybindings` localStorage fallback).
 - The auto-updater is REMOVED permanently (plugin, Cargo dep, capability, endpoint
-  config). Never re-add auto-update. The Settings "Check for Updates" button is dead
-  UI by design.
+  config). Never re-add auto-update or update controls in Settings.
 
 ## Remotes and pushing
 
