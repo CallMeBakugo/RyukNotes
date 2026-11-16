@@ -289,6 +289,7 @@ export async function getAllNoteTitles(vaultPath: string): Promise<NoteTitleEntr
 export async function getNoteSwitcherTitles(
   recentPaths: string[],
 ): Promise<NoteTitleEntry[]> {
+  if (isDbVault()) return dbGetAllNoteTitles();
   return invoke("get_note_switcher_titles", { recentPaths });
 }
 

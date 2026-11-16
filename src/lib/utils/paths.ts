@@ -118,6 +118,7 @@ export function resolveVaultFilePath(
 		const managed = target.match(/^(?:\.{1,2}\/)*(\.ryuknotes\/attachments\/.*)$/);
 		if (managed) return resolvePathFromFile(`${root}/.vault-root`, managed[1]);
 		if (target.startsWith('.ryuknotes/')) return resolvePathFromFile(`${root}/.vault-root`, target);
+		if (root.endsWith('.rn') && isNoteLink(target, root)) return target.replace(/^\.\//, '');
 	}
 	if (notePath) return resolvePathFromFile(notePath, target);
 	if (root) return resolvePathFromFile(`${root}/.vault-root`, target);
@@ -193,6 +194,7 @@ export function resolvePathFromFile(filePath: string, targetPath: string): strin
 /** Lexical ownership for the UI; native code enforces filesystem access. */
 export function isPathInDirectory(path: string, directory: string | null): boolean {
 	if (!directory) return false;
+	if (directory.endsWith('.rn') && path && !/^(?:[\\/]|[A-Za-z]:)/.test(path)) return true;
 	let root = resolvePathFromFile('', directory).replace(/\/+$/, '');
 	let target = resolvePathFromFile('', path);
 	if (/^[A-Za-z]:\//.test(root) || root.startsWith('//')) {
@@ -202,6 +204,20 @@ export function isPathInDirectory(path: string, directory: string | null): boole
 	return target.startsWith(`${root}/`);
 }
 
-export function isTrashedNote(path: string | null, vaultRoot: string | null | undefined): boolean {
+export function isTrashedNote(path: string | null, vaultRoot: string | null | undefined, lifecycle?: boolean): boolean {
+	if (lifecycle !== undefined) return lifecycle;
 	return !!path && !!vaultRoot && isPathInDirectory(path, `${vaultRoot}/.ryuknotes/trash`);
+}
+
+/** Resolve a note identity without turning a database ID into a file path. */
+export function resolveNoteReference(path: string, vault: string | null | undefined): string {
+	if (!vault || /^(?:[\\/]|[A-Za-z]:)/.test(path)) return path;
+	if (vault.endsWith('.rn')) return path.replace(/^\.\//, '');
+	return vault.replace(/[\\/]+$/, '') + '/' + path.replace(/\\/g, '/');
+}
+
+export function isNoteLink(path: string, vault: string | null | undefined): boolean {
+	if (path.endsWith('.md')) return true;
+	return !!vault?.endsWith('.rn') && !!path && !/^(?:[\\/]|[A-Za-z]:|[a-z]+:)/i.test(path)
+		&& !/\.[a-z\d]+$/i.test(path.replace(/^\.\//, ''));
 }

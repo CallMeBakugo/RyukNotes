@@ -994,6 +994,23 @@ impl VaultDb {
         data: &[u8],
         now: &str,
     ) -> Result<String, String> {
+        let id = self.store_blob_on(tx, filename, mime_type, data, now)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO note_attachments(note_id, attachment_id) VALUES(?1, ?2)",
+            params![note_id, id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+
+    pub(crate) fn store_blob_on(
+        &self,
+        tx: &Connection,
+        filename: &str,
+        mime_type: &str,
+        data: &[u8],
+        now: &str,
+    ) -> Result<String, String> {
         if data.len() as i64 > self.max_attachment_bytes {
             return Err(format!(
                 "Attachment {filename} exceeds the vault cap of {} bytes",
@@ -1025,12 +1042,6 @@ impl VaultDb {
                 |r| r.get(0),
             )
             .map_err(|e| e.to_string())?;
-        // Even a duplicate must pass the note foreign key.
-        tx.execute(
-            "INSERT OR IGNORE INTO note_attachments(note_id, attachment_id) VALUES(?1, ?2)",
-            params![note_id, id],
-        )
-        .map_err(|e| e.to_string())?;
         Ok(id)
     }
 
@@ -1083,6 +1094,17 @@ impl VaultDb {
             .map_err(|e| e.to_string())?;
         Ok(Some((meta, data)))
     }
+}
+
+/// SQLite INTEGER is signed; reject corrupt negative sizes rather than wrapping.
+pub(crate) fn nonnegative_integer(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    u64::try_from(row.get::<_, i64>(index)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1503,15 +1525,4 @@ mod tests {
             .unwrap();
         assert_eq!(version, "999");
     }
-}
-
-/// SQLite INTEGER is signed; reject corrupt negative sizes rather than wrapping.
-pub(crate) fn nonnegative_integer(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
-    u64::try_from(row.get::<_, i64>(index)?).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(
-            index,
-            rusqlite::types::Type::Integer,
-            Box::new(error),
-        )
-    })
 }

@@ -75,7 +75,7 @@
 	import { tagIterationKey } from '$lib/utils/tag-styles';
 	import { replaceWithWikiLink } from '$lib/editor/wikiLinks';
 	import { renamedLink, renamedLinkChanges, type LinkRename } from '$lib/editor/renamedLinks';
-	import { assetSourceToMarkdown, assetUrlToLocalPath, encodeMarkdownPath, resolveFileReference, noteAssetRoot, isTrashedNote } from '$lib/utils/paths';
+	import { assetSourceToMarkdown, assetUrlToLocalPath, encodeMarkdownPath, resolveFileReference, noteAssetRoot, isTrashedNote, resolveNoteReference, isNoteLink } from '$lib/utils/paths';
 	import TagSuggestInput from './TagSuggestInput.svelte';
 	import TagLabel from './TagLabel.svelte';
 	import ImageViewer from './ImageViewer.svelte';
@@ -185,7 +185,7 @@
 		},
 	});
 	let editorReady = $state(false);
-	const trashPreview = $derived(isTrashedNote($activeNotePath, $appConfig?.active_vault));
+	const trashPreview = $derived(isTrashedNote($activeNotePath, $appConfig?.active_vault, $activeNote?.meta.accepted?.trashed));
 
 	// Hermes integration: summary notes carry the hermes/session tag and a
 	// hermes-session-<id> note id; the restore button resurrects that session
@@ -1042,18 +1042,7 @@
 	 * so they don't break before the migration pass rewrites them.
 	 */
 	function resolveNotePath(path: string): string {
-		if (!path) return path;
-		const vaultRoot = $appConfig?.active_vault;
-		if (!vaultRoot) return path;
-		// Normalize separators for comparison
-		const norm = path.replace(/\\/g, '/');
-		const root = vaultRoot.replace(/\\/g, '/');
-		// Already absolute (starts with vault root, or has a Windows drive letter, or starts with /)
-		if (norm.startsWith(root + '/')) return path;
-		if (/^[A-Za-z]:[\\/]/.test(path)) return path;
-		if (path.startsWith('/')) return path;
-		// Relative: join with vault root
-		return vaultRoot + '/' + path;
+		return resolveNoteReference(path, $appConfig?.active_vault);
 	}
 
 	/**
@@ -4265,7 +4254,7 @@
 			$sourceMode = true;
 		}
 		lastSourceMode = $sourceMode;
-		const shouldBeReadOnly = isViewer || isTrashedNote(path, $appConfig?.active_vault)
+		const shouldBeReadOnly = isViewer || isTrashedNote(path, $appConfig?.active_vault, $activeNote?.meta.accepted?.trashed)
 			? true : (isNewNote ? false : ($appConfig?.default_view_mode ?? false));
 		$readOnly = shouldBeReadOnly;
 		if (editor) editor.setEditable(!shouldBeReadOnly && !externalOperationBusy);
@@ -7145,7 +7134,7 @@
 	function resolveNoteHref(href: string): string | null {
 		if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(href)) return null;
 		const path = resolveFileReference(href, $activeNotePath, currentNoteAssetRoot()).path;
-		return path.endsWith('.md') ? path : null;
+		return isNoteLink(path, currentNoteAssetRoot()) ? path : null;
 	}
 
 	function linkMenuOpen() {

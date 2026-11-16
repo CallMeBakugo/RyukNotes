@@ -550,3 +550,94 @@ mod tests {
         assert!(create(&db, "/v.rn", None, "B").is_err());
     }
 }
+
+pub fn create_daily_note(
+    db: &VaultDb,
+    date: chrono::NaiveDate,
+    format: &str,
+) -> Result<serde_json::Value, String> {
+    let id = format!("daily-{}", date.format("%Y-%m-%d"));
+    let tx = db.begin_write("gui", None, &serde_json::json!(["daily", id]))?;
+    if let Some(note) = db.accepted_note(&id).map_err(|e| e.to_string())? {
+        if note["trashed"] == true {
+            return Err("This daily note is in Trash; restore it before opening it.".into());
+        }
+        return Ok(note);
+    }
+    let mut layout = Layout::load(&tx)?;
+    layout.notebooks.insert("Daily".into());
+    let now = chrono::Utc::now().to_rfc3339();
+    let note = super::db::NewNote {
+        id: id.clone(),
+        title: super::operations::daily_note_title(date, format),
+        content: String::new(),
+        pinned: false,
+        tags: vec![],
+        created: now.clone(),
+        modified: now,
+    };
+    super::writer::create_on(db, &tx, &note)?;
+    layout.assign(&id, "Daily")?;
+    layout.save(&tx)?;
+    let receipt = tx.receipt(&id)?;
+    tx.commit()?;
+    Ok(receipt)
+}
+
+#[cfg(test)]
+mod daily_tests {
+    use super::*;
+    #[test]
+    fn daily_creation_is_idempotent_formatted_and_assigned_without_resurrecting_trash() {
+        let root = tempfile::tempdir().unwrap();
+        let (db, _) =
+            VaultDb::open_with_report(&root.path().join("fixture.rn"), &root.path().join("ledger"))
+                .unwrap();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
+        let first = create_daily_note(&db, date, "us").unwrap();
+        assert_eq!(first["title"], "11/15/2026");
+        assert_eq!(create_daily_note(&db, date, "iso").unwrap(), first);
+        assert_eq!(db.list_notes(false).unwrap().len(), 1);
+        assert_eq!(
+            Layout::load(&db.conn).unwrap().notes["daily-2026-11-15"],
+            "Daily"
+        );
+        db.set_note_trashed("daily-2026-11-15", true).unwrap();
+        assert!(create_daily_note(&db, date, "iso").is_err());
+    }
+}
+
+pub fn duplicate_note(db: &VaultDb, source: &str) -> Result<serde_json::Value, String> {
+    let tx = db.begin_write("gui", None, &serde_json::json!(["duplicate", source]))?;
+    let original = db
+        .accepted_note(source)
+        .map_err(|e| e.to_string())?
+        .ok_or("Source note not found")?;
+    if original["trashed"] == true {
+        return Err("Restore the source note before duplicating it".into());
+    }
+    let mut layout = Layout::load(&tx)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let note = super::db::NewNote {
+        id: uuid::Uuid::new_v4().to_string(),
+        title: format!(
+            "{} (copy)",
+            original["title"].as_str().ok_or("Missing source title")?
+        ),
+        content: original["content"]
+            .as_str()
+            .ok_or("Missing source content")?
+            .into(),
+        pinned: false,
+        tags: serde_json::from_value(original["tags"].clone()).map_err(|e| e.to_string())?,
+        created: now.clone(),
+        modified: now,
+    };
+    super::writer::create_on(db, &tx, &note)?;
+    let notebook = layout.notes.get(source).cloned().unwrap_or_default();
+    layout.assign(&note.id, &notebook)?;
+    layout.save(&tx)?;
+    let receipt = tx.receipt(&note.id)?;
+    tx.commit()?;
+    Ok(receipt)
+}

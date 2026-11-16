@@ -406,7 +406,7 @@ impl VaultDb {
             WHERE NOT EXISTS(SELECT 1 FROM note_attachments n WHERE n.attachment_id=a.id)
             AND NOT EXISTS(SELECT 1 FROM revision_attachments r WHERE r.attachment_id=a.id)
             AND NOT EXISTS(SELECT 1 FROM versions v WHERE instr(v.content,a.id)>0)
-            AND NOT EXISTS(SELECT 1 FROM meta m WHERE (m.key LIKE 'recovery_fork:%' OR m.key LIKE 'review_apply:%' OR m.key LIKE 'pending_summary:%') AND instr(m.value,a.id)>0)
+            AND NOT EXISTS(SELECT 1 FROM meta m WHERE (m.key LIKE 'recovery_fork:%' OR m.key LIKE 'review_apply:%' OR m.key LIKE 'pending_summary:%' OR m.key IN ('notebook_icons','tag_styles')) AND instr(m.value,a.id)>0)
             AND NOT EXISTS(SELECT 1 FROM meta m WHERE m.key LIKE 'attachment_stage:v3:%' AND json_extract(CASE WHEN m.key LIKE 'attachment_stage:v3:%' THEN m.value ELSE '{}' END,'$.attachmentId')=a.id)
             AND NOT EXISTS(SELECT 1 FROM meta m,json_each(CASE WHEN m.key LIKE 'recovery_assets:v3:%' THEN m.value ELSE '[]' END) held WHERE m.key LIKE 'recovery_assets:v3:%' AND held.value=a.id)",[]).map_err(error)? as u64;
         ancestry::validate(&tx)?;

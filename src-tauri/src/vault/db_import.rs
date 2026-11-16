@@ -53,19 +53,22 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
     }
     let mut report = ImportReport::default();
     let metadata_dir = vault_root.join(".ryuknotes");
-    let trash_dir = metadata_dir.join("trash");
-    let history_dir = metadata_dir.join("history");
+    let legacy_dir = vault_root.join(".helixnotes");
+    let trash_dirs = [metadata_dir.join("trash"), legacy_dir.join("trash")];
+    let history_dirs = [metadata_dir.join("history"), legacy_dir.join("history")];
 
     let mut md_files: Vec<std::path::PathBuf> = Vec::new();
     collect_md_files(vault_root, &metadata_dir, &mut md_files)
         .map_err(|e| format!("walking vault: {e}"))?;
     // Trashed notes live inside .ryuknotes/trash; collect them too.
-    collect_md_files(&trash_dir, &metadata_dir, &mut md_files)
-        .map_err(|e| format!("walking trash: {e}"))?;
-
-    if db.is_v3() {
-        md_files.sort();
+    for trash_dir in &trash_dirs {
+        collect_md_files(trash_dir, &metadata_dir, &mut md_files)
+            .map_err(|e| format!("walking trash: {e}"))?;
     }
+
+    md_files.sort();
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut identities = std::collections::HashMap::new();
     for path in md_files {
         let raw = match std::fs::read_to_string(&path) {
             Ok(text) => text,
@@ -90,7 +93,15 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
             meta.id = fallback_id(&path);
         }
 
-        let in_trash = path.starts_with(&trash_dir);
+        if !seen_ids.insert(meta.id.clone()) {
+            report.warnings.push(format!(
+                "Duplicate source identity rescued as a separate note: {}",
+                path.display()
+            ));
+            meta.id = fallback_id(&path);
+            seen_ids.insert(meta.id.clone());
+        }
+        let in_trash = trash_dirs.iter().any(|dir| path.starts_with(dir));
         // A trashed note keeps its frontmatter id so history still links.
         let mut note = NewNote {
             id: meta.id,
@@ -133,6 +144,27 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
                 )
                 .map_err(|e| e.to_string())?;
             }
+            if !in_trash {
+                let relative = path
+                    .parent()
+                    .ok_or("Missing source parent")?
+                    .strip_prefix(vault_root)
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let relative = super::db_notebooks::relative("", &relative)?;
+                let mut layout = super::db_notebooks::Layout::load(&tx)?;
+                let mut ancestor = String::new();
+                for part in relative.split('/').filter(|part| !part.is_empty()) {
+                    if !ancestor.is_empty() {
+                        ancestor.push('/');
+                    }
+                    ancestor.push_str(part);
+                    layout.notebooks.insert(ancestor.clone());
+                }
+                layout.assign(&note_id, &relative)?;
+                layout.save(&tx)?;
+            }
             tx.commit().map_err(|e| e.to_string())
         })();
         if let Err(e) = imported {
@@ -142,6 +174,13 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
             report.files_skipped += 1;
             continue;
         }
+        identities.insert(
+            path.strip_prefix(vault_root)
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .replace('\\', "/"),
+            note_id.clone(),
+        );
         if in_trash {
             if !db.is_v3() {
                 db.set_note_trashed(&note_id, true)?;
@@ -152,51 +191,89 @@ pub fn import_md_vault(vault_root: &Path, db: &VaultDb) -> Result<ImportReport, 
         }
 
         // History snapshots: .ryuknotes/history/<note id>/*.md (raw bodies).
-        let note_history = history_dir.join(sanitize(&note_id));
-        if std::fs::canonicalize(&note_history).is_ok_and(|path| path.starts_with(vault_root)) {
-            if let Ok(entries) = std::fs::read_dir(&note_history) {
-                for entry in entries.flatten() {
-                    let history_path = entry.path();
-                    if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
-                        continue;
-                    }
-                    if history_path.extension().and_then(|e| e.to_str()) != Some("md") {
-                        continue;
-                    }
-                    if let Ok(snapshot) = std::fs::read_to_string(&history_path) {
-                        let imported = (|| -> Result<(), String> {
-                            let tx = db.begin_auxiliary_write(
-                                "import",
-                                &serde_json::json!([note_id, snapshot]),
-                            )?;
-                            if tx.is_replay() {
-                                return tx.commit();
+        for history_dir in &history_dirs {
+            let note_history = history_dir.join(sanitize(&note_id));
+            if std::fs::canonicalize(&note_history).is_ok_and(|path| path.starts_with(vault_root)) {
+                if let Ok(entries) = std::fs::read_dir(&note_history) {
+                    for entry in entries.flatten() {
+                        let history_path = entry.path();
+                        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                            continue;
+                        }
+                        if history_path.extension().and_then(|e| e.to_str()) != Some("md") {
+                            continue;
+                        }
+                        if let Ok(snapshot) = std::fs::read_to_string(&history_path) {
+                            let imported = (|| -> Result<(), String> {
+                                let tx = db.begin_auxiliary_write(
+                                    "import",
+                                    &serde_json::json!([note_id, snapshot]),
+                                )?;
+                                if tx.is_replay() {
+                                    return tx.commit();
+                                }
+                                let snapshot = super::db_attachments::import_references(
+                                    db,
+                                    &tx,
+                                    vault_root,
+                                    &history_path,
+                                    &snapshot,
+                                    &note_id,
+                                )?;
+                                tx.commit().map_err(|e| e.to_string())?;
+                                db.add_version(
+                                    &note_id,
+                                    &snapshot,
+                                    &history_timestamp(&history_path),
+                                )?;
+                                Ok(())
+                            })();
+                            match imported {
+                                Ok(()) => report.versions_imported += 1,
+                                Err(error) => report.warnings.push(format!(
+                                    "failed to import history {}: {error}",
+                                    history_path.display()
+                                )),
                             }
-                            let snapshot = super::db_attachments::import_references(
-                                db,
-                                &tx,
-                                vault_root,
-                                &history_path,
-                                &snapshot,
-                                &note_id,
-                            )?;
-                            tx.commit().map_err(|e| e.to_string())?;
-                            db.add_version(&note_id, &snapshot, &rfc3339(Utc::now()))?;
-                            Ok(())
-                        })();
-                        match imported {
-                            Ok(()) => report.versions_imported += 1,
-                            Err(error) => report.warnings.push(format!(
-                                "failed to import history {}: {error}",
-                                history_path.display()
-                            )),
                         }
                     }
                 }
             }
         }
     }
+    for dir in [&legacy_dir, &metadata_dir] {
+        if let Err(error) =
+            super::db_appearance::import_folder_metadata(db, vault_root, dir, &identities)
+        {
+            report
+                .warnings
+                .push(format!("Metadata import {}: {error}", dir.display()));
+        }
+    }
     Ok(report)
+}
+
+fn history_timestamp(path: &Path) -> String {
+    let mut stamp = path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    if stamp.as_bytes().get(10) == Some(&b'T')
+        && stamp.as_bytes().get(13) == Some(&b'-')
+        && stamp.as_bytes().get(16) == Some(&b'-')
+    {
+        stamp.replace_range(16..17, ":");
+        stamp.replace_range(13..14, ":");
+        stamp.push('Z');
+    }
+    let parsed = frontmatter::parse_date_flexible(&stamp).or_else(|| {
+        std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .map(chrono::DateTime::<Utc>::from)
+    });
+    rfc3339(parsed.unwrap_or_else(Utc::now))
 }
 
 /// Windows forbids a handful of characters in file names; the history store
@@ -231,7 +308,7 @@ fn collect_md_files(
         .filter_entry(|e| {
             // Never descend into the metadata dir from the vault walk (the
             // trash/history passes handle their subdirectories explicitly).
-            e.path() != skip
+            e.path() != skip && e.path() != selected_root.join(".helixnotes")
         })
     {
         let entry = match entry {
@@ -360,6 +437,99 @@ pub(crate) fn import_single(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_folder_import_preserves_layout_history_metadata_and_duplicate_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        for path in [
+            "Projects/Child",
+            ".helixnotes/trash",
+            ".helixnotes/history/shared",
+        ] {
+            std::fs::create_dir_all(source.join(path)).unwrap();
+        }
+        let raw = "---\nid: shared\ntitle: Original\n---\nbody";
+        std::fs::write(source.join("Projects/Child/A.md"), raw).unwrap();
+        std::fs::write(source.join("Projects/Child/B.md"), raw).unwrap();
+        std::fs::write(
+            source.join(".helixnotes/trash/old.md"),
+            "---\nid: old\ntitle: Deleted\n---\nold",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join(".helixnotes/history/shared/2020-01-02T03-04-05.md"),
+            "historical body",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join(".helixnotes/notebook_icons.json"),
+            r#"{"Projects":"builtin:star"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            source.join(".helixnotes/tag_styles.json"),
+            r##"{"work":{"color":"#abc"}}"##,
+        )
+        .unwrap();
+        std::fs::write(
+            source.join(".helixnotes/quick_access.json"),
+            r#"["Projects/Child/A.md"]"#,
+        )
+        .unwrap();
+        let (db, _) =
+            VaultDb::open_with_report(&root.path().join("fixture.rn"), &root.path().join("ledger"))
+                .unwrap();
+        let report = import_md_vault(&source, &db).unwrap();
+        assert_eq!(
+            (
+                report.notes_imported,
+                report.notes_trashed,
+                report.files_skipped
+            ),
+            (2, 1, 0)
+        );
+        assert_eq!(report.warnings.len(), 1);
+        let layout = super::super::db_notebooks::Layout::load(&db.conn).unwrap();
+        assert_eq!(layout.notes["shared"], "Projects/Child");
+        let icons: std::collections::HashMap<String, String> =
+            super::super::db_appearance::load(&db, "notebook_icons").unwrap();
+        assert_eq!(icons["Projects"], "builtin:star");
+        assert_eq!(
+            db.get_state("quick_access").unwrap().unwrap(),
+            serde_json::json!(["shared"])
+        );
+        let stamp: String = db
+            .conn
+            .query_row(
+                "SELECT created FROM versions WHERE note_id='shared'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(stamp.starts_with("2020-01-02T03:04:05"));
+        import_md_vault(&source, &db).unwrap();
+        assert_eq!(db.list_notes(true).unwrap().len(), 3);
+        let versions: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM versions WHERE note_id='shared'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(versions, 1);
+        let duplicate = super::super::db_notebooks::duplicate_note(&db, "shared").unwrap();
+        let id = duplicate["id"].as_str().unwrap();
+        assert_ne!(id, "shared");
+        assert_eq!(
+            super::super::db_notebooks::Layout::load(&db.conn)
+                .unwrap()
+                .notes[id],
+            "Projects/Child"
+        );
+        assert_eq!(duplicate["content"], "body");
+    }
 
     #[test]
     fn plain_files_keep_distinct_stable_identities_in_production_vaults() {

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { resolveAttachmentImage } from '$lib/api';
 	import { reportOperationError } from '$lib/stores/operation-feedback';
 	import { getActiveEditorPane, type PaneRelease } from '$lib/stores/editor-workspace';
 
@@ -740,7 +741,7 @@
 		if (!iconPath || iconPath.startsWith('builtin:')) return null;
 		const vaultRoot = $appConfig?.active_vault;
 		if (!vaultRoot) return null;
-		return convertFileSrc(`${vaultRoot}/${iconPath}`);
+		return resolveAttachmentImage(iconPath, vaultRoot) ?? convertFileSrc(`${vaultRoot}/${iconPath}`);
 	}
 
 	function clampMenu(x: number, y: number, menuWidth = 220, menuHeight = 300): { x: number; y: number } {

@@ -65,3 +65,9 @@ export function dateBucketLabel(dateStr: string, now: Date = new Date()): string
 	if (d.getFullYear() === now.getFullYear()) return monthFormatter.format(d);
 	return monthYearFormatter.format(d);
 }
+
+/** Daily identities retain their calendar date across both supported stores. */
+export function dailyNoteDate(path: string | null): string | null {
+    if (!path) return null;
+    return /^(?:daily-)?(\d{4}-\d{2}-\d{2})(?:\.md)?$/.exec(path.split(/[\\/]/).pop() ?? '')?.[1] ?? null;
+}

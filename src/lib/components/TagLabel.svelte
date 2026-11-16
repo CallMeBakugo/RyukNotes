@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { resolveAttachmentImage } from '$lib/api';
 	import { convertFileSrc } from '@tauri-apps/api/core';
 	import { appConfig, tagStyles } from '$lib/stores/app';
 	import NotebookGlyph from './NotebookGlyph.svelte';
@@ -27,7 +28,7 @@
 		const icon = style?.icon;
 		const vault = $appConfig?.active_vault;
 		if (!icon || builtinIcon || icon.startsWith('builtin:') || !vault) return null;
-		return convertFileSrc(`${vault}/${icon}`);
+		return resolveAttachmentImage(icon, vault) ?? convertFileSrc(`${vault}/${icon}`);
 	});
 </script>
 

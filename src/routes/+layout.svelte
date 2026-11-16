@@ -9,7 +9,7 @@
 	import { darkThemes, isMobile, isAndroid } from '$lib/platform';
 	import type { CustomTheme } from '$lib/types';
 	import ResizeHandles from '$lib/components/ResizeHandles.svelte';
-	import { noteAssetRoot, resolveFileReference } from '$lib/utils/paths';
+	import { noteAssetRoot, resolveFileReference, isNoteLink } from '$lib/utils/paths';
 
 	let { children } = $props();
 
@@ -97,7 +97,7 @@
 			const root = noteAssetRoot(note, config?.active_vault ?? null, config?.vaults.map(vault => vault.path) ?? []);
 			const absPath = resolveFileReference(href, note, root).path;
 			// Internal .md note link - navigate within the app
-			if (absPath.endsWith('.md')) {
+			if (isNoteLink(absPath, root)) {
 				window.dispatchEvent(new CustomEvent('ryuknotes-open-note', { detail: { path: absPath, paneId: origin?.dataset.paneId } }));
 			} else {
 				openLocalFile(absPath);

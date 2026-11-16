@@ -1,5 +1,6 @@
 pub mod ancestry;
 pub mod db;
+pub(crate) mod db_appearance;
 pub(crate) mod db_attachments;
 pub mod db_export;
 pub mod db_import;

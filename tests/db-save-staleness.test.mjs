@@ -130,20 +130,16 @@ test('task updates use full-state update policy and never fall back to an unchec
   assert.equal(f.requests[0].policy.kind, 'update');
 });
 
-test('daily creation races select the existing identity without deleting or replacing it', async () => {
-  const calls = [];
-  let read = 0;
-  const id = 'daily-2026-11-11';
-  const daily = { ...original, id, content: 'created in the other window' };
-  const adapter = load(adapterSource, { require: () => ({ invoke: async (command) => {
-    calls.push(command);
-    if (command === 'db_get_note') return read++ === 0 ? null : receipt(daily);
-    if (command === 'db_writer_identity') return vault;
-    assert.equal(command, 'db_save_note');
-    throw { kind: 'changed', message: 'Already created' };
-  } }) });
-  const entry = await adapter.dbCreateDailyNote('2026-11-11', '/vault.rn');
-  assert.equal(entry.path, id);
-  assert.equal(entry.preview, daily.content);
-  assert.ok(!calls.includes('db_delete_note'));
+test('daily creation delegates date and captured vault to the atomic native boundary', async () => {
+  const calls=[];
+  const daily={...original,id:'daily-2026-11-11'};
+  const adapter=load(adapterSource,{require:()=>({invoke:async(command,args)=>{
+    calls.push([command,args]); return receipt(daily);
+  }})});
+  const entry=await adapter.dbCreateDailyNote('2026-11-11','/vault.rn');
+  assert.equal(entry.path,daily.id);
+  assert.equal(calls.length,1);
+  assert.equal(calls[0][0],'db_create_daily_note');
+  assert.equal(calls[0][1].vaultPath,'/vault.rn');
+  assert.equal(calls[0][1].date,'2026-11-11');
 });

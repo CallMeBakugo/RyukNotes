@@ -2328,6 +2328,12 @@ pub async fn get_notebook_icons(
     vault_path: String,
 ) -> Result<std::collections::HashMap<String, String>, String> {
     state.validate_vault(&vault_path)?;
+    if vault_path.ends_with(".rn") {
+        return with_db(&state, |db| {
+            validate_db_vault(db, &vault_path)?;
+            crate::vault::db_appearance::load(db, "notebook_icons")
+        });
+    }
     tauri::async_runtime::spawn_blocking(move || operations::load_notebook_icons(&vault_path))
         .await
         .map_err(|error| error.to_string())?
@@ -2341,6 +2347,13 @@ pub async fn set_notebook_icon(
     icon_relative: Option<String>,
 ) -> Result<(), String> {
     state.validate_vault(&vault_path)?;
+    if vault_path.ends_with(".rn") {
+        return with_db(&state, |db| {
+            validate_db_vault(db, &vault_path)?;
+            crate::vault::db_appearance::notebook(db, &notebook_relative, icon_relative, None)
+                .map(|_| ())
+        });
+    }
     let write_guard = state.note_save.clone().lock_owned().await;
     tauri::async_runtime::spawn_blocking(move || {
         let _write_guard = write_guard;
@@ -2359,6 +2372,17 @@ pub async fn import_notebook_icon(
     data: Vec<u8>,
 ) -> Result<String, String> {
     state.validate_vault(&vault_path)?;
+    if vault_path.ends_with(".rn") {
+        return with_db(&state, |db| {
+            validate_db_vault(db, &vault_path)?;
+            crate::vault::db_appearance::notebook(
+                db,
+                &notebook_relative,
+                None,
+                Some((&name, &data)),
+            )
+        });
+    }
     let write_guard = state.note_save.clone().lock_owned().await;
     tauri::async_runtime::spawn_blocking(move || {
         let _write_guard = write_guard;
@@ -2376,6 +2400,12 @@ pub async fn get_tag_styles(
     vault_path: String,
 ) -> Result<std::collections::HashMap<String, crate::types::TagStyle>, String> {
     state.validate_vault(&vault_path)?;
+    if vault_path.ends_with(".rn") {
+        return with_db(&state, |db| {
+            validate_db_vault(db, &vault_path)?;
+            crate::vault::db_appearance::load(db, "tag_styles")
+        });
+    }
     tauri::async_runtime::spawn_blocking(move || operations::load_tag_styles(&vault_path))
         .await
         .map_err(|error| error.to_string())?
@@ -2389,6 +2419,12 @@ pub async fn set_tag_style(
     change: TagStyleChange,
 ) -> Result<Option<TagStyle>, String> {
     state.validate_vault(&vault_path)?;
+    if vault_path.ends_with(".rn") {
+        return with_db(&state, |db| {
+            validate_db_vault(db, &vault_path)?;
+            crate::vault::db_appearance::tag(db, &tag, change, None)
+        });
+    }
     let write_guard = state.note_save.clone().lock_owned().await;
     tauri::async_runtime::spawn_blocking(move || {
         let _write_guard = write_guard;
@@ -2407,6 +2443,13 @@ pub async fn import_tag_icon(
     data: Vec<u8>,
 ) -> Result<TagStyle, String> {
     state.validate_vault(&vault_path)?;
+    if vault_path.ends_with(".rn") {
+        return with_db(&state, |db| {
+            validate_db_vault(db, &vault_path)?;
+            crate::vault::db_appearance::tag(db, &tag, TagStyleChange::Reset, Some((&name, &data)))?
+                .ok_or("Missing imported tag style".into())
+        });
+    }
     let write_guard = state.note_save.clone().lock_owned().await;
     tauri::async_runtime::spawn_blocking(move || {
         let _write_guard = write_guard;
@@ -4286,6 +4329,59 @@ fn with_db<T>(
     f(db)
 }
 
+fn publish_db_change(state: &AppState, vault: &str) {
+    crate::recovery::notify(state);
+    if let Ok(app) = state.recovery_events.lock() {
+        if let Some(app) = app.as_ref() {
+            let path = state
+                .config
+                .lock()
+                .ok()
+                .and_then(|config| config.active_vault.clone())
+                .filter(|path| {
+                    std::fs::canonicalize(path).ok() == std::fs::canonicalize(vault).ok()
+                })
+                .unwrap_or_else(|| vault.into());
+            let _ = app.emit(
+                "file-changed",
+                FileEvent {
+                    vault_path: path.clone(),
+                    path,
+                    event_type: "modify".into(),
+                    note: None,
+                },
+            );
+        }
+    }
+}
+
+/// Connection-local observations are hints only; they never advance an editor baseline.
+#[tauri::command]
+pub fn db_poll_changes(state: State<'_, AppState>, vault_path: String) -> Result<bool, String> {
+    let observed = with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        Ok((
+            state
+                .vault_db_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+            db.conn
+                .pragma_query_value(None, "data_version", |row| row.get::<_, i64>(0))
+                .map_err(|e| e.to_string())?,
+            db.conn.total_changes(),
+        ))
+    })?;
+    let changed = {
+        let mut previous = state.db_observation.lock().map_err(|e| e.to_string())?;
+        let changed = previous.as_ref() != Some(&observed);
+        *previous = Some(observed);
+        changed
+    };
+    if changed {
+        publish_db_change(&state, &vault_path);
+    }
+    Ok(changed)
+}
+
 #[tauri::command]
 pub fn db_list_notes(
     state: State<'_, AppState>,
@@ -4349,7 +4445,7 @@ pub fn db_save_note(
     })?;
     let receipt = db.write_authoritative(&request, limit)?;
     drop(slot);
-    crate::recovery::notify(&state);
+    publish_db_change(&state, &request.vault.path);
     Ok(receipt)
 }
 
@@ -4740,6 +4836,20 @@ pub fn db_get_notes(
         let relative =
             crate::vault::db_notebooks::relative(db.conn.path().ok_or("No vault path")?, &path)?;
         let layout = crate::vault::db_notebooks::Layout::load(&db.conn)?;
+        if relative == "Daily" {
+            return Ok(notes
+                .into_iter()
+                .filter(|note| {
+                    layout
+                        .notes
+                        .get(&note.id)
+                        .is_some_and(|path| path == "Daily")
+                        || note.id.strip_prefix("daily-").is_some_and(|date| {
+                            chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
+                        })
+                })
+                .collect());
+        }
         layout.require(&relative)?;
         Ok(notes
             .into_iter()
@@ -5182,6 +5292,7 @@ pub fn db_create_backup(
         );
         let backup_path = backup_dir.join(&filename);
         with_db(&state, |db| {
+            validate_db_vault(db, &vault_path)?;
             crate::vault::ancestry::snapshot(&db.conn, &backup_path, false, true)
         })?;
         let size = std::fs::metadata(&backup_path)
@@ -8017,4 +8128,148 @@ mod db_activation_tests {
             original
         );
     }
+}
+
+#[cfg(test)]
+mod db_change_monitor_tests {
+    use super::*;
+    #[test]
+    fn polling_ipc_detects_local_and_external_commits_without_advancing_notes() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = root.path().join("fixture.rn");
+        let ledger = root.path().join("ledger");
+        let (db, _) = crate::vault::db::VaultDb::open_with_report(&vault, &ledger).unwrap();
+        let state = AppState::new(AppConfig::default());
+        *state.vault_db.lock().unwrap() = Some(db);
+        let app = tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![
+                db_poll_changes,
+                db_create_daily_note,
+                db_duplicate_note
+            ])
+            .manage(state)
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let view = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let poll = || {
+            tauri::test::get_ipc_response(
+                &view,
+                tauri::webview::InvokeRequest {
+                    cmd: "db_poll_changes".into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: if cfg!(any(windows, target_os = "android")) {
+                        "http://tauri.localhost"
+                    } else {
+                        "tauri://localhost"
+                    }
+                    .parse()
+                    .unwrap(),
+                    body: tauri::ipc::InvokeBody::Json(serde_json::json!({"vaultPath":vault})),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.into(),
+                },
+            )
+            .unwrap()
+            .deserialize::<bool>()
+            .unwrap()
+        };
+        assert!(poll());
+        assert!(!poll());
+        let other = crate::vault::db::VaultDb::open_with_report(&vault, &ledger)
+            .unwrap()
+            .0;
+        other.set_state("fixture", &serde_json::json!(1)).unwrap();
+        assert!(poll());
+        assert!(!poll());
+        app.state::<AppState>()
+            .vault_db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .set_state("fixture", &serde_json::json!(2))
+            .unwrap();
+        assert!(poll());
+        assert!(!poll());
+        let invoke = |cmd: &str, body: serde_json::Value| {
+            tauri::test::get_ipc_response(
+                &view,
+                tauri::webview::InvokeRequest {
+                    cmd: cmd.into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: if cfg!(any(windows, target_os = "android")) {
+                        "http://tauri.localhost"
+                    } else {
+                        "tauri://localhost"
+                    }
+                    .parse()
+                    .unwrap(),
+                    body: tauri::ipc::InvokeBody::Json(body),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.into(),
+                },
+            )
+            .unwrap()
+            .deserialize::<serde_json::Value>()
+            .unwrap()
+        };
+        let daily = invoke(
+            "db_create_daily_note",
+            serde_json::json!({"vaultPath":vault,"date":"2026-11-15"}),
+        );
+        assert_eq!(daily["id"], "daily-2026-11-15");
+        let copy = invoke(
+            "db_duplicate_note",
+            serde_json::json!({"vaultPath":vault,"notePath":daily["id"]}),
+        );
+        let guard = app.state::<AppState>();
+        let slot = guard.vault_db.lock().unwrap();
+        let db = slot.as_ref().unwrap();
+        assert_eq!(
+            crate::vault::db_notebooks::Layout::load(&db.conn)
+                .unwrap()
+                .notes[copy["id"].as_str().unwrap()],
+            "Daily"
+        );
+    }
+}
+
+#[tauri::command]
+pub fn db_create_daily_note(
+    state: State<'_, AppState>,
+    vault_path: String,
+    date: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let format = state
+        .config
+        .lock()
+        .map_err(|e| e.to_string())?
+        .daily_title_format
+        .clone();
+    let date = match date {
+        Some(date) => {
+            chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").map_err(|e| e.to_string())?
+        }
+        None => chrono::Local::now().date_naive(),
+    };
+    with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        crate::vault::db_notebooks::create_daily_note(db, date, &format)
+    })
+}
+
+#[tauri::command]
+pub fn db_duplicate_note(
+    state: State<'_, AppState>,
+    vault_path: String,
+    note_path: String,
+) -> Result<serde_json::Value, String> {
+    with_db(&state, |db| {
+        validate_db_vault(db, &vault_path)?;
+        crate::vault::db_notebooks::duplicate_note(db, &note_path)
+    })
 }

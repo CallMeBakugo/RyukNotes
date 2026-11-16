@@ -41,7 +41,7 @@
 		createDailyNote,
 		revealFile
 	} from '$lib/api';
-	import { formatRelativeTime, formatDate } from '$lib/utils/time';
+	import { formatRelativeTime, formatDate, dailyNoteDate } from '$lib/utils/time';
 	import { openNoteWindow } from '$lib/utils/window';
 	import { encodeNoteDragPaths } from '$lib/utils/note-drag';
 	import { tagIterationKey } from '$lib/utils/tag-styles';
@@ -568,8 +568,8 @@
 			$notes = list;
 			if (mode === 'daily') {
 				dailyDates = new Set(list.flatMap((note) => {
-					const match = note.path.split(/[\\/]/).pop()?.match(/^(\d{4}-\d{2}-\d{2})\.md$/);
-					return match ? [match[1]] : [];
+					const date = dailyNoteDate(note.path);
+					return date ? [date] : [];
 				}));
 			}
 		} catch (e) {
@@ -1501,7 +1501,7 @@
 								class="cal-cell"
 								class:today={cell.current}
 								class:has-note={dailyDates.has(cell.date)}
-								class:active={$activeNotePath?.endsWith(`${cell.date}.md`) ?? false}
+								class:active={dailyNoteDate($activeNotePath) === cell.date}
 								onclick={() => handleDayClick(cell.date)}
 							>
 								{cell.day}

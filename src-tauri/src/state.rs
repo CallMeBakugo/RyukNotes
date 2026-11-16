@@ -49,6 +49,7 @@ pub struct AppState {
     /// The SQLite vault database, when the active vault is DB-backed.
     pub vault_db: Mutex<Option<VaultDb>>,
     pub vault_db_epoch: AtomicU64,
+    pub db_observation: Mutex<Option<(u64, i64, u64)>>,
     #[cfg(desktop)]
     pub quitting: AtomicBool,
     pending_open_files: Mutex<PendingOpenFiles>,
@@ -247,6 +248,7 @@ impl AppState {
             importing: AtomicBool::new(false),
             vault_db: Mutex::new(None),
             vault_db_epoch: AtomicU64::new(0),
+            db_observation: Mutex::new(None),
             #[cfg(desktop)]
             quitting: AtomicBool::new(false),
             pending_open_files: Mutex::new(PendingOpenFiles::default()),

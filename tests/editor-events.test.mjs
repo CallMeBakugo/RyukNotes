@@ -1,3 +1,4 @@
+import { isNoteLink } from '../src/lib/utils/paths.ts';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFile } from 'node:fs/promises';
@@ -75,7 +76,7 @@ test('layout link resolution uses the clicked pane before resolving a relative n
   const sent = [];
   const handler = execute(node.getText(ast) + '\nexports.open = resolveAndHandleLink;', {
     get: key => key === 'config' ? { active_vault: '/vault', vaults: [] } : '/wrong-pane/note.md',
-    appConfig: 'config', activeNotePath: 'path', isAndroid: false,
+    appConfig: 'config', activeNotePath: 'path', isAndroid: false, isNoteLink,
     noteAssetRoot: note => { assert.equal(note, '/vault/right/current.md'); return '/vault'; },
     resolveFileReference: (href, note) => {
       assert.equal(href, 'next.md');

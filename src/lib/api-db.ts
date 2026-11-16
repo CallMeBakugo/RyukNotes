@@ -26,12 +26,28 @@ import type { ExternalNoteReference } from "./editor/externalNote";
 
 let dbMode = false;
 let dbSessionGeneration = 0;
+let changeMonitor: ReturnType<typeof setInterval> | null = null;
+
+function monitorChanges(path: string): void {
+  if (typeof document === 'undefined') return;
+  if (changeMonitor !== null) clearInterval(changeMonitor);
+  const generation = dbSessionGeneration;
+  let reading = false;
+  changeMonitor = setInterval(async () => {
+    if (reading || !dbMode || generation !== dbSessionGeneration || document.visibilityState !== 'visible') return;
+    reading = true;
+    try { await invoke('db_poll_changes', { vaultPath: path }); }
+    catch { /* The next poll retries. Authoritative writes still validate the vault. */ }
+    finally { reading = false; }
+  }, 2_000);
+}
 
 export function isDbVault(): boolean {
   return dbMode;
 }
 
 export function setDbMode(on: boolean): void {
+  if (changeMonitor !== null) { clearInterval(changeMonitor); changeMonitor = null; }
   dbSessionGeneration++;
   dbMode = on;
   if (!on) recordVaultOpenStatus(null);
@@ -55,7 +71,7 @@ interface DbNote {
 function toEntry(note: DbNote): NoteEntry {
   return {
     path: note.id,
-    relative_path: note.title,
+    relative_path: note.id,
     meta: {
       id: note.id,
       title: note.title,
@@ -76,6 +92,7 @@ export async function dbOpenVault(path: string): Promise<void> {
   const report = await invoke<DbOpenReport>('db_open_vault', { path });
   setDbMode(true);
   recordVaultOpenStatus(report?.status ?? null);
+  monitorChanges(path);
 }
 
 // Detached webviews have their own adapter flag, but share the native connection.
@@ -83,6 +100,7 @@ export async function dbOpenVault(path: string): Promise<void> {
 export async function dbAttachVault(path: string): Promise<DbAcceptedState['vault']> {
   const identity = await invoke<DbAcceptedState['vault']>('db_writer_identity', { vaultPath: path }).catch(writeError);
   setDbMode(true);
+  monitorChanges(path);
   return identity;
 }
 
@@ -191,29 +209,19 @@ async function createExplicit(id: string, title: string, content: string, tags: 
     vault, vaultPath, id, title, content, pinned: false, tags, policy: { kind: 'create' },
   } }).catch(writeError);
   const note = toContent(full);
-  return { path: note.path, relative_path: note.meta.title, meta: note.meta, preview: content.slice(0, 120) };
+  return { path: note.path, relative_path: note.path, meta: note.meta, preview: content.slice(0, 120) };
 }
 export async function dbCreateNote(title: string, notebookRelative: string | null = null, vaultPath?: string): Promise<NoteEntry> {
   if (!vaultPath) return createExplicit(crypto.randomUUID(), title, '', []);
   const full = await invoke<Record<string, unknown>>('db_create_note', { vaultPath, notebookRelative, title }).catch(writeError);
   const note = toContent(full);
-  return { path: note.path, relative_path: note.meta.title, meta: note.meta, preview: note.content.slice(0, 120) };
+  return { path: note.path, relative_path: note.path, meta: note.meta, preview: note.content.slice(0, 120) };
 }
 export async function dbCreateDailyNote(date?: string, vaultPath?: string): Promise<NoteEntry> {
-  const iso = date ?? new Date().toISOString().slice(0, 10);
-  const id = `daily-${iso}`;
-  const existing = await invoke<Record<string, unknown> | null>('db_get_note', { id, vaultPath }).catch(writeError);
-  if (existing) {
-    const note = toContent(existing);
-    return { path: id, relative_path: note.meta.title, meta: note.meta, preview: note.content.slice(0, 120) };
-  }
-  try { return await createExplicit(id, iso, '', [], vaultPath); }
-  catch (error) {
-    if (!(error instanceof DbWriteError) || error.kind !== 'changed') throw error;
-    // Another window created today's note first. Select it; never delete/rewrite it.
-    const note = await dbReadNote(id, vaultPath);
-    return { path: id, relative_path: note.meta.title, meta: note.meta, preview: note.content.slice(0, 120) };
-  }
+  if (!vaultPath) throw new Error('The originating vault is required for a daily note.');
+  const full = await invoke<Record<string, unknown>>('db_create_daily_note', { vaultPath, date: date ?? null }).catch(writeError);
+  const note = toContent(full);
+  return { path: note.path, relative_path: note.path, meta: note.meta, preview: note.content.slice(0, 120) };
 }
 export async function dbRenameNote(path: string, newTitle: string, vaultPath?: string): Promise<string> {
   const note = await dbReadNote(path, vaultPath);
@@ -221,8 +229,10 @@ export async function dbRenameNote(path: string, newTitle: string, vaultPath?: s
   return path;
 }
 export async function dbDuplicateNote(path: string, vaultPath?: string): Promise<NoteEntry> {
-  const note = await dbReadNote(path, vaultPath);
-  return createExplicit(crypto.randomUUID(), `${note.meta.title} (copy)`, note.content, note.meta.tags, note.meta.accepted?.vault.path);
+  if (!vaultPath) throw new Error('The originating vault is required to duplicate a note.');
+  const full = await invoke<Record<string, unknown>>('db_duplicate_note', { vaultPath, notePath: path }).catch(writeError);
+  const note = toContent(full);
+  return { path: note.path, relative_path: note.path, meta: note.meta, preview: note.content.slice(0, 120) };
 }
 
 export async function dbSearchNotes(query: string, limit = 20, offset = 0): Promise<SearchPage> {
@@ -292,7 +302,7 @@ export async function dbGetQuickAccess(): Promise<NoteEntry[]> {
     if (!note) continue;
     out.push({
       path: id,
-      relative_path: String(note.title),
+      relative_path: id,
       meta: {
         id,
         title: String(note.title),
@@ -345,6 +355,7 @@ export async function dbCreateBackup(): Promise<import("./types").BackupEntry> {
 export async function dbRestoreBackup(backupPath: string, vaultPath: string): Promise<void> {
   const outcome = await invoke<AncestryRestoreOutcome | null>('db_restore_backup', { backupPath, vaultPath });
   dbSessionGeneration++;
+  monitorChanges(vaultPath);
   if (outcome?.requires_recovery_review) recordVaultOpenStatus('Vault restored with a new storage epoch. Review recovered drafts before rebinding.');
 }
 

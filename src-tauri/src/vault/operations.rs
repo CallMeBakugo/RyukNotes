@@ -1107,6 +1107,21 @@ fn get_system_locale() -> Locale {
     }
 }
 
+pub fn daily_note_title(target_date: chrono::NaiveDate, format: &str) -> String {
+    match format {
+        "iso" => target_date.format("%Y-%m-%d").to_string(),
+        "long" => target_date.format("%B %-d, %Y").to_string(),
+        "us" => target_date.format("%m/%d/%Y").to_string(),
+        "eu" => target_date.format("%d/%m/%Y").to_string(),
+        _ => {
+            let locale = get_system_locale();
+            target_date
+                .format_localized("%B %d, %Y", locale)
+                .to_string()
+        }
+    }
+}
+
 pub fn create_daily_note(
     vault_path: &str,
     date: Option<&str>,
@@ -1118,18 +1133,7 @@ pub fn create_daily_note(
         None => Local::now().date_naive(),
     };
     let date_str = target_date.format("%Y-%m-%d").to_string();
-    let title = match format {
-        "iso" => target_date.format("%Y-%m-%d").to_string(),
-        "long" => target_date.format("%B %-d, %Y").to_string(),
-        "us" => target_date.format("%m/%d/%Y").to_string(),
-        "eu" => target_date.format("%d/%m/%Y").to_string(),
-        _ => {
-            let locale = get_system_locale();
-            target_date
-                .format_localized("%B %d, %Y", locale)
-                .to_string()
-        }
-    };
+    let title = daily_note_title(target_date, format);
 
     let dir = Path::new(vault_path).join("Daily");
     if fs::symlink_metadata(&dir).is_err() {
@@ -2386,8 +2390,8 @@ pub fn load_tag_styles(
     Ok(collapsed)
 }
 
-pub fn patch_tag_style(
-    vault_path: &str,
+pub(crate) fn patch_tag_style_map(
+    styles: &mut std::collections::HashMap<String, TagStyle>,
     tag: &str,
     change: TagStyleChange,
 ) -> Result<Option<TagStyle>, String> {
@@ -2396,7 +2400,6 @@ pub fn patch_tag_style(
         return Err("Tag name is required".to_string());
     }
 
-    let mut styles = load_tag_styles(vault_path)?;
     let stored_key = styles
         .keys()
         .find(|existing| tag_style_key_fold(existing) == tag_style_key_fold(&key))
@@ -2413,6 +2416,16 @@ pub fn patch_tag_style(
         styles.insert(stored_key, style.clone());
     }
 
+    Ok(next)
+}
+
+pub fn patch_tag_style(
+    vault_path: &str,
+    tag: &str,
+    change: TagStyleChange,
+) -> Result<Option<TagStyle>, String> {
+    let mut styles = load_tag_styles(vault_path)?;
+    let next = patch_tag_style_map(&mut styles, tag, change)?;
     let dir = ryuknotes_dir(vault_path);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let data = serde_json::to_string_pretty(&styles).map_err(|e| e.to_string())?;

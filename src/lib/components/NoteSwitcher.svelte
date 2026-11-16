@@ -2,6 +2,7 @@
 	import { getActiveEditorPane } from '$lib/stores/editor-workspace';
 
 	import { tick } from 'svelte';
+	import { isPathInDirectory, resolveNoteReference } from '$lib/utils/paths';
 	import { appConfig } from '$lib/stores/app';
 	import { getNoteSwitcherTitles, getQuickAccess } from '$lib/api';
 	import { openNoteWindow } from '$lib/utils/window';
@@ -38,17 +39,16 @@
 	}
 
 	function isInsideVault(path: string, vaultPath: string): boolean {
-		return normalizedPath(path).startsWith(`${normalizedPath(vaultPath)}/`);
+		return isPathInDirectory(path, vaultPath);
 	}
 
 	function vaultRelativePath(path: string, vaultPath: string): string {
-		return normalizedPath(path).slice(normalizedPath(vaultPath).length + 1);
+		const prefix = `${normalizedPath(vaultPath)}/`;
+		return normalizedPath(path).startsWith(prefix) ? normalizedPath(path).slice(prefix.length) : path;
 	}
 
 	function joinVaultPath(vaultPath: string, relativePath: string): string {
-		const separator = vaultPath.includes('\\') && !vaultPath.includes('/') ? '\\' : '/';
-		const root = vaultPath.replace(/[\\/]+$/, '');
-		return `${root}${separator}${relativePath.replace(/[\\/]/g, separator)}`;
+		return resolveNoteReference(relativePath, vaultPath);
 	}
 
 	function titleEntryToNote(entry: NoteTitleEntry, vaultPath: string): NoteSwitcherNote | null {
