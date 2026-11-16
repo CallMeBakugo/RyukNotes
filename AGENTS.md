@@ -86,9 +86,6 @@ modified. Display name is "Ryuk's Notebook"; machinery stays apostrophe-free.
 9. Map a feature's full wiring surface BEFORE cutting it: grep its symbols across the
    backend files, then `api.ts`/stores, then every component including
    `src/routes/+layout.svelte` (startup wiring hides there).
-10. The in-app Ryuk fan-art icon ships for personal use only; swap for original
-    death-god art before any public-facing release branding. Removing a character's
-    NAME does not de-risk the LIKENESS.
 
 ## Build and verify (this machine's quirks)
 
@@ -180,8 +177,8 @@ walls, and an honest status line until the project stabilizes.
   must be available to the new session; obsolete cage limitations do not apply
   unless independently observed. Use offline/cached dependencies when available.
 - Run native packaging and boot checks for changes affecting startup, packaging
-  or releases. CI, correct versions, AGPL attribution, artifact verification,
-  and the original-art requirement for public release branding remain required.
+  or releases. CI, correct versions, AGPL attribution and artifact verification
+  remain required.
 - Report what changed, verification performed, gates not run, and any commit,
   push or release URLs. A `.session-commit-msg` file and `codex-collect` are no
   longer required; do not reuse the old stale handoff as a new commit message.
