@@ -63,6 +63,6 @@ The `ryuk` CLI binary lands in `src-tauri/target/release/ryuk`.
 
 ## Credits and license
 
-Forked from HelixNotes by Yuri Karamian (ArkHost) — the editor, UI, and
-original architecture are his work. Rebadged and reworked as RyukNotes
-under the same AGPL-3.0 license. Upstream: https://gitlab.com/ArkHost/HelixNotes
+Originally forked from HelixNotes by Yuri Karamian (ArkHost); independently
+developed as Ryuk's Notebook. Licensed AGPL-3.0-or-later.
+Upstream: https://gitlab.com/ArkHost/HelixNotes
