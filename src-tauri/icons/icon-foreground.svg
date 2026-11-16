@@ -1,11 +1,16 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
-  <g transform="translate(85.333 85.333) scale(0.666667)">
-  <line x1="178.45584" y1="178.45584" x2="333.54416" y2="333.54416" stroke="#ffffff" stroke-width="25" stroke-opacity="0.5" stroke-linecap="round"/>
-  <line x1="337.53708" y1="174.46292" x2="174.46294" y2="337.53708" stroke="#ffffff" stroke-width="25" stroke-opacity="0.5" stroke-linecap="round"/>
-  <circle cx="153" cy="153" r="36" fill="#ffffff"/>
-  <circle cx="359" cy="153" r="36" fill="#ffffff"/>
-  <circle cx="153" cy="359" r="36" fill="#ffffff"/>
-  <circle cx="359" cy="359" r="36" fill="#ffffff"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>Ryuk's Notebook</title>
+  <desc>Original hooded spirit holding a gold notebook. Created for this project; no franchise character likeness.</desc>
+  <path d="M116 388C125 318 116 202 175 121Q256 31 337 121C396 202 387 318 396 388Q352 423 310 402Q256 432 202 402Q160 423 116 388Z" fill="#486B71"/>
+  <path d="M145 372C154 299 145 212 192 143Q256 67 320 143C367 212 358 299 367 372Q311 356 256 394Q201 356 145 372Z" fill="#263C47"/>
+  <path d="M179 218C179 164 207 127 256 127S333 164 333 218Q333 280 256 302Q179 280 179 218Z" fill="#F0E9D5"/>
+  <ellipse cx="224" cy="220" rx="14" ry="20" fill="#171923"/>
+  <ellipse cx="288" cy="220" rx="14" ry="20" fill="#171923"/>
+  <path d="M248 255Q256 261 264 255" fill="none" stroke="#8C9895" stroke-width="7" stroke-linecap="round"/>
+  <g transform="rotate(-8 256 356)">
+    <rect x="162" y="282" width="188" height="152" rx="18" fill="#D6AE61"/>
+    <path d="M184 282H199V434H184Q162 434 162 412V304Q162 282 184 282Z" fill="#A5783C"/>
+    <path d="M222 326H319M222 353H303M222 380H289" stroke="#634D34" stroke-width="10" stroke-linecap="round"/>
+    <path d="M200 416H331" stroke="#F0E9D5" stroke-width="7" stroke-linecap="round"/>
   </g>
 </svg>
